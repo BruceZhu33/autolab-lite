@@ -1,0 +1,2250 @@
+# =====================================================================
+# AutoLab · sidecar OpenAPI v1 契约（M1 四件套之一）
+# 版本：v1.0-draft.6（第五轮评审修订版） · 2026-09-13
+# 基线：技术设计 v2.7 §6 · 需求 v0.5.3 · 选型 v2.2
+# 通用语义（全端点）：
+#   1. capability token：除 GET /healthz 外全部 API 必持有效 token（B2；loopback 随机端口）
+#   2. 幂等键：所有非只读 POST 支持/要求 Idempotency-Key 头（服务端在业务事务内写
+#      api_idempotency 记录请求 hash 与原始响应；同键同载荷→重放原响应；同键异载荷→
+#      409 IDEMPOTENCY_CONFLICT）；唯一例外 POST /api/v1/uploads（二进制不缓存响应，按
+#      文件 sha256 天然幂等）——复审 S8
+#   3. 乐观锁：状态迁移操作携带 expected_state_revision；不匹配→409 STATE_REVISION_CONFLICT
+#   4. 错误体统一 AlError{code,message,request_id,details}；request_id 全链路贯穿
+#   5. gpu-agent 对外 API（设计 §5）不在本文件——独立进程、SSH 隧道内、不同鉴权（manifest HMAC）
+#   6. WS 事件流（/ws）见 ws-events.md（OpenAPI 3.1 不覆盖 WS 语义）
+# =====================================================================
+openapi: 3.1.0
+info:
+  title: AutoLab sidecar API
+  version: 1.0.0-draft.6
+  description: |
+    科研训练自动化桌面应用的本机控制面 API（Tauri 壳内前端 ↔ Python sidecar）。
+    所有路径以 /api/v1 为统一前缀（健康检查除外）。
+    统一标识：request_id / run_id / attempt_id / event_seq（设计 §6）。
+servers:
+- url: http://127.0.0.1:{port}
+  description: sidecar 仅绑定本机回环随机端口（D46/B2；端口由 Tauri 壳注入）
+  variables:
+    port: {default: "0", description: 随机端口}
+
+security:
+- capabilityToken: []
+
+tags:
+- {name: System, description: 健康与元信息}
+- {name: Servers, description: 服务器/GPU 注册与管理（P1/P2）}
+- {name: Projects, description: 立项与项目生命周期（P3）}
+- {name: Data, description: 数据版本与副本校验（D16/D39）}
+- {name: Plan, description: '方案评审、协议冻结与修订（P4/D21/D38/D43）。[BLOCKED-ADD-4：逐模块 thread/turn 对话流、反问清单逐项确认 API 待设计增补 ADD-4 冻结]'}
+- {name: Iteration, description: 训练闭环控制与观测（P5/D23/D31/D32/D41）}
+- {name: Budget, description: 预算账本与下调（V6 双返回语义）}
+- {name: Evaluation, description: 可信评测、候选与批次（D29/D34/D36/D37/D45）}
+- {name: FinalConfirmation, description: test 结果一次性释放（U3 原子语义）}
+- {name: Reports, description: 阶段/最终报告与复现包（Q05/A06/D28）}
+- {name: Audit, description: 审计与状态回放（设计 §4 迁移留痕）}
+
+paths:
+  /healthz:
+    get:
+      tags: [System]
+      summary: 健康检查（唯一免 token 端点）
+      security: []
+      operationId: getHealthz
+      responses:
+        "200":
+          description: sidecar 存活
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, schema_ver, app_ver]
+                properties:
+                  status: {const: ok}
+                  schema_ver: {type: integer, description: DB schema_migrations 最大版本（启动握手）}
+                  app_ver: {type: string}
+  /api/v1/meta:
+    get:
+      tags: [System]
+      summary: 版本与能力元信息
+      operationId: getMeta
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_version: {const: "1"}
+                  design_baseline: {type: string, example: "v2.7"}
+                  requirements_baseline: {type: string, example: "v0.5.3"}
+                  plan_schema: {type: string, example: "plan.schema.json@1"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # =================================================================
+  # Servers（P1/P2）
+  # =================================================================
+  /api/v1/servers:
+    get:
+      tags: [Servers]
+      summary: 服务器列表（含 agent 能力/沙箱策略探测结果）
+      operationId: listServers
+      responses: {"200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Server"}}}}}, '401': {$ref: '#/components/responses/Unauthorized'}}
+    post:
+      tags: [Servers]
+      summary: 登记服务器（SSH 直连，D14）
+      operationId: createServer
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, host, username, auth]
+              properties:
+                name: {type: string}
+                host: {type: string}
+                port: {type: integer, default: 22}
+                username: {type: string}
+                auth:
+                  type: object
+                  required: [kind, credential_ref]
+                  properties:
+                    kind: {enum: [password, key]}
+                    credential_ref: {type: string, description: 平台钥匙串引用（D48 适配器）}
+      responses:
+        "201": {description: 已登记, content: {application/json: {schema: {$ref: "#/components/schemas/Server"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/servers/{serverId}:
+    parameters: [$ref: "#/components/parameters/ServerId"]
+    get:
+      tags: [Servers]
+      summary: 服务器详情
+      operationId: getServer
+      responses: {"200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/Server"}}}}, "404": {$ref: "#/components/responses/NotFound"}, '401': {$ref: '#/components/responses/Unauthorized'}}
+    patch:
+      tags: [Servers]
+      summary: 更新登记（凭据变更后须重新验证连接；失联任务记录保留，A11）
+      operationId: updateServer
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: {type: string}
+                host: {type: string}
+                port: {type: integer}
+                auth: {type: object}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/Server"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    delete:
+      tags: [Servers]
+      summary: 注销服务器（前置：无该项目在途任务，否则 409）
+      operationId: deleteServer
+      responses:
+        "204": {description: 已注销}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/servers/{serverId}/connectivity-test:
+    post:
+      tags: [Servers]
+      summary: 一键连通性测试（SSH+隧道）
+      operationId: testServerConnectivity
+      parameters: [$ref: "#/components/parameters/ServerId", $ref: "#/components/parameters/IdempotencyKey"]
+      responses:
+        "200":
+          description: 测试结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reachable]
+                properties:
+                  reachable: {type: boolean}
+                  detail: {type: string}
+                  checked_at: {type: string, format: date-time}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      x-remote-agent-operation: true
+  /api/v1/servers/{serverId}/agent:
+    get:
+      tags: [Servers]
+      summary: 最近一次 gpu-agent /healthz 探测缓存（能力清单+沙箱策略 hash；缺沙箱=诊断模式 Z1）
+      operationId: getServerAgent
+      parameters: [$ref: "#/components/parameters/ServerId"]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_ver: {type: string}
+                  schema_ver: {type: string}
+                  capabilities: {type: object, additionalProperties: true}
+                  sandbox_policy_hash: {type: string}
+                  diagnostic_only: {type: boolean, description: 无 systemd 沙箱能力时 true（不产 trusted 指标）}
+                  sudo_verified: {type: boolean}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/servers/{serverId}/agent/probe:
+    post:
+      tags: [Servers]
+      summary: 主动探测 gpu-agent
+      operationId: probeServerAgent
+      parameters: [$ref: "#/components/parameters/ServerId", $ref: "#/components/parameters/IdempotencyKey"]
+      responses:
+        "200": {description: 探测完成（结果同 GET /agent）, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
+        "503": {$ref: "#/components/responses/AgentUnreachable"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+      x-remote-agent-operation: true
+  /api/v1/servers/{serverId}/gpus:
+    get:
+      tags: [Servers]
+      summary: 该机 GPU 状态（占用区分 平台任务/外部进程，A03）
+      operationId: listServerGpus
+      parameters: [$ref: "#/components/parameters/ServerId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Gpu"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/servers/{serverId}/environments:
+    get:
+      tags: [Servers]
+      summary: 已装环境版本列表（版本管理，D40）
+      operationId: listServerEnvironments
+      parameters: [$ref: "#/components/parameters/ServerId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/EnvironmentVersion"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/gpus:
+    get:
+      tags: [Servers]
+      summary: 全局卡视图（P2 勾卡数据源；含占用项目归属）
+      operationId: listGpus
+      parameters:
+      - {name: occupancy, in: query, schema: {enum: [all, idle, busy_platform, busy_external]}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Gpu"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # =================================================================
+  # Projects（P3）
+  # =================================================================
+  /api/v1/projects:
+    get:
+      tags: [Projects]
+      summary: 项目列表
+      operationId: listProjects
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Project"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Projects]
+      summary: |
+        立项：BASE 导入（复制快照，D19）+ GPU 卡池勾选（D15）+ 数据主副本登记（D16）
+        + 论文登记（D17）。产出项目档案；状态 INIT。
+      operationId: createProject
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ProjectCreate"}
+      responses:
+        "201": {description: 已创建（状态 INIT）, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Projects]
+      summary: 项目详情（含 status/state_revision/pause_reason/outcome）
+      operationId: getProject
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    patch:
+      tags: [Projects]
+      summary: 元数据修改（名称/方向文本；非状态迁移，不动 state_revision 语义）
+      operationId: updateProject
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: {type: string}
+                direction_text: {type: string}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/gpu-pool:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Projects]
+      summary: 卡池视图（含每卡 VALIDATING/ACTIVE/DRAINING/REMOVED，R11）
+      operationId: getProjectGpuPool
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    gpu: {$ref: "#/components/schemas/Gpu"}
+                    pool_status: {enum: [VALIDATING, ACTIVE, DRAINING, REMOVED]}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    put:
+      tags: [Projects]
+      summary: |
+        调整卡池。新增卡须完成校验后才可接单（A11）；移除有在途任务的卡默认
+        "停止派发+排空后移除"，仅 mode=force 经用户显式确认才立即终止在途任务（R11）。
+      operationId: updateProjectGpuPool
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [add_gpu_ids, remove]
+              properties:
+                add_gpu_ids: {type: array, items: {type: string}}
+                remove:
+                  type: array
+                  items:
+                    type: object
+                    required: [gpu_id, mode]
+                    properties:
+                      gpu_id: {type: string}
+                      mode: {enum: [drain, force], default: drain}
+      responses:
+        "200": {description: 已调整, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/env-setup:
+    post:
+      tags: [Projects]
+      summary: 启动远程环境搭建（INIT --start_env_setup--> ENV_SETUP；对卡池每台服务器执行）
+      operationId: startEnvSetup
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_state_revision]
+              properties:
+                expected_state_revision: {type: integer}
+                startup_policy: {enum: [full_pool_ready, allowed_subset], default: full_pool_ready, description: R11 启动策略（plan 声明为准）}
+      responses:
+        "200": {description: 已启动, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      x-remote-agent-operation: true
+  /api/v1/projects/{projectId}/env-setup/retry:
+    post:
+      tags: [Projects]
+      summary: 部分失败重试——只修复失败步骤，不影响已就绪部分与在跑任务（A11）
+      operationId: retryEnvSetup
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server_ids]
+              properties:
+                server_ids: {type: array, items: {type: string}}
+                steps: {type: array, items: {enum: [code, env, data]}}
+      responses:
+        "200": {description: 已重试, content: {application/json: {schema: {type: object}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      x-remote-agent-operation: true
+  /api/v1/projects/{projectId}/readiness:
+    get:
+      tags: [Projects]
+      summary: 机器就绪状态（每机 code+env+data 三分量，A11）
+      operationId: getProjectReadiness
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    server_id: {type: string}
+                    code: {$ref: "#/components/schemas/ReadinessItem"}
+                    env: {$ref: "#/components/schemas/ReadinessItem"}
+                    data: {$ref: "#/components/schemas/ReadinessItem"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/projects/{projectId}/papers:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Projects]
+      summary: 论文库（解析入库的元数据与结构化内容）
+      operationId: listPapers
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Paper"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Projects]
+      summary: 论文登记（arXiv/DOI/期刊 URL 自动抓取；失败或本地 PDF 上传兜底，D17）
+      operationId: createPaper
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: {type: string}
+                upload_file_sha256: {type: string, description: 先经 /api/v1/uploads 上传后引用}
+      responses:
+        "201": {description: 已登记, content: {application/json: {schema: {$ref: "#/components/schemas/Paper"}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/uploads:
+    post:
+      tags: [System]
+      summary: |
+        本地文件上传（PDF 等；返回 sha256 供登记引用）。幂等语义例外（S8）：不写
+        api_idempotency，重复上传同文件→同 sha256，天然幂等。
+      operationId: uploadFile
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema: {type: string}
+        description: 不参与服务端幂等（全局语义声明的唯一例外）
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: {type: string, format: binary}
+                purpose: {enum: [paper, base_code_archive]}
+      responses:
+        "201":
+          description: 已接收
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sha256, size_bytes]
+                properties:
+                  sha256: {type: string}
+                  size_bytes: {type: integer}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # =================================================================
+  # Data（D16/D39）
+  # =================================================================
+  /api/v1/projects/{projectId}/data-versions:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Data]
+      summary: 数据版本列表
+      operationId: listDataVersions
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/DataVersion"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Data]
+      summary: 登记数据主副本并生成清单（文件清单+校验和，D39）
+      operationId: createDataVersion
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [master_server_id, master_path, logical_name]
+              properties:
+                master_server_id: {type: string}
+                master_path: {type: string}
+                logical_name: {type: string}
+      responses:
+        "201": {description: 已登记（manifest_sha256 生成）, content: {application/json: {schema: {$ref: "#/components/schemas/DataVersion"}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/data-versions/{dataVersionId}/sync:
+    post:
+      tags: [Data]
+      summary: |
+        同步到目标服务器：SYNCING→VERIFYING→READY|FAILED（临时位置校验后原子发布；
+        运行中副本禁止更新，D39）。rsync 仅 Linux/mac 加速，Windows 走纯 SFTP（D48）。
+      operationId: syncDataVersion
+      parameters: [$ref: "#/components/parameters/DataVersionId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server_ids]
+              properties:
+                server_ids: {type: array, items: {type: string}}
+      responses:
+        "202": {description: 同步任务已受理（进度经 WS 事件 sync.state_changed）}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      x-remote-agent-operation: true
+  /api/v1/data-versions/{dataVersionId}/replicas:
+    get:
+      tags: [Data]
+      summary: 副本状态与校验记录
+      operationId: listDataReplicas
+      parameters: [$ref: "#/components/parameters/DataVersionId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/DataReplica"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/data-replicas/{replicaId}/revalidate:
+    post:
+      tags: [Data]
+      summary: 重新校验副本（手动放置同样要过校验，不以"目录存在"放行，D16/D39）
+      operationId: revalidateDataReplica
+      parameters:
+      - {name: replicaId, in: path, required: true, schema: {type: string}}
+      - {$ref: "#/components/parameters/IdempotencyKey"}
+      responses:
+        "202": {description: 校验任务已受理}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # =================================================================
+  # Plan（P4 / D21/D38/D43）
+  # =================================================================
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      x-remote-agent-operation: true
+  /api/v1/projects/{projectId}/plan-protocols:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Plan]
+      summary: 协议版本链（含各版本状态与生效轮次）
+      operationId: listPlanProtocols
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/PlanProtocol"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Plan]
+      summary: 新建协议草案（body 须通过 plan.schema.json 校验）
+      operationId: createPlanProtocol
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: {$ref: "#/components/schemas/PlanBody"}
+                parent_id: {type: string, description: 修订时指向父版本（D38 版本链）}
+      responses:
+        "201": {description: 草案已建（DRAFT）, content: {application/json: {schema: {$ref: "#/components/schemas/PlanProtocol"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /api/v1/plan-protocols/{protocolId}:
+    get:
+      tags: [Plan]
+      summary: 协议详情（frozen_yaml / body_hash / 状态 / 生效轮次）
+      operationId: getPlanProtocol
+      parameters: [$ref: "#/components/parameters/ProtocolId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/PlanProtocol"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/plan-protocols/{protocolId}/freeze:
+    post:
+      tags: [Plan]
+      summary: |-
+        冻结协议（REVIEW_GATE +confirm，D21）。guard 全部读取**数据库实况**：plan 完整校验（JSON Schema + app constraints）∧ 绑定 validator 的 PASSED 校验（plan.bound_*）∧ 卡池全机副本 READY（空池拒）∧ plan 绑定 evaluator 已冻结。
+      operationId: freezePlanProtocol
+      parameters: [$ref: "#/components/parameters/ProtocolId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - expected_state_revision
+              properties:
+                expected_state_revision: {type: integer}
+                next_round: {type: integer}
+      responses:
+        "200": {description: 已冻结（项目进入 BASELINE_ACCEPTANCE）, content: {application/json: {schema: {$ref: "#/components/schemas/PlanProtocol"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /api/v1/plan-protocols/{protocolId}/revisions:
+    post:
+      tags: [Plan]
+      summary: |
+        创建修订版本（D38）。class=control（预算/取消类，立即约束后续执行，control_epoch+1）
+        或 protocol（指标/划分/seed/消融，只对新轮次生效，触发 D44 失效传播）。
+        本操作只建新版本；应用到项目状态走 Iteration 域的 apply_* 端点。
+      operationId: createPlanRevision
+      parameters: [$ref: "#/components/parameters/ProtocolId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [revision_class, patch]
+              properties:
+                revision_class: {enum: [control, protocol]}
+                patch: {$ref: "#/components/schemas/PlanBody", description: "完整新版本 body（不可变，非增量）"}
+                reason: {type: string}
+      responses:
+        "201": {description: 新版本已建（父版本将 SUPERSEDED 于冻结时）, content: {application/json: {schema: {$ref: "#/components/schemas/PlanProtocol"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/plan-protocols/{protocolId}/splits:
+    parameters: [$ref: "#/components/parameters/ProtocolId"]
+    get:
+      tags: [Plan]
+      summary: 划分清单
+      operationId: listSplits
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Split"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Plan]
+      summary: 登记划分（独立单位/分组或时间规则；D43）
+      operationId: createSplit
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Split"}
+      responses:
+        "201": {description: 已登记, content: {application/json: {schema: {$ref: "#/components/schemas/Split"}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/splits/{splitId}/validations:
+    parameters:
+    - {name: splitId, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [Plan]
+      summary: 校验记录（guard 只读有效 PASSED）
+      operationId: listSplitValidations
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/SplitValidation"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Plan]
+      summary: |
+        发起/登记划分有效性校验（D43）：跨集合对象交叉、单位/分组规则、
+        预处理拟合范围。四元组 (proto, data_ver, split, validator_ver) 唯一。
+      operationId: createSplitValidation
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data_version_id, validator_version]
+              properties:
+                data_version_id: {type: string}
+                validator_version: {type: string}
+      responses:
+        "202": {description: 校验任务已受理}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/evaluator-snapshots:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Plan]
+      summary: 评测协议快照列表（冻结指标代码摘要）
+      operationId: listEvaluatorSnapshots
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/EvaluatorSnapshot"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Plan]
+      summary: 冻结评测协议快照（D29：指标算法/聚合/ckpt 规则；资产文件 root:autolab-agg 0640）
+      operationId: createEvaluatorSnapshot
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [spec_yaml]
+              properties:
+                spec_yaml: {type: string}
+                upload_file_sha256: {type: string}
+      responses:
+        "201": {description: 已冻结, content: {application/json: {schema: {$ref: "#/components/schemas/EvaluatorSnapshot"}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/baseline-acceptance:
+    post:
+      tags: [Plan]
+      summary: |
+        Round 0 基线验收（BASELINE_ACCEPTANCE +accept/--reject，D33）。
+        accept→SEARCH；reject→PAUSED(manual_baseline)。环境兼容补丁与方法修改分离留档。
+      operationId: submitBaselineAcceptance
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verdict, expected_state_revision]
+              properties:
+                verdict: {enum: [accept, reject]}
+                expected_state_revision: {type: integer}
+                patch_class: {enum: [none, env_compat, method], description: "Round 0 报错修补的类别；patch_class=method（方法修改，Round 0 禁止）时 verdict 必须 reject 或转 D38 修订——服务端校验（D33）"}
+                notes: {type: string, description: 与论文数值差异的可解释性记录}
+      responses:
+        "200": {description: 已受理, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/modules:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Plan]
+      summary: 模块列表（评审状态）
+      operationId: listModules
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Plan]
+      summary: 提交模块想法（自然语言；对话式评审 M3 细化，本版提供最小面）
+      operationId: createModule
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idea_text]
+              properties:
+                idea_text: {type: string}
+                identity_hint: {type: string}
+      responses:
+        "201": {description: 已登记}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/modules/{moduleId}/review-evidence:
+    post:
+      tags: [Plan]
+      summary: 文献对照留档（retrieval_mode 必填——查重结论必须标注检索范围与时间，D42）
+      operationId: createReviewEvidence
+      parameters:
+      - {name: moduleId, in: path, required: true, schema: {type: string}}
+      - {$ref: "#/components/parameters/IdempotencyKey"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [retrieval_mode, query, sources]
+              properties:
+                retrieval_mode: {enum: [imported_only, external]}
+                query: {type: string}
+                sources: {type: array, items: {type: string}}
+      responses:
+        "201": {description: 已留档}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # =================================================================
+  # Iteration（P5）
+  # =================================================================
+  /api/v1/projects/{projectId}/runs:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Iteration]
+      summary: run 列表（轮次时间线数据源）
+      operationId: listRuns
+      parameters:
+      - {name: status, in: query, schema: {type: string}}
+      - {name: role, in: query, schema: {enum: [baseline, search, candidate, ablation, multi_seed]}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Run"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Iteration]
+      summary: |
+        手动创建 run（M1 纵切/人工干预入口；自动循环由 sidecar 驱动）。
+        Round 0（role=baseline）在验收前创建；后续轮由 continue 事件派生。
+      operationId: createRun
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: {enum: [baseline, search]}
+                init_spec:
+                  type: object
+                  description: 初始化协议（D35：从头/父权重/预训练）
+                  properties:
+                    kind: {enum: [from_scratch, parent_ckpt, pretrained]}
+                    parent_attempt_id: {type: string}
+                    ckpt_sha256: {type: string}
+                notes: {type: string}
+      responses:
+        "201": {description: run 已建（PLANNED）, content: {application/json: {schema: {$ref: "#/components/schemas/Run"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /api/v1/runs/{runId}:
+    parameters: [$ref: "#/components/parameters/RunId"]
+    get:
+      tags: [Iteration]
+      summary: run 详情（五版本绑定 + 状态 + state_revision）
+      operationId: getRun
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/Run"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/runs/{runId}/diff:
+    get:
+      tags: [Iteration]
+      summary: 本轮 diff（链式血缘；Monaco 回放数据源）
+      operationId: getRunDiff
+      parameters: [$ref: "#/components/parameters/RunId"]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  commit_sha: {type: string}
+                  parent_commit_sha: {type: string}
+                  diff: {type: string}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/runs/{runId}/llm-sessions:
+    get:
+      tags: [Iteration]
+      summary: LLM 分析结论留档（D25 上下文与结论，审计回放）
+      operationId: getRunLlmSessions
+      parameters: [$ref: "#/components/parameters/RunId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/runs/{runId}/attempts:
+    get:
+      tags: [Iteration]
+      summary: run 的 attempt 列表（含 profile 与 dispatch_id）
+      operationId: listRunAttempts
+      parameters: [$ref: "#/components/parameters/RunId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Attempt"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/attempts/{attemptId}:
+    get:
+      tags: [Iteration]
+      summary: attempt 详情（状态/失败分类/预算授权引用）
+      operationId: getAttempt
+      parameters:
+      - {name: attemptId, in: path, required: true, schema: {type: string}}
+      - {name: tail, in: query, schema: {type: integer, description: 日志尾行数}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/Attempt"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/attempts/{attemptId}/stop:
+    post:
+      tags: [Iteration]
+      summary: 单 attempt 停止（三段停止链 SUBMITTED..RUNNING→STOP_REQUESTED→STOP_SENT→STOP_CONFIRMED）
+      operationId: stopAttempt
+      parameters:
+      - {name: attemptId, in: path, required: true, schema: {type: string}}
+      - {$ref: "#/components/parameters/IdempotencyKey"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_state_revision]
+              properties:
+                expected_state_revision: {type: integer}
+                reason: {type: string}
+      responses:
+        "202": {description: 停止请求已发出（回执经 WS/对账确认，D31——失联显示"停止待确认"）}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      x-remote-agent-operation: true
+  /api/v1/attempts/{attemptId}/cancel:
+    post:
+      tags: [Iteration]
+      summary: |
+        撤回 attempt（仅 SUBMITTED 且派发 outbox 未投递：同事务撤回本地终结 CANCELLED；
+        可能已投递→409 提示改走 /stop 停止链）。
+      operationId: cancelAttempt
+      parameters:
+      - {name: attemptId, in: path, required: true, schema: {type: string}}
+      - {$ref: "#/components/parameters/IdempotencyKey"}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_state_revision: {type: integer}
+              required:
+              - expected_state_revision
+      responses:
+        "200": {description: 已撤回（CANCELLED）}
+        "409": {$ref: "#/components/responses/Conflict", description: "可能已投递——改走停止链"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/pause:
+    post:
+      tags: [Iteration]
+      summary: |
+        项目暂停（SEARCH/BASELINE_* +pause[D8 条件]→PAUSED(reason)；在跑 attempts 继续至完成，
+        仅停止派发新 attempt——竞态裁决①）。REVIEW_GATE 等非 D8 态→409。
+      operationId: pauseProject
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_state_revision]
+              properties:
+                expected_state_revision: {type: integer}
+                reason: {type: string}
+      responses:
+        "200": {description: 已暂停, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/resume:
+    post:
+      tags: [Iteration]
+      summary: |
+        恢复（PAUSED +resume[无待应用修订]→原状态）。U4：resume 与三个 apply_* 是四个独立接口，
+        不得合并；有待应用修订→409 GUARD_UNMET。
+      operationId: resumeProject
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_state_revision]
+              properties:
+                expected_state_revision: {type: integer}
+      responses:
+        "200": {description: 已恢复原状态, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/terminate:
+    post:
+      tags: [Iteration]
+      summary: |
+        统一项目终止事件（任意非终态 +terminate(reason)）：有活跃 attempt→STOPPING（对全部
+        活跃 attempt 发停止链+冻结派发）；无→FINISHING。REPORTING 中重复 terminate 仅更新
+        reason 不迁移；REPORTED 终态→幂等 no-op。
+      operationId: terminateProject
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason, expected_state_revision]
+              properties:
+                reason: {type: string}
+                expected_state_revision: {type: integer}
+      responses:
+        "200": {description: 终止流程已启动, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/stop/reconcile:
+    post:
+      tags: [Iteration]
+      summary: 人工触发停止对账（STOP_PENDING_CONFIRMATION +reconciled_*；D31 先对账再调度）
+      operationId: reconcileStop
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      responses:
+        "200":
+          description: 对账结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: {enum: [all_stopped, still_running, unreachable]}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_state_revision:
+                  type: integer
+                  description: 乐观锁：客户端持有的项目 state_revision（A2）
+              required:
+              - expected_state_revision
+
+      x-remote-agent-operation: true
+  /api/v1/projects/{projectId}/control-revisions:
+    post:
+      tags: [Iteration]
+      summary: |
+        应用控制类修订（PAUSED +apply_control_revision→原状态，control_epoch+1；
+        不中断候选资格，D38/D44：控制类不触发科研对照重跑）。预算下调走 Budget 域专用端点。
+      operationId: applyControlRevision
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_protocol_id, expected_state_revision]
+              properties:
+                plan_protocol_id: {type: string}
+                expected_state_revision: {type: integer}
+      responses:
+        "200": {description: 已应用（epoch+1）, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/protocol-revisions/apply:
+    post:
+      tags: [Iteration]
+      summary: 应用协议类修订（PAUSED +apply_protocol_revision→REVIEW_GATE/BASELINE_ACCEPTANCE；D44 失效传播）
+      operationId: applyProtocolRevision
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_protocol_id, expected_state_revision]
+              properties:
+                plan_protocol_id: {type: string}
+                expected_state_revision: {type: integer}
+      responses:
+        "200": {description: 已应用（失效边已写入）, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/method-revisions/apply:
+    post:
+      tags: [Iteration]
+      summary: |
+        应用方法类修订（PAUSED +apply_method_revision：新 candidate 先重验 D37，满足→新 batch
+        →CONFIRMATION_PREP；未满足→SEARCH）。
+      operationId: applyMethodRevision
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [candidate_id, expected_state_revision]
+              properties:
+                candidate_id: {type: string}
+                expected_state_revision: {type: integer}
+      responses:
+        "200": {description: 已应用, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/state-history:
+    get:
+      tags: [Audit]
+      summary: 状态迁移回放（state_events：event/actor/reason/occurred_at/expected_revision）
+      operationId: getProjectStateHistory
+      parameters:
+      - {$ref: "#/components/parameters/ProjectId"}
+      - {name: aggregate, in: query, schema: {enum: [project, run, attempt]}}
+      - {name: limit, in: query, schema: {type: integer, default: 100}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # =================================================================
+  # Budget（V6 双返回）
+  # =================================================================
+  /api/v1/projects/{projectId}/budget:
+    get:
+      tags: [Budget]
+      summary: 账本快照（limit_s/status/consumed_s/reserved_s/revision + 可分配余额 B−C−R）
+      operationId: getBudget
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/BudgetAccount"}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/projects/{projectId}/budget/reduction:
+    post:
+      tags: [Budget]
+      summary: |
+        预算下调（两阶段，V6）——**双返回语义**：
+        · 200 {"phase":"achieved"}：C+R 已满足新限 → 本请求事务内原子完成
+          limit_s=requested_limit、账户回 ACTIVE；
+        · 202 {"phase":"accepted"}：仍有预留占位 → requested_limit 落库、账户入 DRAINING
+          （limit_s 不变、C+R≤旧限恒成立），对最大预留循环发 STOP，结算满足后原子达成
+          （WS budget.reduction_settled + GET 本端点可见新 ACTIVE）。
+        拒绝：新限 < C（历史消耗不可回退）→ 422 BUDGET_REDUCTION_BELOW_CONSUMED；
+        新限 ≥ 当前限 → 400。幂等重放返回原受理结果（当前状态以 GET /budget 为准）。
+      operationId: reduceBudget
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requested_limit_s, expected_budget_revision]
+              properties:
+                requested_limit_s: {type: integer, exclusiveMinimum: 0}
+                expected_budget_revision:
+                  type: integer
+                  description: 预算账本乐观锁（budget_accounts.revision，T-DRAIN CAS）
+      responses:
+        "200":
+          description: 已达成（achieved——原子完成）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BudgetReductionResult"}
+        "202":
+          description: 已接受（accepted——DRAINING 进行中，STOP 已发出）
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BudgetReductionResult"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ReductionBelowConsumed"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/budget/reservations:
+    get:
+      tags: [Budget]
+      summary: 预留明细（ACTIVE/STOPPING 继续计入 R；SETTLED 已释放）
+      operationId: listBudgetReservations
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/BudgetReservation"}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/projects/{projectId}/budget/usage:
+    get:
+      tags: [Budget]
+      summary: usage 事件流（agent 自采样，(attempt,seq) 幂等）
+      operationId: listBudgetUsage
+      parameters:
+      - {$ref: "#/components/parameters/ProjectId"}
+      - {name: since, in: query, schema: {type: string}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # =================================================================
+  # Evaluation（D29/D34/D36/D37/D45）
+  # =================================================================
+  /api/v1/runs/{runId}/evaluation-requests:
+    post:
+      tags: [Evaluation]
+      summary: |-
+        创建可信评测请求（**仅 scope=val**，schema const 机器固定；test 请求由确认流程内部创建，属 sidecar 内部命令域，不经公开 API）。冻结完整评测身份：协议+数据版本+划分+ckpt 摘要+evaluator_digest。
+      operationId: createEvaluationRequest
+      parameters: [$ref: "#/components/parameters/RunId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, data_version_id, split_id, ckpt_artifact_id]
+              properties:
+                scope:
+                  const: val
+                  description: 机器固定 val（r3-A1）：scope=test 的评测请求由确认流程内部创建，本公开端点 schema 层拒绝任何其他值——不依赖运行时 403
+                data_version_id: {type: string}
+                split_id: {type: string}
+                ckpt_artifact_id: {type: string}
+                ckpt_expected_sha256: {type: string}
+      responses:
+        "201": {description: 已创建（QUEUED，infer→agg 双步调度）, content: {application/json: {schema: {$ref: "#/components/schemas/EvaluationRequest"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/runs/{runId}/evaluation-results:
+    get:
+      tags: [Evaluation]
+      summary: |-
+        可信评测结果（scope=val：正式指标，附 run/数据版本/评测协议版本）。S14：scope=test 数值不存在于本端点——唯一出口为 final-confirmation/read 的固定 payload（重放亦只读 release payload）。
+      operationId: getEvaluationResults
+      parameters:
+      - {$ref: "#/components/parameters/RunId"}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/EvaluationResult"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/evaluation-requests/{requestId}:
+    get:
+      tags: [Evaluation]
+      summary: 评测请求详情（身份冻结字段 + 双步 attempt 状态）
+      operationId: getEvaluationRequest
+      parameters: [$ref: "#/components/parameters/EvaluationRequestId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/EvaluationRequest"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/projects/{projectId}/candidates/selection:
+    post:
+      tags: [Evaluation]
+      summary: |
+        胜出方案选择（SEARCH +candidate_selected→CONFIRMATION_PREP，D37：按定稿规则
+        验证集主指标最佳轮+约束+平局，不依测试分数）。"只有 BASE/未改善/证据不足"
+        为合法终态如实报告。
+      operationId: selectCandidate
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_state_revision: {type: integer}
+                selected_run_id: {type: string, description: 缺省按冻结规则自动计算}
+              required:
+              - expected_state_revision
+      responses:
+        "200": {description: 已选定, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict", description: "D37 资格不满足（如证据不足）——亦为合法终态，body 给出终态说明"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /api/v1/projects/{projectId}/candidates:
+    get:
+      tags: [Evaluation]
+      summary: 候选列表（搜索版本/验证最佳/最终确认三分档）
+      operationId: listCandidates
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/projects/{projectId}/ablation-matrices:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Evaluation]
+      summary: 消融矩阵版本列表
+      operationId: listAblationMatrices
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Evaluation]
+      summary: 新建消融矩阵草案（模块身份映射，D36）
+      operationId: createAblationMatrix
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items: {type: array, items: {type: object}}
+      responses:
+        "201": {description: 草案已建}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/ablation-matrices/{matrixId}/revalidate:
+    post:
+      tags: [Evaluation]
+      summary: |-
+        按最终代码重校验（D36）：原矩阵有效→自动 FROZEN；需修订→NEEDS_CONFIRMATION
+        →项目 PAUSED(matrix_revision)（R07，P5 显示原因）。
+        。服务端由 matrixId→proto→project 解析所属项目并以 expected_state_revision 锁定项目乐观锁（A2）。
+      operationId: revalidateAblationMatrix
+      parameters:
+      - {name: matrixId, in: path, required: true, schema: {type: string}}
+      - {$ref: "#/components/parameters/IdempotencyKey"}
+      responses:
+        "200":
+          description: 重校验结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [outcome]
+                properties:
+                  outcome: {enum: [frozen, needs_confirmation]}
+                  invalidated_items: {type: array, items: {type: string}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_state_revision:
+                  type: integer
+                  description: 乐观锁：客户端持有的项目 state_revision（A2）
+              required:
+              - expected_state_revision
+
+  /api/v1/ablation-matrices/{matrixId}/confirm:
+    post:
+      tags: [Evaluation]
+      summary: 用户确认修订后的矩阵（PAUSED(matrix_revision) 恢复路径）
+      operationId: confirmAblationMatrix
+      parameters:
+      - {name: matrixId, in: path, required: true, schema: {type: string}}
+      - {$ref: "#/components/parameters/IdempotencyKey"}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_state_revision: {type: integer}
+              required:
+              - expected_state_revision
+      responses:
+        "200": {description: 已确认（FROZEN）}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/batches/freeze:
+    post:
+      tags: [Evaluation]
+      summary: |-
+        冻结确认批次（**r5-S1：服务端权威派生**）。请求只含身份与乐观锁——items/is_required/status/比较规格一律由 T-FREEZE-BATCH 从冻结 plan 派生（spec 来源=plan.body_hash；条目=候选+已验收 BASE+矩阵 required 项×预登记 confirm seeds）。幂等：同键同载荷重放原响应（api_idempotency）。
+      operationId: freezeBatch
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - candidate_id
+              - matrix_id
+              - expected_state_revision
+              additionalProperties: false
+              properties:
+                candidate_id:
+                  type: string
+                matrix_id:
+                  type: string
+                expected_state_revision:
+                  type: integer
+      responses:
+        "200": {description: 批次已冻结（进入确认运行）, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+  /api/v1/batches/{batchId}:
+    get:
+      tags: [Evaluation]
+      summary: 批次详情与逐项状态（全部/部分/失败/取消；缺失显式显示不补零，A07）
+      operationId: getBatch
+      parameters:
+      - {name: batchId, in: path, required: true, schema: {type: string}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: object}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # =================================================================
+  # FinalConfirmation（U3 原子语义）
+  # =================================================================
+  /api/v1/projects/{projectId}/final-confirmation:
+    get:
+      tags: [FinalConfirmation]
+      summary: 确认状态（不暴露 test 数值——仅齐套进度与可读性）
+      operationId: getFinalConfirmationStatus
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project_status: {type: string}
+                  batch_id: {type: string}
+                  release: {type: object, description: 已释放时返回释放记录摘要（含 payload_hash）}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/projects/{projectId}/final-confirmation/read:
+    post:
+      tags: [FinalConfirmation]
+      summary: |-
+        scope=test 读取的唯一入口（原子事务，U3）。[BLOCKED-ADD-2：读取后的新实验版本创建入口与"测试集已参与开发"持久标记待设计增补 ADD-2 冻结] 单事务：幂等优先查询（api_idempotency / test_result_releases）→ 归属闭包关系查询（batch→candidate→selected_run→project→current_protocol）→ guard（required 条目全部 SUCCEEDED，证据不足拒绝）→ 写 test_result_releases（release_payload_json 固定响应体）+ api_idempotency + audit → 项目 CAS 迁移 FINISHING(completed|failed)。同键重试返回持久化响应（replayed=true）；异键二次读→409 FINAL_CONFIRM_ALREADY_RELEASED。
+      operationId: readFinalConfirmation
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [batch_id, expected_state_revision]
+              properties:
+                batch_id: {type: string}
+                expected_state_revision: {type: integer}
+      responses:
+        "200":
+          description: |
+            释放成功或幂等重放（同一固定结果）。outcome=completed|failed 按 plan 预登记的
+            最终比较与证据规则（Q01）判定——全部到齐不自动等于提升成立。
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/FinalReadResult"}
+        "409":
+          description: "GUARD_UNMET（guard 明细）/ STATE_REVISION_CONFLICT / FINAL_CONFIRM_ALREADY_RELEASED（异键重放）"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # =================================================================
+  # Reports（Q05/A06/D28）
+  # =================================================================
+  /api/v1/projects/{projectId}/reports:
+    parameters: [$ref: "#/components/parameters/ProjectId"]
+    get:
+      tags: [Reports]
+      summary: 报告列表
+      operationId: listReports
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Reports]
+      summary: |-
+        生成报告（FINISHING/REPORTED +report_requested→REPORTING）。任何终态可产出阶段报告（Q05：不为补报告隐式启动训练；LLM 预算耗尽用确定性模板）。kind=final 在 final-read 之后可用。[BLOCKED-ADD-3：reports 落库模型与响应 schema 待设计增补 ADD-3 冻结，当前响应为占位]
+      operationId: generateReport
+      parameters: [$ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, expected_state_revision]
+              properties:
+                kind: {enum: [stage, final]}
+                expected_state_revision: {type: integer}
+      responses:
+        "202": {description: 生成任务已受理（完成经 WS report.completed）}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/reports/{reportId}:
+    get:
+      tags: [Reports]
+      summary: 报告内容（含图表引用：消融热力图缺失项显式留空标注原因，D36/A07； 效率指标按硬件型号分组，A03）
+      operationId: getReport
+      parameters:
+      - {name: reportId, in: path, required: true, schema: {type: string}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: object}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/projects/{projectId}/repro-package:
+    get:
+      tags: [Reports]
+      summary: |
+        可复现代码包（A06 复现绑定：commit+环境版本+配置+数据/划分版本+seed+
+        初始化与预训练来源+实际执行命令+硬件与数值精度+plan 版本）。
+      operationId: getReproPackage
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: 包清单与下载引用, content: {application/json: {schema: {type: object}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # =================================================================
+  # Audit
+  # =================================================================
+  /api/v1/projects/{projectId}/audit-events:
+    get:
+      tags: [Audit]
+      summary: 审计事件流（LLM 分析/决策/改动全留档可回放）
+      operationId: listAuditEvents
+      parameters:
+      - {$ref: "#/components/parameters/ProjectId"}
+      - {name: since, in: query, schema: {type: string}}
+      - {name: limit, in: query, schema: {type: integer, default: 100}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: array, items: {type: object}}}}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/settings/llm:
+    get:
+      tags:
+      - System
+      operationId: listLlmSettings
+      summary: LLM 供应商与模型按使用点配置（D11/P7：评审对话/每轮分析/自修复/报告四使用点）
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    put:
+      tags:
+      - System
+      operationId: updateLlmSettings
+      summary: 更新 LLM 使用点配置（密钥引用走平台钥匙串，库内不存明文 D30）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: OK
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/settings/llm/test:
+    post:
+      tags:
+      - System
+      operationId: testLlmSettings
+      summary: LLM 供应商连通性测试（P7）
+      responses:
+        '200':
+          description: 测试结果
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+  /api/v1/projects/{projectId}/llm-usage:
+    get:
+      tags:
+      - Audit
+      operationId: getProjectLlmUsage
+      summary: 项目 token 消耗与成本统计（多供应商，需求 §5 LLM 成本可见）
+      parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/runs/{runId}/retry:
+    post:
+      tags:
+      - Iteration
+      operationId: retryFailedRun
+      summary: A08 恢复入口：重试失败任务（INFRA_RETRY 重派 / REPAIRING 再试 / METRIC_MISSING 重评）
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - expected_state_revision
+              properties:
+                expected_state_revision:
+                  type: integer
+                mode:
+                  enum:
+                  - redispatch
+                  - repair_retry
+                  - reevaluate
+      responses:
+        '200':
+          description: 已受理
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      x-remote-agent-operation: true
+  /api/v1/runs/{runId}/resume-from-checkpoint:
+    post:
+      tags:
+      - Iteration
+      operationId: resumeRunFromCheckpoint
+      summary: A08 恢复入口：从检查点恢复（创建 parent_ckpt 初始化的新 run，D35 加载报告）。guard：ckpt_artifact 须 kind=ckpt 且属于本 run 的 train attempt（D35）；父 run 非 JUDGED/失败态 → 409
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - ckpt_artifact_id
+              - expected_state_revision
+              properties:
+                ckpt_artifact_id:
+                  type: string
+                expected_state_revision:
+                  type: integer
+                  description: 父 run 状态乐观锁（A2）
+      responses:
+        '201':
+          description: 新 run 已建（PLANNED）
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+        '503':
+          $ref: '#/components/responses/AgentUnreachable'
+      x-remote-agent-operation: true
+components:
+  securitySchemes:
+    capabilityToken:
+      type: apiKey
+      in: header
+      name: X-Capability-Token
+      description: sidecar 启动时生成；除 /healthz 外全部 API 与 WS 必须（B2）
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, format: uuid}
+      description: 同键同载荷重放原响应；同键异载荷 409 IDEMPOTENCY_CONFLICT
+    ServerId: {name: serverId, in: path, required: true, schema: {type: string}}
+    ProjectId: {name: projectId, in: path, required: true, schema: {type: string}}
+    DataVersionId: {name: dataVersionId, in: path, required: true, schema: {type: string}}
+    ProtocolId: {name: protocolId, in: path, required: true, schema: {type: string}}
+    RunId: {name: runId, in: path, required: true, schema: {type: string}}
+    EvaluationRequestId: {name: requestId, in: path, required: true, schema: {type: string}}
+
+  responses:
+    BadRequest:
+      description: "400 VAL_SCHEMA_INVALID / VAL_SEMANTIC_INVALID（如 requested_limit_s ≥ 当前限）"
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    NotFound:
+      description: 404 NOT_FOUND
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    Conflict:
+      description: "409：STATE_REVISION_CONFLICT / STATE_INVALID_TRANSITION / GUARD_UNMET / IDEMPOTENCY_CONFLICT / BUDGET_INSUFFICIENT / BUDGET_DRAINING / FINAL_CONFIRM_ALREADY_RELEASED / FOREIGN_BUSY"
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    TestResultSealed:
+      description: 409 TEST_RESULT_SEALED（test 结果仅经 final-confirmation/read 一次性释放）
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    ReductionBelowConsumed:
+      description: 422 BUDGET_REDUCTION_BELOW_CONSUMED（新限 < 已消耗 C，历史消耗不可回退）
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    AgentUnreachable:
+      description: 503 AGENT_UNREACHABLE
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    Unauthorized:
+      description: 401 AUTH_INVALID_TOKEN（capability token 无效/缺失）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: 403 FORBIDDEN（越权操作，如直接创建 scope=test 评测请求）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unprocessable:
+      description: 422 VAL_SEMANTIC_INVALID（通用语义校验失败）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code: {type: string, description: "错误码表：VAL_SCHEMA_INVALID|VAL_SEMANTIC_INVALID|AUTH_INVALID_TOKEN|FORBIDDEN|NOT_FOUND|STATE_REVISION_CONFLICT|STATE_INVALID_TRANSITION|GUARD_UNMET|IDEMPOTENCY_CONFLICT|BUDGET_INSUFFICIENT|BUDGET_DRAINING|BUDGET_REDUCTION_BELOW_CONSUMED|SETTLE_PRECONDITION|AGENT_EVENT_CONFLICT|DATA_REPLICA_NOT_READY|PROJECT_NOT_DISPATCHABLE|TEST_SEALED|FINAL_CONFIRM_ALREADY_RELEASED|GAP_DETECTED|CURSOR_EXPIRED|SNAPSHOT_REQUIRED|AGENT_UNREACHABLE|FOREIGN_BUSY|INTERNAL"}
+        message: {type: string}
+        request_id: {type: string}
+        details:
+          type: object
+          additionalProperties: true
+          description: "如 GUARD_UNMET→{violations:[{guard,reason}]}；STATE_REVISION_CONFLICT→{current_state, current_state_revision}"
+
+    Server:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        host: {type: string}
+        port: {type: integer}
+        username: {type: string}
+        status: {enum: [UNKNOWN, REACHABLE, UNREACHABLE, DECOMMISSIONED]}
+        agent_capabilities: {type: object}
+        sandbox_policy_hash: {type: string}
+        sudo_verified: {type: boolean}
+        diagnostic_only: {type: boolean}
+
+    Gpu:
+      type: object
+      properties:
+        id: {type: string}
+        server_id: {type: string}
+        gpu_index: {type: integer}
+        model_name: {type: string}
+        vram_mb: {type: integer}
+        status: {enum: [UNKNOWN, IDLE, BUSY_PLATFORM, BUSY_EXTERNAL, UNREACHABLE, DRAINED]}
+        occupied_by: {type: string, description: BUSY_PLATFORM 时的 attempt_id}
+        utilization_pct:
+          type: integer
+        mem_used_mb:
+          type: integer
+        telemetry_at:
+          type: string
+          format: date-time
+
+    EnvironmentVersion:
+      type: object
+      properties:
+        id: {type: string}
+        server_id: {type: string}
+        ver: {type: integer}
+        spec_hash: {type: string}
+        status: {enum: [PLANNED, INSTALLING, READY, FAILED]}
+
+    Project:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        direction_text: {type: string}
+        base_source_kind: {enum: [github, local]}
+        base_source_ref: {type: string}
+        status:
+          enum: [INIT, ENV_SETUP, REVIEW_GATE, BASELINE_ACCEPTANCE, SEARCH, CONFIRMATION_PREP, CONFIRMATION_RUNNING, TEST_RESULT_SEALED, STOPPING, STOP_PENDING_CONFIRMATION, FINISHING, REPORTING, REPORTED, PAUSED]
+        state_revision: {type: integer}
+        pause_reason: {type: string}
+        paused_from_state: {type: string}
+        current_protocol_id: {type: string}
+        control_epoch: {type: integer}
+        outcome: {enum: [completed, failed, cancelled, budget_exhausted, stopped]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    ProjectCreate:
+      type: object
+      required: [name, direction_text, base_source, gpu_ids, dataset]
+      properties:
+        name: {type: string}
+        direction_text: {type: string}
+        base_source:
+          type: object
+          required: [kind, ref]
+          properties:
+            kind: {enum: [github, local]}
+            ref: {type: string}
+        gpu_ids: {type: array, items: {type: string}}
+        dataset:
+          type: object
+          required: [master_server_id, master_path]
+          properties:
+            master_server_id: {type: string}
+            master_path: {type: string}
+        paper_urls: {type: array, items: {type: string}}
+        paper_upload_sha256: {type: array, items: {type: string}}
+
+    ReadinessItem:
+      type: object
+      properties:
+        status: {enum: [PENDING, SYNCING, VERIFYING, READY, FAILED]}
+        detail: {type: string}
+        updated_at: {type: string, format: date-time}
+
+    Paper:
+      type: object
+      properties:
+        id: {type: string}
+        source_kind: {enum: [url, upload]}
+        url: {type: string}
+        title: {type: string}
+        parsed: {type: object, description: 方法/指标结构化内容}
+
+    DataVersion:
+      type: object
+      properties:
+        id: {type: string}
+        project_id: {type: string}
+        logical_name: {type: string}
+        manifest_sha256: {type: string}
+        created_at: {type: string, format: date-time}
+
+    DataReplica:
+      type: object
+      properties:
+        id: {type: string}
+        data_version_id: {type: string}
+        server_id: {type: string}
+        logical_path: {type: string}
+        actual_path: {type: string}
+        status: {enum: [SYNCING, VERIFYING, READY, FAILED]}
+        last_validation: {type: object}
+
+    PlanProtocol:
+      type: object
+      properties:
+        id: {type: string}
+        project_id: {type: string}
+        parent_id: {type: string}
+        ver: {type: integer}
+        body_hash: {type: string}
+        status: {enum: [DRAFT, FROZEN, SUPERSEDED, INVALIDATED]}
+        effective_round: {type: integer}
+        created_at: {type: string, format: date-time}
+        frozen_at: {type: string, format: date-time}
+
+    PlanBody:
+      type: object
+      description: experiment_plan 定稿体（校验契约见 plan.schema.json@1，此处透传）
+      additionalProperties: true
+
+      x-external-schema: plan.schema.json（客户端模型生成以其为准；OpenAPI 内不内联——复审 O2 部分采纳）
+    Split:
+      type: object
+      required: [name, unit_rule, preprocess_fit_scope]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        unit_rule:
+          type: object
+          required: [independent_unit]
+          properties:
+            independent_unit: {type: string}
+            grouping_rule: {type: string}
+            time_rule: {type: string}
+        preprocess_fit_scope: {enum: [train_only, declared_exception]}
+
+    SplitValidation:
+      type: object
+      properties:
+        id: {type: string}
+        plan_protocol_id: {type: string}
+        data_version_id: {type: string}
+        split_id: {type: string}
+        validator_version: {type: string}
+        status: {enum: [RUNNING, PASSED, FAILED]}
+        evidence_hash: {type: string}
+        validated_at: {type: string, format: date-time}
+
+    EvaluatorSnapshot:
+      type: object
+      properties:
+        id: {type: string}
+        project_id: {type: string}
+        digest: {type: string}
+        frozen_at: {type: string, format: date-time}
+
+    Run:
+      type: object
+      properties:
+        id: {type: string}
+        project_id: {type: string}
+        round_no: {type: integer}
+        role: {enum: [baseline, search, ablation, multi_seed]}
+        plan_protocol_id: {type: string}
+        code_snapshot_id: {type: string}
+        env_version_id: {type: string}
+        data_version_id: {type: string}
+        recipe_id: {type: string}
+        init_spec_id: {type: string}
+        candidate_id: {type: string}
+        control_epoch: {type: integer}
+        status: {type: string, description: run 层状态（state-machine.md §2）}
+        state_revision: {type: integer}
+        fail_class: {enum: [model, infra, metric, llm]}
+
+    Attempt:
+      type: object
+      properties:
+        id: {type: string}
+        run_id: {type: string}
+        seq: {type: integer}
+        dispatch_id: {type: string}
+        evaluation_request_id: {type: string}
+        server_id: {type: string}
+        gpu_id: {type: string}
+        profile: {enum: [train, infer, agg]}
+        exec_manifest_hash: {type: string}
+        control_epoch: {type: integer}
+        budget_reservation_id: {type: string}
+        status: {type: string, description: attempt 层状态（state-machine.md §2）}
+        state_revision: {type: integer}
+        fail_class: {enum: [model, infra, metric, llm]}
+        log_tail: {type: string}
+
+    BudgetAccount:
+      type: object
+      properties:
+        project_id: {type: string}
+        limit_s: {type: integer}
+        status: {enum: [ACTIVE, DRAINING]}
+        requested_limit_s: {type: integer, nullable: true}
+        drain_started_at: {type: string, nullable: true}
+        consumed_s: {type: integer, description: C}
+        reserved_s: {type: integer, description: R}
+        allocatable_s: {type: integer, description: B−C−R（Q02）}
+        revision: {type: integer}
+
+    BudgetReservation:
+      type: object
+      properties:
+        id: {type: string}
+        attempt_id: {type: string}
+        authorized_s: {type: integer}
+        remaining_s: {type: integer}
+        status: {enum: [ACTIVE, STOPPING, SETTLED]}
+        settle_reason: {enum: [completed, stop_confirmed, hard_deadline, expired, cancelled], nullable: true}
+        expires_at: {type: string}
+
+    BudgetReductionResult:
+      type: object
+      required: [phase, budget]
+      properties:
+        phase: {enum: [accepted, achieved], description: "accepted=已接受（DRAINING 中）；achieved=已达成（原子完成）"}
+        budget: {$ref: "#/components/schemas/BudgetAccount"}
+        pending_stops:
+          type: array
+          description: phase=accepted 时待停止的预留（按 remaining 降序）
+          items: {$ref: "#/components/schemas/BudgetReservation"}
+
+    EvaluationRequest:
+      type: object
+      properties:
+        id: {type: string}
+        run_id: {type: string}
+        scope: {enum: [val, test]}
+        plan_protocol_id: {type: string}
+        data_version_id: {type: string}
+        split_id: {type: string}
+        ckpt_artifact_id: {type: string}
+        ckpt_expected_sha256: {type: string}
+        evaluator_digest: {type: string}
+        ckpt_selection_rule_ver: {type: string}
+        status: {enum: [QUEUED, INFER_PENDING, INFER_RUNNING, AGG_PENDING, AGG_RUNNING, COMPLETED, FAILED]}
+
+    EvaluationResult:
+      type: object
+      properties:
+        evaluation_request_id: {type: string}
+        metric: {type: string}
+        value: {type: number}
+        evidence_hash: {type: string}
+        scope: {enum: [val, test]}
+        run_id: {type: string}
+        plan_protocol_id: {type: string, description: 附带协议版本（R01 可信来源三要素之一）}
+        data_version_id: {type: string}
+
+    FinalReadResult:
+      type: object
+      required: [release_id, batch_id, outcome, release_payload_hash, released_at]
+      properties:
+        release_id: {type: string}
+        batch_id: {type: string}
+        outcome: {enum: [completed, failed], description: 按 plan 预登记最终比较规则判定（Q01）}
+        release_payload_hash: {type: string, description: 重放可验证内容未变}
+        released_at: {type: string, format: date-time}
+        replayed: {type: boolean, description: true=幂等重放（同 Idempotency-Key）}
+        final_comparison:
+          type: object
+          description: 最终比较明细（均值±标准差/区间、样本数、随机源、初筛是否被推翻）
+        test_metrics:
+          type: array
+          items: {$ref: "#/components/schemas/EvaluationResult"}

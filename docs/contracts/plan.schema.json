@@ -1,0 +1,2023 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autolab.local/contracts/plan.schema.json",
+  "title": "AutoLab experiment_plan（定稿产物字段契约）",
+  "description": "需求 A01 字段契约的机器可验证形态。契约版本：v1.0-draft.6（第五轮评审修订版）· 2026-09-13。plan_protocols.frozen_yaml = 本对象的规范化 YAML 序列化；body_hash = 该规范化字节的 SHA-256。修订分类（D38）：控制类字段变更立即生效（control_epoch+1）；协议类字段变更只对新轮次生效并触发 D44 失效传播——字段归属见 revision_classification。",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "goal",
+    "dataset",
+    "commands",
+    "randomness",
+    "metrics",
+    "fairness",
+    "termination",
+    "ablation",
+    "final_comparison",
+    "protected_protocol",
+    "resource_requirements",
+    "review_conclusions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "generated_by": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "goal": {
+      "description": "目标指标与方向（A01 ①）",
+      "type": "object",
+      "required": [
+        "primary_metric",
+        "direction"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "primary_metric": {
+          "$ref": "#/$defs/metricRef"
+        },
+        "direction": {
+          "enum": [
+            "maximize",
+            "minimize"
+          ]
+        },
+        "target_value": {
+          "type": "number"
+        },
+        "constraint_metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "metric",
+              "op",
+              "value"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "metric": {
+                "$ref": "#/$defs/metricRef"
+              },
+              "op": {
+                "enum": [
+                  "<=",
+                  ">=",
+                  "<",
+                  ">",
+                  "=="
+                ]
+              },
+              "value": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      }
+    },
+    "dataset": {
+      "description": "数据集与划分协议（A01 ② + D43 划分有效性 + D39 版本一致性）",
+      "type": "object",
+      "required": [
+        "name",
+        "master_copy",
+        "splits",
+        "version_control",
+        "bound_data_version_id",
+        "bound_validator_version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "master_copy": {
+          "description": "数据主副本登记（D16：机器+路径；主副本只读 D30）",
+          "type": "object",
+          "required": [
+            "server_name",
+            "path"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "server_name": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "logical_path": {
+              "type": "string"
+            }
+          }
+        },
+        "splits": {
+          "description": "划分清单；每项对应 splits 表一行；跨集合对象交叉校验为 D43 硬校验项",
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "role",
+              "unit_rule",
+              "preprocess_fit_scope",
+              "cross_set_checks"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "role": {
+                "enum": [
+                  "train",
+                  "val",
+                  "test"
+                ]
+              },
+              "unit_rule": {
+                "description": "独立单位与分组/时间规则（D43：文件哈希不同 ≠ 划分有效）",
+                "type": "object",
+                "required": [
+                  "independent_unit"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "independent_unit": {
+                    "type": "string",
+                    "description": "如 sample/object/patient/user_id"
+                  },
+                  "grouping_rule": {
+                    "type": "string"
+                  },
+                  "time_rule": {
+                    "type": "string"
+                  }
+                }
+              },
+              "preprocess_fit_scope": {
+                "description": "需拟合的预处理仅在训练部分学习；例外协议单独声明（D43）",
+                "oneOf": [
+                  {
+                    "const": "train_only"
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "exception",
+                      "justification"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "exception": {
+                        "type": "string"
+                      },
+                      "justification": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                ]
+              },
+              "cross_set_checks": {
+                "description": "D43 校验项：跨集合对象交叉检查配置",
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "object_overlap_forbidden": {
+                    "const": true
+                  },
+                  "identity_key": {
+                    "type": "string",
+                    "description": "对象身份键（非文件路径）"
+                  },
+                  "hash_algorithm": {
+                    "enum": [
+                      "sha256",
+                      "md5"
+                    ],
+                    "default": "sha256"
+                  }
+                },
+                "required": [
+                  "object_overlap_forbidden",
+                  "identity_key"
+                ]
+              }
+            }
+          }
+        },
+        "version_control": {
+          "description": "D39：文件清单+校验和；逻辑路径→各机实际路径映射；先同步临时位置、校验后原子发布",
+          "type": "object",
+          "required": [
+            "manifest_required",
+            "atomic_publish",
+            "manual_placement_policy"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "manifest_required": {
+              "const": true
+            },
+            "expected_manifest_sha256": {
+              "type": "string"
+            },
+            "atomic_publish": {
+              "const": true
+            },
+            "manual_placement_policy": {
+              "const": "must_pass_validation"
+            }
+          }
+        },
+        "bound_data_version_id": {
+          "type": "string",
+          "description": "r4-S4：冻结时绑定的数据版本（权威，不猜测）"
+        },
+        "bound_validator_version": {
+          "type": "string",
+          "description": "r4-S4：划分校验的权威 validator 版本"
+        }
+      }
+    },
+    "commands": {
+      "description": "训练/评估命令模板、工作目录、checkpoint 与恢复、退出码、冒烟标准（A01 ③④⑦⑧ + A02）",
+      "type": "object",
+      "required": [
+        "train_command_template",
+        "eval_command_template",
+        "working_dir",
+        "checkpoint",
+        "exit_codes",
+        "smoke"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "train_command_template": {
+          "type": "string"
+        },
+        "eval_command_template": {
+          "type": "string"
+        },
+        "working_dir": {
+          "type": "string"
+        },
+        "checkpoint": {
+          "type": "object",
+          "required": [
+            "location_template",
+            "recovery_command"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "location_template": {
+              "type": "string"
+            },
+            "recovery_command": {
+              "type": "string"
+            },
+            "best_selection_rule": {
+              "type": "string"
+            }
+          }
+        },
+        "exit_codes": {
+          "type": "object",
+          "required": [
+            "success"
+          ],
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "properties": {
+            "success": {
+              "const": 0
+            }
+          }
+        },
+        "smoke": {
+          "description": "增强标准（A02）：前向、有限 loss、反向、预期可训练参数的梯度与更新、ckpt 保存重载、最小评估链路；任务语义检查由适配配置声明",
+          "type": "object",
+          "required": [
+            "enhanced_checks"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "baseline_standard": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "环境搭建末尾：可 import、跑通 1 个 step"
+            },
+            "enhanced_checks": {
+              "type": "array",
+              "minItems": 6,
+              "items": {
+                "enum": [
+                  "forward",
+                  "finite_loss",
+                  "backward",
+                  "trainable_grad_update",
+                  "ckpt_save_reload",
+                  "minimal_eval_chain"
+                ]
+              }
+            },
+            "adapter_declared_checks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "randomness": {
+      "description": "seed 与随机性协议（A01 ⑤ + D34 两门槛 + D26）——seed 预登记，先登记后使用",
+      "type": "object",
+      "required": [
+        "registered_seed_sets",
+        "per_round_seed_rule",
+        "multi_seed",
+        "screening_rule"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "registered_seed_sets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "role",
+              "seeds"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "role": {
+                "enum": [
+                  "train",
+                  "infer",
+                  "screening",
+                  "confirm"
+                ]
+              },
+              "seeds": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "per_round_seed_rule": {
+          "description": "迭代期每轮单 seed 快速验证（D9）；seed 取自预登记集合",
+          "type": "object",
+          "required": [
+            "source"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "const": "registered_train_seeds"
+            },
+            "iteration_policy": {
+              "enum": [
+                "first_seed",
+                "round_robin"
+              ]
+            }
+          }
+        },
+        "multi_seed": {
+          "type": "object",
+          "required": [
+            "count"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "count": {
+              "type": "integer",
+              "minimum": 3,
+              "maximum": 5
+            },
+            "parallel": {
+              "const": true
+            }
+          }
+        },
+        "screening_rule": {
+          "description": "D34 初筛预登记：判『值得补跑』；初筛结论可被最终比较推翻",
+          "type": "object",
+          "required": [
+            "metric",
+            "threshold",
+            "dataset_scope"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "metric": {
+              "$ref": "#/$defs/metricRef"
+            },
+            "op": {
+              "enum": [
+                ">=",
+                "<=",
+                ">",
+                "<"
+              ],
+              "default": ">="
+            },
+            "threshold": {
+              "type": "number"
+            },
+            "dataset_scope": {
+              "enum": [
+                "val"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "description": "指标 schema 或日志正则（A01 ⑥ + D24：解析值仅诊断；正式指标来自 D29 可信评测）",
+      "type": "object",
+      "required": [
+        "definitions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "metric_file": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "format": {
+              "enum": [
+                "json",
+                "csv"
+              ]
+            },
+            "path_template": {
+              "type": "string"
+            },
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "log_regex": {
+          "type": "string"
+        },
+        "definitions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "direction",
+              "source"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "maximize",
+                  "minimize"
+                ]
+              },
+              "source": {
+                "enum": [
+                  "trusted_evaluator",
+                  "diagnostic_parse"
+                ],
+                "description": "终止判定/跨轮比较/候选选择仅允许 trusted_evaluator（R01）"
+              },
+              "aggregation": {
+                "type": "string"
+              },
+              "missing_policy": {
+                "enum": [
+                  "block_next_round",
+                  "degrade_display",
+                  "diagnostic_repair"
+                ],
+                "description": "Q04：正式缺失阻断改码；诊断缺失降级"
+              }
+            }
+          }
+        }
+      }
+    },
+    "fairness": {
+      "description": "基线与公平比较口径（A01 ⑨ + D33 + R10）",
+      "type": "object",
+      "required": [
+        "baseline_definition",
+        "recipe_disclosure",
+        "continued_training_disclosure",
+        "round0_patch_policy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "baseline_definition": {
+          "type": "object",
+          "required": [
+            "source"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "const": "round0_base_snapshot"
+            },
+            "paper_reported_values": {
+              "type": "object",
+              "description": "论文数值参照（含数据集版本/划分/协议/训练条件，不只抽最高分，D42）"
+            },
+            "divergence_policy": {
+              "const": "record_explanation",
+              "description": "与论文不一致时记录可解释差异，不强行要求复现"
+            }
+          }
+        },
+        "recipe_disclosure": {
+          "description": "训练配方变化须披露（R10）；结构收益主张必要时补相同配方 BASE 对照",
+          "type": "object",
+          "required": [
+            "fields"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "fields": {
+              "type": "array",
+              "minItems": 6,
+              "items": {
+                "enum": [
+                  "budget_ep",
+                  "pretrain_src",
+                  "optimizer",
+                  "augment",
+                  "precision",
+                  "selection_rule"
+                ]
+              }
+            },
+            "structure_claim_rule": {
+              "type": "string"
+            }
+          }
+        },
+        "continued_training_disclosure": {
+          "description": "父权重续训记录累计步数与优化器/调度器状态，不只记权重文件（R10）",
+          "type": "object",
+          "required": [
+            "cum_steps",
+            "optimizer_scheduler_state",
+            "silent_partial_load"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "cum_steps": {
+              "const": true
+            },
+            "optimizer_scheduler_state": {
+              "const": true
+            },
+            "silent_partial_load": {
+              "const": false,
+              "description": "D35：禁止静默部分加载"
+            }
+          }
+        },
+        "round0_patch_policy": {
+          "type": "object",
+          "required": [
+            "env_compat_allowed",
+            "method_change_allowed"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "env_compat_allowed": {
+              "const": true
+            },
+            "method_change_allowed": {
+              "const": false
+            }
+          }
+        }
+      }
+    },
+    "termination": {
+      "description": "终止条件库（A01 ⑩ + D27/A05：17 项，四组；GPU 时长预算为强制项不可禁用；动作两档）",
+      "type": "object",
+      "required": [
+        "conditions",
+        "metering_policy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "conditions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/terminationCondition"
+          }
+        },
+        "metering_policy": {
+          "type": "object",
+          "required": [
+            "clock_basis",
+            "error_tolerance_s",
+            "stop_grace_s"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "clock_basis": {
+              "enum": [
+                "gpu_seconds_agent_metered",
+                "wall_clock",
+                "hybrid"
+              ]
+            },
+            "error_tolerance_s": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "stop_grace_s": {
+              "type": "integer",
+              "exclusiveMinimum": 0
+            }
+          }
+        }
+      }
+    },
+    "ablation": {
+      "description": "消融矩阵（A01 ⑪ + D36：模块身份映射；进入确认前按最终代码重校验；失败项显式标注不伪填）",
+      "type": "object",
+      "required": [
+        "matrix",
+        "required_roles",
+        "revision_policy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "matrix": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "item_id",
+              "role",
+              "module_identity",
+              "intervention",
+              "training_budget",
+              "seeds"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "item_id": {
+                "type": "string"
+              },
+              "role": {
+                "enum": [
+                  "BASE",
+                  "FULL_METHOD",
+                  "KEY_REMOVAL",
+                  "SUPPORTING"
+                ]
+              },
+              "module_identity": {
+                "type": "string",
+                "description": "结构身份（演化后可自动标记失效项并重新生成）；BASE 用 'base'，FULL_METHOD 用 'full'"
+              },
+              "intervention": {
+                "enum": [
+                  "remove_module",
+                  "replace_module",
+                  "disable_path",
+                  "train_only",
+                  "infer_only",
+                  "both",
+                  "none"
+                ]
+              },
+              "init_spec": {
+                "type": "string",
+                "description": "初始化协议引用（D35）"
+              },
+              "training_budget": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "seeds": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "integer"
+                }
+              },
+              "expected_runnable": {
+                "type": "boolean",
+                "default": true
+              }
+            }
+          }
+        },
+        "required_roles": {
+          "description": "矩阵必须覆盖的角色（S12：BASE/完整方法/关键移除项缺一不可）",
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "prefixItems": [
+            {
+              "const": "BASE"
+            },
+            {
+              "const": "FULL_METHOD"
+            },
+            {
+              "const": "KEY_REMOVAL"
+            }
+          ],
+          "items": false
+        },
+        "revision_policy": {
+          "type": "object",
+          "required": [
+            "revalidate_before_confirmation"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "revalidate_before_confirmation": {
+              "const": true,
+              "description": "进入 [6] 前基于最终代码重校验（D36）"
+            },
+            "needs_revision_flow": {
+              "const": "pause_for_user_confirmation",
+              "description": "R07：待消融方案确认暂停态"
+            },
+            "not_runnable_policy": {
+              "const": "explicit_reason_no_fill"
+            }
+          }
+        }
+      }
+    },
+    "final_comparison": {
+      "description": "最终比较与证据规则（A01 ⑫ + Q01：全部到齐 ≠ 提升成立；区分描述性改善与证据支持的主张）",
+      "type": "object",
+      "required": [
+        "execution_order",
+        "criteria",
+        "evidence_rules"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "execution_order": {
+          "description": "固定执行顺序（Q01）：验证集初筛 → 补齐指定训练与对照 → 冻结最终实验集合 → 测试集确认",
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {
+              "const": "validation_screening"
+            },
+            {
+              "const": "complete_designated_trainings_and_controls"
+            },
+            {
+              "const": "freeze_final_experiment_set"
+            },
+            {
+              "const": "test_confirmation"
+            }
+          ],
+          "items": false
+        },
+        "criteria": {
+          "type": "object",
+          "required": [
+            "main_metric",
+            "direction",
+            "difference_calculation",
+            "minimal_interesting_improvement",
+            "uncertainty",
+            "screening_overridable"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "main_metric": {
+              "$ref": "#/$defs/metricRef"
+            },
+            "direction": {
+              "enum": [
+                "maximize",
+                "minimize"
+              ]
+            },
+            "difference_calculation": {
+              "enum": [
+                "mean_diff",
+                "relative_improvement",
+                "paired_diff"
+              ]
+            },
+            "minimal_interesting_improvement": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "constraint_metrics": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "uncertainty": {
+              "type": "object",
+              "required": [
+                "method"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "method": {
+                  "enum": [
+                    "mean_std",
+                    "confidence_interval",
+                    "significance_test"
+                  ]
+                },
+                "level": {
+                  "type": "number"
+                },
+                "report_requirements": {
+                  "type": "array",
+                  "minItems": 2,
+                  "items": {
+                    "enum": [
+                      "sample_count",
+                      "randomness_source"
+                    ]
+                  },
+                  "description": "均值±标准差须注明样本数与随机源（D34）"
+                }
+              }
+            },
+            "screening_overridable": {
+              "const": true
+            }
+          }
+        },
+        "evidence_rules": {
+          "type": "object",
+          "required": [
+            "all_complete_not_equal_to_success",
+            "no_candidate_switch_by_test_score",
+            "no_mixed_version_aggregation"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "all_complete_not_equal_to_success": {
+              "const": true
+            },
+            "no_candidate_switch_by_test_score": {
+              "const": true,
+              "description": "不依测试分数换候选（D37）"
+            },
+            "no_mixed_version_aggregation": {
+              "const": true,
+              "description": "不输出混合版本同方法均值（D45）"
+            },
+            "legal_end_states": {
+              "type": "array",
+              "description": "合法终态如实报告（D37）",
+              "items": {
+                "enum": [
+                  "only_base_available",
+                  "no_improvement",
+                  "confirmation_failed",
+                  "insufficient_evidence"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "protected_protocol": {
+      "description": "受保护评测协议（D29）：冻结引用与变更语义",
+      "type": "object",
+      "required": [
+        "evaluator_digest_ref",
+        "protected_assets",
+        "change_policy",
+        "test_set_usage"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "evaluator_digest_ref": {
+          "type": "string",
+          "description": "指向 evaluator_snapshots.digest（冻结指标代码摘要）"
+        },
+        "protected_assets": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "prefixItems": [
+            {
+              "const": "data_splits"
+            },
+            {
+              "const": "metric_code"
+            },
+            {
+              "const": "test_set"
+            }
+          ],
+          "items": false
+        },
+        "change_policy": {
+          "const": "new_protocol_version_and_revalidate",
+          "description": "协议变更 = 新实验版本 + D44 转移规则"
+        },
+        "test_set_usage": {
+          "type": "object",
+          "required": [
+            "only_for_final_confirmation",
+            "read_path",
+            "after_read_marking"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "only_for_final_confirmation": {
+              "const": true
+            },
+            "read_path": {
+              "const": "final_confirmation_read_api"
+            },
+            "after_read_marking": {
+              "const": "test_set_participated_in_development"
+            }
+          }
+        }
+      }
+    },
+    "resource_requirements": {
+      "description": "任务资源声明（需求[2]④ GPU 异构防护：显存下限过滤调度；结构修改后更新，不静默改科研配置）",
+      "type": "object",
+      "required": [
+        "vram_min_mb"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "vram_min_mb": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "recommended_arch": {
+          "type": "string"
+        }
+      }
+    },
+    "review_conclusions": {
+      "description": "评审结论留档（A01 ⑬ + D5/D21/D22/D42）",
+      "type": "object",
+      "required": [
+        "module_conclusions",
+        "all_questions_answered",
+        "literature_comparison",
+        "integral_review_passed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "module_conclusions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "module_identity",
+              "conclusion"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "module_identity": {
+                "type": "string"
+              },
+              "conclusion": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "all_questions_answered": {
+          "const": true,
+          "description": "D21：反问清单全部回答后才可整体确认定稿"
+        },
+        "integral_review_passed": {
+          "const": true,
+          "description": "D22：整体汇总已检查模块冲突"
+        },
+        "literature_comparison": {
+          "type": "object",
+          "required": [
+            "retrieval_mode",
+            "checked_at"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "retrieval_mode": {
+              "enum": [
+                "imported_only",
+                "external"
+              ]
+            },
+            "checked_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "novelty_claim_policy": {
+              "const": "no_similarity_is_not_novelty",
+              "description": "'未发现相似工作'不得表述为'创新性成立'（D42）"
+            }
+          }
+        }
+      }
+    },
+    "revision_classification": {
+      "description": "D38 字段归属表（机器可读）：control=立即生效走 control_epoch；protocol=只对新轮次生效+D44 失效传播",
+      "type": "object",
+      "required": [
+        "control_paths",
+        "protocol_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "control_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "终止条件中的资源组阈值（gpu_time_budget/wall_clock/llm_cost/max_rounds）"
+        },
+        "protocol_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "goal/dataset/splits/commands/randomness/metrics/fairness/ablation/final_comparison/protected_protocol"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "S12：17 类型各恰好一次（min=max=17 + 逐类型 contains 联合保证无缺无重）；禁用条件也必须显式登记 enabled=false",
+      "properties": {
+        "termination": {
+          "properties": {
+            "conditions": {
+              "minItems": 17,
+              "maxItems": 17,
+              "allOf": [
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "max_rounds"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "gpu_time_budget"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "wall_clock_budget"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "llm_cost_budget"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "target_metric_reached"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "no_improvement_rounds"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "convergence_plateau"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "below_baseline"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "overfit_divergence"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "metric_regression"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "pareto_stagnation"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "crash_rate_high"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "oscillation_detected"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "single_round_timeout"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "diff_runaway"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "manual_stop"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "type": {
+                        "const": "milestone_gate"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "app_level_constraints": {
+    "description": "S12：跨字段语义约束——JSON Schema 无法表达；唯一执行体为 tests/plan_app_constraints.py:validate_app_constraints（T-FREEZE guard F1 与 CI 调用），本字段仅为人类可读清单",
+    "type": "array",
+    "minItems": 6,
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "randomness.multi_seed.count == len(registered_seed_sets[role=confirm].seeds)（D34：确认组 seed 数与 count 一致）",
+      "randomness.multi_seed.count <= len(registered_seed_sets[role=train].seeds)（多 seed 训练用 seed 不超出登记集）",
+      "randomness.screening_rule.metric.name == goal.primary_metric.name（初筛指标须为主指标或已在 metrics.definitions 登记）",
+      "ablation.required_roles 中每个角色至少被一个 matrix[].role 匹配（BASE/FULL_METHOD/KEY_REMOVAL 不可空挂）",
+      "final_comparison.criteria.main_metric.name 必须出现在 metrics.definitions 且 source=trusted_evaluator（正式比较只用可信来源 R01）",
+      "goal.constraint_metrics[].metric 同上须在 metrics.definitions 登记"
+    ]
+  },
+  "$defs": {
+    "metricRef": {
+      "type": "object",
+      "required": [
+        "name",
+        "direction"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "direction": {
+          "enum": [
+            "maximize",
+            "minimize"
+          ]
+        },
+        "aggregation": {
+          "type": "string"
+        }
+      }
+    },
+    "judgeSpec": {
+      "description": "判定器规格（A05）",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "compare_to": {
+          "enum": [
+            "historical_best",
+            "previous_round",
+            "baseline",
+            "absolute"
+          ],
+          "default": "historical_best"
+        },
+        "window": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_effective_rounds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "threshold_type": {
+          "enum": [
+            "absolute",
+            "relative"
+          ]
+        },
+        "priority": {
+          "type": "integer",
+          "description": "人工取消与硬预算 > 科研成功条件（触发优先级）"
+        },
+        "reset_condition": {
+          "type": "string",
+          "description": "计数重置条件；崩溃轮不计无提升配额（D23）"
+        }
+      }
+    },
+    "terminationCondition": {
+      "type": "object",
+      "required": [
+        "type",
+        "enabled",
+        "action",
+        "params",
+        "judge"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "max_rounds",
+            "gpu_time_budget",
+            "wall_clock_budget",
+            "llm_cost_budget",
+            "target_metric_reached",
+            "no_improvement_rounds",
+            "convergence_plateau",
+            "below_baseline",
+            "overfit_divergence",
+            "metric_regression",
+            "pareto_stagnation",
+            "crash_rate_high",
+            "oscillation_detected",
+            "single_round_timeout",
+            "diff_runaway",
+            "manual_stop",
+            "milestone_gate"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "action": {
+          "enum": [
+            "terminate",
+            "pause",
+            "failure_event"
+          ],
+          "description": "S12：动作按需求 [5] 表格固定为 const（见 allOf）"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "judge": {
+          "$ref": "#/$defs/judgeSpec"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "max_rounds"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "terminate"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "limit"
+                ],
+                "properties": {
+                  "limit": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "gpu_time_budget"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enabled": {
+                "const": true
+              },
+              "action": {
+                "const": "terminate"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "limit_s"
+                ],
+                "properties": {
+                  "limit_s": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "wall_clock_budget"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "terminate"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "limit_s"
+                ],
+                "properties": {
+                  "limit_s": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "llm_cost_budget"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "pause"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "max_cost_usd"
+                ],
+                "properties": {
+                  "max_cost_usd": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  "max_tokens": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "target_metric_reached"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "terminate"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "target_value"
+                ],
+                "properties": {
+                  "target_value": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "no_improvement_rounds"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "terminate"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "n"
+                ],
+                "properties": {
+                  "n": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "convergence_plateau"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "terminate"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "n",
+                  "epsilon"
+                ],
+                "properties": {
+                  "n": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "epsilon": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "below_baseline"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "pause"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "n"
+                ],
+                "properties": {
+                  "n": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "overfit_divergence"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "pause"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "n"
+                ],
+                "properties": {
+                  "n": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "metric_regression"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "pause"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "n",
+                  "magnitude"
+                ],
+                "properties": {
+                  "n": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "magnitude": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "pareto_stagnation"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "terminate"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "n"
+                ],
+                "properties": {
+                  "n": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "crash_rate_high"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "pause"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "window_m",
+                  "ratio"
+                ],
+                "properties": {
+                  "window_m": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "ratio": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "oscillation_detected"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "pause"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "k"
+                ],
+                "properties": {
+                  "k": {
+                    "type": "integer",
+                    "minimum": 2
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "single_round_timeout"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "failure_event"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "timeout_s"
+                ],
+                "properties": {
+                  "timeout_s": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "diff_runaway"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "pause"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "lines",
+                  "rounds"
+                ],
+                "properties": {
+                  "lines": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "rounds": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "manual_stop"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enabled": {
+                "const": true
+              },
+              "action": {
+                "const": "terminate"
+              },
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "maxProperties": 0
+              },
+              "judge": {
+                "type": "object",
+                "additionalProperties": false,
+                "maxProperties": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "milestone_gate"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "pause"
+              },
+              "params": {
+                "type": "object",
+                "required": [
+                  "metric",
+                  "value"
+                ],
+                "properties": {
+                  "metric": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "not": {
+                  "const": "manual_stop"
+                }
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "judge": {
+                "type": "object",
+                "required": [
+                  "compare_to",
+                  "threshold_type"
+                ],
+                "properties": {
+                  "compare_to": {
+                    "enum": [
+                      "historical_best",
+                      "previous_round",
+                      "baseline",
+                      "absolute"
+                    ]
+                  },
+                  "threshold_type": {
+                    "enum": [
+                      "absolute",
+                      "relative"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

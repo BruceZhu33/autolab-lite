@@ -1,0 +1,856 @@
+# =====================================================================
+# AutoLab · 三层状态迁移契约（机器可检查 · 唯一权威载体）
+# 版本：v1.0-draft.6（第五轮评审修订版） · 2026-09-13
+# 基线：技术设计 v2.7 §4（冻结）· 复审处置 S6/S9/S10/GAP-R1/GAP-R2(保守)/O1
+# 规则（校验器 tests/test_state_machine.py 执行）：
+#   R1 每个 terminal:false 状态至少一条出边；所有 from/to 必须是已定义状态
+#   R2 每个 waiting:true 状态有 timeout 或人工接管出口
+#   R3 重复 terminate/cancel/resume/stop 不回退（见各迁移 replay 字段）
+#   R4 重启仅凭持久态恢复（恢复算法只在 §recovery，不依赖内存态）
+# 语义约定：
+#   terminal = 无出边（不可再迁移）。run 层 JUDGED 为 terminal:false +
+#   lifecycle_complete:true（本轮判定完成，但保留派生/上抛出口——复审 S10 修正）
+#   预算账本态 ACTIVE|DRAINING 不属状态机，其出口检查见 R2 备注（DRAINING→T-SETTLE 事件驱动+expires_at 兜底）
+# 命名（U4）：PAUSED 唯一项目暂停态（pause_reason 子字段）；
+#   停止等待分层：项目 STOP_PENDING_CONFIRMATION / attempt ATTEMPT_STOP_UNKNOWN，不得互相投影
+# ADD-5（已冻结·r3）：deadline_expired 本地超时落 ATTEMPT_STOP_UNKNOWN（不虚报）；
+#   agent deadline_exceeded_ack 可信回执（含最终累计 usage/退出原因/dispatch/epoch）→ STOP_CONFIRMED 并同事务结算
+# =====================================================================
+version: 3
+layers:
+  project:
+    states:
+    - {name: INIT, terminal: false, note: 立项完成（BASE 快照+论文+卡池+数据登记就位）}
+    - {name: ENV_SETUP, terminal: false, waiting: true, takeover: 人工重试（A11 部分失败只修复失败步骤）, takeover_events: [terminate]}
+    - {name: REVIEW_GATE, terminal: false, waiting: true, takeover: 人工（D21 定稿闸门，不自动跳过）, takeover_events: [terminate]}
+    - {name: BASELINE_ACCEPTANCE, terminal: false, waiting: true, takeover: 人工（D33 验收）, takeover_events: [accept, reject, terminate]}
+    - {name: SEARCH, terminal: false}
+    - {name: CONFIRMATION_PREP, terminal: false}
+    - {name: CONFIRMATION_RUNNING, terminal: false}
+    - {name: TEST_RESULT_SEALED, terminal: false, waiting: true, takeover: 人工显式 final-read（测试结果不回流开发，禁止超时自动读）, takeover_events: [final_read, terminate]}
+    - {name: STOPPING, terminal: false, waiting: true, takeover: 远端硬截止 expires_at 兜底 + 周期对账 + 人工重试停止, takeover_events: [all_attempts_terminal_or_stop_confirmed, agent_unreachable, terminate]}
+    - {name: STOP_PENDING_CONFIRMATION, terminal: false, waiting: true, takeover: 周期对账 + 硬截止兜底 + 人工裁决（D31 失联不虚报）, takeover_events: [reconciled_stopped, reconciled_running, still_unreachable, terminate]}
+    - {name: FINISHING, terminal: false, note: 终局已定（completed|failed|cancelled|budget_exhausted|stopped）}
+    - {name: REPORTING, terminal: false, waiting: true, takeover: report_failed→重试或 PAUSED(manual_report), takeover_events: [report_done, report_failed, report_failed_escalate, terminate]}
+    - {name: REPORTED, terminal: true, note: 唯一项目终态}
+    - {name: PAUSED, terminal: false, waiting: true, takeover: 人工（A08 恢复入口：继续/终止/修订计划/重试失败任务/从检查点恢复）, fields: [pause_reason, paused_from_state], takeover_events: [resume, apply_control_revision, apply_protocol_revision, apply_method_revision, revise, terminate]}
+    transitions:
+      # ---- 主链 ----
+    - from: [INIT]
+      event: start_env_setup
+      to: ENV_SETUP
+      guard: "卡池非空 ∧ 至少一台服务器可达 ∧ 数据主副本登记"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed, env_setup.start]
+      on_failure: 保持 INIT
+      replay: 状态已是 ENV_SETUP → no-op
+    - from: [ENV_SETUP]
+      event: setup_done
+      to: REVIEW_GATE
+      guard: "全部卡池机器 code+env+data 就绪（data_replicas=READY）"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: 保持 ENV_SETUP（部分失败重试只修复失败步骤 A11）
+      replay: no-op
+    - from: [REVIEW_GATE]
+      event: confirm
+      to: BASELINE_ACCEPTANCE
+      guard: "D21：plan_frozen ∧ split_validation=PASSED(四元组) ∧ 所需 data_replicas=READY ∧ evaluator_snapshot_frozen"
+      tx: "T-FREEZE（含 S-CAS(project)）"
+      outbox: [project.state_changed, plan.frozen]
+      on_failure: "GUARD_UNMET 返回未满足项清单"
+      replay: 幂等
+    - from: [BASELINE_ACCEPTANCE]
+      event: accept
+      to: SEARCH
+      guard: "D33：训练行为正常 ∧ 协议一致 ∧ 配置合理；patch_class=method 时禁止 accept"
+      tx: "S-CAS(project) + baseline_acceptances 插入"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: 已 SEARCH → no-op
+    - from: [BASELINE_ACCEPTANCE]
+      event: reject
+      to: PAUSED
+      guard: 无
+      set: {pause_reason: manual_baseline}
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: 已 PAUSED → no-op
+    - from: [SEARCH]
+      event: candidate_selected
+      to: CONFIRMATION_PREP
+      guard: "D37：按定稿规则（验证集主指标最佳轮+约束+平局）选出，不依测试分数"
+      tx: "S-CAS(project) + candidates 状态推进"
+      outbox: [project.state_changed, candidate.selected]
+      on_failure: 保持 SEARCH
+      replay: 幂等
+    - from: [CONFIRMATION_PREP]
+      event: batch_frozen
+      to: CONFIRMATION_RUNNING
+      guard: "D45：五绑定齐 ∧ 批次清单落库"
+      tx: "S-CAS(project) + batches/batch_items 落库"
+      outbox: [project.state_changed, batch.frozen]
+      on_failure: 保持
+      replay: 批次已冻结 → no-op
+    - from: [CONFIRMATION_PREP]
+      event: matrix_revision_required
+      to: PAUSED
+      guard: "D36/R07：矩阵按最终代码重校验需修订"
+      set: {pause_reason: matrix_revision}
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed, ablation.revision_required]
+      on_failure: 保持
+      replay: no-op
+    - from: [CONFIRMATION_RUNNING]
+      event: protocol_or_method_changed
+      to: PAUSED
+      guard: 无
+      set: {pause_reason: revision_required}
+      tx: "S-CAS(project) + invalidation_edges 写入（D44）"
+      outbox: [project.state_changed, invalidation.propagated]
+      on_failure: 保持
+      replay: no-op
+    - from: [CONFIRMATION_RUNNING]
+      event: all_required_results_present
+      to: TEST_RESULT_SEALED
+      guard: "S6/D34：全部指定 batch_items 达终态 ∧ required 条目全部 SUCCEEDED ∧ 测试集评测 COMPLETED（证据不足不进此门）"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed, batch.completed]
+      on_failure: 保持（缺失项继续补跑或走 terminate 失败路径）
+      replay: 幂等
+    - from: [TEST_RESULT_SEALED]
+      event: final_read
+      to: FINISHING
+      guard: "T-FINAL-READ G1–G7（含幂等优先与归属闭包）"
+      tx: "T-FINAL-READ（单事务：api_idempotency+release+audit+项目 CAS）"
+      outbox: [project.state_changed, final_confirmation.released]
+      on_failure: "GUARD_UNMET 明细返回"
+      replay: "事务已提交但响应丢失→按 idempotency key 返回持久化响应（release_payload_json 原样）；异键→FINAL_CONFIRM_ALREADY_RELEASED"
+      # ---- 统一项目终止事件（13 个非终态逐一展开；REPORTED 终态 no-op）----
+    - from: [INIT, ENV_SETUP, REVIEW_GATE, BASELINE_ACCEPTANCE, SEARCH, CONFIRMATION_PREP, CONFIRMATION_RUNNING, TEST_RESULT_SEALED, PAUSED]
+      event: terminate
+      to: STOPPING
+      guard: has_active_attempts
+      tx: "S-CAS(project) + 冻结派发"
+      outbox: "attempt.stop × 活跃 attempt + project.state_changed"
+      on_failure: 保持原状态
+      replay: 重复 terminate 在同一非终态 → no-op（reason 取最新）
+    - from: [INIT, ENV_SETUP, REVIEW_GATE, BASELINE_ACCEPTANCE, SEARCH, CONFIRMATION_PREP, CONFIRMATION_RUNNING, TEST_RESULT_SEALED, PAUSED]
+      event: terminate
+      to: FINISHING
+      guard: "no_active_attempt"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: 保持原状态
+      replay: no-op
+    - from: [STOPPING]
+      event: terminate
+      to: STOPPING
+      guard: 无
+      tx: 仅更新 reason（不迁移）
+      outbox: []
+      on_failure: "-"
+      replay: no-op
+    - from: [STOP_PENDING_CONFIRMATION]
+      event: terminate
+      to: STOP_PENDING_CONFIRMATION
+      guard: 无
+      tx: 仅更新 reason（不迁移）
+      outbox: []
+      on_failure: "-"
+      replay: no-op
+    - from: [FINISHING]
+      event: terminate
+      to: FINISHING
+      guard: 无
+      tx: 仅更新 reason（不迁移）
+      outbox: []
+      on_failure: "-"
+      replay: no-op
+    - from: [REPORTING]
+      event: terminate
+      to: REPORTING
+      guard: 无
+      tx: "仅更新 reason 不迁移（防循环，设计 §4）"
+      outbox: []
+      on_failure: "-"
+      replay: no-op
+    - from: [REPORTED]
+      event: terminate
+      to: REPORTED
+      guard: "终态不可逆"
+      tx: no-op
+      outbox: []
+      on_failure: "-"
+      replay: no-op
+    - from: [STOPPING]
+      event: all_attempts_terminal_or_stop_confirmed
+      to: FINISHING
+      guard: "全部 attempt 终态或 STOP_CONFIRMED（含 T-SETTLE 结算）"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: 保持 STOPPING
+      replay: 幂等
+    - from: [STOPPING]
+      event: agent_unreachable
+      to: STOP_PENDING_CONFIRMATION
+      guard: 停止链无回执且 agent 失联
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: no-op
+    - from: [STOP_PENDING_CONFIRMATION]
+      event: reconciled_stopped
+      to: FINISHING
+      guard: 对账确认全部 attempt 终态（全机）
+      tx: "S-CAS(project) + T-INGEST 对账结果"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: 幂等
+    - from: [STOP_PENDING_CONFIRMATION]
+      event: reconciled_running
+      to: STOPPING
+      guard: 对账发现有 attempt 仍在跑
+      tx: "S-CAS(project)"
+      outbox: "project.state_changed + attempt.stop(retry)"
+      on_failure: 保持
+      replay: no-op
+    - from: [STOP_PENDING_CONFIRMATION]
+      event: still_unreachable
+      to: STOP_PENDING_CONFIRMATION
+      guard: 周期对账仍失联
+      tx: 仅记 audit_events（自持，不虚报 D31）
+      outbox: []
+      on_failure: "-"
+      replay: 自持
+      # ---- 报告链 ----
+    - from: [FINISHING]
+      event: report_requested
+      to: REPORTING
+      guard: "任何终态可产出阶段报告（Q05）；不为补报告隐式启动训练"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed, report.generate]
+      on_failure: 保持 FINISHING
+      replay: 幂等
+    - from: [REPORTING]
+      event: report_done
+      to: REPORTED
+      guard: 报告产物登记
+      tx: "S-CAS(project) + 产物登记 [BLOCKED-ADD-3]"
+      outbox: [project.state_changed, report.completed]
+      on_failure: 保持
+      replay: 幂等
+    - from: [REPORTING]
+      event: report_failed
+      to: REPORTING
+      guard: 无
+      tx: 记录失败供重试
+      outbox: [report.failed]
+      on_failure: "-"
+      replay: no-op
+    - from: [REPORTING]
+      event: report_failed_escalate
+      to: PAUSED
+      guard: 用户选择人工接管
+      set: {pause_reason: manual_report}
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: no-op
+      # ---- 暂停与恢复（六独立事件，不得合并为单一 resume 接口 U4；S10：动态目标展开）----
+    - from: [SEARCH, BASELINE_ACCEPTANCE]
+      event: pause
+      to: PAUSED
+      guard: "D8：预设暂停条件/需人工协议修订/消融矩阵需确认/自修复失败/LLM 预算/里程碑门禁"
+      set: {pause_reason: from_event}
+      tx: "S-CAS(project)（记录 paused_from）"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: 已 PAUSED → no-op（不叠加）
+    - from: [PAUSED]
+      event: resume
+      to: SEARCH
+      guard: "无待应用修订 ∧ paused_from=SEARCH"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: GUARD_UNMET
+      replay: "非 PAUSED 态收到 resume → STATE_INVALID_TRANSITION（不回退）"
+    - from: [PAUSED]
+      event: resume
+      to: BASELINE_ACCEPTANCE
+      guard: "无待应用修订 ∧ paused_from=BASELINE_ACCEPTANCE"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: GUARD_UNMET
+      replay: 非 PAUSED 态收到 resume → STATE_INVALID_TRANSITION（不回退）
+    - from: [PAUSED]
+      event: resume
+      to: CONFIRMATION_PREP
+      guard: "无待应用修订 ∧ paused_from=CONFIRMATION_PREP"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: GUARD_UNMET
+      replay: 非 PAUSED 态收到 resume → STATE_INVALID_TRANSITION（不回退）
+    - from: [PAUSED]
+      event: resume
+      to: CONFIRMATION_RUNNING
+      guard: "无待应用修订 ∧ paused_from=CONFIRMATION_RUNNING"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: GUARD_UNMET
+      replay: 非 PAUSED 态收到 resume → STATE_INVALID_TRANSITION（不回退）
+    - from: [PAUSED]
+      event: resume
+      to: REPORTING
+      guard: "无待应用修订 ∧ paused_from=REPORTING"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: GUARD_UNMET
+      replay: 非 PAUSED 态收到 resume → STATE_INVALID_TRANSITION（不回退）
+    - from: [PAUSED]
+      event: apply_control_revision
+      to: SEARCH
+      guard: "paused_from=SEARCH ∧ 控制类变更不中断候选资格（D38/D44）"
+      tx: "S-CAS(project) + control_epoch+1（control_events 写入）"
+      outbox: [project.state_changed, control.epoch_advanced]
+      on_failure: 保持
+      replay: 同 epoch 重放 → no-op
+    - from: [PAUSED]
+      event: apply_control_revision
+      to: BASELINE_ACCEPTANCE
+      guard: "paused_from=BASELINE_ACCEPTANCE ∧ 同上"
+      tx: "S-CAS(project) + control_epoch+1"
+      outbox: [project.state_changed, control.epoch_advanced]
+      on_failure: 保持
+      replay: no-op
+    - from: [PAUSED]
+      event: apply_control_revision
+      to: CONFIRMATION_PREP
+      guard: "paused_from=CONFIRMATION_PREP ∧ 同上"
+      tx: "S-CAS(project) + control_epoch+1"
+      outbox: [project.state_changed, control.epoch_advanced]
+      on_failure: 保持
+      replay: no-op
+    - from: [PAUSED]
+      event: apply_control_revision
+      to: CONFIRMATION_RUNNING
+      guard: "paused_from=CONFIRMATION_RUNNING ∧ 同上"
+      tx: "S-CAS(project) + control_epoch+1"
+      outbox: [project.state_changed, control.epoch_advanced]
+      on_failure: 保持
+      replay: no-op
+    - from: [PAUSED]
+      event: apply_control_revision
+      to: REPORTING
+      guard: "paused_from=REPORTING ∧ 同上"
+      tx: "S-CAS(project) + control_epoch+1"
+      outbox: [project.state_changed, control.epoch_advanced]
+      on_failure: 保持
+      replay: no-op
+    - from: [PAUSED]
+      event: apply_protocol_revision
+      to: REVIEW_GATE
+      guard: "D44 失效传播后回闸门（协议改动涉定稿面）"
+      tx: "S-CAS(project) + invalidation_edges"
+      outbox: [project.state_changed, invalidation.propagated]
+      on_failure: 保持
+      replay: 幂等
+    - from: [PAUSED]
+      event: apply_protocol_revision
+      to: BASELINE_ACCEPTANCE
+      guard: "D44 失效传播后仅需重建基线对照"
+      tx: "S-CAS(project) + invalidation_edges"
+      outbox: [project.state_changed, invalidation.propagated]
+      on_failure: 保持
+      replay: 幂等
+    - from: [PAUSED]
+      event: apply_method_revision
+      to: CONFIRMATION_PREP
+      guard: "新 candidate 重验 D37 通过 → 新 batch"
+      tx: "S-CAS(project) + 新 candidate/batch"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: 幂等
+    - from: [PAUSED]
+      event: apply_method_revision
+      to: SEARCH
+      guard: "新 candidate 未满足 D37 → 回搜索"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: 幂等
+    - from: [PAUSED]
+      event: revise
+      to: REVIEW_GATE
+      guard: "D38：协议类变更按类型回闸门"
+      tx: "S-CAS(project) + 新 plan_protocol 版本"
+      outbox: [project.state_changed, plan.revised]
+      on_failure: 保持
+      replay: 幂等
+    - from: [PAUSED]
+      event: revise
+      to: SEARCH
+      guard: "D38：变更类型无需重走定稿"
+      tx: "S-CAS(project) + 新 plan_protocol 版本"
+      outbox: [project.state_changed, plan.revised]
+      on_failure: 保持
+      replay: 幂等
+
+  run:
+    # GAP-R1 已按复审仲裁修改：顺序对齐设计 §2（应用 patch → 冒烟 → commit+snapshot →
+    # 预算 → 签名清单 → 派发）；每步一个持久化检查点
+    states:
+    - {name: PLANNED, terminal: false, note: 轮次创建，六绑定落库}
+    - {name: ANALYZING, terminal: false, note: LLM 全自由决策（D7/D25）；resume_state 记录调用点}
+    - {name: PATCHING, terminal: false, note: "JUDGE 三查(CAS) → 应用 patch（未 commit）"}
+    - {name: SMOKING, terminal: false, waiting: true, takeover: 冒烟超时按失败事件处理（D41）, takeover_events: [smoke_passed, model_fail, terminate]}
+    - {name: REPAIRING, terminal: false, waiting: true, takeover: "上限 3 次（D23），超限→项目层 PAUSED(manual)", takeover_events: [smoke_passed, model_fail, llm_error, terminate]}
+    - {name: LLM_BACKOFF, terminal: false, waiting: true, takeover: "退避到期重试；上限→项目层 PAUSED(manual)", takeover_events: [backoff_ok, terminate]}
+    - {name: SNAPSHOTTING, terminal: false, note: "冒烟通过后：commit + code_snapshot 创建（§2 顺序）"}
+    - {name: READY_TO_DISPATCH, terminal: false, note: "预算 T-RESERVE + manifest HMAC 签名 + attempt/outbox 创建（§2）"}
+    - {name: QUEUED, terminal: false, waiting: true, takeover: "队列等待（预算/卡空闲）；派发前再查取消与预算（D32）", takeover_events: [attempt_running, infra_fail, terminate]}
+    - {name: TRAINING, terminal: false, waiting: true, takeover: 单轮墙钟超限按失败事件处理（D27 健康类）, takeover_events: [attempt_finished, model_fail, infra_fail, terminate]}
+    - {name: EVAL_QUEUED, terminal: false, waiting: true, takeover: 评测调度等待（infer+agg 双步）, takeover_events: [trusted_metrics_stored, metric_missing, terminate]}
+    - {name: INFRA_RETRY, terminal: false, waiting: true, takeover: "限次重试/换机（D41），超限→项目层 PAUSED(manual)", takeover_events: [redispatched, terminate]}
+    - {name: METRIC_MISSING, terminal: false, waiting: true, takeover: "人工/适配修复（D24：正式决策指标缺失阻断改码）", takeover_events: [metric_repaired, terminate]}
+    - {name: JUDGED, terminal: false, lifecycle_complete: true, note: "本轮有效结果入库完毕；terminal:false 保留派生/上抛出口（复审 S10 修正）"}
+    transitions:
+    - from: [PLANNED]
+      event: analysis_started
+      to: ANALYZING
+      guard: 无
+      tx: "S-CAS(run)"
+      outbox: [run.state_changed]
+      on_failure: 保持
+      replay: no-op
+    - from: [ANALYZING]
+      event: patch_generated
+      to: PATCHING
+      guard: "JUDGE 三查通过（不触受保护评测协议 D29；输出完整校验 D41）"
+      tx: "S-CAS(run) + diff 留档"
+      outbox: [run.state_changed]
+      on_failure: "LLM 输出校验失败 → LLM_BACKOFF"
+      replay: no-op
+    - from: [PATCHING]
+      event: smoke_started
+      to: SMOKING
+      guard: patch 应用完成（尚未 commit——§2 顺序）
+      tx: "S-CAS(run)"
+      outbox: [run.state_changed]
+      on_failure: 保持
+      replay: no-op
+    - from: [SMOKING]
+      event: smoke_passed
+      to: SNAPSHOTTING
+      guard: "增强标准（A02）：前向/有限 loss/反向/梯度更新/ckpt 保存重载/最小评估链路"
+      tx: "S-CAS(run)"
+      outbox: [run.state_changed]
+      on_failure: "冒烟失败按 D41 分类"
+      replay: no-op
+    - from:
+      - SMOKING
+      - TRAINING
+      - REPAIRING
+      event: model_fail
+      to: REPAIRING
+      guard: "retry<3（D23）"
+      tx: "S-CAS(run, fail_class=model)"
+      outbox: [run.state_changed]
+      on_failure: 超限 → 跨层 pause → 项目层 PAUSED(manual)
+      replay: no-op
+    - from: [REPAIRING]
+      event: smoke_passed
+      to: SNAPSHOTTING
+      guard: 修复后冒烟过（仍须走 commit+snapshot，§2 顺序）
+      tx: "S-CAS(run)"
+      outbox: [run.state_changed]
+      on_failure: "-"
+      replay: no-op
+    - from: [ANALYZING, REPAIRING]
+      event: llm_error
+      to: LLM_BACKOFF
+      guard: LLM 服务错误
+      tx: "S-CAS(run, resume_state=原调用点)"
+      outbox: [run.state_changed]
+      on_failure: 保持
+      replay: no-op
+    - from: [LLM_BACKOFF]
+      event: backoff_ok
+      to: ANALYZING
+      guard: "退避到期重试成功 ∧ resume_state=分析"
+      tx: "S-CAS(run)"
+      outbox: [run.state_changed]
+      on_failure: 再退避
+      replay: no-op
+    - from: [LLM_BACKOFF]
+      event: backoff_ok
+      to: REPAIRING
+      guard: "退避到期重试成功 ∧ resume_state=修复"
+      tx: "S-CAS(run)"
+      outbox: [run.state_changed]
+      on_failure: 再退避
+      replay: no-op
+    - from: [SNAPSHOTTING]
+      event: snapshot_committed
+      to: READY_TO_DISPATCH
+      guard: "commit+code_snapshot 落库"
+      tx: "S-CAS(run)"
+      outbox: [run.state_changed]
+      on_failure: 保持
+      replay: no-op
+    - from: [READY_TO_DISPATCH]
+      event: dispatch_ready
+      to: QUEUED
+      guard: "预算 guard（C+R+:authorized≤B）∧ manifest HMAC 签名完成（§2 顺序：预算→签名清单→派发）"
+      tx: "T-AUTHORIZE-DISPATCH（单事务：attempt 创建 + S-RESERVE-DELTA + 绑定 reservation + 签名清单 hash + outbox）"
+      outbox: [run.state_changed, attempt.dispatch]
+      on_failure: "预算不足 → 保持（等待/上抛预算暂停）"
+      replay: dispatch_id 幂等
+    - from: [QUEUED]
+      event: attempt_running
+      to: TRAINING
+      guard: attempt RUNNING 回传（T-INGEST）
+      tx: "S-CAS(run)"
+      outbox: []
+      on_failure: 保持
+      replay: no-op
+    - from: [QUEUED, TRAINING]
+      event: infra_fail
+      to: INFRA_RETRY
+      guard: "retry<N（断电/磁盘满/失联，不改模型）"
+      tx: "S-CAS(run, fail_class=infra)"
+      outbox: [run.state_changed]
+      on_failure: 超限 → 项目层 PAUSED(manual)
+      replay: no-op
+    - from: [INFRA_RETRY]
+      event: redispatched
+      to: READY_TO_DISPATCH
+      guard: 换可比执行机重派（新 attempt+新授权）
+      tx: "S-CAS(run) + T-AUTHORIZE-DISPATCH（新 attempt+新授权，data_replica 校验通过的目标机）"
+      outbox: [run.state_changed, attempt.dispatch]
+      on_failure: 保持
+      replay: no-op
+    - from: [TRAINING]
+      event: attempt_finished
+      to: EVAL_QUEUED
+      guard: 训练正常结束（指标不佳 ≠ 失败）
+      tx: "S-CAS(run) + evaluation_requests 创建（scope=val）"
+      outbox: [run.state_changed, evaluation.scheduled]
+      on_failure: 保持
+      replay: no-op
+    - from: [EVAL_QUEUED]
+      event: trusted_metrics_stored
+      to: JUDGED
+      guard: "可信指标入库（D29/R01：判定/比较/选择只用可信来源）"
+      tx: "T-EVAL（含 S-CAS(run)）"
+      outbox: [run.state_changed, evaluation.result_stored]
+      on_failure: 保持
+      replay: 幂等
+    - from: [EVAL_QUEUED]
+      event: metric_missing
+      to: METRIC_MISSING
+      guard: "D24：正式决策指标缺失 → 阻断下一轮改码"
+      tx: "S-CAS(run, fail_class=metric)"
+      outbox: [run.state_changed]
+      on_failure: "-"
+      replay: no-op
+    - from: [METRIC_MISSING]
+      event: metric_repaired
+      to: EVAL_QUEUED
+      guard: 人工/适配修复完成
+      tx: "S-CAS(run)"
+      outbox: [run.state_changed]
+      on_failure: 保持
+      replay: no-op
+      # JUDGED 出口（设计 §4）
+    - from: [JUDGED]
+      event: continue
+      to: PLANNED
+      target: new_run
+      guard: "先判定后行动（D32：终止条件/取消/预算未触发）"
+      tx: 新 run 落库（父链）
+      outbox: [run.created]
+      on_failure: 项目层分流
+      replay: no-op
+    - from: [JUDGED]
+      event: candidate_selected
+      to: CONFIRMATION_PREP
+      layer_jump: project
+      guard: D37
+      tx: "candidates 推进 + 项目层 S-CAS"
+      outbox: [candidate.selected]
+      on_failure: "-"
+      replay: 幂等
+      # terminate 上抛（全部 run 状态展开，S10）
+    - from: [PLANNED, ANALYZING, PATCHING, SMOKING, REPAIRING, LLM_BACKOFF, SNAPSHOTTING, READY_TO_DISPATCH, QUEUED, TRAINING, EVAL_QUEUED, INFRA_RETRY, METRIC_MISSING, JUDGED]
+      event: terminate
+      to: PROPAGATE_PROJECT_TERMINATE
+      propagate: project
+      guard: 无
+      tx: 上抛项目层统一终止事件
+      outbox: []
+      on_failure: "-"
+      replay: 终态重复 → no-op
+
+  attempt:
+    states:
+    - {name: SUBMITTED, terminal: false, note: 派发事务已提交（dispatch_id 幂等）, takeover_events: [ack, cancel, stop, snapshot_reconciled]}
+    - {name: ACKED, terminal: false, takeover_events: [remote_start, stop, snapshot_reconciled]}
+    - {name: REMOTE_QUEUED, terminal: false, waiting: true, takeover: agent 排队 + deadline_at 硬截止, takeover_events: [running, stop, deadline_expired, snapshot_reconciled]}
+    - {name: RUNNING, terminal: false, waiting: true, takeover: deadline_at 硬截止（控制端失联不豁免 R02）, takeover_events: [finished, failed, stop, stop_sig_exit, deadline_expired, snapshot_reconciled]}
+    - {name: FINISHED, terminal: true, note: 自然完成（竞态裁决②按事件因果）}
+    - {name: FAILED, terminal: true, note: 执行失败（fail_class 按 D41）}
+    - {name: STOP_REQUESTED, terminal: false, waiting: true, takeover: 停止链超时 → 重发/升级, takeover_events: [stop_sent, finished, failed, deadline_expired]}
+    - {name: STOP_SENT, terminal: false, waiting: true, takeover: 回执等待超时 → ATTEMPT_STOP_UNKNOWN, takeover_events: [stop_ack, finished, failed, agent_unreachable, deadline_expired]}
+    - {name: STOP_CONFIRMED, terminal: true, note: 停止回执确认（硬截止确认后 settle_reason=hard_deadline）}
+    - {name: ATTEMPT_STOP_UNKNOWN, terminal: false, waiting: true, takeover: "周期对账 + 硬截止兜底 + 人工裁决（attempt 层，不与项目 STOP_PENDING_CONFIRMATION 互相投影）", takeover_events: [reconciled_stopped, reconciled_terminal, reconciled_failed, reconciled_running]}
+    - {name: CANCELLED, terminal: true, note: 仅 SUBMITTED 且 outbox 未投递时本地撤回}
+    transitions:
+    - from: [SUBMITTED]
+      event: ack
+      to: ACKED
+      guard: agent 受理回执
+      tx: "T-INGEST（含 S-CAS(attempt)）"
+      outbox: []
+      on_failure: 派发重试
+      replay: 幂等
+    - from: [ACKED]
+      event: remote_start
+      to: REMOTE_QUEUED
+      guard: 无
+      tx: "T-INGEST + S-CAS(attempt)"
+      outbox: []
+      on_failure: "-"
+      replay: 幂等
+    - from: [REMOTE_QUEUED]
+      event: running
+      to: RUNNING
+      guard: 无
+      tx: "T-INGEST + S-CAS(attempt)"
+      outbox: []
+      on_failure: "-"
+      replay: 幂等
+    - from: [RUNNING]
+      event: finished
+      to: FINISHED
+      guard: "竞态裁决②：waitpid 先于 stop 信号送达"
+      tx: "T-INGEST + S-CAS(attempt) + artifacts 登记"
+      outbox: [attempt.state_changed]
+      on_failure: "-"
+      replay: 幂等（inbox 事件 seq 去重）
+    - from: [RUNNING]
+      event: failed
+      to: FAILED
+      guard: 非信号致退的执行失败（fail_class 按 D41）
+      tx: "T-INGEST + S-CAS(attempt)"
+      outbox: [attempt.state_changed]
+      on_failure: "-"
+      replay: 幂等
+    - from: [SUBMITTED]
+      event: cancel
+      to: CANCELLED
+      guard: "outbox 未投递 → 同事务撤回本地终结（outbox 置 FAILED）"
+      tx: "S-CAS(attempt) + outbox 撤回"
+      outbox: []
+      on_failure: 可能已投递 → 走停止链（STATE_INVALID_TRANSITION 提示）
+      replay: 终态重复 cancel → no-op（不回退）
+      # 停止链（四入口展开，S10）
+    - from: [SUBMITTED, ACKED, REMOTE_QUEUED, RUNNING]
+      event: stop
+      to: STOP_REQUESTED
+      guard: 无
+      tx: "S-CAS(attempt) + budget_reservations→STOPPING（继续计入 R）"
+      outbox: [attempt.stop]
+      on_failure: 保持
+      replay: 已 STOP_REQUESTED → no-op（不重复发）
+    - from: [STOP_REQUESTED]
+      event: stop_sent
+      to: STOP_SENT
+      guard: 无
+      tx: "S-CAS(attempt)"
+      outbox: [attempt.stop]
+      on_failure: 重发
+      replay: no-op
+    - from: [STOP_SENT]
+      event: stop_ack
+      to: STOP_CONFIRMED
+      guard: 回执确认
+      tx: "T-INGEST + S-CAS(attempt) + S-SETTLE（结算释放）"
+      outbox: [attempt.state_changed]
+      on_failure: "-"
+      replay: 幂等
+    - from: [RUNNING]
+      event: stop_sig_exit
+      to: STOP_CONFIRMED
+      guard: "竞态裁决②：信号已送达并致退出（含 rc=0 假退）"
+      tx: "T-INGEST + S-CAS(attempt) + S-SETTLE"
+      outbox: [attempt.state_changed]
+      on_failure: "-"
+      replay: 幂等
+    - from: [STOP_SENT, STOP_REQUESTED]
+      event: agent_unreachable
+      to: ATTEMPT_STOP_UNKNOWN
+      guard: 失联
+      tx: "S-CAS(attempt)"
+      outbox: []
+      on_failure: 保持
+      replay: no-op
+      # deadline：本地时钟到期而无 agent 终态回执 → 不虚报（BLOCKED-ADD-5 保守实现）
+    - from: [REMOTE_QUEUED, RUNNING, STOP_REQUESTED, STOP_SENT]
+      event: deadline_expired
+      to: ATTEMPT_STOP_UNKNOWN
+      guard: 本地时钟超过 expires_at 且无 agent 终态回执
+      tx: "S-CAS(attempt)"
+      outbox: [attempt.state_changed]
+      on_failure: 保持
+      replay: 已 ATTEMPT_STOP_UNKNOWN → no-op
+    - from: [ATTEMPT_STOP_UNKNOWN]
+      event: reconciled_stopped
+      to: STOP_CONFIRMED
+      guard: 对账确认已停（或收到 agent deadline_exceeded）
+      tx: "S-CAS(attempt) + S-SETTLE（settle_reason=hard_deadline|stop_confirmed）"
+      outbox: [attempt.state_changed]
+      on_failure: 保持
+      replay: 幂等
+    - from: [ATTEMPT_STOP_UNKNOWN]
+      event: reconciled_terminal
+      to: FINISHED
+      guard: 对账发现自然完成
+      tx: "S-CAS(attempt) + S-SETTLE"
+      outbox: [attempt.state_changed]
+      on_failure: "-"
+      replay: 幂等
+    - from: [ATTEMPT_STOP_UNKNOWN]
+      event: reconciled_failed
+      to: FAILED
+      guard: 对账发现失败终态
+      tx: "S-CAS(attempt) + S-SETTLE"
+      outbox: [attempt.state_changed]
+      on_failure: "-"
+      replay: 幂等
+    - from: [ATTEMPT_STOP_UNKNOWN]
+      event: reconciled_running
+      to: RUNNING
+      guard: 对账发现仍在跑（回到 RUNNING；重发停止须再次走 stop 事件）
+      tx: "S-CAS(attempt)"
+      outbox: []
+      on_failure: 保持
+      replay: no-op
+
+# ---------------------------------------------------------------------
+# 恢复算法（R4：仅凭持久态，校验器检查其引用的表/事件均存在）
+# ---------------------------------------------------------------------
+    - from:
+      - STOP_REQUESTED
+      - STOP_SENT
+      event: finished
+      to: FINISHED
+      guard: 竞态裁决②：waitpid 先于 stop 信号送达（stop 链中自然完成）
+      tx: T-INGEST + S-CAS(attempt) + S-SETTLE
+      outbox:
+      - attempt.state_changed
+      on_failure: '-'
+      replay: 幂等（inbox seq 去重）
+    - from:
+      - STOP_REQUESTED
+      - STOP_SENT
+      event: failed
+      to: FAILED
+      guard: stop 链中的执行失败（非信号致退）
+      tx: T-INGEST + S-CAS(attempt) + S-SETTLE
+      outbox:
+      - attempt.state_changed
+      on_failure: '-'
+      replay: 幂等
+    - from:
+      - SUBMITTED
+      - ACKED
+      - REMOTE_QUEUED
+      - RUNNING
+      event: snapshot_reconciled
+      to: FINISHED
+      guard: 全量 snapshot 表明远端已自然完成（D31 对账）
+      tx: T-INGEST-SNAPSHOT + S-SETTLE
+      outbox:
+      - attempt.state_changed
+      on_failure: 保持
+      replay: 幂等
+    - from:
+      - SUBMITTED
+      - ACKED
+      - REMOTE_QUEUED
+      - RUNNING
+      event: snapshot_reconciled
+      to: FAILED
+      guard: 全量 snapshot 表明远端已失败终态
+      tx: T-INGEST-SNAPSHOT + S-SETTLE
+      outbox:
+      - attempt.state_changed
+      on_failure: 保持
+      replay: 幂等
+    - from:
+      - SUBMITTED
+      - ACKED
+      - REMOTE_QUEUED
+      - RUNNING
+      event: snapshot_reconciled
+      to: STOP_CONFIRMED
+      guard: 全量 snapshot 表明远端已确认停止
+      tx: T-INGEST-SNAPSHOT + S-SETTLE
+      outbox:
+      - attempt.state_changed
+      on_failure: 保持
+      replay: 幂等
+    - from:
+      - REMOTE_QUEUED
+      - RUNNING
+      - STOP_REQUESTED
+      - STOP_SENT
+      event: deadline_exceeded_ack
+      to: STOP_CONFIRMED
+      guard: agent deadline_exceeded 可信回执（ADD-5 冻结）：携带最终累计 usage、退出原因、attempt/dispatch/epoch
+      tx: T-INGEST（单事务：最终 usage 入账 + S-CAS + S-SETTLE(hard_deadline)）
+      outbox:
+      - attempt.state_changed
+      on_failure: 保持
+      replay: 幂等（inbox seq 去重）
+    - from:
+      - ATTEMPT_STOP_UNKNOWN
+      event: snapshot_reconciled
+      to: STOP_CONFIRMED
+      guard: 全量 snapshot 表明停止链中间态已远端终结（D31 对账；r5-S8 边补）
+      tx: T-INGEST-SNAPSHOT + S-SETTLE
+      outbox:
+      - attempt.state_changed
+      on_failure: 保持
+      replay: 幂等
+    - from:
+      - STOP_REQUESTED
+      event: snapshot_reconciled
+      to: STOP_CONFIRMED
+      guard: 全量 snapshot 表明停止链中间态已远端终结（D31 对账；r5-S8 边补）
+      tx: T-INGEST-SNAPSHOT + S-SETTLE
+      outbox:
+      - attempt.state_changed
+      on_failure: 保持
+      replay: 幂等
+    - from:
+      - STOP_SENT
+      event: snapshot_reconciled
+      to: STOP_CONFIRMED
+      guard: 全量 snapshot 表明停止链中间态已远端终结（D31 对账；r5-S8 边补）
+      tx: T-INGEST-SNAPSHOT + S-SETTLE
+      outbox:
+      - attempt.state_changed
+      on_failure: 保持
+      replay: 幂等
+recovery:
+  sidecar_restart:
+  - "1 启动握手：/healthz + schema_migrations 版本核对（设计 §4.5）"
+  - "2 逐聚合重放权威状态：projects/runs/attempts.status + state_revision（不做任何内存推断）"
+  - "3 outbox PENDING/SENT 未确认 → 重投（idempotency_key 幂等）"
+  - "4 agent 对账：GET /events?since_seq=agent_cursors.last_seq → T-INGEST（cursor 与副作用同事务）"
+  - "5 ATTEMPT_STOP_UNKNOWN / STOP_PENDING_CONFIRMATION → 重新对账（reconciled_* 事件）"
+  - "6 LLM_BACKOFF → 按 runs.resume_state 恢复原调用点"
+  - "7 对账完成前冻结派发（先对账再调度，D31）"

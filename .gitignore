@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.db-wal
+*.db-shm
+.pytest_cache/
+# Node
+node_modules/
+.next/
+out/
+dist/
+# Tauri
+src-tauri/target/
+# Secrets & local state
+.env
+*.local
+autolab-home/
+.DS_Store

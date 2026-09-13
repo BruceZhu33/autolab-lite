@@ -1,0 +1,39 @@
+# AutoLab · 验收场景映射表（17 场景四元组 · draft.2）
+
+- 版本：v1.0-draft.6（第五轮评审修订版） · 2026-09-13
+- 基线：需求 v0.5.3 第 11 节（17 个关键验收场景）× 契约（draft.2）
+- 四元组：**场景 → OpenAPI 操作 → 状态迁移 → 数据库不变量/事务**；每行附 **可执行 Test ID**（复审 A5）与覆盖状态
+- 覆盖状态三档（r4-S9）：`✅ DB` = 事务/trigger 级断言通过（真实触发）；`🔶 结构` = 仅结构/元数据断言
+  （系统级行为留待编码验收）；`⏳ API/OS` = HTTP/操作系统层断言待 M1/M2 编码。SC07 的 OS 目录互不覆盖
+  = ⏳ OS（M2）；SC12 的结构重校验执行器、SC13 的传播事务执行器、SC15 的聚合器排除逻辑 = 编码期落
+  （契约层已提供状态机边与失效模型，测试对 DDL 级必然行为断言）。（`python3 tests/run_all.py` **exit 0 且 0 skipped**）；`⏳ API` = HTTP 层断言待 M1 编码；`⛔ ADD-n` = 依赖提案 v2.8
+- r2 复审要求（门禁 4）：场景测试验证**真实触发与必然行为**——被测行为一律经事务模板（tx_*）或库级 trigger 驱动；
+  状态前置经 fx_project_reach 沿状态机合法主链推进（直插终态被三层状态流 trigger 拒绝），
+  fixture 只构造合法初始数据。最终比较经冻结 spec 计算而非手工写入 outcome（sc10/sc11）。
+- 约定：`SM` = state-machine.yaml；`TX` = transactions.md；迁移记法 `from --event--> to`；无 API 入口的内部机制标注"内部"。
+
+| # | 场景 | OpenAPI 操作 | 状态迁移（SM） | 数据库不变量 / 事务 | Test ID |
+|---|---|---|---|---|---|
+| 1 | LLM 篡改评测脚本（得分×100）→ 正式口径不变（D29） | `GET /api/v1/runs/{runId}/evaluation-results?scope=val`（可信值+evaluator_digest+协议版本）；评测派发为内部 | run `EVAL_QUEUED --trusted_metrics_stored--> JUDGED`；目标达成不触发 | **S2 闭包 trigger**：evaluator_snapshot_id FK+同项目+digest 相等；`CHECK(infer/agg ⇒ request)`；evaluation_results `PK(request,metric)`；closure 禁伪造第二条 request | ✅ `test_sc01_tampered_evaluator_rejected` + `test_evaluator_digest_mismatch_rejected` |
+| 2 | 仓库日志 0.99 vs 可信 0.80：判定/排序只用 0.80（R01/D29） | `GET …/evaluation-results?scope=val`；WS `metric.point`（source=diagnostic 仅展示） | `EVAL_QUEUED→JUDGED` 后 continue/候选选择以 trusted 行计算 | 正式指标唯一入口 evaluation_results（可信来源三要素随 request 携带）；诊断解析值无 DB 正式载体 | ✅ `test_sc02_diagnostic_value_never_formal` |
+| 3 | 生成代码写 BASE/数据主副本被阻；失败准确归类留档（D30） | `GET /api/v1/attempts/{attemptId}`（fail_class/fail_reason）；`GET …/audit-events` | attempt `RUNNING --failed--> FAILED`；run `TRAINING --model_fail--> REPAIRING` | attempts.fail_class/fail_reason 留档；artifacts 限 attempt 独占目录；OS 级沙箱（§4.5 Z1）为库外不变量 | ✅ `test_sc03_write_protected_failure_classified`（DB 层）⏳ OS 层归 M2 验收 |
+| 4 | 启动回执丢失+主服务重启：对账识别不重复派发、结果只入库一次（D31） | `GET /healthz`（schema_ver 握手）；agent 事件续传内部（since_seq） | 恢复仅凭持久态（SM recovery R4） | attempts.`dispatch_id UNIQUE`；outbox `idempotency_key UNIQUE`；agent_inbox `PK(instance,seq)`；**agent_cursors 与副作用同事务**（T-INGEST，+1 单调 trigger） | ✅ `test_sc04_lost_ack_restart_reconciles_once` + `test_ingest_duplicate_seq_is_noop` |
+| 5 | 预算用尽/取消：不再启动消融/多 seed/修复；失联显示"停止待确认"不虚报（D31/D32） | `GET …/budget`；`POST …/terminate`；WS attempt 状态；`GET /projects/{id}` | `任意非终态 --terminate--> STOPPING --agent_unreachable--> STOP_PENDING_CONFIRMATION`（自持不虚报） | T-RESERVE 拒新授权（`CHECK C+R≤B`）；control_epoch 取消定序（T-INGEST 旧 epoch 只归档不派生）；终态分流不隐式启动 | ✅ `test_sc05_budget_exhausted_and_stop_pending` + `test_ingest_stale_control_epoch_archives_without_dispatch` |
+| 6 | 剩 1 GPU·h 三卡并发申请+控制端离线：总授权不超余额；远端独立执行（R02/D32） | 内部 T-RESERVE（BEGIN IMMEDIATE）；观测 `GET …/budget/reservations`；远端额度经 agent 契约 | 满足不等式者 `QUEUED→TRAINING`；余者留队列 | 三 CHECK + reconcile 触发器逐笔核对；**双连接并发测试**：恰 2 成功 1 拒（reserve 与 reduction 各一组）；expires_at 硬截止 | ✅ `test_sc06_concurrent_reserves_within_remaining_budget` + `test_concurrent_reservations_never_exceed_budget` + `test_concurrent_identical_reduction_single_effect` |
+| 7 | 双 4090 并行消融一项需新依赖：版本互不覆盖（D40） | `POST …/batches/freeze`；`GET /runs/{id}`（各自 env_version_id/code_snapshot_id） | 两 run 并行 `…→TRAINING→EVAL_QUEUED→JUDGED`（竞态裁决③不传染） | runs 六绑定冻结 trigger；environment_versions `UNIQUE(server,spec_hash)`；code_snapshots `UNIQUE(project,export_hash)` | ✅ `test_sc07_parallel_isolated_bindings` + `test_runs_binding_frozen` |
+| 8 | 同路径标签内容不同：不以"目录存在"放行（D39） | `POST /api/v1/data-replicas/{id}/revalidate`→FAILED；`GET /data-versions/{id}/replicas` | data_replicas `VERIFYING--FAILED`；该机不接单 | 派发 guard 只认 READY；data_replicas 状态白名单（SYNCING→VERIFYING→READY\|FAILED；READY→VERIFYING 重校验环）；data_replica_validations 留证 | ✅ `test_sc08_replica_validation_gates_scheduling` + `test_data_replica_flow_whitelist` |
+| 9 | 对象级跨集合：阻断协议验收（R03/D43） | `POST /splits/{id}/validations`→FAILED；`GET …/validations` | `REVIEW_GATE +confirm` GUARD_UNMET 不迁移 | split_validations 四元组 UNIQUE + **S2 闭包 trigger**（禁跨项目拼接）；T-FREEZE guard F2 只读 PASSED | ✅ `test_sc09_object_level_split_failure_blocks_freeze` + `test_split_validation_cross_project_rejected` |
+| 10 | 第 8 轮最佳、12 轮终止、确认未超 BASE：按规则选第 8 轮；如实 failed；不按测试分换候选（D34/D37） | `POST …/candidates/selection`；`POST …/final-confirmation/read`→outcome=failed（固定响应重放）；`GET …/candidates` | `SEARCH --candidate_selected--> … --all_required_results_present--> TEST_RESULT_SEALED --final_read--> FINISHING(failed)→REPORTING→REPORTED` | candidates 选择身份冻结 trigger；test_result_releases `UNIQUE(batch_id)`+idempotency+**release_payload_json 持久化固定响应**；T-FINAL-READ 幂等优先（S4）+归属闭包（S5） | ✅ `test_sc10_select_round8_and_report_failed` + `test_final_read_replay_after_response_loss` |
+| 11 | 初筛通过不提前发布；全部到齐才最终比较、允许推翻（R04/D34） | `GET /batches/{id}`；`POST …/final-confirmation/read` | `CONFIRMATION_RUNNING --all_required_results_present--> TEST_RESULT_SEALED`（guard：条目全 SUCCEEDED） | **G4 语义分离（S6）**：非 SUCCEEDED 条目 → GUARD_UNMET(evidence_insufficient)；**G7：每条目 run 须有 COMPLETED test request**；初筛可推翻（plan.final_comparison.screening_overridable） | ✅ `test_sc11_screening_overridden_by_full_results` + `test_final_read_missing_evidence_rejected` |
+| 12 | 定稿 A+B 演化为 C+B，消融 5 项挂 1 项：重校验、显式标注不伪填（D36） | `POST /ablation-matrices/{id}/revalidate`→needs_confirmation；`POST …/confirm` | `CONFIRMATION_PREP --matrix_revision_required--> PAUSED(matrix_revision)` | ablation_items `NOT_RUNNABLE+fail_reason` 显式；矩阵版本链 UNIQUE+body 冻结；状态白名单 | ✅ `test_sc12_matrix_revision_and_not_runnable` + `test_ablation_matrix_body_frozen` |
+| 13 | 修改划分后旧候选权重训练过新测试样本：拒绝继承、重验收、旧最佳不入新排名（R05/D44） | `POST /plan-protocols/{id}/revisions`（protocol）；`POST …/protocol-revisions/apply` | `PAUSED --apply_protocol_revision--> REVIEW_GATE/BASELINE_ACCEPTANCE` | invalidation_edges(protocol→candidate, PENDING)；runs.plan_protocol_id 冻结不可改（比较集隔离）；版本链 parent/ver | ✅ `test_sc13_split_change_invalidates_inheritance` |
+| 14 | 训练中修改主指标/划分：旧 run 按绑定版本追溯，不跨版本合并（D38） | `POST /plan-protocols/{id}/revisions`；在途 `GET /runs/{id}` 显示旧绑定 | 旧 attempt 继续至终态；新协议 `effective_round` 起新 run | plan_protocols 不可变（frozen_at/effective_round 冻结 A6）+版本链；比较集按 plan_protocol_id 过滤 | ✅ `test_sc14_midrun_protocol_change_versions_isolated` + `test_plan_frozen_at_immutable_after_freeze` |
+| 15 | 3 seed 同 ckpt 只换推理 seed：标注重复推理、可追溯（D35） | `GET /runs/{id}`（init_spec_id）；报告标注 | 批次条目 expected_role/expected_seed 如实 | initialization_specs（ckpt_hash/seed_train/seed_infer/cum_steps）不可变；load_report 必填 CHECK | ✅ `test_sc15_shared_ckpt_infer_seeds_traceable` |
+| 16 | seed1/2 用 X、seed3 修复后在 X'：不输出混合均值、按新清单重新确认（R06/D45） | `GET /batches/{id}`（seed3 run 绑定不同 snapshot 可见）；`POST …/method-revisions/apply` | `CONFIRMATION_RUNNING --protocol_or_method_changed--> PAUSED(revision_required) --apply_method_revision--> 新 batch` | batches 五绑定冻结；invalidation_edges(method→batch)；旧批次 CANCELLED 不可确认（G4）；聚合按 batch_id 作用域 | ✅ `test_sc16_mixed_version_seeds_not_aggregated` + `test_batches_binding_frozen_and_flow` |
+| 17 | BASE 首轮报错 LLM 提议改损失：补丁/方法分离、不产优越性结论（D33） | `POST …/baseline-acceptance`（patch_class=method 时 verdict 必须 reject 或转 D38——服务端校验） | `BASELINE_ACCEPTANCE --reject--> PAUSED(manual_baseline)` | baseline_acceptances `UNIQUE(run_id)`、patch_class 枚举、notes 留痕；无有效基线阻断优越性判定 | ✅ `test_sc17_round0_patch_class_separated` ⏳ API 层 guard 编码后接 |
+
+## 补充说明
+
+- **测试入口**：`cd contracts && pip install -r tests/requirements.txt && python3 tests/run_all.py`——**硬门禁：exit 0 且 0 skipped**（缺依赖 = exit 1，r2-S1）。当前基线：**175/175 passed，0 skipped，exit 0**。
+- **API 层断言**：本表 Test ID 覆盖四元组的 DB 不变量与状态迁移；HTTP 语义（错误码/幂等头/双返回）在 M1 编码后以 OpenAPI 契约测试接入（openapi.yaml 已全量声明 401/403/409/422/503，复审 A3）。
+- **⛔ 依赖增补**：场景 10 的"test 后继续开发"路径（新实验版本+标记）= ADD-2；报告落库 = ADD-3——见《技术设计 v2.8 增补提案草案》。

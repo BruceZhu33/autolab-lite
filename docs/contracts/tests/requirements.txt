@@ -1,0 +1,5 @@
+# AutoLab contracts 测试门禁依赖（r3-S10/O2：精确版本锁定；缺依赖 = run_all exit 1）
+# 升级依赖须同步重跑全部测试并更新本文件。
+PyYAML==6.0.3
+jsonschema==4.26.0
+# 完全可复现环境：pip install -r requirements.lock.txt（含传递依赖精确版本）
