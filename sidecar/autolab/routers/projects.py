@@ -36,6 +36,9 @@ class ProjectCreate(BaseModel):
     gpu_ids: list[str] = Field(min_length=1)
     train_command: str = "python train.py"
     eval_command: str = "python eval.py"
+    conda_env: str | None = Field(
+        default=None,
+        description="复用服务器上已有的 conda 环境名（无出网机器跳过 conda create/pip）")
 
 
 @router.post("/projects")

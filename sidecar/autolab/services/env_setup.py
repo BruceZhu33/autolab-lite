@@ -73,10 +73,27 @@ async def _ensure_conda(transport, ssh_mode: bool) -> tuple[str | None, str]:
 
 
 async def _setup_env(state, project_id: str, server_row, transport, env_name: str,
-                     remote_code_dir: str) -> dict:
-    """建 conda/venv 环境；返回 spec（INSERT 进 environment_versions 的冻结身份）。"""
+                     remote_code_dir: str, reuse_env: str | None = None) -> dict:
+    """建 conda/venv 环境；返回 spec（INSERT 进 environment_versions 的冻结身份）。
+
+    reuse_env：复用服务器上现成 conda 环境（无出网机器；conda env list 为本地操作）。
+    """
     ssh_mode = server_row["transport_mode"] == "ssh"
     conda, tool = await _ensure_conda(transport, ssh_mode)
+    if reuse_env:
+        r = await _exec(transport, f"{conda} env list --json")
+        envs = json.loads(r.stdout).get("envs", [])
+        prefix = next((e for e in envs
+                       if e == reuse_env or e.rstrip("/").endswith(f"/{reuse_env}")), None)
+        if prefix is None:
+            raise TxError("GUARD_UNMET",
+                          f"conda env '{reuse_env}' 不存在于 {server_row['name']}（可用："
+                          f"{[e.rstrip('/').rsplit('/', 1)[-1] for e in envs][:8]}…）")
+        spec = {"tool": "conda", "env_name": reuse_env, "bin_dir": f"{prefix}/bin",
+                "python": "reuse", "requirements_sha256": "", "reused": True,
+                "spec_hash": __import__("hashlib").sha256(
+                    f"reuse|{prefix}".encode()).hexdigest()}
+        return spec
     if tool == "conda":
         await _exec(transport, f"{conda} env remove -y -n {env_name} 2>/dev/null; true")
         r = await _exec(transport, f"{conda} create -y -n {env_name} python=3.12", timeout=1800)
@@ -198,11 +215,15 @@ async def setup_on_server(state, project_id: str, server_row) -> dict:
                           "ORDER BY created_at LIMIT 1", (project_id,)).fetchone()
         rp = conn.execute("SELECT * FROM data_replicas WHERE data_version_id=? AND server_id=?",
                           (dv["id"], server_id)).fetchone()
-        env = conn.execute("SELECT * FROM environment_versions WHERE server_id=? AND env_name=?",
-                           (server_id, env_name)).fetchone()
-        return snap, dv, rp, env
+        reuse = conn.execute("SELECT env_reuse_name FROM projects WHERE id=?",
+                             (project_id,)).fetchone()
+        return snap, dv, rp, reuse[0] if reuse else None
 
-    snap, dv, rp, env = await to_thread(db, _load)
+    snap, dv, rp, reuse_env = await to_thread(db, _load)
+    env_name = reuse_env or f"al-{project_id[-10:]}"
+    env = await to_thread(db, lambda conn: conn.execute(
+        "SELECT * FROM environment_versions WHERE server_id=? AND env_name=?",
+        (server_id, env_name)).fetchone())
     transport = state.transport_for(server_row)
 
     result = {"server_id": server_id, "code": None, "env": None, "data": None}
@@ -220,7 +241,8 @@ async def setup_on_server(state, project_id: str, server_row) -> dict:
     if env is None or env["status"] != "READY":
         env_id = env["id"] if env else nid("env")
         try:
-            spec = await _setup_env(state, project_id, server_row, transport, env_name, remote_code)
+            spec = await _setup_env(state, project_id, server_row, transport, env_name,
+                                    remote_code, reuse_env=reuse_env)
             if env is None:
                 await to_thread(db, _insert_env_version, env_id, server_id, env_name, spec, "INSTALLING")
             else:
