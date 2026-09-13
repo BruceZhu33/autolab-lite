@@ -19,6 +19,8 @@
 | 11 | 2026-09-13 | 选型 TD12（Tauri×Next 静态导出） | 本会话机器无 Rust 工具链；浏览器直连 sidecar 有跨源 | 开发期：Next dev server + sidecar loopback CORS（token 仍把守）+ `/api/autolab-config` 桥；Tauri 壳保留 starter 脚手架未编译 | 生产仍为 Tauri 壳同源静态导出（sidecar 已预留 `/app` 静态挂载点） |
 | 12 | 2026-09-13 | 需求 D43（划分有效性校验） | M1 无独立校验器实现 | split_validations v1 = 「全部副本 manifest 校验 PASSED + 划分登记入库」（四元组结构与 tx_freeze F2 查询即契约形态） | 完整校验器（对象交叉/预处理拟合范围）M2 随评测执行器落地 |
 | 13 | 2026-09-13 | 需求 [0]（nvidia-smi 探测 GPU） | local 开发机无 nvidia-smi | 增手工登记端点 POST /servers/{id}/gpus | 真实服务器走 nvidia-smi 自动探测（已实现） |
+| 14 | 2026-09-13 | 需求 D20（无 conda 自动补装 Miniconda / conda create 建环境） | M1 实测目标服务器（192.0.2.46）**无出网**：conda create / pip install 均不可用，机器上已有 25 个科研环境 | migration `0003_project_env_reuse`：`projects.env_reuse_name` 列 + 立项参数 `conda_env`；环境搭建支持复用服务器现成 conda 环境（`conda env list` 本地解析 bin_dir，跳过建环境与 pip） | 无出网是既成事实；复用现有环境是该机器上唯一可行路径，D20 语义（"检测到即用"）自然延伸 |
+| 15 | 2026-09-13 | 设计 §5（gpu-agent 部署形态） | 服务器无出网 → agent 依赖（fastapi/uvicorn）无法在线安装 | 离线部署程序：控制机 `pip download --platform manylinux2014_x86_64` 取轮子 → SFTP 推送 → `pip install --no-index --find-links --target pylibs` → `PYTHONPATH=pylibs` 运行；依赖注入不污染既有 conda 环境 | 与 #14 同因；该部署路径已实测成功（真机 A6000 验收即用此法） |
 
 ## 与契约一致（零偏离）的核心面
 

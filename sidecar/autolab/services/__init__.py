@@ -91,8 +91,9 @@ def create_project_tx(conn, req, ids: dict, plan_body: dict, base_meta: dict,
         # 循环 FK（projects.base_snapshot_id ↔ code_snapshots.project_id）：先 NULL 后回填
         conn.execute(
             "INSERT INTO projects(id,name,direction_text,base_source_kind,base_source_ref,"
-            "base_snapshot_id,status) VALUES(?,?,?,?,?,NULL, 'INIT')",
-            (ids["pid"], req.name, req.direction_text, req.base_source_kind, req.base_source_ref))
+            "base_snapshot_id,status,env_reuse_name) VALUES(?,?,?,?,?,NULL, 'INIT',?)",
+            (ids["pid"], req.name, req.direction_text, req.base_source_kind, req.base_source_ref,
+             getattr(req, "conda_env", None)))
         conn.execute("INSERT INTO budget_accounts(project_id, limit_s) VALUES(?,?)",
                      (ids["pid"], req.budget_limit_s))
         conn.execute("INSERT INTO control_state(project_id, epoch) VALUES(?,0)", (ids["pid"],))
