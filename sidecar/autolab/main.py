@@ -67,6 +67,12 @@ def create_app(cfg: Config | None = None, port: int | None = None) -> FastAPI:
     app = FastAPI(title="AutoLab sidecar", version=__version__, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(TokenMiddleware, token=CapabilityToken(cfg.token_path))
+    # 开发期浏览器直连（Next dev server 跨源 loopback；鉴权仍由 capability token 把守）
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_methods=["*"], allow_headers=["*"])
     app.include_router(meta.router)
     app.include_router(servers.router)
     app.include_router(projects.router)

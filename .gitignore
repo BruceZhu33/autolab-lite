@@ -22,5 +22,5 @@ autolab-home/
 .DS_Store
 # 参考材料（不进产品仓）
 RD-Agent-main/
-shadcn-dash/
 归档-antd原型/
+ui/src-tauri/gen/
