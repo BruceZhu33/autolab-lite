@@ -580,3 +580,101 @@ def tx_freeze(conn, proto: str, next_round: int, project_expected_revision: int,
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+# =====================================================================
+# T-BASELINE-ACCEPTANCE（D33：Round 0 基线验收；accept→SEARCH / reject→PAUSED）
+# =====================================================================
+
+def tx_baseline_acceptance(conn, pid: str, verdict: str, expected_rev: int,
+                           patch_class: str = "none", notes: str = "",
+                           run_id: str | None = None, actor: str = "user"):
+    """D33 基线验收：基线 run 训练完成（train attempt FINISHED）为 accept 前提；
+    patch_class=method 只能伴随 reject（库级 CHECK r3-S9 双保险）；
+    幂等：项目已到目标态 → no-op 返回。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if proj is None:
+            raise TxError("NOT_FOUND", pid)
+        target = "SEARCH" if verdict == "accept" else "PAUSED"
+        if proj["status"] == target:
+            conn.execute("COMMIT")
+            return {"project_id": pid, "status": target, "noop": True}
+        if proj["status"] != "BASELINE_ACCEPTANCE":
+            raise TxError("STATE_INVALID_TRANSITION",
+                          f"project in {proj['status']}（验收仅在 BASELINE_ACCEPTANCE）")
+        if verdict not in ("accept", "reject"):
+            raise TxError("VAL_SEMANTIC_INVALID", f"verdict={verdict}")
+        if patch_class not in ("none", "env_compat", "method"):
+            raise TxError("VAL_SEMANTIC_INVALID", f"patch_class={patch_class}")
+
+        run = conn.execute(
+            "SELECT * FROM runs WHERE id=?" if run_id else
+            "SELECT * FROM runs WHERE project_id=? AND role='baseline' AND plan_protocol_id=? "
+            "ORDER BY round_no DESC LIMIT 1",
+            (run_id,) if run_id else (pid, proj["current_protocol_id"])).fetchone()
+        if run is None:
+            raise TxError("GUARD_UNMET", "无绑定当前协议的 baseline run")
+        if verdict == "accept":
+            # accept 前提：训练正常完成；reject 是"跑坏了/不可接受"的出口，无此前提
+            finished = conn.execute(
+                "SELECT 1 FROM attempts WHERE run_id=? AND profile='train' AND status='FINISHED'",
+                (run["id"],)).fetchone()
+            if not finished:
+                raise TxError("GUARD_UNMET",
+                              f"baseline run {run['id']} 的训练 attempt 未 FINISHED（无法验收）")
+
+        verdict_db = "accepted" if verdict == "accept" else "rejected"
+        conn.execute(
+            "INSERT INTO baseline_acceptances(id,run_id,verdict,patch_class,notes) "
+            "VALUES(?,?,?,?,?)",
+            (nid("ba"), run["id"], verdict_db, patch_class, notes))
+        if verdict == "accept":
+            s_cas(conn, "projects", "project", pid, "BASELINE_ACCEPTANCE", "SEARCH",
+                  expected_rev, "accept", actor=actor,
+                  reason={"run_id": run["id"], "patch_class": patch_class})
+            conn.execute("UPDATE projects SET updated_at=datetime('now') WHERE id=?", (pid,))
+        else:
+            s_cas(conn, "projects", "project", pid, "BASELINE_ACCEPTANCE", "PAUSED",
+                  expected_rev, "reject", actor=actor,
+                  reason={"run_id": run["id"], "patch_class": patch_class})
+            conn.execute(
+                "UPDATE projects SET pause_reason='manual_baseline', "
+                "paused_from_state='BASELINE_ACCEPTANCE' WHERE id=? AND status='PAUSED'", (pid,))
+        conn.execute(
+            "INSERT INTO audit_events(id,actor,action,payload_json) VALUES(?,?,?,?)",
+            (nid("aud"), actor, "baseline.acceptance",
+             json.dumps({"run_id": run["id"], "verdict": verdict,
+                         "patch_class": patch_class}, sort_keys=True)))
+        conn.execute("COMMIT")
+        return {"project_id": pid, "status": target, "run_id": run["id"], "noop": False}
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def tx_project_resume(conn, pid: str, expected_rev: int, actor: str = "user"):
+    """PAUSED +resume → paused_from_state 目标（S10 动态目标展开；清 pause_reason）。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        p = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if p is None:
+            raise TxError("NOT_FOUND", pid)
+        target = p["paused_from_state"]
+        if p["status"] != "PAUSED":
+            raise TxError("STATE_INVALID_TRANSITION",
+                          f"project in {p['status']}（resume 仅自 PAUSED）")
+        if target not in ("SEARCH", "BASELINE_ACCEPTANCE", "CONFIRMATION_PREP",
+                          "CONFIRMATION_RUNNING", "REPORTING"):
+            raise TxError("GUARD_UNMET", f"无可恢复目标（paused_from={target}）")
+        s_cas(conn, "projects", "project", pid, "PAUSED", target, expected_rev,
+              "resume", actor=actor, reason={"paused_from": target})
+        conn.execute(
+            "UPDATE projects SET pause_reason=NULL, paused_from_state=NULL "
+            "WHERE id=? AND status=?", (pid, target))
+        conn.execute("COMMIT")
+        return {"project_id": pid, "status": target}
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise

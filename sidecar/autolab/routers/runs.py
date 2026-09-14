@@ -87,9 +87,9 @@ async def create_run(project_id: str, req: RunCreate, request: Request):
             conn.execute(
                 "INSERT INTO runs(id,project_id,round_no,role,plan_protocol_id,code_snapshot_id,"
                 "env_version_id,data_version_id,recipe_id,init_spec_id,candidate_id,control_epoch,"
-                "status) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?,'PLANNED')",
+                "status,command) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?,'PLANNED',?)",
                 (run_id, project_id, round_no, req.role, proto, snap, env_row["id"], dv,
-                 rec, init, ce))
+                 rec, init, ce, command))
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -141,8 +141,11 @@ async def _do_dispatch(state, run_id: str, opts: dict) -> dict:
                              (run["plan_protocol_id"],)).fetchone()
         seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM attempts WHERE run_id=?",
                            (run_id,)).fetchone()[0]
-        return {"run": dict(run), "proj": dict(proj), "snap": dict(snap), "env": dict(env),
-                "dv": dict(dv), "acc": dict(acc), "proto": dict(proto), "seq": seq}
+        plan_cmd = json.loads(proto["frozen_yaml"])["commands"]["train_command_template"]
+        d = {"run": dict(run), "proj": dict(proj), "snap": dict(snap), "env": dict(env),
+             "dv": dict(dv), "acc": dict(acc), "seq": seq,
+             "effective_command": run["command"] or plan_cmd}
+        return d
     ctx = await to_thread(state.db, _load)
 
     server_id = opts["server_id"]
@@ -190,7 +193,7 @@ async def _do_dispatch(state, run_id: str, opts: dict) -> dict:
                 "bin_dir": env_spec.get("bin_dir", "")},
         "data": {"data_version_id": ctx["dv"]["id"], "manifest_sha": ctx["dv"]["manifest_sha"],
                  "remote_path": replica["actual_path"] if replica else ""},
-        "command": opts.get("command") or "python train.py",
+        "command": opts.get("command") or ctx.get("effective_command") or "python train.py",
         "output_dir": f"~/autolab/runs/{dispatch_id}",
         "gpu": {"gpu_id": gpu_id, "index": gpu_row["gpu_index"] if gpu_row else 0},
     }
@@ -244,7 +247,8 @@ async def dispatch_run(run_id: str, req: DispatchRequest, request: Request):
     server_id = req.server_id or await _pick_server(state, ctx["project_id"])
     return await _do_dispatch(state, run_id, {
         "authorized_s": req.authorized_s, "margin_s": req.margin_s,
-        "server_id": server_id, "gpu_id": req.gpu_id, "command": ctx["command"]})
+        "server_id": server_id, "gpu_id": req.gpu_id,
+        "command": ctx.get("effective_command")})
 
 
 @router.get("/runs/{run_id}")

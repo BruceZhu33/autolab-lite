@@ -23,6 +23,9 @@
 | 15 | 2026-09-13 | 设计 §5（gpu-agent 部署形态） | 服务器无出网 → agent 依赖（fastapi/uvicorn）无法在线安装 | 离线部署程序：控制机 `pip download --platform manylinux2014_x86_64` 取轮子 → SFTP 推送 → zip 解包到 `pylibs` → `PYTHONPATH=pylibs` 运行；不污染既有 conda 环境 | 与 #14 同因；实测发现老 pip 解析不了新式双平台标签轮子 → 解包为唯一安装路径 |
 | 16 | 2026-09-14 | 设计 §5/§7（agent 生命周期未纳入 v2.7：初始化是注册前置的手工步骤） | **用户提案**：探活应检测 agent 存在性与版本，自动安装/更新 | `services/agent_deploy.py` + `POST /servers/{id}/agent/install|upgrade`：探活带 `deploy_status{installed, agent_ver, expected, needs_upgrade}`；部署 = 选远端 Python（≥3.10，conda envs 兜底）→ 控制机取轮缓存 → SFTP → zip 解包 → setsid nohup 启动 → healthz 验证版本一致；升级有在途任务时拒绝（force 例外）。UI P1 增「部署/修复 Agent」「升级」按钮 | 手工部署两台真机重复劳动沉淀为产品能力；幂等/自动修复/强制升级三场景双真机实测通过 |
 
+| 17 | 2026-09-14 | 状态机 run 层（INFRA_RETRY + redispatched"换可比执行机重派"） | runs 六绑定身份冻结（env_version_id 不可变）与换机重派冲突：新机器的环境版本无法绑定回 run | M2-1 实现为**同机重派**（复用原清单路径，新授权新 attempt）；换机重派后置——攒批修订时三选一：attempts 挂 env_override / 放宽 runs 绑定 / 换机=新 run 继承 | 同机重派覆盖瞬时性 infra 错误（断电/磁盘满/OOM）主场景；换机属"限次重试或换可比执行机"后半句 |
+| 18 | 2026-09-14 | contracts/schema.sql `runs` | run 创建时的自定义训练命令未持久化：预算不足等延迟派发场景退回 plan 模板命令（真机实测发现） | migration `0004_run_command`：`runs.command` 列；派发优先级 run.command > plan 模板 | 攒批修订 schema.sql；顺带补 POST /projects/{id}/resume（A08 恢复入口，契约已有路径 M1 未实现） |
+
 ## 与契约一致（零偏离）的核心面
 
 - **事务模板**：`s_cas / tx_usage / tx_settle / tx_drain_* / tx_authorize_dispatch / tx_ingest / tx_ingest_snapshot / tx_freeze` 逐字移植 harness（guard/错误码/幂等语义一致）——`tests/test_tx_contract_parity.py` 9/9
