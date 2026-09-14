@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -169,6 +170,23 @@ async def _do_dispatch(state, run_id: str, opts: dict) -> dict:
     if authorized <= margin:
         raise TxError("BUDGET_INSUFFICIENT",
                       f"可分配余额 {allocatable}s 不足以覆盖 margin {margin}s")
+
+    # 快照同步（D40：run 用独立快照；远端按 export_hash 判断是否需要上传）
+    snap_id = opts.get("_snapshot_id")
+    export_dir = opts.get("_local_export_dir")
+    if snap_id and export_dir:
+        server_row = await to_thread(state.db, lambda conn: dict(conn.execute(
+            "SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()))
+        transport = state.transport_for(server_row)
+        remote_code = f"~/autolab/projects/{ctx['run']['project_id']}/code/{snap_id}"
+        remote_hash = (await transport.exec(
+            f"cat {remote_code}/.autolab_export_hash 2>/dev/null || echo MISSING",
+            timeout=30)).stdout.strip()
+        local_hash_file = Path(export_dir) / ".autolab_export_hash"
+        local_hash = ctx["snap"]["export_hash"]
+        local_hash_file.write_text(local_hash, encoding="utf-8")
+        if remote_hash != local_hash:
+            await transport.upload_tree(Path(export_dir), remote_code)
 
     attempt_id = nid("at")
     dispatch_id = f"disp-{attempt_id}"

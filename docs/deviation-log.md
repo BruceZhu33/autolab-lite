@@ -26,6 +26,9 @@
 | 17 | 2026-09-14 | 状态机 run 层（INFRA_RETRY + redispatched"换可比执行机重派"） | runs 六绑定身份冻结（env_version_id 不可变）与换机重派冲突：新机器的环境版本无法绑定回 run | M2-1 实现为**同机重派**（复用原清单路径，新授权新 attempt）；换机重派后置——攒批修订时三选一：attempts 挂 env_override / 放宽 runs 绑定 / 换机=新 run 继承 | 同机重派覆盖瞬时性 infra 错误（断电/磁盘满/OOM）主场景；换机属"限次重试或换可比执行机"后半句 |
 | 18 | 2026-09-14 | contracts/schema.sql `runs` | run 创建时的自定义训练命令未持久化：预算不足等延迟派发场景退回 plan 模板命令（真机实测发现） | migration `0004_run_command`：`runs.command` 列；派发优先级 run.command > plan 模板 | 攒批修订 schema.sql；顺带补 POST /projects/{id}/resume（A08 恢复入口，契约已有路径 M1 未实现） |
 
+| 19 | 2026-09-14 | 选型 TD6'（RD-Agent 底座）+ openapi /settings/llm | RD-Agent 直接嵌入成本高（场景绑定重、依赖链长），M2-2 先以 OpenAI 兼容薄客户端 + 自研提案 prompt 落地循环；`ProposalEngine` 接口已留 RD-Agent 适配器位 | migration `0005_llm_settings`（契约有端点无表）；版本锁定接入 RD-Agent 时新增实现类即可，产品层循环控制器（TD2'）语义不变 |
+| 20 | 2026-09-14 | 状态机 run 层 + A02 增强冒烟 + D25 上下文 | ① runs 六绑定身份冻结与"快照在 SNAPSHOTTING 才产生"矛盾：LLM 轮各阶段先执行（audit 实时留痕），run 行在快照就绪后落库并回放状态链；② 冒烟 M2 子集=本地 py_compile（A02 完整标准依赖 BASE 适配配置声明 smoke 命令，入口预留）；③ D25 上下文中"指标全程曲线/历史最好"待评测器（M2-4）接入，暂以日志尾+审计摘要替代 | 攒批修订时定 run 落库时序（或放宽绑定 trigger）；冒烟与指标上下文随后续里程碑补全 |
+
 ## 与契约一致（零偏离）的核心面
 
 - **事务模板**：`s_cas / tx_usage / tx_settle / tx_drain_* / tx_authorize_dispatch / tx_ingest / tx_ingest_snapshot / tx_freeze` 逐字移植 harness（guard/错误码/幂等语义一致）——`tests/test_tx_contract_parity.py` 9/9

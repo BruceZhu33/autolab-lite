@@ -251,6 +251,21 @@ async def baseline_acceptance(project_id: str, req: BaselineAcceptance, request:
     return result
 
 
+@router.post("/projects/{project_id}/next-round")
+async def next_round(project_id: str, request: Request):
+    """M2-2：触发一轮 LLM 改码迭代（提案→JUDGE→冒烟→快照→派发，全程自动）。"""
+    from ..services import llm_loop
+    state = request.app.state.autolab
+    result = await llm_loop.next_round(state, project_id)
+    state.hub.publish_threadsafe(
+        state.loop, "run.proposal",
+        {"run_id": result.get("run_id"), "round": result.get("round"),
+         "accepted": result.get("accepted"), "analysis": result.get("analysis", "")[:300]},
+        aggregate={"type": "run", "id": result.get("run_id", "")},
+        project_id=project_id)
+    return result
+
+
 class ResumeRequest(BaseModel):
     expected_state_revision: int = Field(ge=0)
 

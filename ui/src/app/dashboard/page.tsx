@@ -135,6 +135,27 @@ function MonitorPageInner() {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [logs]);
 
+  const nextRound = async () => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const r = await api<{
+        accepted: boolean; round: number; analysis?: string; motivation?: string;
+        risk?: string; judge_reject?: string; smoke_fail?: string; commit?: string;
+      }>('POST', `/api/v1/projects/${selected}/next-round`);
+      if (r.accepted) {
+        setNote(`✔ Round ${r.round} 已派发（commit ${r.commit}）\n分析：${r.analysis}\n动机：${r.motivation}\n风险：${r.risk}`);
+      } else {
+        setNote(`✖ Round ${r.round} 未通过：${r.judge_reject ?? r.smoke_fail ?? '未知'}\n分析：${r.analysis}`);
+      }
+      refresh();
+    } catch (e) {
+      setNote(e instanceof ApiError ? `${e.code}: ${e.message}` : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const trigger = async () => {
     if (!selected) return;
     setBusy(true);
@@ -203,7 +224,8 @@ function MonitorPageInner() {
               <label className="text-xs text-muted-foreground">授权秒数</label>
               <Input value={budgetS} onChange={(e) => setBudgetS(e.target.value)} />
             </div>
-            <Button disabled={busy || !selected} onClick={trigger}>▶ 手动触发训练（Round 0）</Button>
+            <Button disabled={busy || !selected} onClick={trigger}>▶ 手动触发训练</Button>
+            <Button variant="secondary" disabled={busy || !selected} onClick={nextRound}>🧠 LLM 生成下一轮</Button>
             {activeAttempt && (
               <Button variant="destructive" onClick={() => stop(activeAttempt.id)}>■ 停止</Button>
             )}
