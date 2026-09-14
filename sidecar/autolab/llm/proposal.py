@@ -101,7 +101,10 @@ def parse_proposal(raw: str) -> Proposal:
                     risk=d["risk"], raw=raw)
 
 
-async def propose(settings, ctx: ProposalContext) -> Proposal:
+async def propose(settings, ctx: ProposalContext, engine: str = "builtin") -> Proposal:
+    if engine == "rdagent":
+        from .rdagent_engine import propose_via_rdagent
+        return await propose_via_rdagent(settings, ctx)
     raw = await chat(settings, [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(ctx)},

@@ -22,13 +22,14 @@ class LlmSettingsIn(BaseModel):
     model: str
     api_key: str = ""
     enabled: bool = True
+    engine: str = Field(default="builtin", pattern="^(builtin|rdagent)$")
 
 
 @router.get("/settings/llm")
 async def get_llm_settings(request: Request):
     state = request.app.state.autolab
     rows = await to_thread(state.db, lambda conn: [
-        {k: r[k] for k in ("use_point", "base_url", "model", "enabled")}
+        {k: r[k] for k in ("use_point", "base_url", "model", "enabled", "engine")}
         for r in conn.execute("SELECT * FROM llm_settings").fetchall()])
     return {"settings": rows}
 
@@ -53,13 +54,13 @@ async def put_llm_settings(req: LlmSettingsIn, request: Request):
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(
-                "INSERT INTO llm_settings(use_point,base_url,model,api_key_ref,enabled) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(use_point) DO UPDATE SET "
+                "INSERT INTO llm_settings(use_point,base_url,model,api_key_ref,enabled,engine) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(use_point) DO UPDATE SET "
                 "base_url=excluded.base_url, model=excluded.model, "
                 "api_key_ref=excluded.api_key_ref, enabled=excluded.enabled, "
-                "updated_at=datetime('now')",
+                "engine=excluded.engine, updated_at=datetime('now')",
                 (req.use_point, req.base_url, req.model, "llm-settings",
-                 1 if req.enabled else 0))
+                 1 if req.enabled else 0, req.engine))
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

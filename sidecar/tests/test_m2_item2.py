@@ -124,7 +124,7 @@ def m2_state(tmp_path, monkeypatch):
     state.loop = __import__("asyncio").new_event_loop()
     monkeypatch.setattr(state, "transport_for", lambda row: FakeTransport())
 
-    async def fake_propose(settings, ctx):
+    async def fake_propose(settings, ctx, engine='builtin'):
         return P.Proposal(
             analysis="上轮 loss 震荡，怀疑学习率过高",
             motivation="增加 warmup 步数以稳定早期训练",
