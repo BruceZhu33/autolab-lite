@@ -36,6 +36,8 @@
 | 24 | 2026-09-14 | 设计 §4.5 Z1（systemd transient 沙箱） | `systemd-run --scope` 改变进程组/cgroup 归属，破坏 agent 停止链的 killpg 语义与 waitpid 监视 | M2 推迟 systemd 化，保留 setsid 直管；HMAC 清单校验已默认强制（0.1.4）。沙箱随三执行身份（M3/M4）一并设计（unit 级 KillMode/切片归属） | 停止链正确性优先于沙箱形态；Z1"等价沙箱"最低语义本就排后 |
 | 25 | 2026-09-14 | 状态机 r5-S8（伪事件库级拒绝）+ 事件流语义 | 迟到/乱序 agent 事件（如 attempt 在 ACKED 态收到 stop_ack）触发库级 ABORT，**毒死整条事件流**（实测游标卡 392） | `_advance` 预检合法边：无可行边 → 跳过 + audit(event.edge_skipped)；apply 系列按"是否真的推进"决定结算/衍生 | 契约防的是伪事件，迟到真事件应幂等吸收；监视主循环另加 120s watchdog（单服务器轮询限时、超时弃传输重建） |
 
+| 26 | 2026-09-14 | 契约 BLOCKED-ADD-4（review_threads/review_turns/review_confirmations）+ D42 文献 RAG | M3 需要落地评审对话而增补未冻结 | migration `0006_review_turns`：单表 review_turns（挂 module 或 synthesis）+ review_confirmations（可重复定稿，UNIQUE(project) 上 UPDATE）；文献对照 M3-lite = LLM + 已导入论文摘要集合（paper-qa RAG 后置，external 检索模式后置——字段与证据表已按 D42 落库） | 评审结论经 finalize 写入 plan 新版本（D38 链）复用既有冻结流；两段式 D22 全流程实测 |
+
 ## 与契约一致（零偏离）的核心面
 
 - **事务模板**：`s_cas / tx_usage / tx_settle / tx_drain_* / tx_authorize_dispatch / tx_ingest / tx_ingest_snapshot / tx_freeze` 逐字移植 harness（guard/错误码/幂等语义一致）——`tests/test_tx_contract_parity.py` 9/9
