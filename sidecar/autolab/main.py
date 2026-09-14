@@ -18,7 +18,7 @@ from .context import AppState
 from .db import Database
 from .errors import TxError, tx_error_handler
 from .events import Hub
-from .routers import meta, projects, runs, servers, settings, ws
+from .routers import meta, projects, review, runs, servers, settings, ws
 from .security import CapabilityToken, TokenMiddleware
 from .services import dispatcher as dispatcher_svc
 from .services import monitor as monitor_svc
@@ -80,6 +80,7 @@ def create_app(cfg: Config | None = None, port: int | None = None) -> FastAPI:
     app.include_router(projects.router)
     app.include_router(runs.router)
     app.include_router(settings.router)
+    app.include_router(review.router)
     app.include_router(ws.router)
     app.add_exception_handler(TxError, tx_error_handler)
 
