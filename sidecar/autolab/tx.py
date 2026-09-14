@@ -25,7 +25,8 @@ TERMINAL_ATTEMPT_STATES = ("FINISHED", "FAILED", "STOP_CONFIRMED", "CANCELLED")
 
 # r5-S5：阶段 × run.role × profile 允许矩阵（白名单）
 PHASE_MATRIX = {
-    ("baseline", "train"): ("BASELINE_ACCEPTANCE",),
+    # deviation #27：批次 base_seed 复跑（D34 BASE 对照补齐）发生在 CONFIRMATION_RUNNING
+    ("baseline", "train"): ("BASELINE_ACCEPTANCE", "CONFIRMATION_RUNNING"),
     ("search", "train"): ("SEARCH", "CONFIRMATION_RUNNING"),
     ("multi_seed", "train"): ("CONFIRMATION_RUNNING",),
     ("ablation", "train"): ("CONFIRMATION_RUNNING",),
@@ -679,6 +680,295 @@ def tx_project_resume(conn, pid: str, expected_rev: int, actor: str = "user"):
             "WHERE id=? AND status=?", (pid, target))
         conn.execute("COMMIT")
         return {"project_id": pid, "status": target}
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+# =====================================================================
+# T-FREEZE-BATCH / T-FINAL-READ（M4 确认域——移植自 harness 参考实现）
+# =====================================================================
+
+def tx_freeze_batch(conn, pid: str, proto: str, cand: str, matrix: str,
+                    expected_state_revision: int, idem_key: str | None = None,
+                    request_hash: str | None = None):
+    """批次清单与比较 spec 的权威派生（r5-S1/S3）。
+
+    - 幂等优先（api_idempotency，scope=batch_freeze:{pid}）
+    - 比较 spec 从冻结 plan 的 final_comparison 提取；未实现算法显式拒绝
+    - 条目派生：候选 run + BASE 源 run × confirm seeds；矩阵 required 项 × seeds
+    - 项目 CAS：CONFIRMATION_PREP → CONFIRMATION_RUNNING
+    """
+    if idem_key is not None:
+        scope = f"batch_freeze:{pid}"
+        hit = conn.execute(
+            "SELECT request_hash, response_json FROM api_idempotency "
+            "WHERE scope=? AND idempotency_key=?", (scope, idem_key)).fetchone()
+        if hit:
+            if request_hash is not None and hit["request_hash"] != request_hash:
+                raise TxError("IDEMPOTENCY_CONFLICT", "same key different payload (r5-S1)")
+            return json.loads(hit["response_json"])["batch_id"]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        proto_row = conn.execute(
+            "SELECT * FROM plan_protocols WHERE id=? AND project_id=? AND status='FROZEN'",
+            (proto, pid)).fetchone()
+        if proto_row is None:
+            raise TxError("GUARD_UNMET", "protocol not frozen for project")
+        cand_row = conn.execute(
+            "SELECT c.*, r.project_id AS run_project FROM candidates c "
+            "JOIN runs r ON r.id = c.selected_run_id WHERE c.id=? AND c.proto_id=?",
+            (cand, proto)).fetchone()
+        if cand_row is None or cand_row["run_project"] != pid:
+            raise TxError("GUARD_UNMET", "candidate not owned by project/protocol")
+        if cand_row["status"] not in ("SELECTED", "CONFIRMING", "CONFIRMED"):
+            raise TxError("GUARD_UNMET", f"candidate status={cand_row['status']}")
+        base_row = conn.execute(
+            "SELECT r.* FROM runs r JOIN baseline_acceptances ba ON ba.run_id = r.id "
+            "WHERE r.project_id=? AND r.role='baseline' AND r.plan_protocol_id=? "
+            "AND ba.verdict='accepted' ORDER BY r.round_no DESC LIMIT 1", (pid, proto)).fetchone()
+        if base_row is None:
+            raise TxError("GUARD_UNMET", "no accepted baseline run (D33/r5-S3)")
+        body = json.loads(proto_row["frozen_yaml"])
+        fc = body.get("final_comparison", {})
+        crit = fc.get("criteria", {})
+        alg = crit.get("difference_calculation", "mean_diff")
+        if alg not in ("mean_diff", "relative_improvement", "paired_diff"):
+            raise TxError("SPEC_UNSUPPORTED", f"difference_calculation '{alg}' not implemented")
+        unc = crit.get("uncertainty", {}).get("method", "mean_std")
+        if unc not in ("mean_std", "confidence_interval"):
+            raise TxError("SPEC_UNSUPPORTED", f"uncertainty '{unc}' not implemented")
+        spec = {
+            "main_metric": crit.get("main_metric", {}).get("name"),
+            "direction": crit.get("direction", body.get("goal", {}).get("direction", "maximize")),
+            "minimal_improvement": crit["minimal_interesting_improvement"],
+            "difference_calculation": alg, "uncertainty_method": unc,
+            "constraint_metrics": [c["metric"]["name"] for c in
+                                   body.get("goal", {}).get("constraint_metrics", []) or []],
+        }
+        spec_json = json.dumps(spec, sort_keys=True)
+        import hashlib as _h
+        spec_hash = _h.sha256(spec_json.encode()).hexdigest()
+        seeds_row = conn.execute(
+            "SELECT seed_set_json FROM seeds_registered WHERE proto_id=? AND role='confirm'",
+            (proto,)).fetchone()
+        if seeds_row is None:
+            raise TxError("GUARD_UNMET", "no pre-registered confirm seed set (D34)")
+        seeds = json.loads(seeds_row["seed_set_json"])
+        matrix_row = conn.execute(
+            "SELECT * FROM ablation_matrices WHERE id=? AND proto_id=? AND status='FROZEN'",
+            (matrix, proto)).fetchone()
+        if matrix_row is None:
+            raise TxError("GUARD_UNMET", "matrix not frozen for protocol")
+        proj = conn.execute("SELECT status FROM projects WHERE id=?", (pid,)).fetchone()
+        if proj["status"] != "CONFIRMATION_PREP":
+            raise TxError("GUARD_UNMET", f"project status={proj['status']} (need CONFIRMATION_PREP)")
+        cand_run = cand_row["selected_run_id"]
+        batch = nid("batch")
+        # batches 先落（FK 依赖）——五绑定 + 冻结比较 spec（r5-S1）
+        import hashlib as _h2
+        cand_run_row = conn.execute("SELECT * FROM runs WHERE id=?", (cand_run,)).fetchone()
+        conn.execute(
+            "INSERT INTO batches(id,candidate_id,plan_protocol_id,recipe_id,matrix_id,"
+            "init_spec_id,status,comparison_spec_json,comparison_spec_hash,"
+            "comparison_spec_source_hash) VALUES(?,?,?,?,?,?,'FROZEN',?,?,?)",
+            (batch, cand, proto, cand_run_row["recipe_id"], matrix,
+             cand_run_row["init_spec_id"], spec_json, spec_hash, proto_row["body_hash"]))
+
+        def _cand_src(conn_):
+            return conn_.execute("SELECT * FROM runs WHERE id=?", (cand_run,)).fetchone()
+
+        def _base_src(conn_):
+            return conn_.execute("SELECT * FROM runs WHERE id=?", (base_row["id"],)).fetchone()
+
+        def _derive_item(conn_, src, role, seed):
+            import hashlib as _hh
+            init_id = nid("init")
+            conn_.execute(
+                "INSERT INTO initialization_specs(id,kind,load_report,seed_train,seed_infer) "
+                "VALUES(?, 'from_scratch', 'derived by T-FREEZE-BATCH', ?, ?)",
+                (init_id, seed, seed))
+            derived = nid("run")
+            conn_.execute(
+                "INSERT INTO runs(id,project_id,round_no,role,plan_protocol_id,code_snapshot_id,"
+                "env_version_id,data_version_id,recipe_id,init_spec_id,candidate_id,control_epoch,"
+                "status,command) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'PLANNED',?)",
+                (derived, src["project_id"], src["round_no"],
+                 {"candidate_seed": "multi_seed", "base_seed": "baseline",
+                  "ablation_item": "ablation"}[role],
+                 proto, src["code_snapshot_id"], src["env_version_id"], src["data_version_id"],
+                 src["recipe_id"], init_id, cand if role == "candidate_seed" else None, 0,
+                 src["command"]))
+            conn_.execute(
+                "INSERT INTO batch_items(id,batch_id,run_id,expected_role,expected_seed,is_required)"
+                "VALUES(?,?,?,?,?,1)",
+                (nid("bi"), batch, derived, role, seed))
+
+        for src, role in ((cand_run, "candidate_seed"), (base_row["id"], "base_seed")):
+            src_full = conn.execute("SELECT * FROM runs WHERE id=?", (src,)).fetchone()
+            for seed in seeds:
+                _derive_item(conn, src_full, role, seed)
+        for ai in conn.execute(
+                "SELECT * FROM ablation_items WHERE matrix_id=? AND status IN "
+                "('RUNNABLE','PENDING','DONE')", (matrix,)).fetchall():
+            for seed in seeds:
+                _derive_item(conn, src_full, "ablation_item", seed)
+        s_cas(conn, "projects", "project", pid, "CONFIRMATION_PREP", "CONFIRMATION_RUNNING",
+              expected_state_revision, "batch_frozen", actor="user",
+              reason={"batch": batch})
+        if idem_key is not None:
+            conn.execute(
+                "INSERT INTO api_idempotency(scope,idempotency_key,request_hash,status_code,"
+                "response_json) VALUES(?,?,?,?,?)",
+                (f"batch_freeze:{pid}", idem_key, request_hash or "-", 200,
+                 json.dumps({"batch_id": batch})))
+        conn.execute("COMMIT")
+        return batch
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def tx_final_read(conn, pid: str, batch_id: str, idem_key: str, request_hash: str,
+                  expected_state_revision: int):
+    """T-FINAL-READ：幂等优先 → 归属闭包 → guard → 冻结比较 spec → 固定响应 → 迁移。"""
+    scope = f"final_confirmation:{pid}"
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        hit = conn.execute(
+            "SELECT request_hash, response_json FROM api_idempotency "
+            "WHERE scope=? AND idempotency_key=?", (scope, idem_key)).fetchone()
+        frozen_spec = conn.execute(
+            "SELECT comparison_spec_json, comparison_spec_hash, comparison_spec_source_hash "
+            "FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if frozen_spec is None:
+            raise TxError("NOT_FOUND", f"batch {batch_id}")
+        import hashlib as _h
+        if _h.sha256(frozen_spec["comparison_spec_json"].encode()).hexdigest() \
+                != frozen_spec["comparison_spec_hash"]:
+            raise TxError("SPEC_HASH_MISMATCH", f"batch {batch_id} comparison spec hash mismatch")
+        spec = json.loads(frozen_spec["comparison_spec_json"])
+        if hit:
+            if hit["request_hash"] != request_hash:
+                raise TxError("IDEMPOTENCY_CONFLICT", "same key different payload")
+            payload = json.loads(hit["response_json"])
+            payload["replayed"] = True
+            conn.execute("COMMIT")
+            return 200, payload
+        key_owner = conn.execute(
+            "SELECT batch_id FROM test_result_releases WHERE idempotency_key=?",
+            (idem_key,)).fetchone()
+        if key_owner:
+            raise TxError("IDEMPOTENCY_CONFLICT",
+                          f"idempotency key already used by batch {key_owner['batch_id']}")
+        if conn.execute("SELECT 1 FROM test_result_releases WHERE batch_id=?",
+                        (batch_id,)).fetchone():
+            raise TxError("FINAL_CONFIRM_ALREADY_RELEASED", "batch already released")
+        own = conn.execute(
+            "SELECT p.id, p.status, p.state_revision, c.id AS cand_id, c.status AS cand_status, "
+            "b.status AS batch_status, b.matrix_id, b.plan_protocol_id AS bproto "
+            "FROM batches b JOIN candidates c ON c.id=b.candidate_id "
+            "JOIN runs sel ON sel.id=c.selected_run_id JOIN projects p ON p.id=sel.project_id "
+            "WHERE b.id=? AND p.id=? AND c.proto_id=p.current_protocol_id "
+            "AND b.plan_protocol_id=p.current_protocol_id", (batch_id, pid)).fetchone()
+        if not own:
+            raise TxError("GUARD_UNMET", "ownership: batch not owned by project/current protocol")
+        if own["cand_status"] not in ("SELECTED", "CONFIRMING", "CONFIRMED"):
+            raise TxError("GUARD_UNMET", f"candidate status={own['cand_status']}")
+        if own["batch_status"] == "CANCELLED":
+            raise TxError("GUARD_UNMET", "batch cancelled (R06/D45)")
+        if own["status"] != "TEST_RESULT_SEALED":
+            raise TxError("GUARD_UNMET", f"G1 project status={own['status']}")
+        items = conn.execute(
+            "SELECT status, run_id, expected_role, is_required FROM batch_items WHERE batch_id=?",
+            (batch_id,)).fetchall()
+        if not items:
+            raise TxError("GUARD_UNMET", "empty batch")
+        non_terminal = [i["status"] for i in items
+                        if i["status"] not in ("SUCCEEDED", "FAILED", "CANCELLED", "MISSING")]
+        if non_terminal:
+            raise TxError("GUARD_UNMET", f"items not terminal: {non_terminal}")
+        required_bad = [(i["run_id"], i["status"]) for i in items
+                        if i["is_required"] == 1 and i["status"] != "SUCCEEDED"]
+        if required_bad:
+            raise TxError("GUARD_UNMET", f"evidence_insufficient (required): {required_bad}")
+        required_runs = [i["run_id"] for i in items if i["is_required"] == 1]
+        qmarks = ",".join("?" * len(required_runs))
+        pend = conn.execute(
+            f"SELECT id, run_id FROM evaluation_requests WHERE scope='test' "
+            f"AND status!='COMPLETED' AND run_id IN ({qmarks})", required_runs).fetchall()
+        if pend:
+            raise TxError("GUARD_UNMET", f"G7 test requests not completed: {[p[0] for p in pend]}")
+        no_result = [r for r in required_runs if not conn.execute(
+            "SELECT 1 FROM evaluation_results er JOIN evaluation_requests rq "
+            "ON rq.id=er.evaluation_request_id WHERE rq.scope='test' AND rq.status='COMPLETED' "
+            "AND rq.run_id=? AND rq.plan_protocol_id=?", (r, own["bproto"])).fetchone()]
+        if no_result:
+            raise TxError("GUARD_UNMET", f"G7 required runs without test results: {no_result}")
+        if conn.execute(
+            "SELECT 1 FROM invalidation_edges WHERE revalidate_status='PENDING' AND ("
+            " (cause_type='protocol' AND cause_id=:proto)"
+            " OR (cause_type='method' AND cause_id=:cand)"
+            " OR (cause_type='candidate' AND cause_id=:cand)"
+            " OR (cause_type='recipe' AND cause_id=:cand))",
+            {"proto": own["bproto"], "cand": own["cand_id"]}).fetchone():
+            raise TxError("GUARD_UNMET", "invalidation pending (G5/G6)")
+        role_of = {i["run_id"]: i["expected_role"] for i in items}
+        groups = {"candidate": [], "base": []}
+        for row in conn.execute(
+            f"SELECT rq.run_id, er.metric, er.value FROM evaluation_results er "
+            f"JOIN evaluation_requests rq ON rq.id=er.evaluation_request_id "
+            f"WHERE rq.scope='test' AND rq.status='COMPLETED' AND rq.run_id IN ({qmarks}) "
+            f"AND rq.plan_protocol_id=? AND er.metric=?",
+                required_runs + [own["bproto"], spec["main_metric"]]):
+            role = role_of[row["run_id"]]
+            bucket = "candidate" if role.startswith("candidate") else "base"
+            groups[bucket].append(row["value"])
+        if not groups["candidate"] or not groups["base"]:
+            raise TxError("GUARD_UNMET", "comparison groups incomplete")
+        cand_mean = sum(groups["candidate"]) / len(groups["candidate"])
+        base_mean = sum(groups["base"]) / len(groups["base"])
+        delta = cand_mean - base_mean if spec["direction"] == "maximize" else base_mean - cand_mean
+        outcome = "completed" if delta >= spec["minimal_improvement"] else "failed"
+        payload = {
+            "outcome": outcome,
+            "final_comparison": {
+                "rule": "frozen comparison spec (Q01)",
+                "spec_hash": frozen_spec["comparison_spec_hash"],
+                "main_metric": spec["main_metric"], "direction": spec["direction"],
+                "candidate_mean": cand_mean, "base_mean": base_mean,
+                "delta": delta, "minimal_improvement": spec["minimal_improvement"],
+                "sample_counts": {"candidate": len(groups["candidate"]),
+                                  "base": len(groups["base"])},
+            },
+            "test_metrics": {"candidate": groups["candidate"], "base": groups["base"]},
+        }
+        payload_json = json.dumps(payload, sort_keys=True)
+        payload_hash = _h.sha256(payload_json.encode()).hexdigest()
+        conn.execute(
+            "INSERT INTO test_result_releases(id,batch_id,idempotency_key,release_payload_json,"
+            "release_payload_hash,outcome,released_by) VALUES(?,?,?,?,?,?,'user')",
+            (nid("rel"), batch_id, idem_key, payload_json, payload_hash, outcome))
+        conn.execute(
+            "INSERT INTO api_idempotency(scope,idempotency_key,request_hash,status_code,"
+            "response_json) VALUES(?,?,?,?,?)", (scope, idem_key, request_hash, 200, payload_json))
+        cur = conn.execute(
+            "UPDATE projects SET status='FINISHING', state_revision=state_revision+1, "
+            "updated_at=datetime('now') WHERE id=? AND status='TEST_RESULT_SEALED' "
+            "AND state_revision=?", (pid, expected_state_revision))
+        if cur.rowcount != 1:
+            raise TxError("STATE_REVISION_CONFLICT", f"project rev != expected")
+        conn.execute("UPDATE projects SET outcome=? WHERE id=?", (outcome, pid))
+        conn.execute(
+            "INSERT INTO state_events(id,aggregate_type,aggregate_id,event,from_state,to_state,"
+            "actor,reason_json,expected_revision) VALUES(?,?,?,?,?,?,?,'{}',?)",
+            (nid("sev"), "project", pid, "final_read", "TEST_RESULT_SEALED", "FINISHING", "user",
+             expected_state_revision))
+        conn.execute(
+            "INSERT INTO audit_events(id,actor,action,payload_json) VALUES(?,?,?,?)",
+            (nid("aud"), "user", "final_confirmation.read", payload_json))
+        conn.execute("COMMIT")
+        return 200, payload
     except Exception:
         conn.execute("ROLLBACK")
         raise

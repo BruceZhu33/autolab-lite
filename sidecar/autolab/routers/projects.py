@@ -332,3 +332,58 @@ async def budget_reduction(project_id: str, req: BudgetReduction, request: Reque
             state.loop, "budget.reduction_accepted", json.loads(payload),
             aggregate={"type": "budget", "id": project_id}, project_id=project_id)
     return {"phase": phase, "payload": json.loads(payload)}
+
+
+# ===================== M4 确认域与报告 =====================
+
+@router.post("/projects/{project_id}/candidates/selection")
+async def select_candidate(project_id: str, request: Request):
+    """D37：按 val 主指标最佳轮选候选（不依测试分数）。"""
+    state = request.app.state.autolab
+    from ..services import confirm
+    return await confirm.select_candidate(state, project_id)
+
+
+@router.post("/projects/{project_id}/batches/freeze")
+async def freeze_batch(project_id: str, request: Request):
+    """T-FREEZE-BATCH：批次清单权威派生 + 立即铺开（多机并发）。"""
+    state = request.app.state.autolab
+    from ..services import confirm
+    return await confirm.freeze_batch(state, project_id)
+
+
+class FinalReadIn(BaseModel):
+    batch_id: str
+    idempotency_key: str
+    expected_state_revision: int
+
+
+@router.post("/projects/{project_id}/final-confirmation/read")
+async def final_read(project_id: str, req: FinalReadIn, request: Request):
+    """T-FINAL-READ：test 结果一次性释放（不变量②；幂等键全局唯一）。"""
+    state = request.app.state.autolab
+    import hashlib
+    request_hash = hashlib.sha256(
+        f"{project_id}|{req.batch_id}".encode()).hexdigest()
+    code, payload = await to_thread(
+        state.db, Tx.tx_final_read, project_id, req.batch_id,
+        req.idempotency_key, request_hash, req.expected_state_revision)
+    state.hub.publish_threadsafe(
+        state.loop, "final_confirmation.released",
+        {"outcome": payload.get("outcome"),
+         "release_payload_hash": hashlib.sha256(
+             json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]},
+        aggregate={"type": "project", "id": project_id}, project_id=project_id)
+    return payload
+
+
+@router.post("/projects/{project_id}/reports")
+async def generate_report(project_id: str, request: Request):
+    """Q05/D28/A06：报告 + 图表包 + 复现代码包；REPORTING → REPORTED。"""
+    state = request.app.state.autolab
+    from ..services import report
+    result = await report.generate_report(state, project_id)
+    state.hub.publish_threadsafe(
+        state.loop, "report.completed", result,
+        aggregate={"type": "project", "id": project_id}, project_id=project_id)
+    return result
