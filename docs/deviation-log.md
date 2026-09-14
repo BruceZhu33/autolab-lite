@@ -33,6 +33,9 @@
 | 22 | 2026-09-14 | 状态机/契约评测恢复语义 | 评测 request FAILED 为终态（append-only 无重试路径）且 UNIQUE(run,scope) 阻止重建——事件漏拍/瞬时错误会永久卡死该 run 的评测（实测 round0/1 受损） | M2 缓解：evaluator sweep 对账 worker（INFER_PENDING+infer FINISHED 自愈 / AGG_RUNNING+agg FAILED 重派≤2）；完整恢复语义（FAILED→重建或复活）攒批修订 | 与 M2-5 断线对账验收一并处理 |
 | 23 | 2026-09-14 | agent 运行时（设计 §5 manifest.env） | ①manifest.env 自定义变量未被 agent 注入（AUTOLAB_EVAL_DIR 失效）；②登录 shell 重置 PATH 使 `python3` 落到系统 3.8 并沾染 3.12 轮子 | agent 0.1.1-m2：注入 AUTOLAB_* 前缀自定义变量（expanduser）+ 导出 `AUTOLAB_PYTHON=<bin>/python` 显式解释器；经 agent 自动升级双真机验证 | 顺带验证了 agent 自动部署/升级闭环（版本 0.1.0→0.1.1 双机热更） |
 
+| 24 | 2026-09-14 | 设计 §4.5 Z1（systemd transient 沙箱） | `systemd-run --scope` 改变进程组/cgroup 归属，破坏 agent 停止链的 killpg 语义与 waitpid 监视 | M2 推迟 systemd 化，保留 setsid 直管；HMAC 清单校验已默认强制（0.1.4）。沙箱随三执行身份（M3/M4）一并设计（unit 级 KillMode/切片归属） | 停止链正确性优先于沙箱形态；Z1"等价沙箱"最低语义本就排后 |
+| 25 | 2026-09-14 | 状态机 r5-S8（伪事件库级拒绝）+ 事件流语义 | 迟到/乱序 agent 事件（如 attempt 在 ACKED 态收到 stop_ack）触发库级 ABORT，**毒死整条事件流**（实测游标卡 392） | `_advance` 预检合法边：无可行边 → 跳过 + audit(event.edge_skipped)；apply 系列按"是否真的推进"决定结算/衍生 | 契约防的是伪事件，迟到真事件应幂等吸收；监视主循环另加 120s watchdog（单服务器轮询限时、超时弃传输重建） |
+
 ## 与契约一致（零偏离）的核心面
 
 - **事务模板**：`s_cas / tx_usage / tx_settle / tx_drain_* / tx_authorize_dispatch / tx_ingest / tx_ingest_snapshot / tx_freeze` 逐字移植 harness（guard/错误码/幂等语义一致）——`tests/test_tx_contract_parity.py` 9/9

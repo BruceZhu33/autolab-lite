@@ -20,8 +20,10 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=int(os.environ.get("AUTOLAB_AGENT_PORT", 7800)))
     ap.add_argument("--home", type=Path, default=None, help="数据目录（默认 ~/.autolab-agent）")
     ap.add_argument("--token", default=os.environ.get("AUTOLAB_AGENT_TOKEN", ""))
-    ap.add_argument("--require-hmac", action="store_true",
-                    help="强制校验执行清单 HMAC（M1 默认关闭：明文跑通再收紧）")
+    ap.add_argument("--require-hmac", dest="require_hmac", action="store_true",
+                    default=None, help="强制校验执行清单 HMAC（0.1.2 起默认开启）")
+    ap.add_argument("--no-require-hmac", dest="require_hmac", action="store_false",
+                    help="关闭 HMAC 校验（仅限本地裸调试）")
     args = ap.parse_args()
     app = create_app(base_dir=args.home, token=args.token, require_hmac=args.require_hmac)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info", access_log=False)
