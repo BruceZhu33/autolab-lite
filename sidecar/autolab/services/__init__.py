@@ -49,7 +49,8 @@ def _git_init_baseline(dst: Path) -> str:
            "HOME": __import__("os").environ.get("HOME", "")}
     cmds = [["git", "init", "-q"], ["git", "add", "-A"], ["git", "commit", "-qm", "AutoLab BASE import"]]
     for c in cmds:
-        subprocess.run(c + ["-C", str(dst)], check=False, capture_output=True, env=env, timeout=60)
+        subprocess.run(["git", "-C", str(dst)] + c, check=False, capture_output=True,
+                       env=env, timeout=60)
     return _git_head(dst)
 
 
