@@ -266,6 +266,21 @@ async def next_round(project_id: str, request: Request):
     return result
 
 
+class TerminateRequest(BaseModel):
+    reason: str = "manual_stop"
+    expected_state_revision: int | None = None
+
+
+@router.post("/projects/{project_id}/terminate")
+async def terminate_project(project_id: str, req: TerminateRequest, request: Request):
+    """人工叫停（D27 manual_stop / D31 取消竞态）：活跃 attempt 走停止链，
+    无活跃 attempt 直接 FINISHING(outcome=stopped)。"""
+    state = request.app.state.autolab
+    from ..services.judge import _terminate_project
+    await _terminate_project(state, project_id, reason=req.reason, outcome="stopped")
+    return {"project_id": project_id, "terminated": True, "reason": req.reason}
+
+
 class ResumeRequest(BaseModel):
     expected_state_revision: int = Field(ge=0)
 

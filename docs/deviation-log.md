@@ -29,6 +29,10 @@
 | 19 | 2026-09-14 | 选型 TD6'（RD-Agent 底座）+ openapi /settings/llm | RD-Agent 直接嵌入成本高（场景绑定重、依赖链长），M2-2 先以 OpenAI 兼容薄客户端 + 自研提案 prompt 落地循环；`ProposalEngine` 接口已留 RD-Agent 适配器位 | migration `0005_llm_settings`（契约有端点无表）；版本锁定接入 RD-Agent 时新增实现类即可，产品层循环控制器（TD2'）语义不变 |
 | 20 | 2026-09-14 | 状态机 run 层 + A02 增强冒烟 + D25 上下文 | ① runs 六绑定身份冻结与"快照在 SNAPSHOTTING 才产生"矛盾：LLM 轮各阶段先执行（audit 实时留痕），run 行在快照就绪后落库并回放状态链；② 冒烟 M2 子集=本地 py_compile（A02 完整标准依赖 BASE 适配配置声明 smoke 命令，入口预留）；③ D25 上下文中"指标全程曲线/历史最好"待评测器（M2-4）接入，暂以日志尾+审计摘要替代 | 攒批修订时定 run 落库时序（或放宽绑定 trigger）；冒烟与指标上下文随后续里程碑补全 |
 
+| 21 | 2026-09-14 | 设计 §5/契约评测域（evaluation_requests/predictions/infer-agg 两步） | M2-4 最小实现需可落地通用 BASE：①适配约定——训练/评测须产出 `final.ckpt`（缺省打包输出目录为受保护产物）与 `metrics.json`；②infer=运行 eval 命令产出 metrics.json，predictions 登记为该文件的 M2 投影；③agg=产品内置提取器（hash 校验+指标回传）；④完整 infer/agg 语义（候选 ckpt 推理产物）随 M4 | 库级 gate（AGG_RUNNING+FINISHED agg+predictions）全程真实生效（不变量④）；评测身份闭包/受保护 ckpt 产物/唯一指标入口全按契约 |
+| 22 | 2026-09-14 | 状态机/契约评测恢复语义 | 评测 request FAILED 为终态（append-only 无重试路径）且 UNIQUE(run,scope) 阻止重建——事件漏拍/瞬时错误会永久卡死该 run 的评测（实测 round0/1 受损） | M2 缓解：evaluator sweep 对账 worker（INFER_PENDING+infer FINISHED 自愈 / AGG_RUNNING+agg FAILED 重派≤2）；完整恢复语义（FAILED→重建或复活）攒批修订 | 与 M2-5 断线对账验收一并处理 |
+| 23 | 2026-09-14 | agent 运行时（设计 §5 manifest.env） | ①manifest.env 自定义变量未被 agent 注入（AUTOLAB_EVAL_DIR 失效）；②登录 shell 重置 PATH 使 `python3` 落到系统 3.8 并沾染 3.12 轮子 | agent 0.1.1-m2：注入 AUTOLAB_* 前缀自定义变量（expanduser）+ 导出 `AUTOLAB_PYTHON=<bin>/python` 显式解释器；经 agent 自动升级双真机验证 | 顺带验证了 agent 自动部署/升级闭环（版本 0.1.0→0.1.1 双机热更） |
+
 ## 与契约一致（零偏离）的核心面
 
 - **事务模板**：`s_cas / tx_usage / tx_settle / tx_drain_* / tx_authorize_dispatch / tx_ingest / tx_ingest_snapshot / tx_freeze` 逐字移植 harness（guard/错误码/幂等语义一致）——`tests/test_tx_contract_parity.py` 9/9

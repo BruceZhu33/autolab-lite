@@ -53,12 +53,19 @@ async def _exec(transport, cmd: str, timeout: float = 1800):
 
 
 async def _ensure_conda(transport, ssh_mode: bool) -> tuple[str | None, str]:
-    """返回 (conda 可执行路径 | None, tool)。缺 conda 时：ssh 模式自动补装 Miniconda（D20），
-    local 模式返回 None（调用方走 venv 兜底，deviation #5）。"""
+    """返回 (conda 可执行路径 | None, tool)。
+
+    注意：SSH exec 不走 login shell——conda 常不在 PATH，必须显式扫标准安装位置。
+    全部缺席时：ssh 模式自动补装 Miniconda（D20）；local 模式 venv 兜底（deviation #5）。
+    """
     r = await _exec(transport, "command -v conda || true")
     conda = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
     if conda:
         return conda, "conda"
+    for cand in ("~/anaconda3/bin/conda", "~/miniconda3/bin/conda", "/opt/conda/bin/conda"):
+        rc = (await _exec(transport, f"test -x {cand} && echo X")).stdout.strip()
+        if "X" in rc:
+            return cand, "conda"
     if ssh_mode:
         r2 = await _exec(
             transport,
@@ -82,7 +89,11 @@ async def _setup_env(state, project_id: str, server_row, transport, env_name: st
     conda, tool = await _ensure_conda(transport, ssh_mode)
     if reuse_env:
         r = await _exec(transport, f"{conda} env list --json")
-        envs = json.loads(r.stdout).get("envs", [])
+        try:
+            envs = json.loads(r.stdout).get("envs", [])
+        except json.JSONDecodeError as e:
+            raise TxError("GUARD_UNMET",
+                          f"conda env list 解析失败（{conda}）：{r.stderr.strip()[:150]}") from e
         prefix = next((e for e in envs
                        if e == reuse_env or e.rstrip("/").endswith(f"/{reuse_env}")), None)
         if prefix is None:
