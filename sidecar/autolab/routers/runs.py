@@ -194,13 +194,17 @@ async def _do_dispatch(state, run_id: str, opts: dict) -> dict:
     deadline = datetime.now(timezone.utc) + timedelta(seconds=authorized + margin + 60)
     expires = deadline.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    profile = opts.get("_profile", "train")
+    request_id = opts.get("_request_id")
+    env_extra = opts.get("_env_extra") or {}
     m = {
         "dispatch_id": dispatch_id,
         "attempt_id": attempt_id,
         "run_id": run_id,
         "project_id": ctx["run"]["project_id"],
         "server_id": server_id,
-        "profile": "train",
+        "profile": profile,
+        **({"evaluation_request_id": request_id} if request_id else {}),
         "control_epoch": ctx["run"]["control_epoch"],
         "issued_at": issued_at,
         "deadline_at": expires,
@@ -208,24 +212,27 @@ async def _do_dispatch(state, run_id: str, opts: dict) -> dict:
         "code": {"snapshot_id": ctx["snap"]["id"], "export_hash": ctx["snap"]["export_hash"],
                  "remote_path": f"~/autolab/projects/{ctx['run']['project_id']}/code/{ctx['snap']['id']}"},
         "env": {"env_version_id": ctx["env"]["id"], "env_name": ctx["env"]["env_name"],
-                "bin_dir": env_spec.get("bin_dir", "")},
+                "bin_dir": env_spec.get("bin_dir", ""), **env_extra},
         "data": {"data_version_id": ctx["dv"]["id"], "manifest_sha": ctx["dv"]["manifest_sha"],
                  "remote_path": replica["actual_path"] if replica else ""},
         "command": opts.get("command") or ctx.get("effective_command") or "python train.py",
-        "output_dir": f"~/autolab/runs/{dispatch_id}",
+        "output_dir": f"~/autolab/runs/{dispatch_id}{opts.get('_out_dir_suffix', '')}",
         "gpu": {"gpu_id": gpu_id, "index": gpu_row["gpu_index"] if gpu_row else 0},
     }
     mh = manifest_mod.manifest_hash(m)
 
     def _authorize(conn):
         return Tx.tx_authorize_dispatch(
-            conn, run_id, attempt_id, server=server_id, profile="train",
+            conn, run_id, attempt_id, server=server_id, profile=profile,
             dispatch_id=dispatch_id, seq=ctx["seq"], authorized_s=authorized,
+            request_id=request_id,
             manifest_hash=mh, expires=expires, margin_s=margin, gpu_id=gpu_id,
             manifest_payload=m)
     attempt_id, replayed = await to_thread(state.db, _authorize)
 
     def _queue(conn):
+        if profile != "train":
+            return  # 评测 attempt 不迁移 run（run 已在 EVAL_QUEUED）
         run = conn.execute("SELECT status, state_revision FROM runs WHERE id=?",
                            (run_id,)).fetchone()
         if run["status"] == "READY_TO_DISPATCH":

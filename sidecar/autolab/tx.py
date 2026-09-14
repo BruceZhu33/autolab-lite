@@ -308,8 +308,12 @@ def tx_authorize_dispatch(conn, run: str, at: str, server: str, profile: str = "
         if proj["status"] in ("PAUSED", "STOPPING", "STOP_PENDING_CONFIRMATION", "FINISHING",
                               "REPORTING", "REPORTED"):
             raise TxError("PROJECT_NOT_DISPATCHABLE", f"project in {proj['status']}")
-        if run_row["status"] != "READY_TO_DISPATCH":
-            raise TxError("RUN_NOT_READY", f"run {run} in {run_row['status']}")
+        # train 走 dispatch_ready 边（READY_TO_DISPATCH）；infer/agg 由评测调度器
+        # 自 EVAL_QUEUED 派发（SM 语义；harness guard 仅约束 train 派发闭包）
+        required_run_status = "READY_TO_DISPATCH" if profile == "train" else "EVAL_QUEUED"
+        if run_row["status"] != required_run_status:
+            raise TxError("RUN_NOT_READY", f"run {run} in {run_row['status']}"
+                          f"（{profile} 需要 {required_run_status}）")
         allowed = PHASE_MATRIX.get((run_row["role"], profile))
         if allowed is None or proj["status"] not in allowed:
             raise TxError("PHASE_NOT_ALLOWED",

@@ -48,9 +48,11 @@ def create_app(cfg: Config | None = None, port: int | None = None) -> FastAPI:
             hub.publish_threadsafe(state.loop, "system.ready",
                                    {"version": __version__, "migrations": migrated})
         _write_runtime(cfg, port, (cfg.token_path.read_text(encoding="utf-8").strip()))
+        from .services import evaluator as evaluator_svc
         tasks = [
             asyncio.create_task(dispatcher_svc.run_dispatcher(state), name="dispatcher"),
             asyncio.create_task(monitor_svc.run_monitor(state), name="monitor"),
+            asyncio.create_task(evaluator_svc.run_sweeper(state), name="eval-sweeper"),
             asyncio.create_task(_relay_outbox(state), name="outbox-relay"),
             asyncio.create_task(hub.heartbeat(), name="ws-heartbeat"),
         ]

@@ -30,13 +30,25 @@ command -v pnpm >/dev/null || { echo "缺 pnpm：npm install -g pnpm"; exit 1; }
 DEMO="$HOME/autolab-demo"
 mkdir -p "$DEMO/base" "$DEMO/data"
 cat > "$DEMO/base/train.py" <<'PY'
-import os, time, math
+import json, os, time, math
 print("demo train | code:", os.environ.get("AUTOLAB_CODE_DIR"),
       "data:", os.environ.get("AUTOLAB_DATA_DIR"), "out:", os.environ.get("AUTOLAB_OUT_DIR"))
 for i in range(1, 11):
     print(f"epoch {i} loss {1.0/math.sqrt(i):.4f}")
     time.sleep(0.8)
+out = os.environ.get("AUTOLAB_OUT_DIR", ".")
+with open(os.path.join(out, "metrics.json"), "w") as f:
+    json.dump({"val_metric": round(1 - 1/math.sqrt(10), 4)}, f)
+with open(os.path.join(out, "final.ckpt"), "wb") as f:
+    f.write(b"demo-ckpt-bytes")
 print("TRAIN_DONE")
+PY
+cat > "$DEMO/base/eval.py" <<'PY'
+import json, os
+out = os.environ.get("AUTOLAB_OUT_DIR", ".")
+with open(os.path.join(out, "metrics.json"), "w") as f:
+    json.dump({"val_metric": round(0.80 + (os.getpid() % 7) * 0.005, 4)}, f)
+print("EVAL_DONE")
 PY
 printf 'a,b\n1,2\n3,4\n' > "$DEMO/data/train.csv"
 printf 'a,b\n5,6\n' > "$DEMO/data/val.csv"

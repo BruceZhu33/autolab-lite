@@ -78,6 +78,13 @@ class Runner:
         env["AUTOLAB_OUT_DIR"] = out_dir
         env["AUTOLAB_ENV_NAME"] = env.get("CONDA_DEFAULT_ENV", "")
         env["AUTOLAB_DISPATCH_ID"] = dispatch_id
+        # 显式解释器（登录 shell 可能重置 PATH，python3 会落到系统旧版本）
+        if env_dir:
+            env["AUTOLAB_PYTHON"] = os.path.join(_expand(env_dir), "python")
+        # manifest.env 的自定义 AUTOLAB_* 变量（路径展开）
+        for k, v in (manifest.get("env") or {}).items():
+            if k.startswith("AUTOLAB_") and isinstance(v, str) and k not in env:
+                env[k] = _expand(v)
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
         log_path = Path(out_dir) / "log.txt"
         # 允许以代码目录为 cwd 的工作习惯：manifest.command 里的 $AUTOLAB_* 均可用

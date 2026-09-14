@@ -13,5 +13,5 @@
 沙箱（Z1 三用户/systemd transient）：M1 后置（明文跑通后收紧——开工指令授权）；
 HMAC 校验由 --require-hmac 开启。
 """
-__version__ = "0.1.0-m1"
+__version__ = "0.1.1-m2"
 SCHEMA_VER = "1"

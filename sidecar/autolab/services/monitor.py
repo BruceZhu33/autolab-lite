@@ -54,8 +54,10 @@ def apply_simple(attempt_id: str, to_state: str, event: str):
 def apply_running(attempt_id: str, run_id: str):
     def fn(conn):
         changed = _advance(conn, "attempt", "attempts", attempt_id, "RUNNING", "running")
+        at = conn.execute("SELECT profile FROM attempts WHERE id=?",
+                          (attempt_id,)).fetchone()
         run = _row(conn, "runs", run_id)
-        if run and run["status"] == "QUEUED":
+        if at and at["profile"] == "train" and run and run["status"] == "QUEUED":
             Tx.s_cas(conn, "runs", "run", run_id, "QUEUED", "TRAINING",
                      run["state_revision"], event="attempt_running", actor="agent")
         return changed
@@ -83,8 +85,10 @@ def apply_finished(attempt_id: str, run_id: str, rc: int, tail: str):
         _advance(conn, "attempt", "attempts", attempt_id, "FINISHED", "finished",
                  reason={"rc": rc})
         Tx.tx_settle(conn, attempt_id, "completed")
+        at = conn.execute("SELECT profile FROM attempts WHERE id=?",
+                          (attempt_id,)).fetchone()
         run = _row(conn, "runs", run_id)
-        if run and run["status"] == "TRAINING":
+        if at and at["profile"] == "train" and run and run["status"] == "TRAINING":
             Tx.s_cas(conn, "runs", "run", run_id, "TRAINING", "EVAL_QUEUED",
                      run["state_revision"], event="attempt_finished", actor="agent",
                      reason={"rc": rc})
@@ -318,7 +322,7 @@ async def _ingest_event(state, server, inst, ev: dict):
 
     def _lookup(conn):
         row = conn.execute(
-            "SELECT a.id AS attempt_id, a.run_id, a.control_epoch, r.project_id "
+            "SELECT a.id AS attempt_id, a.run_id, a.control_epoch, a.profile, r.project_id "
             "FROM attempts a JOIN runs r ON r.id=a.run_id WHERE a.dispatch_id=?",
             (dispatch_id,)).fetchone()
         if row is None:
@@ -326,6 +330,7 @@ async def _ingest_event(state, server, inst, ev: dict):
         ce = conn.execute("SELECT epoch FROM control_state WHERE project_id=?",
                           (row["project_id"],)).fetchone()
         return {"attempt_id": row["attempt_id"], "run_id": row["run_id"],
+                "profile": row["profile"],
                 "expect_epoch": row["control_epoch"],
                 "current_epoch": ce[0] if ce else 0}
 
@@ -368,6 +373,23 @@ async def _ingest_event(state, server, inst, ev: dict):
 
     if applied and etype == "failed":
         await _maybe_redispatch(state, info["run_id"])
+
+    if applied and etype == "finished":
+        from . import evaluator as evaluator_svc
+        try:
+            if info.get("profile") == "train":
+                await evaluator_svc.on_train_finished(state, info["run_id"],
+                                                       info["attempt_id"])
+            elif info.get("profile") == "infer":
+                await evaluator_svc.on_infer_finished(state, info["run_id"],
+                                                       info["attempt_id"])
+            elif info.get("profile") == "agg":
+                await evaluator_svc.on_agg_finished(state, info["run_id"],
+                                                     info["attempt_id"],
+                                                     payload.get("tail", ""))
+        except Exception as e:  # noqa: BLE001 —— 评测编排失败不阻断状态机
+            state.hub.publish_threadsafe(state.loop, "system.error",
+                                         {"scope": "evaluator", "error": str(e)[:300]})
 
     if applied and etype == "usage":
         await _emit_budget(state, info)

@@ -229,6 +229,14 @@ function MonitorPageInner() {
             {activeAttempt && (
               <Button variant="destructive" onClick={() => stop(activeAttempt.id)}>■ 停止</Button>
             )}
+            {detail && !['FINISHING', 'REPORTED'].includes(detail.status) && (
+              <Button variant="destructive" onClick={() => {
+                if (window.confirm('终止整个项目？活跃任务走停止链（D31）。'))
+                  api('POST', `/api/v1/projects/${selected}/terminate`, { reason: 'manual_stop' })
+                    .then(() => setNote('项目终止已发起（FINISHING/stopped）'))
+                    .catch((e) => setNote(String(e)));
+              }}>⛔ 终止项目</Button>
+            )}
           </div>
           {detail && (
             <div>
