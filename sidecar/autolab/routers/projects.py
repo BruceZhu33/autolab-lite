@@ -229,6 +229,44 @@ async def freeze_plan(protocol_id: str, req: FreezeRequest, request: Request):
     return {"project_id": pid, "project_status": status, "protocol_id": protocol_id}
 
 
+class BaselineAcceptance(BaseModel):
+    verdict: str = Field(pattern="^(accept|reject)$")
+    expected_state_revision: int = Field(ge=0)
+    patch_class: str = Field(default="none", pattern="^(none|env_compat|method)$")
+    notes: str = ""
+    run_id: str | None = None
+
+
+@router.post("/projects/{project_id}/baseline-acceptance")
+async def baseline_acceptance(project_id: str, req: BaselineAcceptance, request: Request):
+    """D33 Round 0 基线验收：accept→SEARCH / reject→PAUSED(manual_baseline)。"""
+    state = request.app.state.autolab
+    result = await to_thread(
+        state.db, Tx.tx_baseline_acceptance, project_id, req.verdict,
+        req.expected_state_revision, req.patch_class, req.notes, req.run_id)
+    state.hub.publish_threadsafe(
+        state.loop, "project.state_changed",
+        {"to": result["status"], "event": f"baseline_{req.verdict}"},
+        aggregate={"type": "project", "id": project_id}, project_id=project_id)
+    return result
+
+
+class ResumeRequest(BaseModel):
+    expected_state_revision: int = Field(ge=0)
+
+
+@router.post("/projects/{project_id}/resume")
+async def resume_project(project_id: str, req: ResumeRequest, request: Request):
+    """PAUSED → paused_from_state（A08 恢复入口之一：继续）。"""
+    state = request.app.state.autolab
+    result = await to_thread(state.db, Tx.tx_project_resume,
+                             project_id, req.expected_state_revision)
+    state.hub.publish_threadsafe(
+        state.loop, "project.state_changed", {"to": result["status"], "event": "resume"},
+        aggregate={"type": "project", "id": project_id}, project_id=project_id)
+    return result
+
+
 @router.get("/projects/{project_id}/budget")
 async def get_budget(project_id: str, request: Request):
     state = request.app.state.autolab

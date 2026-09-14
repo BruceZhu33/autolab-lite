@@ -18,6 +18,8 @@ import time
 from ..agent_client import AgentClient, AgentError
 from ..db import to_thread
 from ..errors import TxError
+from ..ids import nid
+from .. import manifest as manifest_mod
 from .. import tx as Tx
 
 LOG_TAIL_INTERVAL = 1.5
@@ -92,6 +94,15 @@ def apply_finished(attempt_id: str, run_id: str, rc: int, tail: str):
 
 
 def apply_failed(attempt_id: str, run_id: str, rc: int, fail_class: str, reason: str):
+    """D41 四分类路由（M2-1 骨架）：
+    model → run REPAIRING（D23 计数 ≤3）超限 → 项目 PAUSED(manual_selfrepair)
+    infra → run INFRA_RETRY（≤2）超限 → 项目 PAUSED(manual_infra)；重派由
+            _maybe_redispatch 在入库后异步执行（同机重派，deviation #17）
+    metric/llm → 状态机边就位，产生源（评测器/LLM）随 M2-2/2-4 接入
+    """
+    MAX_MODEL_RETRY = 3   # D23
+    MAX_INFRA_RETRY = 2   # D41 限次重试
+
     def fn(conn):
         row = _row(conn, "attempts", attempt_id)
         if row and row["status"] in TERMINALS:
@@ -103,8 +114,61 @@ def apply_failed(attempt_id: str, run_id: str, rc: int, fail_class: str, reason:
                      (fail_class, reason[:500], attempt_id))
         Tx.tx_settle(conn, attempt_id, "completed")
         _free_gpu(conn, attempt_id)
+
+        run = _row(conn, "runs", run_id)
+        if run is None:
+            return True
+        # infra_fail 边仅自 QUEUED/TRAINING；model_fail 边含 REPAIRING（连续修复失败计数）
+        routable = ("QUEUED", "TRAINING") if fail_class == "infra" else \
+                   ("QUEUED", "TRAINING", "REPAIRING")
+        if run["status"] not in routable:
+            return True  # 等待态/非主链：attempt 终态即止
+        if fail_class == "infra":
+            n = conn.execute(
+                "SELECT COUNT(*) FROM attempts WHERE run_id=? AND fail_class='infra'",
+                (run_id,)).fetchone()[0]
+            if n <= MAX_INFRA_RETRY:
+                Tx.s_cas(conn, "runs", "run", run_id, run["status"], "INFRA_RETRY",
+                         run["state_revision"], event="infra_fail", actor="agent",
+                         reason={"fail_count": n, "attempt_id": attempt_id})
+            else:
+                _pause_project(conn, run_id, "manual_infra",
+                               {"attempt_id": attempt_id, "fail_count": n})
+        elif fail_class in ("model", None, ""):
+            n = conn.execute(
+                "SELECT COUNT(*) FROM attempts WHERE run_id=? AND fail_class='model'",
+                (run_id,)).fetchone()[0]
+            if n <= MAX_MODEL_RETRY:
+                Tx.s_cas(conn, "runs", "run", run_id, run["status"], "REPAIRING",
+                         run["state_revision"], event="model_fail", actor="agent",
+                         reason={"fail_count": n, "attempt_id": attempt_id,
+                                 "note": "LLM 自修复 M2-2 接入前等待人工/后续处置"})
+            else:
+                _pause_project(conn, run_id, "manual_selfrepair",
+                               {"attempt_id": attempt_id, "fail_count": n})
         return True
     return fn
+
+
+def _pause_project(conn, run_id: str, pause_reason: str, payload: dict):
+    """项目层 pause（D8/D23 超限）：仅 SEARCH/BASELINE_ACCEPTANCE 有 pause 边。"""
+    r = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    pid = r["project_id"]
+    proj = conn.execute("SELECT status, state_revision FROM projects WHERE id=?",
+                        (pid,)).fetchone()
+    if proj["status"] not in ("SEARCH", "BASELINE_ACCEPTANCE"):
+        conn.execute(
+            "INSERT INTO audit_events(id,actor,action,payload_json) VALUES(?,?,?,?)",
+            (nid("aud"), "agent", "project.pause_skipped",
+             json.dumps({"project": pid, "status": proj["status"],
+                         "pause_reason": pause_reason, **payload}, sort_keys=True)))
+        return
+    Tx.s_cas(conn, "projects", "project", pid, proj["status"], "PAUSED",
+             proj["state_revision"], event="pause", actor="agent",
+             reason={"pause_reason": pause_reason, **payload})
+    conn.execute(
+        "UPDATE projects SET pause_reason=?, paused_from_state=? "
+        "WHERE id=? AND status='PAUSED'", (pause_reason, proj["status"], pid))
 
 
 def apply_stop_ack(attempt_id: str, final_cumulative_s: int = 0, usage_seq: int = 0):
@@ -302,6 +366,9 @@ async def _ingest_event(state, server, inst, ev: dict):
         state.db, Tx.tx_ingest, inst["id"], seq, etype, apply,
         info["expect_epoch"], info["current_epoch"], payload)
 
+    if applied and etype == "failed":
+        await _maybe_redispatch(state, info["run_id"])
+
     if applied and etype == "usage":
         await _emit_budget(state, info)
     if applied and etype in ("finished", "failed", "stop_ack", "deadline_exceeded_ack"):
@@ -380,3 +447,96 @@ async def _tail_logs(state, server, client, last_tail: dict):
              "cumulative_s": detail.get("cumulative_s")},
             aggregate={"type": "attempt", "id": row["id"], "project_id": row["project_id"]},
             project_id=row["project_id"])
+
+
+# ---------------------------------------------------------------------
+# 同机自动重派（INFRA_RETRY，deviation #17：换机重派后置）
+# ---------------------------------------------------------------------
+
+async def _maybe_redispatch(state, run_id: str):
+    """run 处于 INFRA_RETRY 且无在途 attempt → 复用原清单（同机同路径）重派。
+    预算重新走 T-AUTHORIZE-DISPATCH（新授权）；命令/代码/数据路径不变。"""
+    def _load(conn):
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is None or run["status"] != "INFRA_RETRY":
+            return None
+        active = conn.execute(
+            "SELECT 1 FROM attempts WHERE run_id=? AND status NOT IN "
+            "('FINISHED','FAILED','STOP_CONFIRMED','CANCELLED')", (run_id,)).fetchone()
+        if active:
+            return None
+        last = conn.execute(
+            "SELECT a.*, o.payload_json FROM attempts a JOIN outbox o "
+            "ON o.idempotency_key='dispatch:'||a.dispatch_id WHERE a.run_id=? "
+            "AND a.server_id IS NOT NULL ORDER BY a.seq DESC LIMIT 1", (run_id,)).fetchone()
+        acc = conn.execute("SELECT * FROM budget_accounts WHERE project_id=?",
+                           (run["project_id"],)).fetchone()
+        return {"run": dict(run), "last": dict(last) if last else None,
+                "acc": dict(acc) if acc else None}
+    ctx = await to_thread(state.db, _load)
+    if ctx is None or ctx["last"] is None:
+        return None
+    run, last, acc = ctx["run"], ctx["last"], ctx["acc"]
+    old_manifest = json.loads(last["payload_json"]).get("manifest") or {}
+    margin = 31
+    allocatable = (acc["limit_s"] - acc["consumed_s"] - acc["reserved_s"]) if acc else 0
+    authorized = min(old_manifest.get("budget", {}).get("execution_cap_s", 300) or 300,
+                     max(0, allocatable - margin))
+    if authorized <= margin:
+        state.hub.publish_threadsafe(
+            state.loop, "run.redispatch_blocked",
+            {"run_id": run_id, "reason": "budget exhausted"},
+            aggregate={"type": "run", "id": run_id})
+        return None
+
+    from datetime import datetime, timedelta, timezone
+    attempt_id = nid("at")
+    dispatch_id = f"disp-{attempt_id}"
+    issued = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires = (datetime.now(timezone.utc) +
+               timedelta(seconds=authorized + margin + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    m = dict(old_manifest)
+    m.update({"dispatch_id": dispatch_id, "attempt_id": attempt_id,
+              "issued_at": issued, "deadline_at": expires,
+              "output_dir": f"~/autolab/runs/{dispatch_id}",
+              "budget": {"execution_cap_s": authorized}})
+    mh = manifest_mod.manifest_hash(m)
+    seq = last["seq"] + 1
+
+    def _redispatch(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT status, state_revision FROM runs WHERE id=?",
+                               (run_id,)).fetchone()
+            if row["status"] != "INFRA_RETRY":
+                conn.execute("ROLLBACK")
+                return None
+            Tx.s_cas(conn, "runs", "run", run_id, "INFRA_RETRY", "READY_TO_DISPATCH",
+                     row["state_revision"], event="redispatched", actor="sidecar",
+                     reason={"previous_attempt": last["id"]})
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return Tx.tx_authorize_dispatch(
+            conn, run_id, attempt_id, server=last["server_id"], profile="train",
+            dispatch_id=dispatch_id, seq=seq, authorized_s=authorized,
+            manifest_hash=mh, expires=expires, margin_s=margin,
+            gpu_id=last["gpu_id"], manifest_payload=m)
+    result = await to_thread(state.db, _redispatch)
+    if result is None:
+        return None
+
+    def _queue(conn):
+        row = conn.execute("SELECT status, state_revision FROM runs WHERE id=?",
+                           (run_id,)).fetchone()
+        if row["status"] == "READY_TO_DISPATCH":
+            Tx.s_cas(conn, "runs", "run", run_id, "READY_TO_DISPATCH", "QUEUED",
+                     row["state_revision"], event="dispatch_ready", actor="sidecar",
+                     reason={"redispatch": True, "dispatch_id": dispatch_id})
+    await to_thread(state.db, _queue)
+    state.hub.publish_threadsafe(
+        state.loop, "run.redispatched",
+        {"run_id": run_id, "attempt_id": attempt_id, "authorized_s": authorized},
+        aggregate={"type": "run", "id": run_id})
+    return attempt_id

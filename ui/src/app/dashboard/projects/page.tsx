@@ -19,6 +19,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 
 interface ProjectRow {
   id: string; name: string; status: string; state_revision: number; outcome: string | null;
+  pause_reason?: string | null;
 }
 interface ProjectDetail extends ProjectRow {
   budget: { limit_s: number; consumed_s: number; reserved_s: number };
@@ -106,6 +107,40 @@ export default function ProjectsPage() {
     }
   };
 
+  const resumeProject = async (p: ProjectDetail) => {
+    setBusy(`${p.id}:resume`);
+    try {
+      const r = await api<{ status: string }>('POST', `/api/v1/projects/${p.id}/resume`,
+        { expected_state_revision: p.state_revision });
+      setNote(`项目已恢复 → ${r.status}`);
+      await refresh();
+    } catch (e) {
+      setNote(e instanceof ApiError ? `${e.code}: ${e.message}` : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const acceptBaseline = async (p: ProjectDetail, verdict: 'accept' | 'reject') => {
+    setBusy(`${p.id}:baseline`);
+    try {
+      const notes = window.prompt(
+        verdict === 'accept'
+          ? '验收备注（如与论文数值差异）'
+          : '驳回原因（将暂停项目，pause_reason=manual_baseline）',
+        '') ?? '';
+      const r = await api<{ status: string; noop: boolean }>(
+        'POST', `/api/v1/projects/${p.id}/baseline-acceptance`,
+        { verdict, expected_state_revision: p.state_revision, notes });
+      setNote(`基线验收 ${verdict} → 项目 ${r.status}${r.noop ? '（幂等 no-op）' : ''}`);
+      await refresh();
+    } catch (e) {
+      setNote(e instanceof ApiError ? `${e.code}: ${e.message}` : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const freeze = async (p: ProjectDetail) => {
     setBusy(`${p.id}:freeze`);
     try {
@@ -180,6 +215,7 @@ export default function ProjectsPage() {
                 <div className="flex flex-wrap items-center gap-3">
                   <span className="font-medium">{p.name}</span>
                   <Badge variant="outline">{PHASE_LABEL[p.status] ?? p.status}</Badge>
+                  {p.pause_reason && <Badge variant="destructive">{p.pause_reason}</Badge>}
                   <span className="font-mono text-xs text-muted-foreground">{p.id.slice(0, 14)}… · rev {p.state_revision}</span>
                   <span className="ml-auto flex gap-2">
                     {p.status === 'INIT' && (
@@ -190,6 +226,18 @@ export default function ProjectsPage() {
                     )}
                     {p.status === 'REVIEW_GATE' && (
                       <Button size="sm" disabled={busy === `${p.id}:freeze`} onClick={() => freeze(p)}>确认定稿（冻结 plan）</Button>
+                    )}
+                    {p.status === 'PAUSED' && (
+                      <Button size="sm" variant="outline" disabled={busy === `${p.id}:resume`}
+                              onClick={() => resumeProject(p)}>▶ 恢复（resume）</Button>
+                    )}
+                    {p.status === 'BASELINE_ACCEPTANCE' && (
+                      <>
+                        <Button size="sm" disabled={busy === `${p.id}:baseline`}
+                                onClick={() => acceptBaseline(p, 'accept')}>✔ 验收基线（→搜索）</Button>
+                        <Button size="sm" variant="outline" disabled={busy === `${p.id}:baseline`}
+                                onClick={() => acceptBaseline(p, 'reject')}>驳回（暂停）</Button>
+                      </>
                     )}
                     <Button size="sm" variant="ghost" onClick={() => router.push(`/dashboard?project=${p.id}`)}>监视 →</Button>
                   </span>
