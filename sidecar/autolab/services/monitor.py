@@ -201,7 +201,8 @@ async def run_monitor(state):
                 try:
                     inst = await _instance_for(state, server, client)
                 except AgentError:
-                    await to_thread(state.db, _mark_unreachable, server["id"])
+                    # agent 不在 ≠ 服务器不可达（SSH 可能完全正常）：
+                    # 连通性状态由 connectivity-test 端点权威判定，这里不动它
                     continue
                 await to_thread(state.db, _mark_reachable, server["id"])
                 cursor = await to_thread(
@@ -224,15 +225,6 @@ async def run_monitor(state):
                                          {"scope": "monitor", "error": str(e)[:300]})
         await asyncio.sleep(1.0)
 
-
-def _mark_unreachable(conn, server_id):
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute("UPDATE servers SET status='UNREACHABLE', updated_at=datetime('now') "
-                     "WHERE id=?", (server_id,))
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
 
 
 def _mark_reachable(conn, server_id):
