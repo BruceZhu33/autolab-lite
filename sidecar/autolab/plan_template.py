@@ -9,8 +9,8 @@ from __future__ import annotations
 
 def make_plan(bound_dv: str, bound_validator: str, bound_evaluator: str,
               master_server: str, master_path: str,
-              train_command: str = "python train.py",
-              eval_command: str = "python eval.py",
+              train_command: str = "python $AUTOLAB_CODE_DIR/train.py",
+              eval_command: str = "python $AUTOLAB_CODE_DIR/eval.py",
               working_dir: str = "$AUTOLAB_CODE_DIR",
               checkpoint_dir: str = "$AUTOLAB_OUT_DIR/checkpoints",
               gpu_budget_s: int = 36000, max_rounds: int = 20,

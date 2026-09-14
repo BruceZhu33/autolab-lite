@@ -444,6 +444,11 @@ async def _ingest_event(state, server, inst, ev: dict):
 
     if applied and etype == "failed":
         await _maybe_redispatch(state, info["run_id"])
+        from . import confirm as confirm_svc
+        try:
+            await confirm_svc.on_run_terminal(state, info["run_id"])
+        except Exception:  # noqa: BLE001
+            pass
 
     if applied and etype == "finished":
         from . import evaluator as evaluator_svc

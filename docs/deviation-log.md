@@ -38,6 +38,9 @@
 
 | 26 | 2026-09-14 | 契约 BLOCKED-ADD-4（review_threads/review_turns/review_confirmations）+ D42 文献 RAG | M3 需要落地评审对话而增补未冻结 | migration `0006_review_turns`：单表 review_turns（挂 module 或 synthesis）+ review_confirmations（可重复定稿，UNIQUE(project) 上 UPDATE）；文献对照 M3-lite = LLM + 已导入论文摘要集合（paper-qa RAG 后置，external 检索模式后置——字段与证据表已按 D42 落库） | 评审结论经 finalize 写入 plan 新版本（D38 链）复用既有冻结流；两段式 D22 全流程实测 |
 
+| 27 | 2026-09-14 | harness PHASE_MATRIX（r5-S5） | 批次 base_seed 复跑（D34 BASE 对照补齐）需在 CONFIRMATION_RUNNING 派发 train，与矩阵 `("baseline","train"):(BASELINE_ACCEPTANCE,)` 冲突 | PHASE_MATRIX 扩展 baseline/train 允许 CONFIRMATION_RUNNING | 矩阵本意为防 INIT 期派发；确认期 BASE 复跑是批次语义必需 |
+| 28 | 2026-09-14 | 契约 openapi（73 路径）vs M4 实现面 | 确认域新端点（candidates/selection、batches/freeze、final-confirmation/read、reports）按契约语义实现但个别请求体简化（如 selection 无参数化规则） | 攒批对齐 openapi；核心不变量②经 tx_final_read 移植全量生效（幂等重放/异键拒绝/G7 结果齐备检查） | 语义一致优先于形状一致 |
+
 ## 与契约一致（零偏离）的核心面
 
 - **事务模板**：`s_cas / tx_usage / tx_settle / tx_drain_* / tx_authorize_dispatch / tx_ingest / tx_ingest_snapshot / tx_freeze` 逐字移植 harness（guard/错误码/幂等语义一致）——`tests/test_tx_contract_parity.py` 9/9

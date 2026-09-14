@@ -49,6 +49,11 @@ def _now_iso(offset_s: int = 0) -> str:
 # ---------------------------------------------------------------------
 
 async def on_train_finished(state, run_id: str, train_attempt_id: str):
+    await on_train_finished_scope(state, run_id, train_attempt_id, scope="val")
+
+
+async def on_train_finished_scope(state, run_id: str, train_attempt_id: str,
+                                  scope: str = "val"):
     def _load(conn):
         run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if run is None:
@@ -59,13 +64,13 @@ async def on_train_finished(state, run_id: str, train_attempt_id: str):
             "SELECT * FROM evaluator_snapshots WHERE project_id=? ORDER BY frozen_at LIMIT 1",
             (run["project_id"],)).fetchone()
         sp = conn.execute(
-            "SELECT id FROM splits WHERE proto_id=? AND role='val' LIMIT 1",
-            (run["plan_protocol_id"],)).fetchone()
+            "SELECT id FROM splits WHERE proto_id=? AND role=? LIMIT 1",
+            (run["plan_protocol_id"], scope)).fetchone()
         at = conn.execute("SELECT * FROM attempts WHERE id=?", (train_attempt_id,)).fetchone()
         server = conn.execute("SELECT * FROM servers WHERE id=?", (at["server_id"],)).fetchone()
         existing = conn.execute(
-            "SELECT id FROM evaluation_requests WHERE run_id=? AND scope='val'",
-            (run_id,)).fetchone()
+            "SELECT id FROM evaluation_requests WHERE run_id=? AND scope=?",
+            (run_id, scope)).fetchone()
         return {"run": dict(run), "plan": proto["frozen_yaml"], "ev": dict(ev),
                 "split": sp["id"] if sp else None, "at": dict(at),
                 "server": dict(server), "existing": dict(existing) if existing else None}
@@ -93,7 +98,7 @@ async def on_train_finished(state, run_id: str, train_attempt_id: str):
                 "data_version_id,split_id,ckpt_artifact_id,ckpt_expected_sha256,"
                 "evaluator_snapshot_id,evaluator_digest,ckpt_selection_rule_ver) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (req_id, run_id, "val", ctx["run"]["plan_protocol_id"],
+                (req_id, run_id, scope, ctx["run"]["plan_protocol_id"],
                  ctx["run"]["data_version_id"], ctx["split"], art_id, ckpt_sha,
                  ctx["ev"]["id"], ctx["ev"]["digest"], "best-val@1"))
             conn.execute(
@@ -106,8 +111,14 @@ async def on_train_finished(state, run_id: str, train_attempt_id: str):
     req_id = await to_thread(state.db, _create)
 
     plan = json.loads(ctx["plan"])
+    eval_cmd = plan["commands"]["eval_command_template"]
+    # 相对命令增强：脚本名 → $AUTOLAB_CODE_DIR/ 前缀（运行 cwd 是输出目录）
+    import re as _re
+    m = _re.match(r"^(python[\d.]*)\s+([\w./-]+\.(?:py|sh))\s*(.*)$", eval_cmd)
+    if m and not m.group(2).startswith(("/", "$")):
+        eval_cmd = f"{m.group(1)} $AUTOLAB_CODE_DIR/{m.group(2)} {m.group(3)}".strip()
     await _dispatch_eval_attempt(state, ctx, req_id, profile="infer",
-                                 command=plan["commands"]["eval_command_template"],
+                                 command=eval_cmd,
                                  env_extra={"AUTOLAB_EVAL_DIR": "$AUTOLAB_OUT_DIR"})
     return {"id": req_id}
 
@@ -157,7 +168,8 @@ def _hash_dir(root: Path) -> tuple[dict, str]:
 async def on_infer_finished(state, run_id: str, infer_attempt_id: str):
     def _load(conn):
         req = conn.execute(
-            "SELECT * FROM evaluation_requests WHERE run_id=? AND scope='val'", (run_id,)).fetchone()
+            "SELECT * FROM evaluation_requests WHERE run_id=? ORDER BY created_at DESC LIMIT 1",
+            (run_id,)).fetchone()
         at = conn.execute("SELECT * FROM attempts WHERE id=?", (infer_attempt_id,)).fetchone()
         run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         server = conn.execute("SELECT * FROM servers WHERE id=?", (at["server_id"],)).fetchone()
@@ -252,15 +264,16 @@ async def on_agg_finished(state, run_id: str, agg_attempt_id: str, log_tail: str
     m = re.search(r"AUTOLAB_METRICS (\{.*\})", log_tail)
     if not m:
         req = await to_thread(state.db, lambda conn: conn.execute(
-            "SELECT id FROM evaluation_requests WHERE run_id=? AND scope='val'",
+            "SELECT id FROM evaluation_requests WHERE run_id=? ORDER BY created_at DESC LIMIT 1",
             (run_id,)).fetchone()[0])
         await _mark_eval_failed(state, req, "agg 日志无 AUTOLAB_METRICS")
         return
     metrics = json.loads(m.group(1))
 
     def _load(conn):
-        req = conn.execute("SELECT * FROM evaluation_requests WHERE run_id=? AND scope='val'",
-                           (run_id,)).fetchone()
+        req = conn.execute(
+            "SELECT * FROM evaluation_requests WHERE run_id=? ORDER BY created_at DESC LIMIT 1",
+            (run_id,)).fetchone()
         run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         return dict(req), dict(run)
     req, run = await to_thread(state.db, _load)
@@ -301,6 +314,15 @@ async def on_agg_finished(state, run_id: str, agg_attempt_id: str, log_tail: str
         {"run_id": run_id, "scope": "val", "metrics": metrics},
         aggregate={"type": "evaluation", "id": req["id"], "project_id": pid},
         project_id=pid)
+    # M4：批次条目 run → test 评测 + 批次推进（在 auto_continue 之前——
+    # CONFIRMATION_RUNNING 下 judge.evaluate 不触发 continue）
+    from . import confirm as confirm_svc
+    try:
+        await confirm_svc.on_run_judged_test(state, run_id)
+        await confirm_svc.on_run_terminal(state, run_id)
+    except Exception as e:  # noqa: BLE001
+        state.hub.publish_threadsafe(state.loop, "system.error",
+                                     {"scope": "confirm", "error": str(e)[:300]})
     # M2-3：先判定后行动
     from . import judge
     await judge.auto_continue(state, pid)
@@ -327,6 +349,42 @@ async def _dispatch_eval_attempt(state, ctx, req_id: str, profile: str, command:
 # ---------------------------------------------------------------------
 # 对账 sweep：事件钩子漏拍时自愈（每 10s 扫描卡住的评测链）
 # ---------------------------------------------------------------------
+
+async def _retry_failed_infer(state):
+    """infer attempt FAILED 且 request INFER_PENDING → 重派 infer（≤2 次）。"""
+    def _stuck(conn):
+        rows = conn.execute(
+            "SELECT rq.id req_id, rq.run_id, a.id at_id FROM evaluation_requests rq "
+            "JOIN attempts a ON a.evaluation_request_id=rq.id AND a.profile='infer' "
+            "WHERE rq.status='INFER_PENDING' AND a.status='FAILED' "
+            "AND (SELECT COUNT(*) FROM attempts x WHERE x.evaluation_request_id=rq.id "
+            "     AND x.profile='infer') <= 2 ORDER BY rq.created_at LIMIT 5").fetchall()
+        return [dict(r) for r in rows]
+    for row in await to_thread(state.db, _stuck):
+        try:
+            def _ctx(conn):
+                run = conn.execute("SELECT * FROM runs WHERE id=?",
+                                   (row["run_id"],)).fetchone()
+                at = conn.execute("SELECT * FROM attempts WHERE id=?",
+                                  (row["at_id"],)).fetchone()
+                server = conn.execute("SELECT * FROM servers WHERE id=?",
+                                      (at["server_id"],)).fetchone()
+                proto = conn.execute("SELECT frozen_yaml FROM plan_protocols WHERE id=?",
+                                     (run["plan_protocol_id"],)).fetchone()
+                return dict(run), dict(server), json.loads(proto["frozen_yaml"])
+            run, server, plan = await to_thread(state.db, _ctx)
+            eval_cmd = plan["commands"]["eval_command_template"]
+            import re as _re
+            m = _re.match(r"^(python[\d.]*)\s+([\w./-]+\.(?:py|sh))\s*(.*)$", eval_cmd)
+            if m and not m.group(2).startswith(("/", "$")):
+                eval_cmd = f"{m.group(1)} $AUTOLAB_CODE_DIR/{m.group(2)} {m.group(3)}".strip()
+            await _dispatch_eval_attempt(state, {"run": run, "server": server}, row["req_id"],
+                                         profile="infer", command=eval_cmd,
+                                         env_extra={"AUTOLAB_EVAL_DIR": "$AUTOLAB_OUT_DIR"})
+        except Exception as e:  # noqa: BLE001
+            state.hub.publish_threadsafe(state.loop, "system.error",
+                                         {"scope": "evaluator.infer_retry", "error": str(e)[:300]})
+
 
 async def _retry_failed_agg(state):
     """agg attempt FAILED 且 request 仍 AGG_RUNNING → 重派 agg（限 2 次）。"""
@@ -364,8 +422,61 @@ async def _retry_failed_agg(state):
 
 
 async def sweep(state):
-    """对账：agg 失败重派 + 事件漏拍自愈。"""
+    """对账：infer 未派/失败重派 + agg 失败重派 + 事件漏拍自愈。"""
+    await _retry_unstarted_infer(state)
+    await _retry_failed_infer(state)
     await _retry_failed_agg(state)
+
+
+async def _retry_unstarted_infer(state):
+    """request INFER_PENDING 但不存在 infer attempt（ckpt 下载失败/钩子漏拍）→ 重建。"""
+    def _stuck(conn):
+        rows = conn.execute(
+            "SELECT rq.id req_id, rq.run_id FROM evaluation_requests rq "
+            "WHERE rq.status='INFER_PENDING' AND NOT EXISTS ("
+            "  SELECT 1 FROM attempts a WHERE a.evaluation_request_id=rq.id) "
+            "AND rq.updated_at < datetime('now', '-30 seconds') "
+            "ORDER BY rq.created_at LIMIT 5").fetchall()
+        return [dict(r) for r in rows]
+    for row in await to_thread(state.db, _stuck):
+        try:
+            def _ctx(conn):
+                run = conn.execute("SELECT * FROM runs WHERE id=?",
+                                   (row["run_id"],)).fetchone()
+                at = conn.execute(
+                    "SELECT id FROM attempts WHERE run_id=? AND profile='train' "
+                    "AND status='FINISHED' ORDER BY seq LIMIT 1",
+                    (row["run_id"],)).fetchone()
+                server = conn.execute(
+                    "SELECT s.* FROM servers s JOIN attempts a ON a.server_id=s.id "
+                    "WHERE a.run_id=? AND a.profile='train' LIMIT 1",
+                    (row["run_id"],)).fetchone()
+                return (dict(run) if run else None,
+                        dict(at) if at else None, dict(server) if server else None)
+            run, train_at, server = await to_thread(state.db, _ctx)
+            if not (run and train_at and server):
+                continue
+            # 既有 request：直接按 scope 重派 infer
+            scope_row = await to_thread(state.db, lambda conn: conn.execute(
+                "SELECT scope FROM evaluation_requests WHERE id=?",
+                (row["req_id"],)).fetchone())
+            proto = await to_thread(state.db, lambda conn: conn.execute(
+                "SELECT frozen_yaml FROM plan_protocols WHERE id=?",
+                (run["plan_protocol_id"],)).fetchone())
+            plan = json.loads(proto["frozen_yaml"])
+            eval_cmd = plan["commands"]["eval_command_template"]
+            import re as _re
+            m = _re.match(r"^(python[\d.]*)\s+([\w./-]+\.(?:py|sh))\s*(.*)$", eval_cmd)
+            if m and not m.group(2).startswith(("/", "$")):
+                eval_cmd = f"{m.group(1)} $AUTOLAB_CODE_DIR/{m.group(2)} {m.group(3)}".strip()
+            await _dispatch_eval_attempt(state, {"run": run, "server": server},
+                                         row["req_id"], profile="infer",
+                                         command=eval_cmd,
+                                         env_extra={"AUTOLAB_EVAL_DIR": "$AUTOLAB_OUT_DIR"})
+        except Exception as e:  # noqa: BLE001
+            state.hub.publish_threadsafe(state.loop, "system.error",
+                                         {"scope": "evaluator.unstarted_infer",
+                                          "error": str(e)[:300]})
     """INFER_PENDING + infer 已 FINISHED → on_infer_finished；
     AGG_PENDING/AGG_RUNNING + agg 已 FINISHED → on_agg_finished（从日志重取 tail）。"""
     def _stuck(conn):
