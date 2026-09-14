@@ -211,7 +211,7 @@ def test_next_round_llm_failure_pauses_project(m2_state, monkeypatch):
     state, conn, _ = m2_state
     fx = _seed_project(state, conn)
 
-    async def boom(settings, ctx):
+    async def boom(settings, ctx, engine='builtin'):
         raise LLMError("LLM_NETWORK", "mock down")
     monkeypatch.setattr(llm_loop, "propose", boom)
     with pytest.raises(TxError, match="manual_llm"):
