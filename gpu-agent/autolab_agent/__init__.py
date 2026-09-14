@@ -1,4 +1,4 @@
-"""AutoLab gpu-agent —— 服务器端执行代理（设计 §5 契约的 M1 实现）。
+"""AutoLab gpu-agent —— 服务器端执行代理（0.1.2：HMAC 清单校验默认强制）。
 
 能力（M1/v0）：
 - POST /attempts（dispatch_id 幂等 + manifest HMAC 可选校验）→ 事件 ack/remote_start/running
@@ -13,5 +13,5 @@
 沙箱（Z1 三用户/systemd transient）：M1 后置（明文跑通后收紧——开工指令授权）；
 HMAC 校验由 --require-hmac 开启。
 """
-__version__ = "0.1.1-m2"
+__version__ = "0.1.4-m2"
 SCHEMA_VER = "1"

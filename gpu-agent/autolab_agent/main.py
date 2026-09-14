@@ -16,13 +16,16 @@ from .store import Store
 
 
 def create_app(base_dir: Path | None = None, token: str | None = None,
-               require_hmac: bool = False, hmac_key: str | None = None) -> FastAPI:
+               require_hmac: bool | None = None, hmac_key: str | None = None) -> FastAPI:
     base_dir = base_dir or Path(os.environ.get("AUTOLAB_AGENT_HOME",
                                                Path.home() / ".autolab-agent")).expanduser()
     base_dir.mkdir(parents=True, exist_ok=True)
     token = token or os.environ.get("AUTOLAB_AGENT_TOKEN", "")
     hmac_key = hmac_key or os.environ.get("AUTOLAB_AGENT_HMAC_KEY", token)
-    require_hmac = require_hmac or os.environ.get("AUTOLAB_REQUIRE_HMAC", "") == "1"
+    # 0.1.2：执行清单 HMAC 校验默认强制（sidecar 全部派发路径均携带签名）；
+    # 显式关闭仅限本地裸调试（AUTOLAB_REQUIRE_HMAC=0）
+    if require_hmac is None:
+        require_hmac = os.environ.get("AUTOLAB_REQUIRE_HMAC", "1") == "1"
 
     store = Store(base_dir / "agent.db")
     runner = Runner(store, base_dir)
@@ -30,6 +33,26 @@ def create_app(base_dir: Path | None = None, token: str | None = None,
 
     app = FastAPI(title="AutoLab gpu-agent", version=__version__, docs_url=None,
                   redoc_url=None, openapi_url=None)
+
+    @app.on_event("startup")
+    async def _startup_reconcile():
+        """重启自愈：前任实例遗留的非终态 attempt——杀其记录的进程组（孤儿）、封存 STOPPED，
+        并补发 stop_ack 事件（instance_id 跨重启稳定，控制端经正常事件流收口，D31）。"""
+        from .runner import _kill_group_by_pid, _wait_pid_gone
+        for at in store.nonterminal():
+            if at["pid"]:
+                try:
+                    os.kill(at["pid"], 0)
+                    _kill_group_by_pid(at["pid"])
+                    _wait_pid_gone(at["pid"], timeout=10)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            store.update_attempt(at["dispatch_id"], status="STOPPED", ended_at=None)
+            store.emit(at["dispatch_id"], "stop_ack",
+                       {"dispatch_id": at["dispatch_id"],
+                        "final_cumulative_s": at["cumulative_s"] or 0,
+                        "usage_seq": 999998,
+                        "reason": "agent_restart_boot_reconcile"})
 
     def _auth(x_agent_token: str | None):
         if token and x_agent_token != token:

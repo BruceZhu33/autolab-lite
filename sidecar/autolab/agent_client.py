@@ -63,6 +63,16 @@ class AgentClient:
                              body.get("error", {}).get("message", r.text[:200]), r.status_code)
         return r.json()
 
+    async def get_attempts_list(self) -> dict:
+        try:
+            async with await self._client() as c:
+                r = await c.get("/attempts")
+        except httpx.HTTPError as e:
+            raise AgentError("AGENT_UNREACHABLE", str(e)) from e
+        if r.status_code >= 400:
+            raise AgentError("AGENT_EVENTS_FAILED", r.text[:200], r.status_code)
+        return r.json()
+
     async def stop_attempt(self, dispatch_id: str) -> dict:
         try:
             async with await self._client() as c:

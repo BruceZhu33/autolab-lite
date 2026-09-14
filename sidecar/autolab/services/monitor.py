@@ -40,6 +40,18 @@ def _advance(conn, layer, table, agg_id, to_state, event, reason=None) -> bool:
         raise TxError("NOT_FOUND", f"{layer} {agg_id}")
     if row["status"] == to_state:
         return False
+    # 迟到/乱序事件防毒丸：无合法边 → 跳过并留审计（不阻断事件流）
+    legal = conn.execute(
+        "SELECT 1 FROM sm_legal_transitions WHERE layer=? AND from_state=? "
+        "AND event=? AND to_state=?",
+        (layer, row["status"], event, to_state)).fetchone()
+    if not legal:
+        conn.execute(
+            "INSERT INTO audit_events(id,actor,action,payload_json) VALUES(?,?,?,?)",
+            (nid("aud"), "agent", "event.edge_skipped",
+             json.dumps({"layer": layer, "id": agg_id, "from": row["status"],
+                         "event": event, "to": to_state}, sort_keys=True)))
+        return False
     Tx.s_cas(conn, table, layer, agg_id, row["status"], to_state, row["state_revision"],
              event=event, actor="agent", reason=reason)
     return True
@@ -82,8 +94,11 @@ def apply_finished(attempt_id: str, run_id: str, rc: int, tail: str):
         row = _row(conn, "attempts", attempt_id)
         if row and row["status"] in TERMINALS:
             return False
-        _advance(conn, "attempt", "attempts", attempt_id, "FINISHED", "finished",
-                 reason={"rc": rc})
+        moved = _advance(conn, "attempt", "attempts", attempt_id, "FINISHED", "finished",
+                         reason={"rc": rc})
+        after = _row(conn, "attempts", attempt_id)
+        if not (moved or after["status"] == "FINISHED"):
+            return False  # 迟到事件（无可行边）
         Tx.tx_settle(conn, attempt_id, "completed")
         at = conn.execute("SELECT profile FROM attempts WHERE id=?",
                           (attempt_id,)).fetchone()
@@ -111,8 +126,11 @@ def apply_failed(attempt_id: str, run_id: str, rc: int, fail_class: str, reason:
         row = _row(conn, "attempts", attempt_id)
         if row and row["status"] in TERMINALS:
             return False
-        _advance(conn, "attempt", "attempts", attempt_id, "FAILED", "failed",
-                 reason={"rc": rc, "fail_class": fail_class})
+        moved = _advance(conn, "attempt", "attempts", attempt_id, "FAILED", "failed",
+                         reason={"rc": rc, "fail_class": fail_class})
+        after = _row(conn, "attempts", attempt_id)
+        if not (moved or after["status"] == "FAILED"):
+            return False  # 迟到事件
         conn.execute("UPDATE attempts SET fail_class=?, fail_reason=?, "
                      "updated_at=datetime('now') WHERE id=?",
                      (fail_class, reason[:500], attempt_id))
@@ -183,7 +201,10 @@ def apply_stop_ack(attempt_id: str, final_cumulative_s: int = 0, usage_seq: int 
         if final_cumulative_s and usage_seq:
             Tx.tx_usage(conn, attempt_id, usage_seq, final_cumulative_s)
         event = "stop_sig_exit" if row["status"] == "RUNNING" else "stop_ack"
-        _advance(conn, "attempt", "attempts", attempt_id, "STOP_CONFIRMED", event)
+        moved = _advance(conn, "attempt", "attempts", attempt_id, "STOP_CONFIRMED", event)
+        after = _row(conn, "attempts", attempt_id)
+        if not (moved or after["status"] == "STOP_CONFIRMED"):
+            return False  # 迟到事件（无可行边）：仅入库留痕
         Tx.tx_settle(conn, attempt_id, "stop_confirmed")
         _free_gpu(conn, attempt_id)
         return True
@@ -254,7 +275,40 @@ def _resolve_and_build(state, ev: dict):
     return _q
 
 
+async def _poll_one_server(state, server, last_tail: dict):
+    """单服务器一轮：实例→事件摄入→对账→日志尾。"""
+    creds = state.agent_credential(server_row=server)
+    client = AgentClient(state.transport_for(server), server["agent_port"],
+                         creds["agent_token"])
+    try:
+        inst = await _instance_for(state, server, client)
+    except AgentError:
+        return
+    await to_thread(state.db, _mark_reachable, server["id"])
+    cursor = await to_thread(
+        state.db,
+        lambda conn: conn.execute(
+            "SELECT last_seq FROM agent_cursors WHERE agent_instance_id=?",
+            (inst["id"],)).fetchone()[0])
+    try:
+        data = await client.events(cursor, inst["id"])
+    except AgentError as e:
+        if e.code == "INSTANCE_ROTATED":
+            await to_thread(state.db, _drop_instance, inst["id"])
+            try:
+                h = await client.healthz()
+                await to_thread(state.db, _register_instance, server["id"], h)
+                await _reconcile_agent_snapshot(state, server, client)
+            except AgentError:
+                pass
+        return
+    for ev in data.get("events", []):
+        await _ingest_event(state, server, inst, ev)
+    await _tail_logs(state, server, client, last_tail)
+
+
 async def run_monitor(state):
+    """监视主循环（watchdog：单服务器轮询 120s 限时，超时弃传输重建——防单点挂起）。"""
     last_tail: dict[str, float] = {}
     while True:
         try:
@@ -263,36 +317,37 @@ async def run_monitor(state):
                     "SELECT * FROM servers WHERE status != 'DECOMMISSIONED' "
                     "AND agent_port IS NOT NULL").fetchall()])
             for server in servers:
-                creds = state.agent_credential(server_row=server)
-                client = AgentClient(state.transport_for(server), server["agent_port"],
-                                     creds["agent_token"])
                 try:
-                    inst = await _instance_for(state, server, client)
-                except AgentError:
-                    # agent 不在 ≠ 服务器不可达（SSH 可能完全正常）：
-                    # 连通性状态由 connectivity-test 端点权威判定，这里不动它
-                    continue
-                await to_thread(state.db, _mark_reachable, server["id"])
-                cursor = await to_thread(
-                    state.db,
-                    lambda conn: conn.execute(
-                        "SELECT last_seq FROM agent_cursors WHERE agent_instance_id=?",
-                        (inst["id"],)).fetchone()[0])
-                try:
-                    data = await client.events(cursor, inst["id"])
-                except AgentError as e:
-                    if e.code == "INSTANCE_ROTATED":
-                        # agent 重启：重新注册实例（全量对账 M1 简化为重新拉事件流）
-                        await to_thread(state.db, _drop_instance, inst["id"])
-                    continue
-                for ev in data.get("events", []):
-                    await _ingest_event(state, server, inst, ev)
-                await _tail_logs(state, server, client, last_tail)
+                    await asyncio.wait_for(
+                        _poll_one_server(state, server, last_tail), timeout=120)
+                except (TimeoutError, asyncio.TimeoutError):
+                    state.hub.publish_threadsafe(state.loop, "system.error",
+                                                 {"scope": "monitor.watchdog",
+                                                  "error": f"server {server['id']} poll "
+                                                           "timed out; transport recycled"})
+                    tr = state.transports.pop(server["id"], None)
+                    if tr:
+                        try:
+                            await tr.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception as e:  # noqa: BLE001
+                    state.hub.publish_threadsafe(state.loop, "system.error",
+                                                 {"scope": "monitor", "error": str(e)[:200]})
         except Exception as e:  # noqa: BLE001
             state.hub.publish_threadsafe(state.loop, "system.error",
                                          {"scope": "monitor", "error": str(e)[:300]})
+        try:
+            await _deadline_watch(state)
+        except Exception as e:  # noqa: BLE001
+            state.hub.publish_threadsafe(state.loop, "system.error",
+                                         {"scope": "deadline-watch", "error": str(e)[:300]})
+        try:
+            await _finish_stopping_projects(state)
+        except Exception as e:  # noqa: BLE001
+            state.hub.publish_threadsafe(state.loop, "system.error",
+                                         {"scope": "stopping-watcher", "error": str(e)[:300]})
         await asyncio.sleep(1.0)
-
 
 
 def _mark_reachable(conn, server_id):
@@ -303,6 +358,22 @@ def _mark_reachable(conn, server_id):
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
+
+
+def _register_instance(conn, server_id: str, h: dict):
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_instances(id,server_id,agent_ver,schema_ver) "
+            "VALUES(?,?,?,?)", (h["agent_instance_id"], server_id,
+                                h.get("agent_ver"), h.get("schema_ver")))
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_cursors(agent_instance_id,last_seq) VALUES(?,0)",
+            (h["agent_instance_id"],))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _drop_instance(conn, instance_id):
@@ -562,3 +633,121 @@ async def _maybe_redispatch(state, run_id: str):
         {"run_id": run_id, "attempt_id": attempt_id, "authorized_s": authorized},
         aggregate={"type": "run", "id": run_id})
     return attempt_id
+
+
+# ---------------------------------------------------------------------
+# STOPPING 完成监视器（统一项目终止事件：全部 attempt 终态 → FINISHING）
+# ---------------------------------------------------------------------
+
+async def _finish_stopping_projects(state):
+    def _stuck(conn):
+        rows = conn.execute(
+            "SELECT p.id, p.state_revision, p.outcome FROM projects p "
+            "WHERE p.status='STOPPING' AND NOT EXISTS ("
+            "  SELECT 1 FROM attempts a JOIN runs r ON r.id=a.run_id "
+            "  WHERE r.project_id=p.id AND a.status NOT IN "
+            "  ('FINISHED','FAILED','STOP_CONFIRMED','CANCELLED'))").fetchall()
+        return [dict(r) for r in rows]
+
+    def _finish(conn, row):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            Tx.s_cas(conn, "projects", "project", row["id"], "STOPPING", "FINISHING",
+                     row["state_revision"], "all_attempts_terminal_or_stop_confirmed",
+                     actor="sidecar", reason={"watcher": "stopping-completion"})
+            conn.execute("UPDATE projects SET outcome=COALESCE(outcome,'stopped') WHERE id=?",
+                         (row["id"],))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    for row in await to_thread(state.db, _stuck):
+        await to_thread(state.db, _finish, row)
+        state.hub.publish_threadsafe(
+            state.loop, "project.state_changed",
+            {"to": "FINISHING", "event": "all_attempts_terminal_or_stop_confirmed"},
+            aggregate={"type": "project", "id": row["id"]}, project_id=row["id"])
+
+
+# ---------------------------------------------------------------------
+# agent 实例轮换后的快照对账（D31：先对账再调度）
+# ---------------------------------------------------------------------
+
+_AGENT_STATUS_MAP = {
+    "ACCEPTED": "REMOTE_QUEUED", "REMOTE_QUEUED": "REMOTE_QUEUED", "RUNNING": "RUNNING",
+    "FINISHED": "FINISHED", "FAILED": "FAILED", "STOPPED": "STOP_CONFIRMED",
+}
+
+
+async def _reconcile_agent_snapshot(state, server, client):
+    """agent 重启后：GET /attempts 全量快照 → 对本侧非终态 attempt 应用权威状态。"""
+    try:
+        listing = await client.get_attempts_list()
+    except AgentError:
+        return  # 下轮重试
+    agent_rows = {a["dispatch_id"]: a for a in listing.get("attempts", [])}
+
+    def _pending(conn):
+        rows = conn.execute(
+            "SELECT a.id, a.dispatch_id, a.status FROM attempts a WHERE a.server_id=? "
+            "AND a.status NOT IN ('FINISHED','FAILED','STOP_CONFIRMED','CANCELLED')",
+            (server["id"],)).fetchall()
+        inst = conn.execute(
+            "SELECT id FROM agent_instances WHERE server_id=? ORDER BY started_at DESC LIMIT 1",
+            (server["id"],)).fetchone()
+        return [dict(r) for r in rows], (inst["id"] if inst else None)
+
+    pending, inst_id = await to_thread(state.db, _pending)
+    if not inst_id or not pending:
+        return
+    snapshot = []
+    for row in pending:
+        agent_row = agent_rows.get(row["dispatch_id"])
+        if not agent_row:
+            continue  # agent 库里没有（从未到达）——保持，由 deadline 兜底
+        to_status = _AGENT_STATUS_MAP.get(agent_row["status"])
+        if to_status in ("FINISHED", "FAILED", "STOP_CONFIRMED"):
+            snapshot.append((row["id"], to_status, agent_row.get("cumulative_s")))
+    if not snapshot:
+        return
+    watermark = listing.get("max_seq") or 0
+    try:
+        await to_thread(state.db, Tx.tx_ingest_snapshot, inst_id, snapshot, 0, watermark)
+        state.hub.publish_threadsafe(state.loop, "agent.reconciled",
+                                     {"server_id": server["id"], "reconciled": len(snapshot)},
+                                     aggregate={"type": "sync", "id": server["id"]})
+    except Exception as e:  # noqa: BLE001 —— 对账失败下轮重试
+        state.hub.publish_threadsafe(state.loop, "system.error",
+                                     {"scope": "reconcile", "error": str(e)[:300]})
+
+
+async def _deadline_watch(state):
+    """预留超时而无 agent 终态回执 → ATTEMPT_STOP_UNKNOWN（对账兜底；R 继续计入）。"""
+    def _expired(conn):
+        rows = conn.execute(
+            "SELECT a.id, a.status, a.state_revision FROM attempts a "
+            "JOIN budget_reservations br ON br.attempt_id=a.id "
+            "WHERE a.status IN ('SUBMITTED','ACKED','REMOTE_QUEUED','RUNNING',"
+            "'STOP_REQUESTED','STOP_SENT') AND br.expires_at < datetime('now') "
+            "LIMIT 20").fetchall()
+        return [dict(r) for r in rows]
+
+    def _mark(conn, row):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            Tx.s_cas(conn, "attempts", "attempt", row["id"], row["status"],
+                     "ATTEMPT_STOP_UNKNOWN", row["state_revision"],
+                     "deadline_expired", actor="sidecar",
+                     reason={"watcher": "local-deadline"})
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    for row in await to_thread(state.db, _expired):
+        await to_thread(state.db, _mark, row)
+        state.hub.publish_threadsafe(
+            state.loop, "attempt.state_changed",
+            {"to": "ATTEMPT_STOP_UNKNOWN", "event": "deadline_expired"},
+            aggregate={"type": "attempt", "id": row["id"]})
