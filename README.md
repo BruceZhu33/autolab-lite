@@ -55,5 +55,5 @@ cd ../docs/contracts && python tests/run_all.py              # 契约套件回�
   final-confirmation/read 一次性释放（库级 trigger 生效；API 属 M4）；③ dispatch_id /
   agent 事件幂等（权威哈希比较）；④ 正式指标唯一入口（evaluation_results gate trigger）。
 - **状态机三层**（project/run/attempt）全部经 `sm_legal_transitions` 合法边迁移，
-  伪事件与非法迁移被库级 trigger 拒绝。
+  伪事https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan#h_8dd84c836b件与非法迁移被库级 trigger 拒绝。
 - SSH 生产通道（asyncssh 命令/SFTP/端口转发隧道）与 local 开发通道同一 Transport 抽象。
