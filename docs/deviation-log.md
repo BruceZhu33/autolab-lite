@@ -20,7 +20,8 @@
 | 12 | 2026-09-13 | 需求 D43（划分有效性校验） | M1 无独立校验器实现 | split_validations v1 = 「全部副本 manifest 校验 PASSED + 划分登记入库」（四元组结构与 tx_freeze F2 查询即契约形态） | 完整校验器（对象交叉/预处理拟合范围）M2 随评测执行器落地 |
 | 13 | 2026-09-13 | 需求 [0]（nvidia-smi 探测 GPU） | local 开发机无 nvidia-smi | 增手工登记端点 POST /servers/{id}/gpus | 真实服务器走 nvidia-smi 自动探测（已实现） |
 | 14 | 2026-09-13 | 需求 D20（无 conda 自动补装 Miniconda / conda create 建环境） | M1 实测目标服务器（192.0.2.46）**无出网**：conda create / pip install 均不可用，机器上已有 25 个科研环境 | migration `0003_project_env_reuse`：`projects.env_reuse_name` 列 + 立项参数 `conda_env`；环境搭建支持复用服务器现成 conda 环境（`conda env list` 本地解析 bin_dir，跳过建环境与 pip） | 无出网是既成事实；复用现有环境是该机器上唯一可行路径，D20 语义（"检测到即用"）自然延伸 |
-| 15 | 2026-09-13 | 设计 §5（gpu-agent 部署形态） | 服务器无出网 → agent 依赖（fastapi/uvicorn）无法在线安装 | 离线部署程序：控制机 `pip download --platform manylinux2014_x86_64` 取轮子 → SFTP 推送 → `pip install --no-index --find-links --target pylibs` → `PYTHONPATH=pylibs` 运行；依赖注入不污染既有 conda 环境 | 与 #14 同因；该部署路径已实测成功（真机 A6000 验收即用此法） |
+| 15 | 2026-09-13 | 设计 §5（gpu-agent 部署形态） | 服务器无出网 → agent 依赖（fastapi/uvicorn）无法在线安装 | 离线部署程序：控制机 `pip download --platform manylinux2014_x86_64` 取轮子 → SFTP 推送 → zip 解包到 `pylibs` → `PYTHONPATH=pylibs` 运行；不污染既有 conda 环境 | 与 #14 同因；实测发现老 pip 解析不了新式双平台标签轮子 → 解包为唯一安装路径 |
+| 16 | 2026-09-14 | 设计 §5/§7（agent 生命周期未纳入 v2.7：初始化是注册前置的手工步骤） | **用户提案**：探活应检测 agent 存在性与版本，自动安装/更新 | `services/agent_deploy.py` + `POST /servers/{id}/agent/install|upgrade`：探活带 `deploy_status{installed, agent_ver, expected, needs_upgrade}`；部署 = 选远端 Python（≥3.10，conda envs 兜底）→ 控制机取轮缓存 → SFTP → zip 解包 → setsid nohup 启动 → healthz 验证版本一致；升级有在途任务时拒绝（force 例外）。UI P1 增「部署/修复 Agent」「升级」按钮 | 手工部署两台真机重复劳动沉淀为产品能力；幂等/自动修复/强制升级三场景双真机实测通过 |
 
 ## 与契约一致（零偏离）的核心面
 

@@ -29,6 +29,10 @@ class Config:
         self.db_path = self.data_dir / "autolab.db"
         self.migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
         self.assets_dir = Path(__file__).resolve().parent.parent / "assets"
+        # gpu-agent 源码（自动部署用；dev = 仓库同级目录，打包时随应用分发）
+        _repo_root = Path(__file__).resolve().parents[2]
+        self.agent_src_dir = Path(os.environ.get(
+            "AUTOLAB_AGENT_SRC") or (_repo_root / "gpu-agent"))
         self.projects_dir = self.data_dir / "projects"   # BASE 快照 / 项目产物（产品管理的项目库）
         self.artifacts_dir = self.data_dir / "artifacts"
         self.token_path = self.data_dir / "capability_token"

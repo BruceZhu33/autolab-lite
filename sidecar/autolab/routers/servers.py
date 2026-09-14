@@ -191,28 +191,31 @@ async def list_gpus(server_id: str, request: Request):
 async def agent_probe(server_id: str, request: Request):
     state = request.app.state.autolab
     from ..agent_client import AgentClient, AgentError
+    from ..services import agent_deploy
 
-    server = await to_thread(state.db, _load := (lambda conn: dict(
-        conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone())))
+    server = await to_thread(state.db, lambda conn: dict(
+        conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()))
     if server is None:
         raise TxError("NOT_FOUND", server_id)
     if not server.get("agent_port"):
         raise TxError("GUARD_UNMET", "server has no agent_port registered")
     creds = state.agent_credential(server_row=server)
     client = AgentClient(state.transport_for(server), server["agent_port"], creds["agent_token"])
+    status = await agent_deploy.probe_status(state, server)
     try:
         h = await client.healthz()
     except AgentError as e:
-        return {"ok": False, "error": f"{e.code}: {e.message}"}
-    caps = json.dumps(h.get("capabilities", {}))
+        return {"ok": False, "error": f"{e.code}: {e.message}", "deploy_status": status}
+    # caps 由 _update 内合并 agent_ver
 
     def _update(conn):
+        caps_full = dict(h.get("capabilities", {}), agent_ver=h.get("agent_ver"))
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(
                 "UPDATE servers SET agent_capabilities_json=?, agent_schema_ver=?, "
                 "status='REACHABLE', last_seen_at=datetime('now') WHERE id=?",
-                (caps, h.get("schema_ver"), server_id))
+                (json.dumps(caps_full), h.get("schema_ver"), server_id))
             conn.execute(
                 "INSERT OR IGNORE INTO agent_instances(id,server_id,agent_ver,schema_ver) "
                 "VALUES(?,?,?,?)",
@@ -225,4 +228,43 @@ async def agent_probe(server_id: str, request: Request):
             conn.execute("ROLLBACK")
             raise
     await to_thread(state.db, _update)
-    return {"ok": True, "healthz": h}
+    return {"ok": True, "healthz": h, "deploy_status": status}
+
+
+class AgentInstallRequest(BaseModel):
+    force: bool = Field(default=False, description="有在途任务时也强制重启（危险）")
+
+
+@router.post("/{server_id}/agent/install")
+async def agent_install(server_id: str, request: Request):
+    """幂等安装/修复：已装且版本一致 → no-op；缺失/版本旧 → 全流程部署。"""
+    state = request.app.state.autolab
+    from ..services import agent_deploy
+    server = await to_thread(state.db, lambda conn: dict(
+        conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()))
+    if server is None:
+        raise TxError("NOT_FOUND", server_id)
+    result = await agent_deploy.deploy(state, server, force_restart=False)
+    state.hub.publish_threadsafe(
+        state.loop, "agent.deployed",
+        {"server_id": server_id, "agent_ver": result["agent_ver"],
+         "restarted": result["restarted"]},
+        aggregate={"type": "sync", "id": server_id})
+    return result
+
+
+@router.post("/{server_id}/agent/upgrade")
+async def agent_upgrade(server_id: str, req: AgentInstallRequest, request: Request):
+    """升级：强制重装重启（在途任务 guard 除非 force）。"""
+    state = request.app.state.autolab
+    from ..services import agent_deploy
+    server = await to_thread(state.db, lambda conn: dict(
+        conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()))
+    if server is None:
+        raise TxError("NOT_FOUND", server_id)
+    result = await agent_deploy.deploy(state, server, force_restart=req.force)
+    state.hub.publish_threadsafe(
+        state.loop, "agent.upgraded",
+        {"server_id": server_id, "agent_ver": result["agent_ver"]},
+        aggregate={"type": "sync", "id": server_id})
+    return result

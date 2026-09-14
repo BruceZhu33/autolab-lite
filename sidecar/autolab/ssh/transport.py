@@ -26,6 +26,7 @@ REMOTE_ROOT = "~/autolab"
 class Transport:
     async def exec(self, cmd: str, timeout: float = 300) -> ExecResult: ...
     async def upload_tree(self, local_dir: Path, remote_dir: str) -> None: ...
+    async def upload_file(self, local_path: Path, remote_path: str) -> None: ...
     async def download_file(self, remote_path: str, local_path: Path) -> None: ...
     async def agent_base_url(self, agent_port: int) -> str: ...
     async def close(self) -> None: ...
@@ -56,6 +57,11 @@ class LocalTransport(Transport):
         if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(local_dir, dst)
+
+    async def upload_file(self, local_path: Path, remote_path: str) -> None:
+        dst = self._local(remote_path)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_path, dst)
 
     async def download_file(self, remote_path: str, local_path: Path) -> None:
         local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +142,13 @@ class SshTransport(Transport):
         async with conn.start_sftp_client() as sftp:
             local_path.parent.mkdir(parents=True, exist_ok=True)
             await sftp.get(self._sftp_path(remote_path), str(local_path))
+
+    async def upload_file(self, local_path: Path, remote_path: str) -> None:
+        conn = await self._connect()
+        async with conn.start_sftp_client() as sftp:
+            dst = self._sftp_path(remote_path)
+            await self._sftp_mkdirs(sftp, dst.rsplit("/", 1)[0])
+            await sftp.put(str(local_path), dst)
 
     async def agent_base_url(self, agent_port: int) -> str:
         if agent_port in self._tunnels:

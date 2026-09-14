@@ -19,6 +19,7 @@ interface ServerRow {
   id: string; name: string; host: string; port: number; username: string;
   transport_mode: 'ssh' | 'local'; status: string; agent_port: number | null;
   agent_schema_ver: string | null; last_seen_at: string | null;
+  agent_capabilities_json?: string;
 }
 interface GpuRow {
   id: string; gpu_index: number; model_name: string; vram_mb: number; status: string;
@@ -28,6 +29,14 @@ interface ServerDetail extends ServerRow { gpus: GpuRow[] }
 const statusColor: Record<string, string> = {
   REACHABLE: 'bg-emerald-500', UNREACHABLE: 'bg-red-500', UNKNOWN: 'bg-muted-foreground/40'
 };
+
+function agentVer(s: ServerDetail): string | null {
+  try {
+    return JSON.parse(s.agent_capabilities_json || '{}').agent_ver ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export default function GpuPage() {
   const [servers, setServers] = useState<ServerDetail[]>([]);
@@ -57,10 +66,14 @@ export default function GpuPage() {
     return () => clearInterval(t);
   }, [refresh]);
 
-  const act = async (id: string, op: 'connectivity-test' | 'agent/probe') => {
+  const act = async (
+    id: string,
+    op: 'connectivity-test' | 'agent/probe' | 'agent/install' | 'agent/upgrade',
+    body?: unknown
+  ) => {
     setBusy(`${id}:${op}`);
     try {
-      const r = await api<Record<string, unknown>>('POST', `/api/v1/servers/${id}/${op}`);
+      const r = await api<Record<string, unknown>>('POST', `/api/v1/servers/${id}/${op}`, body);
       setNote(`${op} → ${JSON.stringify(r).slice(0, 220)}`);
       await refresh();
     } catch (e) {
@@ -166,12 +179,20 @@ export default function GpuPage() {
                 <span className="font-mono text-xs text-muted-foreground">
                   {s.transport_mode === 'local' ? '本机' : `${s.username}@${s.host}:${s.port}`}
                   {s.agent_port ? ` · agent:${s.agent_port}` : ' · 无 agent'}
+                  {agentVer(s) && ` · agent v${agentVer(s)}`}
                 </span>
                 <span className="ml-auto flex gap-2">
                   <Button size="sm" variant="outline" disabled={busy === `${s.id}:connectivity-test`}
                           onClick={() => act(s.id, 'connectivity-test')}>连通性测试</Button>
                   <Button size="sm" variant="outline" disabled={!s.agent_port || busy === `${s.id}:agent/probe`}
                           onClick={() => act(s.id, 'agent/probe')}>agent 探活</Button>
+                  <Button size="sm" variant="outline" disabled={busy === `${s.id}:agent/install`}
+                          onClick={() => act(s.id, 'agent/install')}>部署/修复 Agent</Button>
+                  <Button size="sm" variant="ghost" disabled={busy === `${s.id}:agent/upgrade`}
+                          onClick={() => {
+                            if (window.confirm('升级会重启服务器上的 agent；有在途任务时将被拒绝。继续？'))
+                              act(s.id, 'agent/upgrade', { force: false });
+                          }}>升级</Button>
                   <Button size="sm" variant="ghost" onClick={() => addGpu(s.id)}>＋ GPU</Button>
                 </span>
               </div>
