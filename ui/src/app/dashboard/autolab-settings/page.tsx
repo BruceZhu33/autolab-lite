@@ -12,11 +12,11 @@ import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Badge } from '@/components/ui/badge';
 
-interface LlmRow { use_point: string; base_url: string; model: string; enabled: boolean }
+interface LlmRow { use_point: string; base_url: string; model: string; enabled: boolean; engine?: string }
 
 export default function SettingsPage() {
   const [rows, setRows] = useState<LlmRow[]>([]);
-  const [form, setForm] = useState({ base_url: '', model: '', api_key: '' });
+  const [form, setForm] = useState({ base_url: '', model: '', api_key: '', engine: 'builtin' });
   const [usePoint, setUsePoint] = useState('round_analysis');
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState('');
@@ -84,7 +84,7 @@ export default function SettingsPage() {
             </div>
             {current && (
               <p className="text-xs text-muted-foreground">
-                当前：{current.base_url || '—'} · {current.model || '—'} ·{' '}
+                当前：{current.base_url || '—'} · {current.model || '—'} · 引擎 {current.engine || 'builtin'} ·{' '}
                 <Badge variant={current.enabled ? 'default' : 'secondary'}>
                   {current.enabled ? '已启用' : '未启用'}
                 </Badge>
@@ -101,6 +101,15 @@ export default function SettingsPage() {
                 <Label>模型</Label>
                 <Input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })}
                        placeholder="glm-4.7 / gpt-4o / deepseek-chat" />
+              </div>
+              <div className="space-y-2">
+                <Label>提案引擎（②使用点专用）</Label>
+                <select className="w-full rounded border bg-transparent px-2 py-1.5 text-sm"
+                        value={form.engine}
+                        onChange={(e) => setForm({ ...form, engine: e.target.value })}>
+                  <option value="builtin">builtin（自研薄客户端）</option>
+                  <option value="rdagent">rdagent（RD-Agent 真身·版本锁定）</option>
+                </select>
               </div>
               <div className="space-y-2">
                 <Label>API Key（留空则保持不变）</Label>

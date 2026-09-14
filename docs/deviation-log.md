@@ -41,6 +41,8 @@
 | 27 | 2026-09-14 | harness PHASE_MATRIX（r5-S5） | 批次 base_seed 复跑（D34 BASE 对照补齐）需在 CONFIRMATION_RUNNING 派发 train，与矩阵 `("baseline","train"):(BASELINE_ACCEPTANCE,)` 冲突 | PHASE_MATRIX 扩展 baseline/train 允许 CONFIRMATION_RUNNING | 矩阵本意为防 INIT 期派发；确认期 BASE 复跑是批次语义必需 |
 | 28 | 2026-09-14 | 契约 openapi（73 路径）vs M4 实现面 | 确认域新端点（candidates/selection、batches/freeze、final-confirmation/read、reports）按契约语义实现但个别请求体简化（如 selection 无参数化规则） | 攒批对齐 openapi；核心不变量②经 tx_final_read 移植全量生效（幂等重放/异键拒绝/G7 结果齐备检查） | 语义一致优先于形状一致 |
 
+| 29 | 2026-09-14 | 选型 TD6'（RD-Agent 底座）——替换 deviation #19 的"适配器位预留" | **已接入真身**：PYTHONPATH 直连工作区源码（RD-Agent-main/，534 py 文件，天然版本锁定）；复用 LLMHypothesisGen + MSRA 原版 jinja2 提示词 + LiteLLM 后端 + Hypothesis 六字段结构；补丁生成仍走产品层（JUDGE 三查闭环）。接入坑：①pydantic-settings 单例 import 时读 env（须直接改 LITELLM_SETTINGS 字段 + OPENAI_API_BASE/KEY env 双管齐下）；②litellm 需 openai/ 前缀走自定义端点；③chat_stream 默认 true 须关 | migration 0007 llm_settings.engine（builtin|rdagent）；设置页引擎切换 UI；真机验证：SE 假设生成→JUDGE→commit→训练 FINISHED |
+
 ## 与契约一致（零偏离）的核心面
 
 - **事务模板**：`s_cas / tx_usage / tx_settle / tx_drain_* / tx_authorize_dispatch / tx_ingest / tx_ingest_snapshot / tx_freeze` 逐字移植 harness（guard/错误码/幂等语义一致）——`tests/test_tx_contract_parity.py` 9/9

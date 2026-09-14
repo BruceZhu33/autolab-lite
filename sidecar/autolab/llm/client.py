@@ -68,3 +68,11 @@ async def ping(settings: LLMSettings) -> dict:
         return {"ok": True, "reply": text.strip()[:80], "model": settings.model}
     except LLMError as e:
         return {"ok": False, "error": f"{e.code}: {e.message}"}
+
+
+def load_engine(state, use_point: str = "round_analysis") -> str:
+    """提案引擎选择（migration 0007；缺省 builtin）。"""
+    row = state.db.connect().execute(
+        "SELECT engine FROM llm_settings WHERE use_point=? AND enabled=1",
+        (use_point,)).fetchone()
+    return (row["engine"] if row and row["engine"] else "builtin")

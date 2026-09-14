@@ -223,6 +223,7 @@ async def next_round(state, pid: str) -> dict:
     settings = llm_client.load_settings(state, "round_analysis")
     if settings is None:
         raise TxError("GUARD_UNMET", "LLM 未配置（设置页配置 round_analysis 使用点）")
+    engine = llm_client.load_engine(state, "round_analysis")
     work = _ensure_work_repo(state, pid)
     round_no = (ctx0["last_run"]["round_no"] + 1) if ctx0["last_run"] else 0
     run_id = nid("run")
@@ -239,11 +240,11 @@ async def next_round(state, pid: str) -> dict:
                f"B={ctx0['acc']['limit_s']}s",
         notes="受保护评测协议不可触碰；评测器未接入，效果以训练日志与后续可信评测验证")
     try:
-        proposal = await propose(settings, pctx)
+        proposal = await propose(settings, pctx, engine=engine)
     except llm_client.LLMError as e:
         await asyncio.sleep(5)
         try:
-            proposal = await propose(settings, pctx)
+            proposal = await propose(settings, pctx, engine=engine)
         except llm_client.LLMError as e2:
             await _pause_project(state, pid, "manual_llm",
                                  {"error": f"{e2.code}: {e2.message}"[:200]})
