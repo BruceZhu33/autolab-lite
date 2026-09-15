@@ -8,7 +8,7 @@
   },
   "packageManager": "pnpm@10.28.2",
   "scripts": {
-    "dev": "turbo dev --filter=@multica/web",
+    "dev": "turbo dev --filter=@multica/web & node scripts/warm-dev.mjs; wait",
     "build": "turbo build --filter=@multica/web",
     "typecheck": "turbo typecheck --filter=@multica/web",
     "test": "turbo test --filter=@multica/web",
