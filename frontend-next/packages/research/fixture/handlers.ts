@@ -32,6 +32,7 @@ import {
 import {
   acceptBaseline,
   baselineSummary,
+  datasetResult,
   dispatchBaseline,
   getBaselineWorkshop,
   importStatus,
@@ -434,7 +435,7 @@ export const fixtureRoutes: FixtureRoute[] = [
       const issue = findIssue(params.id ?? "");
       if (!issue) return { error: "issue not found" };
       const ws = getBaselineWorkshop(issue);
-      return { ...ws, summary: baselineSummary(ws.runs) };
+      return { ...ws, summary: baselineSummary(ws.runs), result: datasetResult(ws) };
     },
   },
   // 对话：意图解析（派发/状态/验收/驳回）+ Agent 回复（Phase 2 换 LLM）

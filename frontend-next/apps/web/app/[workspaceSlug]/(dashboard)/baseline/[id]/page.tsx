@@ -39,6 +39,15 @@ interface RunView {
   dispatchedAt: string;
   finishAt: string | null;
   metric: number | null;
+  artifacts: { dir: string; metricsJson: boolean; finalCkpt: boolean; trainLog: boolean };
+}
+
+interface ResultView {
+  dataset: string;
+  dir: string;
+  seeds: { seed: number; metric: number | null; artifacts: RunView["artifacts"] }[];
+  complete: boolean;
+  missing: string[];
 }
 
 interface MsgView {
@@ -67,6 +76,7 @@ interface WorkshopView {
   blocker: { kind: string; title: string; reason: string; actions: string[] } | null;
   messages: MsgView[];
   summary: { avg: number; min: number; max: number } | null;
+  result: ResultView | null;
 }
 
 async function fixtureApi<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -398,6 +408,44 @@ export default function BaselineWorkshopPage({
               </p>
             )}
           </div>
+
+          {/* 基线结果文件夹（验收证据） */}
+          {ws?.result && ws.result.seeds.length > 0 && (
+            <div className="rounded-lg border">
+              <p className="flex items-center gap-2 border-b px-4 py-2.5 text-caption font-medium text-muted-foreground">
+                基线结果文件夹
+                <span className="truncate font-mono font-normal">{ws.result.dir}</span>
+                <Badge variant={ws.result.complete ? "default" : "secondary"}
+                       className={ws.result.complete ? "bg-emerald-600" : "text-amber-600"}>
+                  {ws.result.complete ? "完整" : "不完整"}
+                </Badge>
+              </p>
+              <div className="divide-y">
+                {ws.result.seeds.map((s) => (
+                  <div key={s.seed} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2 text-caption">
+                    <span className="font-mono">seed {s.seed}</span>
+                    <span className={s.artifacts.metricsJson ? "text-emerald-600" : "text-destructive"}>
+                      {s.artifacts.metricsJson ? "✓" : "✗"} metrics.json
+                    </span>
+                    <span className={s.artifacts.finalCkpt ? "text-emerald-600" : "text-destructive"}>
+                      {s.artifacts.finalCkpt ? "✓" : "✗"} final.ckpt
+                    </span>
+                    <span className={s.artifacts.trainLog ? "text-emerald-600" : "text-muted-foreground"}>
+                      {s.artifacts.trainLog ? "✓" : "✗"} train.log
+                    </span>
+                    <span className="ml-auto font-mono tabular-nums">
+                      {s.metric !== null ? s.metric.toFixed(3) : "—"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {!ws.result.complete && (
+                <p className="border-t px-4 py-2 text-caption text-amber-600">
+                  验收条件未满足：{ws.result.missing.join("；")}
+                </p>
+              )}
+            </div>
+          )}
 
           {/* 指标汇总与验收 */}
           {ws && ws.runs.length > 0 && (
