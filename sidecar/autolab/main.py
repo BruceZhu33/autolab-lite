@@ -18,7 +18,7 @@ from .context import AppState
 from .db import Database
 from .errors import TxError, tx_error_handler
 from .events import Hub
-from .routers import meta, projects, review, runs, servers, settings, ws
+from .routers import assistant, meta, projects, review, runs, servers, settings, ws
 from .security import CapabilityToken, TokenMiddleware
 from .services import dispatcher as dispatcher_svc
 from .services import monitor as monitor_svc
@@ -76,6 +76,7 @@ def create_app(cfg: Config | None = None, port: int | None = None) -> FastAPI:
         allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
         allow_methods=["*"], allow_headers=["*"])
     app.include_router(meta.router)
+    app.include_router(assistant.router)
     app.include_router(servers.router)
     app.include_router(projects.router)
     app.include_router(runs.router)

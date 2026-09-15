@@ -52,6 +52,8 @@
 
 | 34 | 2026-09-15 | 设计 §状态机——阶段顺序翻转（用户拍板，新 UI 先行） | 科研阶段顺序由「准备→评审→基线→迭代」改为 **「准备→基线验证→方案评审→迭代→确认→完成」**。语义简化：**BASE 绑定原始代码库而非 plan**——准备门确认代码库后直接派发 BASE；评审时专家已手握基线数字，讨论"在 BASE 上改进什么"；plan 迭代不重跑 BASE（仅评测口径变化才失效）。v0.2 §1.1-1 预埋的张力的正式解封 | 目前仅前端 fixture（frontend-next 六阶段目录/过门链/Projects 提交按钮/评审剧本引用 BASE 数字）；**sidecar 状态机未动**——Phase 2 接线时需正式 RFC：删 REVIEW_GATE→BASELINE 顺序、BASE 验收绑定代码库快照、评审产出 plan 的生效语义、契约测试同步 | 该顺序是 v0.2 记录的"用户期望"目标序（方案 §4.1 目标顺序候选），产品上更合理：评审讨论有基线数字做锚 |
 
+| 35 | 2026-09-15 | 契约 openapi（assistant 域不存在） | GPU 服务器页新增**平台助手**（ZCode 式通用 AI 聊天）：`POST /api/v1/assistant/chat`（服务端每轮注入只读实时快照：servers/gpus/projects/recent_runs/active_attempts/recent_state_events → system prompt → OpenAI 兼容端点）+ `GET /api/v1/assistant/status`（面板徽标）。LLM **复用 round_analysis 使用点**（不新增 use_point——llm_settings CHECK 冻结在 0005 四值，扩列应攒批修订）；无 DB 变更、纯只读快照、错误码 LLM_NOT_CONFIGURED(503)/LLM_*(502) | `routers/assistant.py` + main.py 挂载；单测 5 项（未配置/缺 key/mock LLM 快照注入/status 摘要/role guard），sidecar 全量 37/37；真机 status 实测（2 服务器/3 GPU/5 在途 attempt 快照正确）；前端 frontend-next：**/chat 重写为全局平台助手页**（替代绑定 Multica chat 会话体系的遗留 ChatPage；组件 features/autolab/assistant-chat；GPU 页曾试行双栏内嵌助手，2026-09-15 按用户口径撤除恢复单栏——助手入口统一在 /chat）；Multica 遗留清理：FloatingChat 浮窗与侧栏 chat 未读徽标移除；LLM 配置对话框直写 settings 域（engine 透传防误改迭代引擎） | 助手与迭代分析共用 key 是 D11「用户必配项」的最短路径；快照为唯一事实来源（不编指标，正式指标以落盘为准 #20）；攒批修订时给 assistant 独立 use_point + 流式输出 |
+
 
 ## 与契约一致（零偏离）的核心面
 

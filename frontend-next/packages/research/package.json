@@ -8,7 +8,8 @@
     "./fixture": "./fixture/index.ts",
     "./sidecar/config": "./sidecar/config.ts",
     "./sidecar/client": "./sidecar/client.ts",
-    "./sidecar/servers": "./sidecar/servers.ts"
+    "./sidecar/servers": "./sidecar/servers.ts",
+    "./sidecar/assistant": "./sidecar/assistant.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
