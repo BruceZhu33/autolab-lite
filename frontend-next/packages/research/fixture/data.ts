@@ -291,6 +291,60 @@ function lb(i: number): Label {
   return l;
 }
 
+/**
+ * 科研项目登记信息（Projects 页 / 准备门的数据源）。
+ * 对应 sidecar 立项契约的 Phase 1 投影：base_source_kind=local，
+ * base_source_ref=本地工作区；论文走 papers 域（可选）。
+ */
+export interface ResearchProjectMeta {
+  issueId: string;
+  /** 本地代码工作区绝对路径（BASE 来源，sidecar base_source_ref）。 */
+  workspacePath: string;
+  /** 论文（可选）：arXiv 链接或标题。 */
+  paper?: string;
+  /** 研究方向一句话（sidecar direction_text）。 */
+  direction: string;
+  /** 原始代码库摘要——Phase 2 由 env setup 的真实导入/哈希替代。 */
+  codebase: {
+    files: number;
+    languages: string;
+    entry: string;
+    readmeKb: number;
+  };
+  createdAt: string;
+}
+
+function meta(
+  issueId: string,
+  workspacePath: string,
+  direction: string,
+  paper: string | undefined,
+  files: number,
+  languages: string,
+  entry: string,
+  readmeKb: number,
+): ResearchProjectMeta {
+  return {
+    issueId,
+    workspacePath,
+    direction,
+    paper,
+    codebase: { files, languages, entry, readmeKb },
+    createdAt: "2026-09-06T08:00:00Z",
+  };
+}
+
+/** issueId → 项目登记信息（与看板 issue 一一对应）。 */
+export const projectMetas: Record<string, ResearchProjectMeta> = {
+  "issue-1": meta("issue-1", "~/work/mynet-clinic", "复现并改进自适应网络训练", "Adaptive Residual Networks, arXiv:2404.xxxxx", 312, "Python 91% · Shell 6%", "train.py", 12),
+  "issue-2": meta("issue-2", "~/work/mnist-quickstart", "验证派发→训练→评测→final-read 全链", undefined, 24, "Python 100%", "train.py", 2),
+  "issue-3": meta("issue-3", "~/work/clinic-aug", "数据增强对基线的贡献对照", undefined, 287, "Python 88% · Notebook 9%", "main.py", 9),
+  "issue-4": meta("issue-4", "~/work/tranfm", "表格特征穿透的网络改造", "Tabular FM: Bridging Tables and Transformers", 540, "Python 85% · CUDA 8%", "train.py", 18),
+  "issue-5": meta("issue-5", "~/work/gnn-mol", "分子属性预测的图网络基线", undefined, 196, "Python 93%", "run_gnn.py", 6),
+  "issue-6": meta("issue-6", "~/work/mynet-clinic", "消融与 seed 扩展，量化增益来源", undefined, 312, "Python 91% · Shell 6%", "train.py", 12),
+  "issue-7": meta("issue-7", "~/work/mynet-clinic", "test 集一次性释放与报告定稿", undefined, 312, "Python 91% · Shell 6%", "train.py", 12),
+};
+
 let issueSeq = 0;
 function makeIssue(
   overrides: Partial<Issue> &

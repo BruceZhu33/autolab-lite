@@ -10,15 +10,18 @@ import type { Comment } from "@multica/core/types";
 import type { Issue } from "@multica/core/types";
 import type { FixtureRoute } from "./router";
 import {
+  WS_ID,
   agents,
   archivedBuiltIns,
   commentsByIssue,
   issues,
   labels,
   member,
+  projectMetas,
   stageStatuses,
   user,
   workspace,
+  type ResearchProjectMeta,
 } from "./data";
 
 function actorName(id: string): string {
@@ -32,6 +35,36 @@ function findIssue(id: string): Issue | undefined {
 
 function issueComments(issueId: string): Comment[] {
   return commentsByIssue[issueId] ?? [];
+}
+
+/** Projects 页视图：看板 issue + 登记信息合成。 */
+function projectView(issue: Issue) {
+  const m = projectMetas[issue.id];
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    stage: issue.status,
+    priority: issue.priority,
+    direction: m?.direction ?? "",
+    workspacePath: m?.workspacePath ?? "",
+    paper: m?.paper ?? null,
+    codebase: m?.codebase ?? null,
+    createdAt: m?.createdAt ?? issue.created_at,
+    updatedAt: issue.updated_at,
+  };
+}
+
+/** Phase 1 伪代码库摘要（Phase 2 由 env setup 真实导入/哈希替代）。 */
+function pseudoCodebase(workspacePath: string): ResearchProjectMeta["codebase"] {
+  let h = 0;
+  for (const ch of workspacePath) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return {
+    files: 150 + (h % 450),
+    languages: "Python 91% · Shell 6%",
+    entry: h % 3 === 0 ? "main.py" : "train.py",
+    readmeKb: 4 + (h % 16),
+  };
 }
 
 /** 评论 + 关键状态事件 → TimelineEntry[]（系统事件不进 messages，读取时投影）。 */
@@ -222,7 +255,100 @@ export const fixtureRoutes: FixtureRoute[] = [
   {
     method: "GET",
     pattern: "/api/projects",
-    handler: () => ({ projects: [], total: 0 }),
+    handler: () => ({
+      projects: issues.map(projectView),
+      total: issues.length,
+    }),
+  },
+  // 新建科研项目（Projects 页 → 准备门入口）：
+  // 创建 issue 落在看板"准备"列，登记工作区/论文，并让 AutoLab 在
+  // 工作台留下代码库确认信息。Phase 2 对接 sidecar POST /api/v1/projects
+  //（base_source_kind=local + base_source_ref + papers 域）。
+  {
+    method: "POST",
+    pattern: "/api/projects",
+    handler: ({ body }) => {
+      const input = (body ?? {}) as {
+        name?: string;
+        direction?: string;
+        workspacePath?: string;
+        paper?: string;
+      };
+      const name = (input.name ?? "").trim();
+      const workspacePath = (input.workspacePath ?? "").trim();
+      if (!name) return { error: "项目名称必填" };
+      if (!workspacePath) return { error: "本地代码工作区路径必填" };
+
+      const number = issues.reduce((mx, i) => Math.max(mx, i.number), 0) + 1;
+      const now = new Date().toISOString();
+      const direction = (input.direction ?? "").trim();
+      const paper = (input.paper ?? "").trim() || undefined;
+      const codebase = pseudoCodebase(workspacePath);
+
+      const issue: Issue = {
+        id: `issue-${number}`,
+        workspace_id: WS_ID,
+        number,
+        identifier: `LAB-${number}`,
+        title: name,
+        description: direction || `以 ${workspacePath} 为 BASE 的科研项目`,
+        status: "prepare",
+        priority: "medium",
+        assignee_type: "agent",
+        assignee_id: "agent-autolab",
+        creator_type: "member",
+        creator_id: user.id,
+        parent_issue_id: null,
+        project_id: null,
+        position: number * 1000,
+        stage: null,
+        start_date: now,
+        due_date: null,
+        labels: [],
+        metadata: {},
+        properties: {},
+        created_at: now,
+        updated_at: now,
+      } as Issue;
+      issues.push(issue);
+
+      projectMetas[issue.id] = {
+        issueId: issue.id,
+        workspacePath,
+        paper,
+        direction,
+        codebase,
+        createdAt: now,
+      };
+
+      createdSeq += 1;
+      const confirmComment: Comment = {
+        id: `comment-${createdSeq}`,
+        issue_id: issue.id,
+        author_type: "agent",
+        author_id: "agent-autolab",
+        type: "comment",
+        content:
+          `**原始代码库已登记（准备门）**\n\n` +
+          `- 工作区：\`${workspacePath}\`\n` +
+          `- 规模：${codebase.files} 个文件 · ${codebase.languages}\n` +
+          `- 训练入口：\`${codebase.entry}\` · README ${codebase.readmeKb} KB\n` +
+          (paper ? `- 论文：${paper}\n` : "- 论文：未登记（可选）\n") +
+          `\n请核对以上信息。确认无误后，把状态改为「方案评审」完成准备门；` +
+          `下一步将进入两段式评审（草案 → 反问 → 定稿）。`,
+        parent_id: null,
+        reactions: [],
+        attachments: [],
+        created_at: now,
+        updated_at: now,
+        resolved_at: null,
+        resolved_by_type: null,
+        resolved_by_id: null,
+      } as unknown as Comment;
+      commentsByIssue[issue.id] = [confirmComment];
+
+      return projectView(issue);
+    },
   },
 
   // ---- 项目工作台（issue 详情 + 评论 transcript）----
@@ -277,6 +403,34 @@ export const fixtureRoutes: FixtureRoute[] = [
       } as unknown as Comment;
       commentsByIssue[issue.id] = [...issueComments(issue.id), created];
       return created;
+    },
+  },
+  {
+    method: "PUT",
+    pattern: "/api/issues/:id",
+    handler: ({ params, body }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const input = (body ?? {}) as Partial<Issue> & { label_ids?: string[] };
+      // 只应用显式出现的字段（PUT 语义按 UpdateIssueRequest 的部分字段）
+      for (const key of [
+        "title",
+        "description",
+        "status",
+        "priority",
+        "assignee_type",
+        "assignee_id",
+        "due_date",
+        "start_date",
+        "parent_issue_id",
+        "project_id",
+      ] as const) {
+        if (input[key] !== undefined) {
+          (issue as unknown as Record<string, unknown>)[key] = input[key];
+        }
+      }
+      issue.updated_at = new Date().toISOString();
+      return issue;
     },
   },
   {
