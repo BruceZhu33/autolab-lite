@@ -29,6 +29,7 @@ import {
 } from "@multica/ui/components/ui/popover";
 import { PageHeader } from "@multica/views/layout/page-header";
 import { stageColor, stageLabel } from "@/features/autolab/stage";
+import { StageTeamBar } from "@/features/autolab/stage-team";
 
 interface ProjectView {
   id: string;
@@ -230,6 +231,7 @@ export default function ReviewWorkshopPage({
         <p className="ml-2 hidden min-w-0 truncate text-caption text-muted-foreground md:block">
           {project.title}
         </p>
+        <StageTeamBar stage="review" />
         <div className="ml-auto">{stageBadge}</div>
       </PageHeader>
 

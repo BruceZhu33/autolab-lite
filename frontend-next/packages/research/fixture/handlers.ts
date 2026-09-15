@@ -152,6 +152,52 @@ export const fixtureRoutes: FixtureRoute[] = [
     pattern: "/api/agents/:id",
     handler: ({ params }) => agents.find((a) => a.id === params.id) ?? null,
   },
+  // 创建 Agent（Multica 原生 manual 表单提交；Phase 2 由 sidecar persona 替代）
+  {
+    method: "POST",
+    pattern: "/api/agents",
+    handler: ({ body }) => {
+      const input = (body ?? {}) as {
+        name?: string;
+        description?: string;
+        instructions?: string;
+        runtime_id?: string;
+        visibility?: string;
+        model?: string;
+      };
+      const name = (input.name ?? "").trim();
+      if (!name) return { error: "名称必填" };
+      createdSeq += 1;
+      const now = new Date().toISOString();
+      const agent = {
+        id: `agent-${createdSeq}`,
+        workspace_id: WS_ID,
+        runtime_id: input.runtime_id ?? "rt-sidecar",
+        runtime_bound: true,
+        runtime_availability: "online",
+        name,
+        description: input.description ?? "",
+        instructions: input.instructions ?? "",
+        avatar_url: null,
+        runtime_mode: "local",
+        runtime_config: {},
+        custom_args: [],
+        visibility: input.visibility ?? "workspace",
+        permission_mode: { mode: "workspace" },
+        status: "active",
+        max_concurrent_tasks: 2,
+        model: input.model ?? "glm-4.7",
+        skills: [],
+        disabled_runtime_skills: [],
+        owner_id: user.id,
+        created_by: user.id,
+        created_at: now,
+        updated_at: now,
+      };
+      agents.push(agent as never);
+      return agent;
+    },
+  },
 
   // ---- 六阶段科研目录（看板列来源；内置 status 归档返回以压制兜底列）----
   {
@@ -632,9 +678,38 @@ export const fixtureRoutes: FixtureRoute[] = [
     pattern: "/api/workspaces/:id/runtimes",
     handler: () => ({ runtimes: [] }),
   },
-  { method: "GET", pattern: "/api/runtimes", handler: () => [] },
+  // AutoLab 执行运行时（绑定 sidecar；owner=本地用户 → 创建 Agent 时可选）
+  {
+    method: "GET",
+    pattern: "/api/runtimes",
+    handler: () => [
+      {
+        id: "rt-sidecar",
+        workspace_id: WS_ID,
+        daemon_id: null,
+        name: "AutoLab Sidecar",
+        runtime_mode: "local",
+        provider: "autolab",
+        launch_header: "AutoLab",
+        status: "online",
+        device_info: "macOS · arm64 · loopback",
+        metadata: {},
+        owner_id: user.id,
+        visibility: "public",
+        last_seen_at: new Date().toISOString(),
+        created_at: "2026-09-01T00:00:00Z",
+        updated_at: "2026-09-01T00:00:00Z",
+      },
+    ],
+  },
   { method: "GET", pattern: "/api/agent-task-snapshot", handler: () => [] },
   { method: "GET", pattern: "/api/agent-run-counts", handler: () => [] },
+  { method: "GET", pattern: "/api/agents/:id/tasks", handler: () => [] },
+  { method: "GET", pattern: "/api/workspaces/:id/lark/installations", handler: () => [] },
+  { method: "GET", pattern: "/api/workspaces/:id/slack/installations", handler: () => [] },
+  { method: "GET", pattern: "/api/workspaces/:id/dingtalk/installations", handler: () => [] },
+  { method: "GET", pattern: "/api/workspaces/:id/wecom/installations", handler: () => [] },
+  { method: "GET", pattern: "/api/workspaces/:id/telegram/installations", handler: () => [] },
   { method: "GET", pattern: "/api/agent-activity-30d", handler: () => [] },
   { method: "GET", pattern: "/api/skills", handler: () => [] },
   { method: "GET", pattern: "/api/invitations", handler: () => [] },
