@@ -409,17 +409,15 @@ describe("personal nav — Chat", () => {
   const chatBadge = (container: HTMLElement) =>
     chatNav(container)?.querySelector("number-flow-react") ?? null;
 
-  it("keeps persistent Inbox and Chat counters static", () => {
+  it("keeps persistent Inbox counters static", () => {
     summary.current = [{ workspace_id: "ws-1", count: 1 }];
     chatSessions.current = [{ id: "chat-1", unread_count: 2 }];
     const { container } = render(<AppSidebar />);
     const inboxBadge = container
       .querySelector<HTMLElement>('button[data-href="/acme/inbox"]')
       ?.querySelector("number-flow-react") as (HTMLElement & { animated?: boolean }) | null;
-    const currentChatBadge = chatBadge(container) as (HTMLElement & { animated?: boolean }) | null;
 
     expect(inboxBadge?.animated).toBe(false);
-    expect(currentChatBadge?.animated).toBe(false);
   });
 
   it("renders a Chat nav link to the workspace chat route", () => {
@@ -427,65 +425,11 @@ describe("personal nav — Chat", () => {
     expect(chatNav(container)).not.toBeNull();
   });
 
-  it("badges the Chat nav with the summed unread_count of chat sessions", () => {
-    chatSessions.current = [{ id: "a", unread_count: 3 }, { id: "b", unread_count: 2 }, { id: "c", unread_count: 0 }];
-    const { container } = render(<AppSidebar />);
-    expect(chatBadge(container)).toHaveAttribute("aria-label", "5");
-  });
-
-  it("shows no Chat unread badge when every session is read", () => {
-    chatSessions.current = [{ id: "a", unread_count: 0 }, { id: "b" }];
+  // AutoLab（v0.3）：/chat 改为平台助手页（sidecar assistant 域，deviation
+  // #35），Multica 会话未读徽标已移除——有会话数据也不得再出徽标
+  it("renders no Chat unread badge even with unread chat sessions", () => {
+    chatSessions.current = [{ id: "a", unread_count: 3 }, { id: "b", unread_count: 2 }];
     const { container } = render(<AppSidebar />);
     expect(chatBadge(container)).toBeNull();
-  });
-
-  it("excludes the session being viewed on the chat page from the badge", () => {
-    // The thread list zeroes the open session's row badge; the aggregate
-    // must follow, or a reply landing in the open conversation flashes a
-    // count with no matching row.
-    chatSessions.current = [{ id: "a", unread_count: 2 }, { id: "b", unread_count: 3 }];
-    navigation.current = { pathname: "/acme/chat" };
-    chatStore.current = { activeSessionId: "a", isOpen: false };
-    const { container } = render(<AppSidebar />);
-    expect(chatBadge(container)).toHaveAttribute("aria-label", "3");
-  });
-
-  it("excludes the viewed session when the floating chat window is open off-route", () => {
-    chatSessions.current = [{ id: "a", unread_count: 2 }, { id: "b", unread_count: 3 }];
-    navigation.current = { pathname: "/acme/issues" };
-    chatStore.current = { activeSessionId: "a", isOpen: true };
-    const { container } = render(<AppSidebar />);
-    expect(chatBadge(container)).toHaveAttribute("aria-label", "3");
-  });
-
-  it("still counts a remembered selection when no chat surface is showing it", () => {
-    // activeSessionId persists after the chat page closes; with both
-    // surfaces closed nothing will auto mark-read, so the badge must count.
-    chatSessions.current = [{ id: "a", unread_count: 2 }, { id: "b", unread_count: 3 }];
-    navigation.current = { pathname: "/acme/issues" };
-    chatStore.current = { activeSessionId: "a", isOpen: false };
-    const { container } = render(<AppSidebar />);
-    expect(chatBadge(container)).toHaveAttribute("aria-label", "5");
-  });
-
-  it("counts the active session while the floating window is open but the app is backgrounded", () => {
-    // A reply landing while the app is not in the foreground is NOT auto
-    // marked-read (MUL-4485), so its unread must still badge — otherwise the
-    // notification is silently eaten while the user is away.
-    chatSessions.current = [{ id: "a", unread_count: 2 }, { id: "b", unread_count: 3 }];
-    navigation.current = { pathname: "/acme/issues" };
-    chatStore.current = { activeSessionId: "a", isOpen: true };
-    appForeground.current = false;
-    const { container } = render(<AppSidebar />);
-    expect(chatBadge(container)).toHaveAttribute("aria-label", "5");
-  });
-
-  it("counts the active session on the chat route while the app is backgrounded", () => {
-    chatSessions.current = [{ id: "a", unread_count: 2 }, { id: "b", unread_count: 3 }];
-    navigation.current = { pathname: "/acme/chat" };
-    chatStore.current = { activeSessionId: "a", isOpen: false };
-    appForeground.current = false;
-    const { container } = render(<AppSidebar />);
-    expect(chatBadge(container)).toHaveAttribute("aria-label", "5");
   });
 });
