@@ -49,6 +49,8 @@ export interface CodeImport {
   sourceKind: "local" | "github";
   sourceRef: string;
   serverName: string;
+  /** 服务器上的项目工作区（导入目标）。 */
+  remotePath: string;
   files: number;
   sizeMb: number;
   startedAt: string;
@@ -92,6 +94,25 @@ export interface BaselineWorkshopState {
 const IMPORT_DURATION_MS = 20_000;
 const SEED_DELAYS_MS = [32_000, 68_000];
 
+/**
+ * GPU 服务器注册（真机数据）。立项后整条链路绑定服务器上的项目工作区：
+ * 代码导入目标、数据集、run 产物都在 `user@host:~/autolab/work/{projectId}/` 下。
+ */
+const SERVERS: Record<string, { user: string; host: string }> = {
+  "gpu-a-a6000": { user: "serveruser", host: "192.0.2.46" },
+  "4090D": { user: "user", host: "192.0.2.179" },
+};
+
+function serverPrefix(serverName: string): string {
+  const s = SERVERS[serverName];
+  return s ? `${s.user}@${s.host}` : serverName;
+}
+
+/** 服务器上的项目工作区（链路根目录，各机同构路径）。 */
+function remoteWorkspace(projectId: string): string {
+  return `~/autolab/work/${projectId}/`;
+}
+
 let seq = 7000;
 const nid = (p: string) => `${p}-${(seq += 1)}`;
 
@@ -105,13 +126,17 @@ function baseMetric(issue: Issue): number {
   return 0.76 + (hashOf(issue.id + issue.title) % 60) / 500; // 0.76 ~ 0.88
 }
 
-/** 工作区数据集候选（fixture 探测；Phase 2 由 env 探测/登记替代）。 */
-export function datasetCandidates(m: ResearchProjectMeta | undefined): { name: string; path: string; sizeMb: number }[] {
+/** 服务器工作区内的数据集候选（fixture 探测；Phase 2 由 env 探测/登记替代）。 */
+export function datasetCandidates(
+  m: ResearchProjectMeta | undefined,
+  projectId = "issue-x",
+): { name: string; path: string; sizeMb: number }[] {
   const h = hashOf(m?.workspacePath ?? "default");
   const main = m?.workspacePath.split("/").pop() ?? "clinic";
+  const root = `${remoteWorkspace(projectId)}data/`;
   return [
-    { name: main, path: `data/${main}`, sizeMb: 40 + (h % 40) },
-    { name: `${main}-mini`, path: `data/${main}-mini`, sizeMb: 4 + (h % 6) },
+    { name: main, path: `${root}${main}`, sizeMb: 40 + (h % 40) },
+    { name: `${main}-mini`, path: `${root}${main}-mini`, sizeMb: 4 + (h % 6) },
   ];
 }
 
@@ -173,6 +198,7 @@ function startImport(issue: Issue, ws: BaselineWorkshopState): void {
     sourceKind: m?.sourceKind ?? "local",
     sourceRef: m?.workspacePath ?? "BASE 工作区",
     serverName: "gpu-a-a6000",
+    remotePath: remoteWorkspace(issue.id),
     files: m?.codebase.files ?? 300,
     sizeMb: 60 + (hashOf(issue.id) % 120),
     startedAt: new Date().toISOString(),
@@ -204,6 +230,7 @@ export function getBaselineWorkshop(issue: Issue): BaselineWorkshopState {
       sourceKind: "local",
       sourceRef: m?.workspacePath ?? "~/work/clinic-aug",
       serverName: "gpu-a-a6000",
+      remotePath: remoteWorkspace("issue-3"),
       files: m?.codebase.files ?? 287,
       sizeMb: 97,
       startedAt: "2026-09-13T07:40:00Z",
@@ -221,7 +248,7 @@ export function getBaselineWorkshop(issue: Issue): BaselineWorkshopState {
         finishAt: null,
         metric: null,
         artifacts: {
-          dir: "projects/issue-3/runs/brun-issue-3-1/",
+          dir: `${serverPrefix("gpu-a-a6000")}:~/autolab/work/issue-3/runs/brun-issue-3-1/`,
           metricsJson: false,
           finalCkpt: false,
           trainLog: true,
@@ -254,11 +281,12 @@ function maybeAutoMessages(ws: BaselineWorkshopState): void {
   if (ws.codeImport && !ws.codeImport.importReported && importStatus(ws.codeImport) === "SYNCED") {
     ws.codeImport.importReported = true;
     const imp = ws.codeImport;
-    const cands = datasetCandidates(projectMetas[ws.projectId]);
+    const cands = datasetCandidates(projectMetas[ws.projectId], ws.projectId);
     pushMsg(ws, "agent",
       `**代码导入完成**（${imp.sourceKind === "github" ? "git clone" : "SFTP 上传 + sha256 全量校验"}）：\n\n` +
       `- 来源：${imp.sourceRef}\n` +
-      `- 服务器：${imp.serverName} · ${imp.files} 个文件 · ${imp.sizeMb} MB · 耗时 40s\n\n` +
+      `- 服务器工作区：${serverPrefix(imp.serverName)}:${imp.remotePath} · ${imp.files} 个文件 · ${imp.sizeMb} MB · 耗时 40s\n` +
+      `- 副本：已同步至 ${serverPrefix("4090D")}:${remoteWorkspace(ws.projectId)}（后续多机派发用）\n\n` +
       `下一步确认基线数据集——我在工作区探测到：\n` +
       cands.map((c, i) => `${i + 1}. **${c.name}**（${c.path}，约 ${c.sizeMb} MB）`).join("\n") +
       `\n\n基线先训练哪个？直接告诉我名字（如「用 ${cands[0]?.name}」）。`);
@@ -297,9 +325,10 @@ export function datasetResult(ws: BaselineWorkshopState): DatasetResultView | nu
     if (!r.artifacts.metricsJson) missing.push(`seed ${r.seed}：缺 metrics.json`);
     if (!r.artifacts.finalCkpt) missing.push(`seed ${r.seed}：缺 final.ckpt`);
   }
+  const mainServer = ws.runs[0]?.serverName ?? "gpu-a-a6000";
   return {
     dataset: ws.dataset.name,
-    dir: `projects/${ws.projectId}/runs/`,
+    dir: `${serverPrefix(mainServer)}:~/autolab/work/${ws.projectId}/runs/`,
     seeds,
     complete: missing.length === 0,
     missing,
@@ -314,16 +343,17 @@ export function dispatchBaseline(issue: Issue): BaselineRun[] {
     const base = baseMetric(issue);
     ws.runs = SEED_DELAYS_MS.map((delay, i) => {
       const runId = `brun-${issue.id}-${i + 1}`;
+      const serverName = i === 0 ? "gpu-a-a6000" : "4090D";
       return {
         id: runId,
         seed: i + 1,
-        serverName: i === 0 ? "gpu-a-a6000" : "4090D",
+        serverName,
         gpu: "RTX A6000 / 4090D",
         dispatchedAt: new Date(now).toISOString(),
         finishAt: new Date(now + delay).toISOString(),
         metric: Math.round((base + (i === 0 ? 0 : 0.008) + (issue.id.length % 3) * 0.002) * 1000) / 1000,
         artifacts: {
-          dir: `projects/${issue.id}/runs/${runId}/`,
+          dir: `${serverName}:~/autolab/work/${issue.id}/runs/${runId}/`,
           metricsJson: true,
           finalCkpt: true,
           trainLog: true,
@@ -394,7 +424,7 @@ export function pushBaselineMessage(issue: Issue, content: string): BaselineMess
   pushMsg(ws, "user", content);
 
   const m = projectMetas[issue.id];
-  const cands = datasetCandidates(m);
+  const cands = datasetCandidates(m, issue.id);
   const summary = baselineSummary(ws.runs);
   const impStat = importStatus(ws.codeImport);
 
@@ -432,7 +462,8 @@ export function pushBaselineMessage(issue: Issue, content: string): BaselineMess
   } else if (wantsImport && impStat === "none") {
     startImport(issue, ws);
     reply =
-      `收到，开始导入 BASE 代码（${m?.sourceKind === "github" ? `git clone ${m?.workspacePath}` : `SFTP 上传 ${m?.workspacePath}`} → ${ws.codeImport?.serverName}）：` +
+      `收到，开始导入 BASE 代码（${m?.sourceKind === "github" ? `git clone ${m?.workspacePath}` : `SFTP 上传 ${m?.workspacePath}`}）：\n\n` +
+      `→ ${serverPrefix(ws.codeImport?.serverName ?? "")}:${ws.codeImport?.remotePath}\n\n` +
       `${ws.codeImport?.files} 个文件 · 约 ${ws.codeImport?.sizeMb} MB，含 sha256 全量校验。完成后我马上汇报，然后我们确认数据集。`;
   } else if (datasetMatch && impStat === "SYNCED") {
     ws.dataset = { ...datasetMatch, confirmedAt: new Date().toISOString() };
