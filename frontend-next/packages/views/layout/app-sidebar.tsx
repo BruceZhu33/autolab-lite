@@ -147,8 +147,8 @@ type NavLabelKey =
 // destination path at render time, so the sidebar and the desktop tab bar
 // always agree. See route-icon-components.tsx.
 const personalNav: { key: NavKey; labelKey: NavLabelKey }[] = [
-  { key: "inbox", labelKey: "inbox" },
-  { key: "myIssues", labelKey: "my_issues" },
+  // AutoLab（v0.3 迁移）：Inbox / My Issues 移除——单人形态没有通知流，
+  // "我的任务"与 Work 分组的 Issues 重复。
   { key: "chat", labelKey: "chat" },
   // AutoLab（v0.3 迁移）：GPU 服务器是基础设施配置，不是工作流的一步，
   // 放在 Work 分组标题上方的基础区
