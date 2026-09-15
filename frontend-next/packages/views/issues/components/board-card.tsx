@@ -34,6 +34,28 @@ function formatDate(date: string, locale: string): string {
   return formatDateOnly(date, { month: "short", day: "numeric" }, locale);
 }
 
+/**
+ * AutoLab（v0.3 迁移）：看板卡片按阶段路由到 Work 模块——卡片是流程地图
+ * 的入口，点击进入该阶段的工作现场而不是通用评论页。
+ * 准备 → Projects（选中该项目：核对代码库/补充材料/提审）；
+ * 方案评审 → 评审页（两段式现场：草案/反问/定稿）；
+ * 其余阶段暂留通用工作台（Phase 2 建对应模块后接管）。
+ */
+function autolabStageWorkspaceHref(
+  p: { projects: () => string; issueDetail: (id: string) => string },
+  issue: Issue,
+): string {
+  const wsBase = p.projects().slice(0, -"/projects".length);
+  switch (issue.status) {
+    case "prepare":
+      return `${p.projects()}?project=${encodeURIComponent(issue.id)}`;
+    case "review":
+      return `${wsBase}/review/${encodeURIComponent(issue.id)}`;
+    default:
+      return p.issueDetail(issue.id);
+  }
+}
+
 /** Stops event from bubbling to Link/drag handlers */
 function PickerWrapper({ children, className }: { children: React.ReactNode; className?: string }) {
   const stop = (e: React.SyntheticEvent) => {
@@ -380,7 +402,7 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({
         className={`group/card ${isDragging ? "opacity-30" : ""}`}
       >
         <AppLink
-          href={p.issueDetail(issue.id)}
+          href={autolabStageWorkspaceHref(p, issue)}
           newTabTitle={issue.identifier}
           className={`group block transition-colors ${isDragging ? "pointer-events-none" : ""}`}
         >

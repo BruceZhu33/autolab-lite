@@ -1,19 +1,21 @@
 "use client";
 
 /**
- * 科研项目管理（Projects，Work 分组）。
+ * 科研项目管理（Projects，Work 分组）——准备阶段的工作现场。
  *
- * 新建项目 = 选择本地代码工作区（BASE 来源）+ 可选论文；创建后项目
- * 进入看板「准备」列，工作台内确认原始代码库信息，通过后进入方案评审。
+ * 对齐口径 2026-09-15：看板「准备」卡片点击进入本页并选中该项目；
+ * 双栏 = 左项目列表 + 右选中项目详情（代码库核对 / 补充材料 / 提审 /
+ * 内嵌时间线）。创建项目（本地工作区 BASE + 可选论文）后项目进入
+ * 看板「准备」列。
  * Phase 1 走 fixture（/api/projects 内存态）；Phase 2 对接 sidecar
  * POST /api/v1/projects（base_source_kind=local + base_source_ref）与
  * papers 域，文件选择器由 Tauri 原生提供（v0.3 Phase F）。
  */
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FolderKanban } from "lucide-react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 
 import { Badge } from "@multica/ui/components/ui/badge";
@@ -30,6 +32,8 @@ import {
 import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
 import { PageHeader } from "@multica/views/layout/page-header";
+import { ProjectTimeline } from "@/features/autolab/project-timeline";
+import { stageColor, stageLabel } from "@/features/autolab/stage";
 
 interface ProjectView {
   id: string;
@@ -45,27 +49,7 @@ interface ProjectView {
   updatedAt: string;
 }
 
-/** 与 fixture 六阶段目录（issue-statuses）同色。 */
-const STAGE_STYLE: Record<string, { label: string; color: string }> = {
-  prepare: { label: "准备", color: "#94a3b8" },
-  review: { label: "方案评审", color: "#8b5cf6" },
-  baseline: { label: "基线验证", color: "#0ea5e9" },
-  iterate: { label: "自动迭代", color: "#f59e0b" },
-  confirm: { label: "最终确认", color: "#ec4899" },
-  reported: { label: "已完成", color: "#10b981" },
-};
-
 const EMPTY_FORM = { name: "", direction: "", workspacePath: "", paper: "" };
-
-function stageBadge(stage: string) {
-  const s = STAGE_STYLE[stage] ?? { label: stage, color: "#94a3b8" };
-  return (
-    <Badge variant="outline" className="gap-1.5">
-      <span className="size-1.5 rounded-full" style={{ backgroundColor: s.color }} />
-      {s.label}
-    </Badge>
-  );
-}
 
 async function fixtureApi<T>(method: string, path: string, body?: unknown): Promise<T> {
   const r = await fetch(path, {
@@ -80,11 +64,21 @@ async function fixtureApi<T>(method: string, path: string, body?: unknown): Prom
   return r.json() as Promise<T>;
 }
 
+function StageBadge({ stage }: { stage: string }) {
+  return (
+    <Badge variant="outline" className="gap-1.5">
+      <span className="size-1.5 rounded-full" style={{ backgroundColor: stageColor(stage) }} />
+      {stageLabel(stage)}
+    </Badge>
+  );
+}
+
 export default function ProjectsPage() {
   const qc = useQueryClient();
   const pathname = usePathname();
-  // 工作台链接跟随当前 workspace slug（fixture 模式为 autolab）
-  const issueHref = (id: string) => `/${pathname.split("/")[1] ?? "autolab"}/issues/${id}`;
+  const searchParams = useSearchParams();
+  const wsSlug = pathname.split("/")[1] ?? "autolab";
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState(EMPTY_FORM);
 
@@ -93,15 +87,30 @@ export default function ProjectsPage() {
     queryFn: () => fixtureApi<{ projects: ProjectView[] }>("GET", "/api/projects"),
   });
 
+  const projects = useMemo(() => data?.projects ?? [], [data]);
+
+  // 看板卡片路由带 ?project={id}；本地选择优先，列表变化后兜底选第一个
+  const fromUrl = searchParams.get("project");
+  useEffect(() => {
+    if (fromUrl && projects.some((p) => p.id === fromUrl)) setSelectedId(fromUrl);
+  }, [fromUrl, projects]);
+  useEffect(() => {
+    if (!fromUrl && projects.length > 0 && (selectedId === null || !projects.some((p) => p.id === selectedId))) {
+      setSelectedId(projects[0]?.id ?? null);
+    }
+  }, [projects, fromUrl, selectedId]);
+  const selected = projects.find((p) => p.id === selectedId) ?? null;
+
   const create = useMutation({
     mutationFn: (input: typeof EMPTY_FORM) =>
       fixtureApi<ProjectView>("POST", "/api/projects", input),
     onSuccess: (p) => {
       toast.success(`项目 ${p.identifier} 已创建`, {
-        description: "已加入看板「准备」列；进入工作台确认原始代码库信息。",
+        description: "已加入看板「准备」列；在右侧核对代码库信息后提审。",
       });
       setOpen(false);
       setForm(EMPTY_FORM);
+      setSelectedId(p.id);
       void qc.invalidateQueries({ queryKey: ["autolab", "fixture-projects"] });
       // Multica QueryProvider 用 staleTime: Infinity，真实产品靠 WS 失效通知
       // 刷新看板；fixture 模式没有 WS，创建后主动失效全量查询（内存数据源，
@@ -125,7 +134,21 @@ export default function ProjectsPage() {
     create.mutate(form);
   };
 
-  const projects = data?.projects ?? [];
+  /** 准备门：确认代码库信息 → 提交评审（Phase 4 改接 sidecar availableActions）。 */
+  const submitReview = async () => {
+    if (!selected) return;
+    try {
+      await fixtureApi("PUT", `/api/issues/${selected.id}`, { status: "review" });
+      toast.success(`${selected.identifier} 已提交评审`, {
+        description: "看板卡片已移至「方案评审」列，可前往评审页继续两段式评审。",
+      });
+      void qc.invalidateQueries();
+    } catch (e) {
+      toast.error("提审失败", {
+        description: (e instanceof Error ? e.message : String(e)).slice(0, 300),
+      });
+    }
+  };
 
   return (
     <>
@@ -138,7 +161,7 @@ export default function ProjectsPage() {
           </span>
         ) : null}
         <p className="ml-2 hidden min-w-0 truncate text-caption text-muted-foreground md:block">
-          新建项目（本地工作区作为 BASE · 论文可选）→ 准备 → 方案评审
+          新建项目（本地工作区作为 BASE · 论文可选）→ 核对代码库 → 提审
         </p>
         <div className="ml-auto">
           <Dialog open={open} onOpenChange={setOpen}>
@@ -196,52 +219,105 @@ export default function ProjectsPage() {
         </div>
       </PageHeader>
 
-      <div className="p-4 md:px-6">
-        {isPending && <p className="text-sm text-muted-foreground">加载项目列表…</p>}
-        {isError && (
-          <p className="text-sm text-destructive">
-            加载失败：{error instanceof Error ? error.message : String(error)}
-          </p>
-        )}
-        {!isPending && projects.length === 0 && (
-          <p className="text-sm text-muted-foreground">
-            尚无科研项目。新建一个：本地工作区作为 BASE，论文可选。
-          </p>
-        )}
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+      <div className="flex min-h-0 flex-1 gap-4 p-4 md:px-6">
+        {/* 左栏：项目列表 */}
+        <div className="hidden w-72 shrink-0 space-y-1.5 overflow-y-auto md:block">
+          {isPending && <p className="text-sm text-muted-foreground">加载项目列表…</p>}
+          {isError && (
+            <p className="text-sm text-destructive">
+              加载失败：{error instanceof Error ? error.message : String(error)}
+            </p>
+          )}
+          {!isPending && projects.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              尚无科研项目。新建一个：本地工作区作为 BASE，论文可选。
+            </p>
+          )}
           {projects.map((p) => (
-            <Link
+            <button
               key={p.id}
-              href={issueHref(p.id)}
-              className="group space-y-3 rounded-lg border p-4 transition-colors hover:bg-muted/40"
+              onClick={() => setSelectedId(p.id)}
+              className={`flex w-full flex-col gap-1 rounded-lg border p-3 text-left transition-colors ${
+                p.id === selectedId ? "border-primary/60 bg-muted/50" : "hover:bg-muted/40"
+              }`}
             >
-              <div className="flex items-center gap-2">
-                {stageBadge(p.stage)}
+              <span className="flex items-center gap-2">
+                <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: stageColor(p.stage) }} />
                 <span className="font-mono text-caption text-muted-foreground">{p.identifier}</span>
-                <span className="ml-auto font-mono text-caption text-muted-foreground">
-                  {new Date(p.createdAt).toLocaleDateString("zh-CN")}
-                </span>
-              </div>
-              <div>
-                <p className="text-body font-medium group-hover:underline">{p.title}</p>
-                {p.direction && (
-                  <p className="mt-1 line-clamp-2 text-caption text-muted-foreground">{p.direction}</p>
-                )}
-              </div>
-              <div className="space-y-1 border-t pt-2 font-mono text-caption text-muted-foreground">
-                <p className="truncate">{p.workspacePath || "—"}</p>
-                {p.codebase && (
-                  <p>
-                    {p.codebase.files} 文件 · {p.codebase.entry} · README {p.codebase.readmeKb} KB
-                  </p>
-                )}
-              </div>
-              {p.paper && (
-                <p className="line-clamp-1 text-caption text-muted-foreground">📄 {p.paper}</p>
-              )}
-            </Link>
+                <span className="ml-auto text-caption text-muted-foreground">{stageLabel(p.stage)}</span>
+              </span>
+              <span className="truncate text-sm font-medium">{p.title}</span>
+            </button>
           ))}
         </div>
+
+        {/* 右栏：选中项目详情（准备阶段工作现场） */}
+        {!selected ? (
+          <div className="flex flex-1 items-center justify-center">
+            <p className="text-sm text-muted-foreground">选择左侧项目查看详情</p>
+          </div>
+        ) : (
+          <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto lg:flex-row">
+            <div className="flex min-w-0 flex-1 flex-col gap-4">
+              {/* 标题区 */}
+              <div className="flex flex-wrap items-center gap-3">
+                <StageBadge stage={selected.stage} />
+                <span className="font-mono text-caption text-muted-foreground">{selected.identifier}</span>
+                <h2 className="text-body font-medium">{selected.title}</h2>
+                {selected.stage === "review" && (
+                  <Link
+                    href={`/${wsSlug}/review/${selected.id}`}
+                    className="ml-auto text-caption text-primary hover:underline"
+                  >
+                    前往评审页 →
+                  </Link>
+                )}
+              </div>
+              {selected.direction && (
+                <p className="text-caption text-muted-foreground">{selected.direction}</p>
+              )}
+
+              {/* 代码库登记（准备门核对材料） */}
+              <div className="rounded-lg border">
+                <p className="border-b px-4 py-2.5 text-caption font-medium text-muted-foreground">
+                  原始代码库登记（准备门）
+                </p>
+                <div className="space-y-1.5 px-4 py-3 font-mono text-sm">
+                  <p>工作区：<span className="text-foreground">{selected.workspacePath || "—"}</span></p>
+                  {selected.codebase && (
+                    <p>
+                      {selected.codebase.files} 文件 · {selected.codebase.languages} · 入口{" "}
+                      {selected.codebase.entry} · README {selected.codebase.readmeKb} KB
+                    </p>
+                  )}
+                  <p className="font-sans">
+                    论文：<span className="text-foreground">{selected.paper ?? "未登记（可选）"}</span>
+                  </p>
+                </div>
+                {selected.stage === "prepare" && (
+                  <div className="flex items-center gap-3 border-t px-4 py-2.5">
+                    <p className="min-w-0 flex-1 truncate text-caption text-muted-foreground">
+                      核对以上信息无误后提审；需要变更请在时间线补充说明。
+                    </p>
+                    <Button size="sm" onClick={() => void submitReview()}>
+                      确认代码库信息，提交评审
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* 内嵌时间线：补充材料 / 与 Agent 讨论 */}
+            <div className="flex min-h-64 min-w-0 flex-col rounded-lg border lg:w-96 lg:shrink-0">
+              <p className="border-b px-4 py-2.5 text-caption font-medium text-muted-foreground">
+                项目时间线（评论 / Agent 汇报）
+              </p>
+              <div className="flex min-h-0 flex-1 flex-col p-4">
+                <ProjectTimeline projectId={selected.id} />
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </>
   );

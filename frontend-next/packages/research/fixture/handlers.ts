@@ -405,6 +405,57 @@ export const fixtureRoutes: FixtureRoute[] = [
       return created;
     },
   },
+  // 方案评审内容（两段式现场：草案 → 反问清单 → 定稿）。
+  // Phase 2 对接 sidecar review 域（D22 两段式 + D17 论文登记 + D42 文献对照）。
+  {
+    method: "GET",
+    pattern: "/api/projects/:id/review",
+    handler: ({ params }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const m = projectMetas[issue.id];
+      const name = m?.direction || issue.title;
+      return {
+        projectId: issue.id,
+        draft: [
+          `## 方案草案（${issue.identifier}）`,
+          "",
+          `**目标**：${name}`,
+          "",
+          "**方法**：以 BASE 代码库为起点，按论文对照列出可迁移的改进点；",
+          "优先复现论文设置，再叠加候选取舍（每轮一个变量，可归因）。",
+          "",
+          "**实验设计**：",
+          "- BASE：2 seed 冻结（tx_freeze_batch），作为所有对比的锚点",
+          "- 候选轮次：提案 → JUDGE 三查（泄漏/语义/预算）→ 冒烟 → 派发",
+          "- 消融：对每个进入迭代的改进做 leave-one-out 验证",
+          "",
+          "**预算**：默认 10 GPU·h；触发 drain 两阶段下调，不超限。",
+          "",
+          "**风险**：数据划分泄漏（评测口径固定）；环境差异（离线轮子 + conda 复用）。",
+        ].join("\n"),
+        questions: [
+          {
+            id: "q-1",
+            question: "BASE 验收线用「复现论文指标」还是「可用基线」口径？",
+            status: "open",
+          },
+          {
+            id: "q-2",
+            question: "改进优先级：网络结构、数据增强、训练策略三者先做哪个分支？",
+            status: "open",
+          },
+          {
+            id: "q-3",
+            question: m?.paper ? "论文中的对照设置是否全部纳入消融矩阵？" : "未登记论文：是否需要文献对照（可后续补登记）？",
+            status: "open",
+          },
+        ],
+        paper: m?.paper ?? null,
+      };
+    },
+  },
+
   {
     method: "PUT",
     pattern: "/api/issues/:id",
