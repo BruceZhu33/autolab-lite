@@ -265,9 +265,12 @@ export default function ProjectsPage() {
                 <span className="font-mono text-caption text-muted-foreground">{selected.identifier}</span>
                 <h2 className="text-body font-medium">{selected.title}</h2>
                 {selected.stage === "baseline" && (
-                  <span className="ml-auto text-caption text-muted-foreground">
-                    基线验证中：BASE 派发与验收请看板跟进
-                  </span>
+                  <Link
+                    href={`/${wsSlug}/baseline/${selected.id}`}
+                    className="ml-auto text-caption text-primary hover:underline"
+                  >
+                    前往基线验证 →
+                  </Link>
                 )}
                 {selected.stage === "review" && (
                   <Link

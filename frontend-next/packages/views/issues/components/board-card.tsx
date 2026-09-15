@@ -37,8 +37,9 @@ function formatDate(date: string, locale: string): string {
 /**
  * AutoLab（v0.3 迁移）：看板卡片按阶段路由到 Work 模块——卡片是流程地图
  * 的入口，点击进入该阶段的工作现场而不是通用评论页。
- * 准备 → Projects（选中该项目：核对代码库/补充材料/提审）；
- * 方案评审 → 评审页（两段式现场：草案/反问/定稿）；
+ * 准备 → Projects（选中该项目：核对代码库/补充材料/过准备门）；
+ * 基线验证 → 基线工作区（BASE 派发/run 监视/验收）；
+ * 方案评审 → 评审页（自由对话/评分/人工终审）；
  * 其余阶段暂留通用工作台（Phase 2 建对应模块后接管）。
  */
 function autolabStageWorkspaceHref(
@@ -49,6 +50,8 @@ function autolabStageWorkspaceHref(
   switch (issue.status) {
     case "prepare":
       return `${p.projects()}?project=${encodeURIComponent(issue.id)}`;
+    case "baseline":
+      return `${wsBase}/baseline/${encodeURIComponent(issue.id)}`;
     case "review":
       return `${wsBase}/review/${encodeURIComponent(issue.id)}`;
     default:
