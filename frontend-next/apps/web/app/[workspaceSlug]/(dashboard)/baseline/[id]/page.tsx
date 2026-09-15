@@ -1,20 +1,17 @@
 "use client";
 
 /**
- * 基线验证工作区（基线模块核心）。
+ * 基线验证工作区（基线模块核心，对话驱动）。
  *
- * 流程（deviation #34 顺序）：BASE 绑定原始代码库——
- *  ① 派发 BASE（多 seed，时间驱动模拟进度）；
- *  ② 监视 run（RUNNING / FINISHED / REPAIRING）与指标；
- *  ③ 全部完成后汇总（均值 + seed 区间），对照验收线；
- *  ④ 验收通过 → 方案评审；驳回 → 回准备（时间线留痕）。
- * 阻塞卡态（REPAIRING 无出口等）以「需要你」覆盖层呈现（v0.2 §12）。
- *
- * Phase 2 对接 sidecar：env-setup / runs 域 / tx_baseline_acceptance。
+ * 交互模型（2026-09-15 口径）：用户与 AutoLab 协调 Agent 对话，
+ * Agent 去 GPU 服务器执行——「跑基线」→ 派发多 seed BASE → 汇报进度 →
+ * 完成后主动汇报指标 →「验收通过」过门进方案评审（对话/按钮双通道）。
+ * 右侧是执行状态面板（run 表 / 指标 / 验收 / 阻塞「需要你」）。
+ * Run 进度时间驱动模拟；Phase 2 对接 sidecar env-setup / runs 域。
  */
-import { use, useState } from "react";
+import { use, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FileCode, PlayCircle } from "lucide-react";
+import { FileCode, Send } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { toast } from "sonner";
@@ -23,7 +20,6 @@ import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
 import { PageHeader } from "@multica/views/layout/page-header";
-import { ProjectTimeline } from "@/features/autolab/project-timeline";
 import { stageColor, stageLabel } from "@/features/autolab/stage";
 
 interface ProjectView {
@@ -35,7 +31,7 @@ interface ProjectView {
   workspacePath: string;
 }
 
-interface BaselineRunView {
+interface RunView {
   id: string;
   seed: number;
   serverName: string;
@@ -45,11 +41,19 @@ interface BaselineRunView {
   metric: number | null;
 }
 
+interface MsgView {
+  id: string;
+  role: "user" | "agent";
+  content: string;
+  createdAt: string;
+}
+
 interface WorkshopView {
   projectId: string;
-  runs: BaselineRunView[];
+  runs: RunView[];
   accepted: { avg: number; threshold: number; at: string } | null;
   blocker: { kind: string; title: string; reason: string; actions: string[] } | null;
+  messages: MsgView[];
   summary: { avg: number; min: number; max: number } | null;
 }
 
@@ -66,12 +70,12 @@ async function fixtureApi<T>(method: string, path: string, body?: unknown): Prom
   return r.json() as Promise<T>;
 }
 
-function runStatus(r: BaselineRunView): "RUNNING" | "FINISHED" | "REPAIRING" {
+function runStatus(r: RunView): "RUNNING" | "FINISHED" | "REPAIRING" {
   if (r.finishAt === null) return "REPAIRING";
   return Date.now() >= new Date(r.finishAt).getTime() ? "FINISHED" : "RUNNING";
 }
 
-function RunStatusBadge({ r }: { r: BaselineRunView }) {
+function RunStatusBadge({ r }: { r: RunView }) {
   const s = runStatus(r);
   if (s === "FINISHED") return <Badge variant="default" className="bg-emerald-600">FINISHED</Badge>;
   if (s === "REPAIRING") return <Badge variant="destructive">REPAIRING</Badge>;
@@ -92,7 +96,10 @@ export default function BaselineWorkshopPage({
   const qc = useQueryClient();
   const pathname = usePathname();
   const wsSlug = pathname.split("/")[1] ?? "autolab";
+  const [draft, setDraft] = useState("");
+  const [typing, setTyping] = useState(false);
   const [threshold, setThreshold] = useState("0.75");
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const { data: project } = useQuery({
     queryKey: ["autolab", "fixture-projects"],
@@ -100,12 +107,18 @@ export default function BaselineWorkshopPage({
     select: (d) => d.projects.find((p) => p.id === id || p.identifier === id) ?? null,
   });
 
-  // 5s 轮询：时间驱动的 run 进度自然推进
+  // 5s 轮询：时间驱动 run 进度 + Agent 完成汇报（惰性触发）自然出现
   const { data: ws } = useQuery({
     queryKey: ["autolab", "baseline-workshop", id],
     queryFn: () => fixtureApi<WorkshopView>("GET", `/api/projects/${id}/baseline-workshop`),
+    // 训练监控页：后台标签也要刷新（Agent 汇报不因失焦缺席）
     refetchInterval: 5000,
+    refetchIntervalInBackground: true,
   });
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [ws?.messages.length, typing]);
 
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ["autolab", "baseline-workshop", id] });
@@ -113,13 +126,30 @@ export default function BaselineWorkshopPage({
     void qc.invalidateQueries({ queryKey: ["autolab", "timeline", id] });
   };
 
+  const send = useMutation({
+    mutationFn: (content: string) =>
+      fixtureApi<MsgView>("POST", `/api/projects/${id}/baseline-workshop/messages`, { content }),
+    onMutate: () => setTyping(true),
+    onSuccess: () => {
+      setDraft("");
+      // typing 演出：Agent 回复已入库（可能带动作副作用），延迟一拍刷新
+      window.setTimeout(() => {
+        setTyping(false);
+        refresh();
+      }, 900);
+    },
+    onError: (e: Error) => {
+      setTyping(false);
+      toast.error("发送失败", { description: e.message.slice(0, 200) });
+    },
+  });
+
   const dispatch = useMutation({
     mutationFn: () => fixtureApi("POST", `/api/projects/${id}/baseline-workshop/dispatch`),
     onSuccess: () => {
-      toast.success("BASE 已派发", { description: "多 seed 运行中；完成后汇总指标供验收。" });
+      toast.success("BASE 已派发", { description: "多 seed 运行中，Agent 会汇报进展。" });
       refresh();
     },
-    onError: (e: Error) => toast.error("派发失败", { description: e.message.slice(0, 200) }),
   });
 
   const accept = useMutation({
@@ -142,13 +172,18 @@ export default function BaselineWorkshopPage({
   const reject = useMutation({
     mutationFn: () =>
       fixtureApi("POST", `/api/projects/${id}/baseline-workshop/reject`, {
-        reason: "指标未达线（演示驳回路径）",
+        reason: "指标未达线（面板驳回）",
       }),
     onSuccess: () => {
       toast.info("已驳回", { description: "项目回退「准备」阶段，时间线已留痕。" });
       refresh();
     },
   });
+
+  const allDone = useMemo(
+    () => ws !== undefined && ws.runs.length > 0 && ws.summary !== null,
+    [ws],
+  );
 
   if (!project) {
     return (
@@ -164,7 +199,11 @@ export default function BaselineWorkshopPage({
     );
   }
 
-  const allDone = ws !== undefined && ws.runs.length > 0 && ws.summary !== null;
+  const submit = () => {
+    const content = draft.trim();
+    if (!content) return;
+    send.mutate(content);
+  };
 
   return (
     <>
@@ -183,8 +222,65 @@ export default function BaselineWorkshopPage({
         </div>
       </PageHeader>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-4 p-4 md:px-6 lg:flex-row">
-        <div className="flex min-w-0 flex-1 flex-col gap-4 overflow-y-auto">
+      <div className="flex min-h-0 flex-1 gap-4 p-4 md:px-6">
+        {/* 左：与 AutoLab 协调 Agent 对话（它去 GPU 服务器执行） */}
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col rounded-lg border">
+          <p className="border-b px-4 py-2.5 text-caption font-medium text-muted-foreground">
+            与 AutoLab 协调 Agent 对话 · 它在 GPU 服务器上执行基线训练
+          </p>
+
+          <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto p-4">
+            {(ws?.messages ?? []).map((m) =>
+              m.role === "user" ? (
+                <div key={m.id} className="flex justify-end">
+                  <p className="max-w-[85%] whitespace-pre-wrap break-words rounded-lg bg-primary/10 px-3 py-2 text-sm">
+                    {m.content}
+                  </p>
+                </div>
+              ) : (
+                <div key={m.id} className="flex gap-2.5">
+                  <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-muted text-caption font-medium">
+                    A
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="flex items-baseline gap-2">
+                      <span className="text-caption font-medium">AutoLab</span>
+                      <span className="rounded bg-muted px-1 text-[10px] leading-4 text-muted-foreground">执行 Agent</span>
+                    </p>
+                    <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed">{m.content}</p>
+                  </div>
+                </div>
+              ),
+            )}
+            {typing && (
+              <div className="flex gap-2.5">
+                <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-muted text-caption font-medium">A</span>
+                <p className="flex items-center gap-1 pt-2 text-muted-foreground">
+                  <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60" />
+                  <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:120ms]" />
+                  <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:240ms]" />
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 border-t p-3">
+            <Input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) submit();
+              }}
+              placeholder="跟 AutoLab 说：跑基线 / 进度怎么样 / 验收通过…"
+            />
+            <Button size="icon-sm" onClick={submit} disabled={send.isPending || !draft.trim()} aria-label="发送">
+              <Send className="size-4" />
+            </Button>
+          </div>
+        </div>
+
+        {/* 右：执行状态面板 */}
+        <div className="hidden w-96 shrink-0 flex-col gap-4 overflow-y-auto lg:flex">
           {/* 阻塞覆盖层（需要你） */}
           {ws?.blocker && (
             <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-4">
@@ -204,60 +300,44 @@ export default function BaselineWorkshopPage({
             </div>
           )}
 
-          {/* BASE 派发 / run 监视 */}
+          {/* BASE 运行表 */}
           <div className="rounded-lg border">
             <div className="flex items-center gap-2 border-b px-4 py-2.5">
               <p className="flex-1 text-caption font-medium text-muted-foreground">
                 BASE 运行（原始代码 · 多 seed）
               </p>
-              <span className="font-mono text-caption text-muted-foreground">{project.workspacePath}</span>
               {(!ws || ws.runs.length === 0) && project.stage === "baseline" && (
-                <Button size="sm" onClick={() => dispatch.mutate()} disabled={dispatch.isPending}>
-                  <PlayCircle className="size-3.5" />
-                  派发 BASE
+                <Button size="sm" variant="ghost" onClick={() => dispatch.mutate()} disabled={dispatch.isPending}>
+                  派发
                 </Button>
               )}
             </div>
             {ws && ws.runs.length > 0 ? (
-              <table className="w-full text-sm">
-                <thead className="bg-muted/50 text-caption text-muted-foreground">
-                  <tr>
-                    <th className="px-4 py-1.5 text-left font-normal">Seed</th>
-                    <th className="px-4 py-1.5 text-left font-normal">服务器 / GPU</th>
-                    <th className="px-4 py-1.5 text-left font-normal">状态</th>
-                    <th className="px-4 py-1.5 text-left font-normal">macro-F1</th>
-                    <th className="px-4 py-1.5 text-left font-normal">派发时间</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ws.runs.map((r) => {
-                    const s = runStatus(r);
-                    return (
-                      <tr key={r.id} className="border-t">
-                        <td className="px-4 py-2 font-mono text-xs">seed {r.seed}</td>
-                        <td className="px-4 py-2 font-mono text-xs text-muted-foreground">
-                          {r.serverName} · {r.gpu}
-                        </td>
-                        <td className="px-4 py-2"><RunStatusBadge r={r} /></td>
-                        <td className="px-4 py-2 font-mono tabular-nums">
-                          {s === "FINISHED" ? r.metric?.toFixed(3) : "—"}
-                        </td>
-                        <td className="px-4 py-2 text-caption text-muted-foreground">
-                          {new Date(r.dispatchedAt).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <div className="divide-y">
+                {ws.runs.map((r) => {
+                  const s = runStatus(r);
+                  return (
+                    <div key={r.id} className="flex items-center gap-2 px-4 py-2 text-sm">
+                      <span className="font-mono text-xs">seed {r.seed}</span>
+                      <span className="truncate font-mono text-caption text-muted-foreground">
+                        {r.serverName}
+                      </span>
+                      <span className="ml-auto"><RunStatusBadge r={r} /></span>
+                      <span className="w-14 text-right font-mono tabular-nums">
+                        {s === "FINISHED" ? r.metric?.toFixed(3) : "—"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
             ) : (
               <p className="px-4 py-3 text-caption text-muted-foreground">
-                BASE 尚未派发。派发后以原始代码运行多 seed，建立对比锚点（deviation #34：BASE 绑定代码库而非 plan）。
+                未派发。对话里说「跑基线」，AutoLab 会去 GPU 服务器执行（deviation #34：BASE 绑定代码库而非 plan）。
               </p>
             )}
           </div>
 
-          {/* 指标汇总 + 验收 */}
+          {/* 指标汇总与验收 */}
           {ws && ws.runs.length > 0 && (
             <div className="rounded-lg border">
               <p className="border-b px-4 py-2.5 text-caption font-medium text-muted-foreground">
@@ -265,15 +345,15 @@ export default function BaselineWorkshopPage({
               </p>
               {ws.accepted ? (
                 <p className="px-4 py-3 text-caption text-emerald-600">
-                  已验收：均值 {ws.accepted.avg} ≥ 验收线 {ws.accepted.threshold}（{new Date(ws.accepted.at).toLocaleString("zh-CN")}）。
+                  已验收：均值 {ws.accepted.avg} ≥ 验收线 {ws.accepted.threshold}。
                 </p>
               ) : !allDone ? (
                 <p className="px-4 py-3 text-caption text-muted-foreground">
-                  等待全部 run 完成（时间驱动模拟，页面自动刷新进度）…
+                  等待全部 run 完成（Agent 汇报后自动出现汇总）…
                 </p>
               ) : (
                 <div className="space-y-3 px-4 py-3">
-                  <p className="flex items-baseline gap-3">
+                  <p className="flex items-baseline gap-2">
                     <span className="font-mono text-lg font-semibold tabular-nums">
                       {ws.summary!.avg.toFixed(4)}
                     </span>
@@ -289,10 +369,10 @@ export default function BaselineWorkshopPage({
                       className="h-7 w-20 font-mono text-sm"
                     />
                     <Button size="sm" onClick={() => accept.mutate()} disabled={accept.isPending}>
-                      验收通过，进入方案评审
+                      验收通过
                     </Button>
                     <Button size="sm" variant="ghost" onClick={() => reject.mutate()} disabled={reject.isPending}>
-                      驳回（回准备）
+                      驳回
                     </Button>
                   </div>
                 </div>
@@ -301,20 +381,11 @@ export default function BaselineWorkshopPage({
           )}
 
           <p className="text-caption text-muted-foreground">
+            BASE：<span className="font-mono">{project.workspacePath || "—"}</span> ·{" "}
             <Link href={`/${wsSlug}/projects?project=${encodeURIComponent(project.id)}`} className="text-primary hover:underline">
               返回项目详情
             </Link>
           </p>
-        </div>
-
-        {/* 内嵌时间线：Agent 运行汇报 / 用户介入 */}
-        <div className="flex min-h-64 min-w-0 flex-col rounded-lg border lg:w-96 lg:shrink-0">
-          <p className="border-b px-4 py-2.5 text-caption font-medium text-muted-foreground">
-            运行时间线（Agent 汇报 / 人工介入）
-          </p>
-          <div className="flex min-h-0 flex-1 flex-col p-4">
-            <ProjectTimeline projectId={project.id} />
-          </div>
         </div>
       </div>
     </>
