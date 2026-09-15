@@ -62,6 +62,9 @@ function workspaceScoped(slug: string) {
     myIssues: () => `${ws}/my-issues`,
     // AutoLab（v0.3 迁移）：GPU 服务器管理页，挂在 Work 分组
     gpu: () => `${ws}/gpu`,
+    // AutoLab（v0.3 迁移）：方案评审模块（列表 + 项目评审工作区）
+    review: () => `${ws}/review`,
+    reviewDetail: (id: string) => `${ws}/review/${encode(id)}`,
     runtimes: () => `${ws}/runtimes`,
     runtimeDetail: (id: string) => `${ws}/runtimes/${encode(id)}`,
     runtimeSettings: (machineId: string, runtimeId: string) =>

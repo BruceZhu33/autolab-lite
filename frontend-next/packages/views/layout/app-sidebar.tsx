@@ -119,6 +119,7 @@ type NavKey =
   | "projects"
   | "autopilots"
   | "gpu"
+  | "review"
   | "agents"
   | "squads"
   | "usage"
@@ -136,6 +137,7 @@ type NavLabelKey =
   | "projects"
   | "autopilots"
   | "gpu"
+  | "review"
   | "agents"
   | "squads"
   | "usage"
@@ -159,13 +161,15 @@ const workNav: { key: NavKey; labelKey: NavLabelKey }[] = [
   { key: "issues", labelKey: "issues" },
   { key: "projects", labelKey: "projects" },
   { key: "autopilots", labelKey: "autopilots" },
+  // AutoLab（v0.3 迁移）：方案评审工作区（Agent 协作最深的现场）
+  { key: "review", labelKey: "review" },
 ];
 
+// AutoLab（v0.3 迁移）：单人形态只保留 Agents / Skills
+// （Squads 团队协作与 Runtimes 机器管理不适用；GPU 服务器在基础区）
 const aiTeamNav: { key: NavKey; labelKey: NavLabelKey }[] = [
   { key: "agents", labelKey: "agents" },
-  { key: "squads", labelKey: "squads" },
   { key: "skills", labelKey: "skills" },
-  { key: "runtimes", labelKey: "runtimes" },
 ];
 
 const utilityNav: { key: NavKey; labelKey: NavLabelKey }[] = [

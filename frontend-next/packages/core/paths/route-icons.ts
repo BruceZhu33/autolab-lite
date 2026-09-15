@@ -51,6 +51,7 @@ export type NavLabelKey =
   | "projects"
   | "autopilots"
   | "gpu"
+  | "review"
   | "agents"
   | "squads"
   | "usage"
@@ -67,6 +68,7 @@ export type WorkspacePageKey =
   | "projects"
   | "autopilots"
   | "gpu"
+  | "review"
   | "agents"
   | "squads"
   | "usage"
@@ -96,6 +98,8 @@ export const WORKSPACE_PAGES: Record<WorkspacePageKey, WorkspacePage> = {
   autopilots: { segment: "autopilots", icon: "Zap", navKey: "autopilots" },
   // AutoLab（v0.3 迁移）：GPU 服务器管理（产品基础设施，Work 分组）
   gpu: { segment: "gpu", icon: "Server", navKey: "gpu" },
+  // AutoLab（v0.3 迁移）：方案评审工作区（Agent 协作最深的现场）
+  review: { segment: "review", icon: "FileText", navKey: "review" },
   agents: { segment: "agents", icon: "Bot", navKey: "agents" },
   squads: { segment: "squads", icon: "Users", navKey: "squads" },
   usage: { segment: "usage", icon: "BarChart3", navKey: "usage" },

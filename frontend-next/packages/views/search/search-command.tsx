@@ -97,6 +97,7 @@ const PAGE_KEYWORDS: Record<WorkspacePageKey, string[]> = {
   projects: ["projects", "kanban", "项目"],
   autopilots: ["autopilot", "autopilots", "automation", "schedule", "cron", "webhook", "自动化", "定时"],
   gpu: ["gpu", "server", "servers", "agent", "deploy", "upgrade", "服务器", "部署", "升级"],
+  review: ["review", "proposal", "score", "评审", "方案", "评分"],
   agents: ["agents", "bots", "ai", "智能体"],
   squads: ["squads", "teams", "小队", "团队"],
   usage: ["usage", "analytics", "stats", "metrics", "统计", "分析", "用量"],
