@@ -187,6 +187,62 @@ async def list_gpus(server_id: str, request: Request):
                                       (server_id,)).fetchall()])
 
 
+@router.delete("/{server_id}")
+async def delete_server(server_id: str, request: Request):
+    """删除服务器注册（deviation #33）。
+
+    Guard：有训练/环境历史（attempts、environment_versions、data_replicas）
+    或 GPU 已被项目绑定的服务器拒绝删除——RESTRICT 审计链不允许断。
+    只允许删除注册后未投产的条目（错注册/测试服务器）。
+    凭据随删除清理；agent_instances/cursors 是可再生的运行时观测，一并清。
+    """
+    state = request.app.state.autolab
+
+    def _delete(conn):
+        row = conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()
+        if row is None:
+            raise TxError("NOT_FOUND", server_id)
+        guards = [
+            ("attempts", "SELECT COUNT(*) c FROM attempts WHERE server_id=?"),
+            ("environment_versions",
+             "SELECT COUNT(*) c FROM environment_versions WHERE server_id=?"),
+            ("data_replicas", "SELECT COUNT(*) c FROM data_replicas WHERE server_id=?"),
+            ("project_gpus",
+             "SELECT COUNT(*) c FROM project_gpus WHERE gpu_id IN "
+             "(SELECT id FROM gpus WHERE server_id=?)"),
+        ]
+        for table, sql in guards:
+            c = conn.execute(sql, (server_id,)).fetchone()["c"]
+            if c:
+                raise TxError("HAS_REFERENCES", f"{c} rows in {table} reference this server")
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "DELETE FROM agent_cursor_repositions WHERE agent_instance_id IN "
+                "(SELECT id FROM agent_instances WHERE server_id=?)", (server_id,))
+            conn.execute(
+                "DELETE FROM agent_cursors WHERE agent_instance_id IN "
+                "(SELECT id FROM agent_instances WHERE server_id=?)", (server_id,))
+            conn.execute("DELETE FROM agent_instances WHERE server_id=?", (server_id,))
+            conn.execute("DELETE FROM gpus WHERE server_id=?", (server_id,))
+            conn.execute("DELETE FROM servers WHERE id=?", (server_id,))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return dict(row)
+
+    row = await to_thread(state.db, _delete)
+    # 凭据清理：失败静默（sidecar 无日志设施；残留凭据可人工清理，
+    # 不阻塞注册条目删除）
+    try:
+        state.creds.delete(row["credential_ref"])
+    except Exception:
+        pass
+    return {"deleted": True, "server_id": server_id, "name": row["name"]}
+
+
 @router.post("/{server_id}/agent/probe")
 async def agent_probe(server_id: str, request: Request):
     state = request.app.state.autolab
