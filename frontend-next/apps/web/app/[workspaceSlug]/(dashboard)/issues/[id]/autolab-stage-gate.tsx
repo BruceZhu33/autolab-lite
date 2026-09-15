@@ -34,25 +34,28 @@ interface StageGate {
 
 /** 六阶段推进门（顺序沿 v0.2 兼容状态机；reported 为终态）。 */
 const STAGE_GATES: Record<string, StageGate> = {
+  // 2026-09-15 口径：BASE 绑定原始代码库而非 plan——准备门确认代码库后
+  // 直接派发 BASE；评审时专家已手握基线数字，方案讨论"在 BASE 上改进什么"；
+  // plan 迭代不重跑 BASE（仅评测口径变化失效）。
   prepare: {
-    next: "review",
-    nextLabel: "方案评审",
-    action: "确认代码库信息，提交评审",
-    hint: "核对工作台的原始代码库登记（工作区 / 规模 / 入口 / 论文）后过准备门",
-    color: "#8b5cf6",
-  },
-  review: {
     next: "baseline",
     nextLabel: "基线验证",
-    action: "评审定稿，进入基线验证",
-    hint: "两段式评审定稿后推进（草案 → 反问清单 → 定稿）",
+    action: "确认代码库信息，开始基线验证",
+    hint: "核对原始代码库登记（工作区 / 规模 / 入口 / 论文）后，派发 BASE 跑原始代码",
     color: "#0ea5e9",
   },
   baseline: {
+    next: "review",
+    nextLabel: "方案评审",
+    action: "基线验收通过，进入方案评审",
+    hint: "BASE 指标达到验收线（tx_baseline_acceptance guard）；带着基线数字与专家讨论改进",
+    color: "#8b5cf6",
+  },
+  review: {
     next: "iterate",
     nextLabel: "自动迭代",
-    action: "基线验收通过，进入自动迭代",
-    hint: "BASE 指标达到验收线（tx_baseline_acceptance guard）",
+    action: "评审定稿，进入自动迭代",
+    hint: "方案经评分 Agent 评审与人工终审后推进",
     color: "#f59e0b",
   },
   iterate: {

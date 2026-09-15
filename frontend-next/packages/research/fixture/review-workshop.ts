@@ -80,7 +80,7 @@ function makePlan(version: number, issue: Issue): ReviewPlan {
       {
         key: "goal",
         title: "目标",
-        content: `${goal}；验收口径以 BASE 对比为锚（macro 指标），不追求绝对值。`,
+        content: `${goal}。BASE 已验收（原始代码基线），所有改进以「相对 BASE 的增益」为验收口径，不追求绝对值。`,
       },
       {
         key: "method",
@@ -93,8 +93,8 @@ function makePlan(version: number, issue: Issue): ReviewPlan {
         key: "experiment",
         title: "实验设计",
         content:
-          "BASE：2 seed 冻结（tx_freeze_batch）作为对比锚点；候选轮次：提案 → JUDGE 三查 → 冒烟 → 派发；" +
-          "每个进入迭代的改进做 leave-one-out 消融；评测口径全程固定，test 集保持一次性释放。",
+          "BASE：已验收（绑定原始代码库，方案迭代不重跑；仅评测口径变化才失效）；候选轮次：提案 → JUDGE 三查 → 冒烟 → 派发；" +
+          "每个进入迭代的改进做 leave-one-out 消融；评测口径全程与 BASE 一致，test 集保持一次性释放。",
       },
       {
         key: "budget",
@@ -129,8 +129,8 @@ function makeScores(plan: ReviewPlan): ReviewScore[] {
       dimension: "实验与统计",
       score: v2 ? 8.5 : 7.5,
       comment: v2
-        ? "已采纳多 seed 建议（v2 起 BASE 3 seed + 置信区间），统计口径可支撑结论。"
-        : "BASE 仅 2 seed，置信区间偏宽；建议 3 seed 并报告区间而非单点，避免把方差当增益。",
+        ? "已采纳多 seed 建议（BASE 补至 3 seed + 全程报告置信区间），统计口径可支撑结论。"
+        : "BASE 仅 2 seed，置信区间偏宽；建议补 1 个 seed 并报告区间而非单点，避免把方差当增益。改进轮同理。",
     },
     {
       agentId: "agent-engineer",
@@ -179,10 +179,10 @@ function expertReply(
   }
   if (parts.length === 0) {
     parts.push(
-      `收到。结合项目方向（${m?.direction ?? issue.title}），我建议下一步：` +
+      `收到。结合项目方向（${m?.direction ?? issue.title}）和已验收的 BASE，我建议下一步：` +
         (m?.paper
-          ? `把论文里最相关的 1-2 个机制和 BASE 做逐项对照，列出可迁移清单。`
-          : `先登记一篇对照论文，我们按它的设置建立复现基线，再谈改进。`) +
+          ? `把论文里最相关的 1-2 个机制和 BASE 做逐项对照，按「预期增益 ÷ 改动成本」排出改进清单。`
+          : `先登记一篇对照论文，把它的机制和 BASE 对照后排改进清单。`) +
         "你可以直接把材料发我（论文 / 代码），也可以继续聊思路。",
     );
   }
@@ -199,8 +199,9 @@ function seed(issue: Issue): ReviewWorkshopState {
           id: nid("rm"),
           role: "expert",
           content:
-            `我是 Researcher，这个项目的方案评审专家。把论文、代码或者你的想法直接发我，` +
-            `我们讨论收敛出方案后，会交给三位评分 Agent 评审，达标后进入你的人工终审。`,
+            `我是 Researcher，这个项目的方案评审专家。基线已经验收（数字在工作台时间线里），` +
+            `把论文、代码或者你的想法直接发我，我们讨论在 BASE 之上改进什么；` +
+            `收敛出方案后交给三位评分 Agent 评审，达标后进入你的人工终审。`,
           createdAt: new Date().toISOString(),
         },
       ],
@@ -216,7 +217,7 @@ function seed(issue: Issue): ReviewWorkshopState {
       {
         id: nid("rm"),
         role: "user",
-        content: "这是论文，先对齐他们的评测设置。",
+        content: "BASE 已验收（macro-F1 0.792，3 seed）。这是论文，结合基线看看改进什么。",
         materials: [{ kind: "paper", label: "Tabular FM: Bridging Tables and Transformers" }],
         createdAt: "2026-09-14T10:00:00Z",
       },
@@ -224,8 +225,9 @@ function seed(issue: Issue): ReviewWorkshopState {
         id: nid("rm"),
         role: "expert",
         content:
-          "已精读。它的评测协议和我们一致（同划分、同指标），表示方法里的特征穿透机制是主要可迁移点；" +
-          "训练目标差异较大，建议第二轮再动。先按单变量原则排改进线。",
+          "基线数字收到。论文的评测协议和 BASE 一致（同划分、同指标），可以直接对比；" +
+          "表示方法里的特征穿透机制对 0.792 这个起点预期增益最大，训练目标差异大放第二轮。" +
+          "按单变量原则排改进线，每轮只动一个因子。",
         createdAt: "2026-09-14T10:02:00Z",
       },
       {

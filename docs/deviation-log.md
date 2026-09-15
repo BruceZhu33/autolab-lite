@@ -50,6 +50,8 @@
 | 32 | 2026-09-14 | （观测记录，未修码）真机首轮实践暴露的产品缺口 | ①fail_class 分类启发式：PYTHONPATH 污染类环境错误被判为 model（进 REPAIRING）而非 infra（进 INFRA_RETRY 自动重派）——分类应看错误指纹（ImportError/ModuleNotFound→env 类）；②REPAIRING 的 baseline run 无自动出路（next_round 仅 SEARCH），只能重建项目；③run 创建绑定**最老**代码快照（`ORDER BY created_at LIMIT 1`），BASE 级修复需整项目重建；④agent 升级的在途 guard 被 5 个历史僵尸 attempt（RUNNING/ACKED 残留）阻塞，需 force 绕过；⑤env setup 无远端磁盘空间预检（A6000 根分区 100% 满，1.8G 余量跑大 BASE 有风险）；⑥verify 阶段（远端 sha256 全量校验 612 文件）耗时 3-5 分钟，成为 env setup 主要瓶颈 | 攒批处理：①错误指纹分类表；②REPAIRING 出口（baseline 修复轮或人工重派端点）；③快照选择策略（或 BASE 热修入口）；④attempt 对账 sweep 收僵尸；⑤磁盘预检 guard；⑥verify 增量/并行化 | 首轮真实 BASE（mynet/clinic）全链路实践的直接产出；BASE 侧另有四项适配属用户代码问题不计入（GBK 转码/未定义 clinicdatasets/梯度爆炸 NaN/Xid43 eval 崩溃→重排版 main+评测 CPU 兜底） |
 | 33 | 2026-09-15 | 契约 openapi（servers 域）——新增端点（v0.3 前端迁移驱动） | 新增 `DELETE /api/v1/servers/{server_id}`：删除服务器注册。**Guard**：attempts / environment_versions / data_replicas / project_gpus 任一引用即拒绝（`HAS_REFERENCES`，报行数与表名）——RESTRICT 审计链不允许断，只允许删除未投产条目（错注册/测试服务器）。删除范围：servers 行 + gpus + agent_instances/agent_cursors/cursor_repositions（可再生观测）+ 凭据存储条目 | `routers/servers.py` 新端点；前端 GPU 页（frontend-next）删除按钮 + 二次确认；真机验证：A6000 被拒（158 attempts）✓、tmp 注册→删除→消失 ✓；sidecar 单测 32/32 | 错注册条目无法清理是旧 UI 时代的缺口；有训练历史的服务器永久保留（审计），与"暂停项目保留上下文"同哲学 |
 
+| 34 | 2026-09-15 | 设计 §状态机——阶段顺序翻转（用户拍板，新 UI 先行） | 科研阶段顺序由「准备→评审→基线→迭代」改为 **「准备→基线验证→方案评审→迭代→确认→完成」**。语义简化：**BASE 绑定原始代码库而非 plan**——准备门确认代码库后直接派发 BASE；评审时专家已手握基线数字，讨论"在 BASE 上改进什么"；plan 迭代不重跑 BASE（仅评测口径变化才失效）。v0.2 §1.1-1 预埋的张力的正式解封 | 目前仅前端 fixture（frontend-next 六阶段目录/过门链/Projects 提交按钮/评审剧本引用 BASE 数字）；**sidecar 状态机未动**——Phase 2 接线时需正式 RFC：删 REVIEW_GATE→BASELINE 顺序、BASE 验收绑定代码库快照、评审产出 plan 的生效语义、契约测试同步 | 该顺序是 v0.2 记录的"用户期望"目标序（方案 §4.1 目标顺序候选），产品上更合理：评审讨论有基线数字做锚 |
+
 
 ## 与契约一致（零偏离）的核心面
 

@@ -15,7 +15,7 @@ FRONTEND_PORT=3200 pnpm dev     # http://localhost:3200/autolab/issues
 - fixture 模式由 `apps/web/.env.local` 的 `NEXT_PUBLIC_AUTOLAB_FIXTURE=1` 开启；
   删掉该文件即回到连接真实 server 的原生行为（Phase 2 接 sidecar 时用）。
 - 数据来自 `packages/research/fixture`（内存态，刷新重置）：
-  - 六个科研阶段 = 六条自定义 issue status（`prepare/review/baseline/iterate/confirm/reported`），
+  - 六个科研阶段 = 六条自定义 issue status（`prepare/baseline/review/iterate/confirm/reported`），
     七个 Multica 内置 status 以归档态返回以压制兜底列。
   - 科研项目 = Issue（LAB-1~7，内容取材 mynet-clinic 真机轮次）。
   - Agent persona = Agent（AutoLab/Researcher/Engineer/Reviewer，v0.2 §6.2）。
