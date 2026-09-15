@@ -61,6 +61,7 @@ interface ImportView {
   sourceKind: "local" | "github";
   sourceRef: string;
   serverName: string;
+  remotePath: string;
   files: number;
   sizeMb: number;
   startedAt: string;
@@ -348,7 +349,7 @@ export default function BaselineWorkshopPage({
                   <>
                     <Badge variant="default" className="bg-emerald-600">SYNCED</Badge>
                     <span className="truncate font-mono text-caption text-muted-foreground">
-                      {ws.codeImport.sourceKind === "github" ? "git clone" : "SFTP+sha256"} · {ws.codeImport.files} 文件 · {ws.codeImport.sizeMb} MB · {ws.codeImport.serverName}
+                      {ws.codeImport.serverName}:{ws.codeImport.remotePath} · {ws.codeImport.files} 文件 · {ws.codeImport.sizeMb} MB
                     </span>
                   </>
                 )}
