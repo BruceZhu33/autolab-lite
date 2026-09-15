@@ -106,7 +106,7 @@ export default function ProjectsPage() {
       fixtureApi<ProjectView>("POST", "/api/projects", input),
     onSuccess: (p) => {
       toast.success(`项目 ${p.identifier} 已创建`, {
-        description: "已加入看板「准备」列；在右侧核对代码库信息后提审。",
+        description: "已加入看板「准备」列；在右侧核对代码库信息后开始基线验证。",
       });
       setOpen(false);
       setForm(EMPTY_FORM);
@@ -134,13 +134,13 @@ export default function ProjectsPage() {
     create.mutate(form);
   };
 
-  /** 准备门：确认代码库信息 → 提交评审（Phase 4 改接 sidecar availableActions）。 */
+  /** 准备门：确认代码库信息 → 进入基线验证（Phase 4 改接 sidecar availableActions）。 */
   const submitReview = async () => {
     if (!selected) return;
     try {
-      await fixtureApi("PUT", `/api/issues/${selected.id}`, { status: "review" });
-      toast.success(`${selected.identifier} 已提交评审`, {
-        description: "看板卡片已移至「方案评审」列，可前往评审页继续两段式评审。",
+      await fixtureApi("PUT", `/api/issues/${selected.id}`, { status: "baseline" });
+      toast.success(`${selected.identifier} 已提交基线验证`, {
+        description: "BASE（原始代码）派发后，验收通过即可带着基线数字进方案评审。",
       });
       void qc.invalidateQueries();
     } catch (e) {
@@ -161,7 +161,7 @@ export default function ProjectsPage() {
           </span>
         ) : null}
         <p className="ml-2 hidden min-w-0 truncate text-caption text-muted-foreground md:block">
-          新建项目（本地工作区作为 BASE · 论文可选）→ 核对代码库 → 提审
+          新建项目（本地工作区作为 BASE · 论文可选）→ 核对代码库 → 基线验证
         </p>
         <div className="ml-auto">
           <Dialog open={open} onOpenChange={setOpen}>
@@ -264,6 +264,11 @@ export default function ProjectsPage() {
                 <StageBadge stage={selected.stage} />
                 <span className="font-mono text-caption text-muted-foreground">{selected.identifier}</span>
                 <h2 className="text-body font-medium">{selected.title}</h2>
+                {selected.stage === "baseline" && (
+                  <span className="ml-auto text-caption text-muted-foreground">
+                    基线验证中：BASE 派发与验收请看板跟进
+                  </span>
+                )}
                 {selected.stage === "review" && (
                   <Link
                     href={`/${wsSlug}/review/${selected.id}`}
@@ -297,10 +302,10 @@ export default function ProjectsPage() {
                 {selected.stage === "prepare" && (
                   <div className="flex items-center gap-3 border-t px-4 py-2.5">
                     <p className="min-w-0 flex-1 truncate text-caption text-muted-foreground">
-                      核对以上信息无误后提审；需要变更请在时间线补充说明。
+                      核对无误后开始基线验证（跑原始代码建立 BASE）；需要变更请在时间线补充说明。
                     </p>
                     <Button size="sm" onClick={() => void submitReview()}>
-                      确认代码库信息，提交评审
+                      确认代码库信息，开始基线验证
                     </Button>
                   </div>
                 )}

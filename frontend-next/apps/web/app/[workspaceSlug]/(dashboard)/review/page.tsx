@@ -50,7 +50,7 @@ export default function ReviewIndexPage() {
           </span>
         )}
         <p className="ml-2 hidden min-w-0 truncate text-caption text-muted-foreground md:block">
-          与专家 Agent 自由讨论 → 收敛方案 → 评分 Agent 评审 → 人工终审
+          基于已验收 BASE 与专家 Agent 讨论改进 → 评分 → 人工终审
         </p>
       </PageHeader>
 
@@ -58,7 +58,7 @@ export default function ReviewIndexPage() {
         {isPending && <p className="text-sm text-muted-foreground">加载中…</p>}
         {!isPending && inReview.length === 0 && (
           <p className="text-sm text-muted-foreground">
-            暂无评审中的项目。在 Projects 页提审后，项目会出现在这里。
+            暂无评审中的项目。基线验收通过后，项目会出现在这里。
           </p>
         )}
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">

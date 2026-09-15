@@ -97,8 +97,8 @@ function timelineEntries(issueId: string): Record<string, unknown>[] {
       actor_type: "member",
       actor_id: user.id,
       actor_name: user.name,
-      action: "baseline → iterate",
-      details: { from: "baseline", to: "iterate", guard: "tx_baseline_acceptance" },
+      action: "review → iterate",
+      details: { from: "review", to: "iterate", guard: "review_finalized" },
       created_at: "2026-09-13T09:30:00Z",
     });
   }
