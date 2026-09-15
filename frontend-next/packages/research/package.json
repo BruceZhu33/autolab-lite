@@ -1,0 +1,20 @@
+{
+  "name": "@autolab/research",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./platform": "./platform.ts",
+    "./fixture": "./fixture/index.ts",
+    "./sidecar/config": "./sidecar/config.ts",
+    "./sidecar/client": "./sidecar/client.ts",
+    "./sidecar/servers": "./sidecar/servers.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@multica/tsconfig": "workspace:*",
+    "typescript": "catalog:"
+  }
+}

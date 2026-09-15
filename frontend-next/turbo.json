@@ -1,0 +1,42 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  // AutoLab 迁移修剪：globalDependencies 原指向 .github/workflows/ci.yml
+  // （Multica CI 工具链 pin），切片不含该文件，改用 .nvmrc 固定 Node 版本。
+  "globalDependencies": [".nvmrc"],
+  "globalEnv": [
+    "PORT",
+    "FRONTEND_PORT",
+    "FRONTEND_ORIGIN",
+    "NEXT_PUBLIC_API_URL",
+    "NEXT_PUBLIC_WS_URL",
+    "MULTICA_SERVER_URL",
+    "DOCS_URL"
+  ],
+  "tasks": {
+    "mdx": {
+      "outputs": [".source/**"]
+    },
+    "build": {
+      "dependsOn": ["^build", "mdx"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**", "out/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "dev:staging": {
+      "cache": false,
+      "persistent": true
+    },
+    "typecheck": {
+      "dependsOn": ["^typecheck", "mdx"]
+    },
+    "cache-inputs": {
+      "dependsOn": ["^cache-inputs"]
+    },
+    "test": {
+      "dependsOn": ["^cache-inputs"]
+    },
+    "lint": {}
+  }
+}

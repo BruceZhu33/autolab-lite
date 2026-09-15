@@ -43,6 +43,14 @@
 
 | 29 | 2026-09-14 | 选型 TD6'（RD-Agent 底座）——替换 deviation #19 的"适配器位预留" | **已接入真身**：PYTHONPATH 直连工作区源码（RD-Agent-main/，534 py 文件，天然版本锁定）；复用 LLMHypothesisGen + MSRA 原版 jinja2 提示词 + LiteLLM 后端 + Hypothesis 六字段结构；补丁生成仍走产品层（JUDGE 三查闭环）。接入坑：①pydantic-settings 单例 import 时读 env（须直接改 LITELLM_SETTINGS 字段 + OPENAI_API_BASE/KEY env 双管齐下）；②litellm 需 openai/ 前缀走自定义端点；③chat_stream 默认 true 须关 | migration 0007 llm_settings.engine（builtin|rdagent）；设置页引擎切换 UI；真机验证：SE 假设生成→JUDGE→commit→训练 FINISHED |
 
+| 30 | 2026-09-14 | 设计 §5（agent 部署形态）/ 传输层 | **真机实测**：env setup 的 SFTP 大文件上传与 monitor 隧道/exec 流量共享连接时无错误悬挂（replica 永久 SYNCING；独立连接/独立代码/独立目标位置均无法复现，仅 sidecar 进程内触发）；另 upload/download 无整体超时，悬挂不可自愈；close() 引用的 _listeners 属性不存在（隧道 listener 从未关闭） | `SshTransport`：批量传输（upload_tree/upload_file/download_file）改用**专用短命连接**（_bulk_conn）+ `wait_for(BULK_TIMEOUT_S=1800)` 硬上限（悬挂转异常→replica FAILED）；close() 真正关闭隧道 listener。修复后 97MB 代码+54MB 数据 40s 内上传完成（原卡死于 13-28MB 随机位置） | 隔离共享连接的未知交互面；悬挂必须转为可观测失败（A11 重入修复的前提） |
+
+| 31 | 2026-09-14 | 设计 §5（agent 运行时 manifest.env）——deviation #23 同类 | **真机实测**：agent 以 `PYTHONPATH=pylibs` 运行（#15 离线轮子），runner 用 `dict(os.environ)` 起子进程，把 pylibs 中为 py3.10+ 打包的老版 typing_extensions 泄入用户训练进程——zwm conda 环境（py3.8）`import torch` 即崩（`typing._SpecialGenericAlias` 缺失） | agent 0.1.5-m2：runner 起子进程前 `env.pop("PYTHONPATH")`；经 agent 自动升级双路径验证（0.1.4→0.1.5 热更） | agent 自身的依赖视图与用户代码的依赖视图必须隔离；#23 修的是 PATH 方向，本次是 PYTHONPATH 方向 |
+
+| 32 | 2026-09-14 | （观测记录，未修码）真机首轮实践暴露的产品缺口 | ①fail_class 分类启发式：PYTHONPATH 污染类环境错误被判为 model（进 REPAIRING）而非 infra（进 INFRA_RETRY 自动重派）——分类应看错误指纹（ImportError/ModuleNotFound→env 类）；②REPAIRING 的 baseline run 无自动出路（next_round 仅 SEARCH），只能重建项目；③run 创建绑定**最老**代码快照（`ORDER BY created_at LIMIT 1`），BASE 级修复需整项目重建；④agent 升级的在途 guard 被 5 个历史僵尸 attempt（RUNNING/ACKED 残留）阻塞，需 force 绕过；⑤env setup 无远端磁盘空间预检（A6000 根分区 100% 满，1.8G 余量跑大 BASE 有风险）；⑥verify 阶段（远端 sha256 全量校验 612 文件）耗时 3-5 分钟，成为 env setup 主要瓶颈 | 攒批处理：①错误指纹分类表；②REPAIRING 出口（baseline 修复轮或人工重派端点）；③快照选择策略（或 BASE 热修入口）；④attempt 对账 sweep 收僵尸；⑤磁盘预检 guard；⑥verify 增量/并行化 | 首轮真实 BASE（mynet/clinic）全链路实践的直接产出；BASE 侧另有四项适配属用户代码问题不计入（GBK 转码/未定义 clinicdatasets/梯度爆炸 NaN/Xid43 eval 崩溃→重排版 main+评测 CPU 兜底） |
+| 33 | 2026-09-15 | 契约 openapi（servers 域）——新增端点（v0.3 前端迁移驱动） | 新增 `DELETE /api/v1/servers/{server_id}`：删除服务器注册。**Guard**：attempts / environment_versions / data_replicas / project_gpus 任一引用即拒绝（`HAS_REFERENCES`，报行数与表名）——RESTRICT 审计链不允许断，只允许删除未投产条目（错注册/测试服务器）。删除范围：servers 行 + gpus + agent_instances/agent_cursors/cursor_repositions（可再生观测）+ 凭据存储条目 | `routers/servers.py` 新端点；前端 GPU 页（frontend-next）删除按钮 + 二次确认；真机验证：A6000 被拒（158 attempts）✓、tmp 注册→删除→消失 ✓；sidecar 单测 32/32 | 错注册条目无法清理是旧 UI 时代的缺口；有训练历史的服务器永久保留（审计），与"暂停项目保留上下文"同哲学 |
+
+
 ## 与契约一致（零偏离）的核心面
 
 - **事务模板**：`s_cas / tx_usage / tx_settle / tx_drain_* / tx_authorize_dispatch / tx_ingest / tx_ingest_snapshot / tx_freeze` 逐字移植 harness（guard/错误码/幂等语义一致）——`tests/test_tx_contract_parity.py` 9/9

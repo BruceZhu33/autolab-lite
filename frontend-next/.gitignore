@@ -1,0 +1,10 @@
+node_modules/
+.next/
+.turbo/
+.source/
+dist/
+out/
+coverage/
+*.tsbuildinfo
+.env
+.env.local
