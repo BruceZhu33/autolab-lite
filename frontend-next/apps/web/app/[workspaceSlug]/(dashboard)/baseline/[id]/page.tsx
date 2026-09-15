@@ -21,6 +21,7 @@ import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
 import { PageHeader } from "@multica/views/layout/page-header";
 import { stageColor, stageLabel } from "@/features/autolab/stage";
+import { StageTeamBar } from "@/features/autolab/stage-team";
 
 interface ProjectView {
   id: string;
@@ -242,6 +243,7 @@ export default function BaselineWorkshopPage({
         <p className="ml-2 hidden min-w-0 truncate text-caption text-muted-foreground md:block">
           {project.title}
         </p>
+        <StageTeamBar stage="baseline" />
         <div className="ml-auto">
           <Badge variant="outline" className="gap-1.5">
             <span className="size-1.5 rounded-full" style={{ backgroundColor: stageColor(project.stage) }} />
