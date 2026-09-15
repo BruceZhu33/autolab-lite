@@ -4,6 +4,7 @@ export const navGroups: NavGroup[] = [
   {
     label: 'AutoLab · 科研训练台',
     items: [
+      { title: '项目看板', url: '/dashboard/board', icon: 'kanban', isActive: false, shortcut: ['g', 'b'], items: [] },
       { title: '迭代监视', url: '/dashboard', icon: 'dashboard', isActive: false, shortcut: ['g', 'm'], items: [] },
       { title: '服务器 / GPU', url: '/dashboard/gpu', icon: 'kanban', isActive: false, shortcut: ['g', 's'], items: [] },
       { title: '项目', url: '/dashboard/projects', icon: 'teams', isActive: false, shortcut: ['g', 'p'], items: [] },

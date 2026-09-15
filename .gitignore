@@ -24,3 +24,6 @@ autolab-home/
 RD-Agent-main/
 归档-antd原型/
 ui/src-tauri/gen/
+
+# Multica 源码快照（provenance 已记录 commit SHA，zip 不入库）
+multica-main.zip
