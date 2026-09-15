@@ -8,6 +8,7 @@
     "autopilots": "オートパイロット",
     "gpu": "GPUサーバー",
     "review": "レビュー",
+    "baseline": "ベースライン検証",
     "agents": "エージェント",
     "squads": "スクワッド",
     "usage": "分析",

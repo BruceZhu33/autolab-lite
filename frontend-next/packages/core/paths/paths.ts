@@ -65,6 +65,9 @@ function workspaceScoped(slug: string) {
     // AutoLab（v0.3 迁移）：方案评审模块（列表 + 项目评审工作区）
     review: () => `${ws}/review`,
     reviewDetail: (id: string) => `${ws}/review/${encode(id)}`,
+    // AutoLab（v0.3 迁移）：基线验证模块（列表 + 项目基线工作区）
+    baseline: () => `${ws}/baseline`,
+    baselineDetail: (id: string) => `${ws}/baseline/${encode(id)}`,
     runtimes: () => `${ws}/runtimes`,
     runtimeDetail: (id: string) => `${ws}/runtimes/${encode(id)}`,
     runtimeSettings: (machineId: string, runtimeId: string) =>

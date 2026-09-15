@@ -120,6 +120,7 @@ type NavKey =
   | "autopilots"
   | "gpu"
   | "review"
+  | "baseline"
   | "agents"
   | "squads"
   | "usage"
@@ -138,6 +139,7 @@ type NavLabelKey =
   | "autopilots"
   | "gpu"
   | "review"
+  | "baseline"
   | "agents"
   | "squads"
   | "usage"
@@ -161,6 +163,8 @@ const workNav: { key: NavKey; labelKey: NavLabelKey }[] = [
   { key: "issues", labelKey: "issues" },
   { key: "projects", labelKey: "projects" },
   { key: "autopilots", labelKey: "autopilots" },
+  // AutoLab（v0.3 迁移）：基线验证 → 方案评审（阶段顺序 deviation #34）
+  { key: "baseline", labelKey: "baseline" },
   // AutoLab（v0.3 迁移）：方案评审工作区（Agent 协作最深的现场）
   { key: "review", labelKey: "review" },
 ];

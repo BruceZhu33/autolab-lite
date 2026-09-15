@@ -29,6 +29,13 @@ import {
   pushUserMessage,
   setHumanDecision,
 } from "./review-workshop";
+import {
+  acceptBaseline,
+  dispatchBaseline,
+  getBaselineWorkshop,
+  rejectBaseline,
+  baselineSummary,
+} from "./baseline-workshop";
 
 function actorName(id: string): string {
   if (id === user.id) return user.name;
@@ -411,6 +418,100 @@ export const fixtureRoutes: FixtureRoute[] = [
       return created;
     },
   },
+  // ---- 基线验证工作区（基线模块核心端点）----
+  {
+    method: "GET",
+    pattern: "/api/projects/:id/baseline-workshop",
+    handler: ({ params }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const ws = getBaselineWorkshop(issue);
+      return { ...ws, summary: baselineSummary(ws.runs) };
+    },
+  },
+  {
+    method: "POST",
+    pattern: "/api/projects/:id/baseline-workshop/dispatch",
+    handler: ({ params }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const runs = dispatchBaseline(issue);
+      return { runs, summary: baselineSummary(runs) };
+    },
+  },
+  {
+    method: "POST",
+    pattern: "/api/projects/:id/baseline-workshop/accept",
+    handler: ({ params, body }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const input = (body ?? {}) as { threshold?: number };
+      const verdict = acceptBaseline(issue, input.threshold ?? 0.75);
+      if (verdict.ok) {
+        issue.status = "review";
+        issue.updated_at = new Date().toISOString();
+        // 时间线留痕：验收结论
+        createdSeq += 1;
+        commentsByIssue[issue.id] = [
+          ...issueComments(issue.id),
+          {
+            id: `comment-${createdSeq}`,
+            issue_id: issue.id,
+            author_type: "agent",
+            author_id: "agent-autolab",
+            type: "progress_update",
+            content:
+              `**基线验收通过**：BASE 均值 ${verdict.summary?.avg}（seed 区间 ${verdict.summary?.min} ~ ${verdict.summary?.max}）≥ 验收线 ${input.threshold ?? 0.75}。` +
+              `已进入「方案评审」——带着基线数字与 Researcher 讨论改进。`,
+            parent_id: null,
+            reactions: [],
+            attachments: [],
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            resolved_at: null,
+            resolved_by_type: null,
+            resolved_by_id: null,
+          } as unknown as Comment,
+        ];
+        return { passed: true, summary: verdict.summary };
+      }
+      return { passed: false, reason: verdict.reason };
+    },
+  },
+  {
+    method: "POST",
+    pattern: "/api/projects/:id/baseline-workshop/reject",
+    handler: ({ params, body }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const input = (body ?? {}) as { reason?: string };
+      rejectBaseline(issue, input.reason ?? "");
+      issue.status = "prepare";
+      issue.updated_at = new Date().toISOString();
+      createdSeq += 1;
+      commentsByIssue[issue.id] = [
+        ...issueComments(issue.id),
+        {
+          id: `comment-${createdSeq}`,
+          issue_id: issue.id,
+          author_type: "agent",
+          author_id: "agent-autolab",
+          type: "comment",
+          content: `**基线驳回**：${input.reason || "未说明原因"}。已回退「准备」阶段；请修正后在 Projects 重新过准备门。`,
+          parent_id: null,
+          reactions: [],
+          attachments: [],
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          resolved_at: null,
+          resolved_by_type: null,
+          resolved_by_id: null,
+        } as unknown as Comment,
+      ];
+      return { rejected: true };
+    },
+  },
+
   // ---- 方案评审工作区（评审模块核心端点）----
   {
     method: "GET",
