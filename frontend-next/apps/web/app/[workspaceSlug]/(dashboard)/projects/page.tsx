@@ -41,6 +41,7 @@ interface ProjectView {
   title: string;
   stage: string;
   priority: string;
+  sourceKind: "local" | "github";
   direction: string;
   workspacePath: string;
   paper: string | null;
@@ -49,7 +50,7 @@ interface ProjectView {
   updatedAt: string;
 }
 
-const EMPTY_FORM = { name: "", direction: "", workspacePath: "", paper: "" };
+const EMPTY_FORM = { name: "", direction: "", sourceKind: "local" as "local" | "github", workspacePath: "", paper: "" };
 
 async function fixtureApi<T>(method: string, path: string, body?: unknown): Promise<T> {
   const r = await fetch(path, {
@@ -128,7 +129,7 @@ export default function ProjectsPage() {
       return;
     }
     if (!form.workspacePath.trim()) {
-      toast.error("本地代码工作区路径必填");
+      toast.error(form.sourceKind === "github" ? "GitHub 仓库链接必填" : "本地代码工作区路径必填");
       return;
     }
     create.mutate(form);
@@ -191,15 +192,23 @@ export default function ProjectsPage() {
                   />
                 </div>
                 <div className="grid gap-1.5">
-                  <Label>本地代码工作区 *</Label>
+                  <Label>BASE 来源 *</Label>
+                  <div className="flex gap-1.5">
+                    <Button size="sm" variant={form.sourceKind === "local" ? "default" : "outline"}
+                            onClick={() => setForm({ ...form, sourceKind: "local" })}>📁 本地工作区</Button>
+                    <Button size="sm" variant={form.sourceKind === "github" ? "default" : "outline"}
+                            onClick={() => setForm({ ...form, sourceKind: "github" })}>🐙 GitHub</Button>
+                  </div>
                   <Input
                     value={form.workspacePath}
                     onChange={(e) => setForm({ ...form, workspacePath: e.target.value })}
-                    placeholder="/Users/you/work/mynet"
+                    placeholder={form.sourceKind === "local" ? "/Users/you/work/mynet" : "https://github.com/you/mynet"}
                     className="font-mono text-sm"
                   />
                   <p className="text-caption text-muted-foreground">
-                    创建后进入「准备」：确认代码库信息无误即过准备门。原生目录选择器随 Tauri 壳提供。
+                    {form.sourceKind === "local"
+                      ? "创建后进入「准备」：确认代码库信息后开始基线验证。原生目录选择器随 Tauri 壳提供。"
+                      : "GitHub 来源在基线导入时走 git clone（sidecar deviation #8 后置，当前 fixture 先行）。"}
                   </p>
                 </div>
                 <div className="grid gap-1.5">
@@ -291,7 +300,7 @@ export default function ProjectsPage() {
                   原始代码库登记（准备门）
                 </p>
                 <div className="space-y-1.5 px-4 py-3 font-mono text-sm">
-                  <p>工作区：<span className="text-foreground">{selected.workspacePath || "—"}</span></p>
+                  <p>{selected.sourceKind === "github" ? "仓库" : "工作区"}：<span className="text-foreground">{selected.workspacePath || "—"}</span></p>
                   {selected.codebase && (
                     <p>
                       {selected.codebase.files} 文件 · {selected.codebase.languages} · 入口{" "}

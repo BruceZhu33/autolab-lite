@@ -34,6 +34,7 @@ import {
   baselineSummary,
   dispatchBaseline,
   getBaselineWorkshop,
+  importStatus,
   pushBaselineMessage,
   rejectBaseline,
 } from "./baseline-workshop";
@@ -60,6 +61,7 @@ function projectView(issue: Issue) {
     title: issue.title,
     stage: issue.status,
     priority: issue.priority,
+    sourceKind: m?.sourceKind ?? "local",
     direction: m?.direction ?? "",
     workspacePath: m?.workspacePath ?? "",
     paper: m?.paper ?? null,
@@ -285,13 +287,17 @@ export const fixtureRoutes: FixtureRoute[] = [
       const input = (body ?? {}) as {
         name?: string;
         direction?: string;
+        sourceKind?: "local" | "github";
         workspacePath?: string;
         paper?: string;
       };
       const name = (input.name ?? "").trim();
+      const sourceKind = input.sourceKind === "github" ? "github" : "local";
       const workspacePath = (input.workspacePath ?? "").trim();
       if (!name) return { error: "项目名称必填" };
-      if (!workspacePath) return { error: "本地代码工作区路径必填" };
+      if (!workspacePath) {
+        return { error: sourceKind === "github" ? "GitHub 仓库链接必填" : "本地代码工作区路径必填" };
+      }
 
       const number = issues.reduce((mx, i) => Math.max(mx, i.number), 0) + 1;
       const now = new Date().toISOString();
@@ -328,6 +334,7 @@ export const fixtureRoutes: FixtureRoute[] = [
 
       projectMetas[issue.id] = {
         issueId: issue.id,
+        sourceKind,
         workspacePath,
         paper,
         direction,
@@ -447,6 +454,14 @@ export const fixtureRoutes: FixtureRoute[] = [
     handler: ({ params }) => {
       const issue = findIssue(params.id ?? "");
       if (!issue) return { error: "issue not found" };
+      // 三步流 guard：代码已导入 + 数据集已确认才可派发（对话路径同样受控）
+      const ws = getBaselineWorkshop(issue);
+      if (importStatus(ws.codeImport) !== "SYNCED") {
+        return { error: "代码尚未导入服务器（说「导入代码」开始）" };
+      }
+      if (!ws.dataset) {
+        return { error: "基线数据集未确认（Agent 引导选择后派发）" };
+      }
       const runs = dispatchBaseline(issue);
       return { runs, summary: baselineSummary(runs) };
     },

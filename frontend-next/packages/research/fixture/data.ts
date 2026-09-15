@@ -298,7 +298,9 @@ function lb(i: number): Label {
  */
 export interface ResearchProjectMeta {
   issueId: string;
-  /** 本地代码工作区绝对路径（BASE 来源，sidecar base_source_ref）。 */
+  /** BASE 来源类型：本地工作区（sidecar base_source_kind=local，M1）或 GitHub（deviation #8 后置）。 */
+  sourceKind: "local" | "github";
+  /** 本地工作区绝对路径（local）或仓库 URL（github）——sidecar base_source_ref。 */
   workspacePath: string;
   /** 论文（可选）：arXiv 链接或标题。 */
   paper?: string;
@@ -326,6 +328,7 @@ function meta(
 ): ResearchProjectMeta {
   return {
     issueId,
+    sourceKind: "local" as const,
     workspacePath,
     direction,
     paper,

@@ -48,8 +48,20 @@ interface MsgView {
   createdAt: string;
 }
 
+interface ImportView {
+  sourceKind: "local" | "github";
+  sourceRef: string;
+  serverName: string;
+  files: number;
+  sizeMb: number;
+  startedAt: string;
+  finishAt: string;
+}
+
 interface WorkshopView {
   projectId: string;
+  codeImport: ImportView | null;
+  dataset: { name: string; path: string; sizeMb: number; confirmedAt: string } | null;
   runs: RunView[];
   accepted: { avg: number; threshold: number; at: string } | null;
   blocker: { kind: string; title: string; reason: string; actions: string[] } | null;
@@ -68,6 +80,11 @@ async function fixtureApi<T>(method: string, path: string, body?: unknown): Prom
     throw new Error(typeof e.error === "string" ? e.error : `HTTP ${r.status}`);
   }
   return r.json() as Promise<T>;
+}
+
+function importStat(imp: ImportView | null): "none" | "SYNCING" | "SYNCED" {
+  if (!imp) return "none";
+  return Date.now() >= new Date(imp.finishAt).getTime() ? "SYNCED" : "SYNCING";
 }
 
 function runStatus(r: RunView): "RUNNING" | "FINISHED" | "REPAIRING" {
@@ -271,7 +288,7 @@ export default function BaselineWorkshopPage({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.nativeEvent.isComposing) submit();
               }}
-              placeholder="跟 AutoLab 说：跑基线 / 进度怎么样 / 验收通过…"
+              placeholder="跟 AutoLab 说：导入代码 / 用 clinic / 跑基线 / 验收通过…"
             />
             <Button size="icon-sm" onClick={submit} disabled={send.isPending || !draft.trim()} aria-label="发送">
               <Send className="size-4" />
@@ -300,13 +317,58 @@ export default function BaselineWorkshopPage({
             </div>
           )}
 
+          {/* 环境准备（三步流的前两步） */}
+          <div className="rounded-lg border">
+            <p className="border-b px-4 py-2.5 text-caption font-medium text-muted-foreground">
+              环境准备（代码导入 · 数据集）
+            </p>
+            <div className="divide-y text-sm">
+              <div className="flex items-center gap-2 px-4 py-2.5">
+                <span className="w-14 text-caption text-muted-foreground">代码</span>
+                {importStat(ws?.codeImport ?? null) === "none" && (
+                  <span className="text-caption text-muted-foreground">未导入——对话里说「导入代码」</span>
+                )}
+                {importStat(ws?.codeImport ?? null) === "SYNCING" && (
+                  <Badge variant="secondary" className="gap-1">
+                    <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+                    SYNCING
+                  </Badge>
+                )}
+                {importStat(ws?.codeImport ?? null) === "SYNCED" && ws?.codeImport && (
+                  <>
+                    <Badge variant="default" className="bg-emerald-600">SYNCED</Badge>
+                    <span className="truncate font-mono text-caption text-muted-foreground">
+                      {ws.codeImport.sourceKind === "github" ? "git clone" : "SFTP+sha256"} · {ws.codeImport.files} 文件 · {ws.codeImport.sizeMb} MB · {ws.codeImport.serverName}
+                    </span>
+                  </>
+                )}
+              </div>
+              <div className="flex items-center gap-2 px-4 py-2.5">
+                <span className="w-14 text-caption text-muted-foreground">数据集</span>
+                {ws?.dataset ? (
+                  <>
+                    <Badge variant="outline">{ws.dataset.name}</Badge>
+                    <span className="truncate font-mono text-caption text-muted-foreground">
+                      {ws.dataset.path} · {ws.dataset.sizeMb} MB
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-caption text-muted-foreground">
+                    未确认——导入完成后 Agent 会引导选择
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
           {/* BASE 运行表 */}
           <div className="rounded-lg border">
             <div className="flex items-center gap-2 border-b px-4 py-2.5">
               <p className="flex-1 text-caption font-medium text-muted-foreground">
                 BASE 运行（原始代码 · 多 seed）
               </p>
-              {(!ws || ws.runs.length === 0) && project.stage === "baseline" && (
+              {(!ws || ws.runs.length === 0) && project.stage === "baseline"
+                && importStat(ws?.codeImport ?? null) === "SYNCED" && ws?.dataset && (
                 <Button size="sm" variant="ghost" onClick={() => dispatch.mutate()} disabled={dispatch.isPending}>
                   派发
                 </Button>
@@ -332,7 +394,7 @@ export default function BaselineWorkshopPage({
               </div>
             ) : (
               <p className="px-4 py-3 text-caption text-muted-foreground">
-                未派发。对话里说「跑基线」，AutoLab 会去 GPU 服务器执行（deviation #34：BASE 绑定代码库而非 plan）。
+                未派发。三步流：对话「导入代码」→ Agent 引导选数据集 →「跑基线」（deviation #34：BASE 绑定代码库而非 plan）。
               </p>
             )}
           </div>

@@ -1,17 +1,20 @@
 /**
- * 基线验证工作区的 fixture 状态机（Phase 1，对话驱动版）。
+ * 基线验证工作区的 fixture 状态机（Phase 1，三步对话驱动）。
  *
- * 产品口径（2026-09-15 对齐）：基线验证 = 用户与 AutoLab 协调 Agent 对话，
- * Agent 去 GPU 服务器执行——「跟我说跑基线」→ 派发多 seed BASE → 汇报
- * 进度 → 完成后主动汇报指标并建议验收 → 对话/按钮双通道验收过门。
- * Run 进度是时间驱动模拟（派发即定完成时刻，轮询自然推进）。
+ * 产品口径（2026-09-15 对齐）：
+ *  ① 代码导入——把 BASE 代码同步到 GPU 服务器（本地工作区 SFTP 上传
+ *     或 GitHub clone；对应 sidecar env-setup replica，deviation #30）；
+ *  ② 数据集确认——Agent 探测工作区数据并引导用户选基线数据集；
+ *  ③ BASE 训练——多 seed 派发 → 汇报指标 → 验收过门（进方案评审）。
+ * 全程对话驱动：Agent 引导下一步，动作由意图触发；导入与训练进度
+ * 均为时间驱动模拟，GET 轮询时惰性产生 Agent 主动汇报。
  *
- * Phase 2 对接 sidecar：env-setup / runs 域 / tx_baseline_acceptance，
- * Agent 动作走 availableActions；消息换 threads API。
+ * Phase 2 对接 sidecar：env-setup / runs 域 / tx_baseline_acceptance；
+ * github 来源对应 deviation #8（M1 仅 local）。
  */
 import type { Comment } from "@multica/core/types";
 import type { Issue } from "@multica/core/types";
-import { commentsByIssue } from "./data";
+import { commentsByIssue, projectMetas, type ResearchProjectMeta } from "./data";
 
 export interface BaselineRun {
   id: string;
@@ -19,9 +22,26 @@ export interface BaselineRun {
   serverName: string;
   gpu: string;
   dispatchedAt: string;
-  /** 完成时刻（时间驱动模拟）；阻塞 run 无值。 */
   finishAt: string | null;
   metric: number | null;
+}
+
+export interface CodeImport {
+  sourceKind: "local" | "github";
+  sourceRef: string;
+  serverName: string;
+  files: number;
+  sizeMb: number;
+  startedAt: string;
+  finishAt: string;
+  importReported: boolean;
+}
+
+export interface DatasetChoice {
+  name: string;
+  path: string;
+  sizeMb: number;
+  confirmedAt: string;
 }
 
 export interface BaselineBlocker {
@@ -40,39 +60,40 @@ export interface BaselineMessage {
 
 export interface BaselineWorkshopState {
   projectId: string;
+  codeImport: CodeImport | null;
+  dataset: DatasetChoice | null;
   runs: BaselineRun[];
-  /** 已验收的结论；未验收为 null。 */
   accepted: { avg: number; threshold: number; at: string } | null;
   blocker: BaselineBlocker | null;
   messages: BaselineMessage[];
-  /** 完成汇报是否已发（GET 时惰性触发，模拟 Agent 主动汇报）。 */
+  /** 训练完成汇报是否已发（惰性触发）。 */
   reported: boolean;
 }
 
-/** 派发后各 seed 的完成延迟（ms）：交错的进度感。 */
+const IMPORT_DURATION_MS = 20_000;
 const SEED_DELAYS_MS = [32_000, 68_000];
 
 let seq = 7000;
 const nid = (p: string) => `${p}-${(seq += 1)}`;
 
-function baseMetric(issue: Issue): number {
+function hashOf(s: string): number {
   let h = 0;
-  for (const ch of issue.id + issue.title) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return 0.76 + (h % 60) / 500; // 0.76 ~ 0.88
+  for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return h;
 }
 
-function dispatchRuns(issue: Issue): BaselineRun[] {
-  const now = Date.now();
-  const base = baseMetric(issue);
-  return SEED_DELAYS_MS.map((delay, i) => ({
-    id: `brun-${issue.id}-${i + 1}`,
-    seed: i + 1,
-    serverName: i === 0 ? "gpu-a-a6000" : "4090D",
-    gpu: "RTX A6000 / 4090D",
-    dispatchedAt: new Date(now).toISOString(),
-    finishAt: new Date(now + delay).toISOString(),
-    metric: Math.round((base + (i === 0 ? 0 : 0.008) + (issue.id.length % 3) * 0.002) * 1000) / 1000,
-  }));
+function baseMetric(issue: Issue): number {
+  return 0.76 + (hashOf(issue.id + issue.title) % 60) / 500; // 0.76 ~ 0.88
+}
+
+/** 工作区数据集候选（fixture 探测；Phase 2 由 env 探测/登记替代）。 */
+export function datasetCandidates(m: ResearchProjectMeta | undefined): { name: string; path: string; sizeMb: number }[] {
+  const h = hashOf(m?.workspacePath ?? "default");
+  const main = m?.workspacePath.split("/").pop() ?? "clinic";
+  return [
+    { name: main, path: `data/${main}`, sizeMb: 40 + (h % 40) },
+    { name: `${main}-mini`, path: `data/${main}-mini`, sizeMb: 4 + (h % 6) },
+  ];
 }
 
 function pushMsg(ws: BaselineWorkshopState, role: "user" | "agent", content: string): BaselineMessage {
@@ -81,7 +102,6 @@ function pushMsg(ws: BaselineWorkshopState, role: "user" | "agent", content: str
   return m;
 }
 
-/** 关键节点同步留痕到项目时间线（各模块共用的一条审计流）。 */
 function appendTimeline(issue: Issue, content: string, type: "comment" | "progress_update"): void {
   const now = new Date().toISOString();
   const c: Comment = {
@@ -105,13 +125,16 @@ function appendTimeline(issue: Issue, content: string, type: "comment" | "progre
 
 export const baselineWorkshops: Record<string, BaselineWorkshopState> = {};
 
-/** run 状态由时间推导：RUNNING → FINISHED（阻塞 run 恒为 REPAIRING）。 */
+export function importStatus(imp: CodeImport | null): "none" | "SYNCING" | "SYNCED" {
+  if (!imp) return "none";
+  return Date.now() >= new Date(imp.finishAt).getTime() ? "SYNCED" : "SYNCING";
+}
+
 export function runStatus(run: BaselineRun): "RUNNING" | "FINISHED" | "REPAIRING" {
   if (run.finishAt === null) return "REPAIRING";
   return Date.now() >= new Date(run.finishAt).getTime() ? "FINISHED" : "RUNNING";
 }
 
-/** 汇总指标：全部 FINISHED 才有值。 */
 export function baselineSummary(runs: BaselineRun[]): { avg: number; min: number; max: number } | null {
   const done = runs.filter((r) => runStatus(r) === "FINISHED" && r.metric !== null);
   if (done.length === 0 || done.length < runs.length) return null;
@@ -123,22 +146,52 @@ export function baselineSummary(runs: BaselineRun[]): { avg: number; min: number
   };
 }
 
+/** 开始代码导入（幂等）。 */
+function startImport(issue: Issue, ws: BaselineWorkshopState): void {
+  if (ws.codeImport || ws.blocker) return;
+  const m = projectMetas[issue.id];
+  ws.codeImport = {
+    sourceKind: m?.sourceKind ?? "local",
+    sourceRef: m?.workspacePath ?? "BASE 工作区",
+    serverName: "gpu-a-a6000",
+    files: m?.codebase.files ?? 300,
+    sizeMb: 60 + (hashOf(issue.id) % 120),
+    startedAt: new Date().toISOString(),
+    finishAt: new Date(Date.now() + IMPORT_DURATION_MS).toISOString(),
+    importReported: false,
+  };
+}
+
 export function getBaselineWorkshop(issue: Issue): BaselineWorkshopState {
   let ws = baselineWorkshops[issue.id];
   if (ws) {
-    maybeReport(ws);
+    maybeAutoMessages(ws);
     return ws;
   }
   ws = {
     projectId: issue.id,
+    codeImport: null,
+    dataset: null,
     runs: [],
     accepted: null,
     blocker: null,
     messages: [],
     reported: false,
   };
-  // LAB-3 预置真实卡态：BASE 修复轮停在 REPAIRING 且无恢复出口（#32②）
+  // LAB-3 预置真实卡态：导入/数据集已就绪，BASE 修复轮停在 REPAIRING（#32②）
   if (issue.id === "issue-3") {
+    const m = projectMetas["issue-3"];
+    ws.codeImport = {
+      sourceKind: "local",
+      sourceRef: m?.workspacePath ?? "~/work/clinic-aug",
+      serverName: "gpu-a-a6000",
+      files: m?.codebase.files ?? 287,
+      sizeMb: 97,
+      startedAt: "2026-09-13T07:40:00Z",
+      finishAt: "2026-09-13T07:41:40Z",
+      importReported: true,
+    };
+    ws.dataset = { name: "clinic-aug", path: "data/clinic-aug", sizeMb: 54, confirmedAt: "2026-09-13T07:45:00Z" };
     ws.runs = [
       {
         id: "brun-issue-3-1",
@@ -158,43 +211,68 @@ export function getBaselineWorkshop(issue: Issue): BaselineWorkshopState {
       actions: ["重建项目（当前唯一出路）", "等待 baseline 修复轮端点（#32 待办）"],
     };
     pushMsg(ws, "agent",
-      "BASE 派发后训练进程崩溃过一次，我做了修复轮，但现在停在 REPAIRING 且没有自动出路——" +
-      "这个状态需要你裁决（右侧「需要你」卡片有选项）。修复期间有疑问随时问我。");
+      "代码和数据集都已就位，BASE 训练进程崩溃过一次，修复轮现在停在 REPAIRING 且没有自动出路——" +
+      "需要你裁决（右侧「需要你」卡片）。期间有疑问随时问我。");
   } else {
+    const m = projectMetas[issue.id];
     pushMsg(ws, "agent",
-      "我是 AutoLab，基线验证的执行协调。代码库确认无误的话，跟我说「跑基线」，" +
-      "我会把原始代码派发到 GPU 服务器做多 seed BASE 训练，全程在这里汇报进展和指标。");
+      `我是 AutoLab，基线验证的执行协调。流程三步：先把 BASE 代码导入 GPU 服务器（${m?.sourceKind === "github" ? "clone 你的 GitHub 仓库" : "上传你的本地工作区"}），` +
+      `再确认基线数据集，最后多 seed 训练并验收。` +
+      `现在说「导入代码」或「开始」即可起步；对目标服务器有偏好也先告诉我。`);
   }
   baselineWorkshops[issue.id] = ws;
   return ws;
 }
 
-/** 完成后惰性汇报：GET 轮询发现全部 FINISHED 且未汇报 → Agent 主动汇报。 */
-function maybeReport(ws: BaselineWorkshopState): void {
-  if (ws.reported || ws.runs.length === 0 || ws.accepted) return;
-  const summary = baselineSummary(ws.runs);
-  if (!summary) return;
-  ws.reported = true;
-  pushMsg(ws, "agent",
-    `**BASE 训练完成**：${ws.runs.length} 个 seed 全部 FINISHED。\n\n` +
-    ws.runs.map((r) => `- seed ${r.seed}（${r.serverName}）：macro-F1 ${r.metric?.toFixed(3)}`).join("\n") +
-    `\n\n均值 **${summary.avg.toFixed(4)}**（区间 ${summary.min.toFixed(3)} ~ ${summary.max.toFixed(3)}）。` +
-    `建议按验收线裁决；你可以说「验收通过」，也可以在右侧面板操作。`);
+/** 惰性主动汇报：导入完成 → 汇报+引导选数据集；训练完成 → 汇报指标。 */
+function maybeAutoMessages(ws: BaselineWorkshopState): void {
+  if (ws.codeImport && !ws.codeImport.importReported && importStatus(ws.codeImport) === "SYNCED") {
+    ws.codeImport.importReported = true;
+    const imp = ws.codeImport;
+    const cands = datasetCandidates(projectMetas[ws.projectId]);
+    pushMsg(ws, "agent",
+      `**代码导入完成**（${imp.sourceKind === "github" ? "git clone" : "SFTP 上传 + sha256 全量校验"}）：\n\n` +
+      `- 来源：${imp.sourceRef}\n` +
+      `- 服务器：${imp.serverName} · ${imp.files} 个文件 · ${imp.sizeMb} MB · 耗时 40s\n\n` +
+      `下一步确认基线数据集——我在工作区探测到：\n` +
+      cands.map((c, i) => `${i + 1}. **${c.name}**（${c.path}，约 ${c.sizeMb} MB）`).join("\n") +
+      `\n\n基线先训练哪个？直接告诉我名字（如「用 ${cands[0]?.name}」）。`);
+  }
+  if (!ws.reported && ws.runs.length > 0 && !ws.accepted) {
+    const summary = baselineSummary(ws.runs);
+    if (summary) {
+      ws.reported = true;
+      pushMsg(ws, "agent",
+        `**BASE 训练完成**：${ws.runs.length} 个 seed 全部 FINISHED。\n\n` +
+        ws.runs.map((r) => `- seed ${r.seed}（${r.serverName}）：macro-F1 ${r.metric?.toFixed(3)}`).join("\n") +
+        `\n\n均值 **${summary.avg.toFixed(4)}**（区间 ${summary.min.toFixed(3)} ~ ${summary.max.toFixed(3)}），数据集 ${ws.dataset?.name ?? "—"}。` +
+        `建议按验收线裁决；说「验收通过」或在右侧面板操作。`);
+    }
+  }
 }
 
-/** 派发 BASE（对话/按钮双入口共用；幂等）。 */
+/** 派发 BASE：guard（代码已导入 + 数据集已确认）；幂等。 */
 export function dispatchBaseline(issue: Issue): BaselineRun[] {
   const ws = getBaselineWorkshop(issue);
   if (ws.runs.length === 0) {
-    ws.runs = dispatchRuns(issue);
+    const now = Date.now();
+    const base = baseMetric(issue);
+    ws.runs = SEED_DELAYS_MS.map((delay, i) => ({
+      id: `brun-${issue.id}-${i + 1}`,
+      seed: i + 1,
+      serverName: i === 0 ? "gpu-a-a6000" : "4090D",
+      gpu: "RTX A6000 / 4090D",
+      dispatchedAt: new Date(now).toISOString(),
+      finishAt: new Date(now + delay).toISOString(),
+      metric: Math.round((base + (i === 0 ? 0 : 0.008) + (issue.id.length % 3) * 0.002) * 1000) / 1000,
+    }));
     ws.accepted = null;
     ws.reported = false;
-    appendTimeline(issue, "**BASE 已派发**：原始代码多 seed 运行（时间驱动模拟）。", "progress_update");
+    appendTimeline(issue, `**BASE 已派发**：原始代码多 seed 运行（数据集 ${ws.dataset?.name ?? "—"}，时间驱动模拟）。`, "progress_update");
   }
   return ws.runs;
 }
 
-/** 验收（对话/按钮双入口共用）：guard 全部完成 + 均值达线。 */
 export function acceptBaseline(
   issue: Issue,
   threshold: number,
@@ -217,12 +295,13 @@ export function acceptBaseline(
   return { ok: true, summary };
 }
 
-/** 驳回（对话/按钮双入口共用）：回准备阶段。 */
 export function rejectBaseline(issue: Issue, reason: string): void {
   const ws = getBaselineWorkshop(issue);
   ws.accepted = null;
   ws.runs = [];
   ws.reported = false;
+  ws.dataset = null;
+  ws.codeImport = null;
   ws.blocker = null;
   issue.status = "prepare";
   issue.updated_at = new Date().toISOString();
@@ -234,36 +313,62 @@ export function rejectBaseline(issue: Issue, reason: string): void {
 }
 
 /**
- * 对话意图解析（确定性剧本）：用户的话 → Agent 的回应 + 副作用。
- * Phase 2 换真实 LLM + availableActions；这里演示交互形态。
+ * 对话意图解析（确定性剧本）：三步引导 + 状态/验收/驳回。
+ * Phase 2 换真实 LLM + availableActions。
  */
 export function pushBaselineMessage(issue: Issue, content: string): BaselineMessage {
   const ws = getBaselineWorkshop(issue);
   pushMsg(ws, "user", content);
 
-  const wantsDispatch = ws.runs.length === 0 && /跑|派发|开始|训练|baseline|BASE|基线/.test(content);
+  const m = projectMetas[issue.id];
+  const cands = datasetCandidates(m);
+  const summary = baselineSummary(ws.runs);
+  const impStat = importStatus(ws.codeImport);
+
+  const wantsImport = /导入|上传|clone|克隆|同步|开始|start/.test(content);
+  const wantsDispatch = /跑|派发|训练|开跑/.test(content) && !wantsImport;
   const wantsStatus = /怎么样|进度|状态|如何|多久|好了/.test(content);
   const wantsAccept = ws.runs.length > 0 && /验收|通过|达标/.test(content) && !/不|未|驳回/.test(content);
   const wantsReject = /驳回|回退|重来/.test(content);
-  const summary = baselineSummary(ws.runs);
+  const datasetMatch = ws.codeImport && ws.dataset === null
+    ? cands.find((c) => content.includes(c.name))
+    : undefined;
 
   let reply: string;
   if (ws.blocker) {
     reply =
       "现在卡在 REPAIRING 没有自动出路——修复轮的出口取决于你的裁决（右侧「需要你」）。" +
-      "如果你想放弃这轮 BASE，说「驳回」我可以回退到准备阶段重来。";
-  } else if (wantsDispatch) {
-    const runs = dispatchBaseline(issue);
-    reply =
-      `收到，正在派发 BASE（原始代码，不做任何改动）：\n\n` +
-      runs.map((r) => `- seed ${r.seed} → ${r.serverName}（${r.gpu}），预计 ${Math.round((new Date(r.finishAt ?? 0).getTime() - Date.now()) / 1000)} 秒后完成`).join("\n") +
-      `\n\n训练中我会盯着，完成即刻汇报指标。中途想看进度随时问。`;
+      "如果想放弃这轮 BASE，说「驳回」我回退到准备阶段重来。";
   } else if (wantsReject) {
-    if (ws.runs.length > 0 || ws.accepted === null) {
-      rejectBaseline(issue, "对话触发驳回");
-      reply = "已回退「准备」阶段并清理这轮 run（时间线已留痕）。修正后从 Projects 重新过准备门，我们再跑。";
+    rejectBaseline(issue, "对话触发驳回");
+    reply = "已回退「准备」并清掉导入、数据集与 run（时间线留痕）。修正后从 Projects 重新过准备门。";
+  } else if (wantsImport && impStat === "none") {
+    startImport(issue, ws);
+    reply =
+      `收到，开始导入 BASE 代码（${m?.sourceKind === "github" ? `git clone ${m?.workspacePath}` : `SFTP 上传 ${m?.workspacePath}`} → ${ws.codeImport?.serverName}）：` +
+      `${ws.codeImport?.files} 个文件 · 约 ${ws.codeImport?.sizeMb} MB，含 sha256 全量校验。完成后我马上汇报，然后我们确认数据集。`;
+  } else if (datasetMatch && impStat === "SYNCED") {
+    ws.dataset = { ...datasetMatch, confirmedAt: new Date().toISOString() };
+    appendTimeline(issue, `**基线数据集确认**：${datasetMatch.name}（${datasetMatch.path}，${datasetMatch.sizeMb} MB）。`, "comment");
+    reply =
+      `已登记 **${datasetMatch.name}** 为 BASE 数据集（${datasetMatch.path}，${datasetMatch.sizeMb} MB）。` +
+      `环境就绪——说「跑基线」，我把原始代码多 seed 派发上去；要不要顺带说明评测口径（默认 macro-F1）。`;
+  } else if (wantsDispatch) {
+    if (impStat === "none") {
+      reply = "代码还没导入服务器。先说「导入代码」——上传/clone 完成后我们确认数据集，再跑基线。";
+    } else if (impStat === "SYNCING") {
+      reply = `代码还在导入中（${ws.codeImport?.files} 个文件）。完成后我会汇报并引导确认数据集，别急。`;
+    } else if (!ws.dataset) {
+      reply =
+        "代码已就位，但基线数据集还没定——先训练哪个？我在工作区探测到：\n" +
+        cands.map((c, i) => `${i + 1}. **${c.name}**（${c.path}，约 ${c.sizeMb} MB）`).join("\n") +
+        "\n直接回我名字（如「用 " + (cands[0]?.name ?? "") + "」）。";
     } else {
-      reply = "当前没有可驳回的运行。";
+      const runs = dispatchBaseline(issue);
+      reply =
+        `好，BASE 派发（原始代码 · ${ws.dataset.name} · 多 seed）：\n\n` +
+        runs.map((r) => `- seed ${r.seed} → ${r.serverName}，预计 ${Math.max(0, Math.round((new Date(r.finishAt ?? 0).getTime() - Date.now()) / 1000))} 秒后完成`).join("\n") +
+        "\n\n训练中我盯着，完成即刻汇报指标。中途想看进度随时问。";
     }
   } else if (wantsAccept && summary) {
     const verdict = acceptBaseline(issue, 0.75);
@@ -272,16 +377,20 @@ export function pushBaselineMessage(issue: Issue, content: string): BaselineMess
         "Researcher 已经在评审工作区等你，带着基线数字讨论改进。"
       : `先别急着验收：${verdict.reason}。`;
   } else if (wantsStatus) {
-    if (ws.runs.length === 0) {
-      reply = "BASE 还没派发。确认代码库没问题的话，说「跑基线」我就去 GPU 服务器执行。";
+    if (impStat === "none") {
+      reply = "还没开始：代码未导入。说「导入代码」起步，三步走完（导入 → 数据集 → 训练）。";
+    } else if (impStat === "SYNCING") {
+      const remain = Math.max(0, Math.round((new Date(ws.codeImport?.finishAt ?? 0).getTime() - Date.now()) / 1000));
+      reply = `代码导入中，约 ${remain} 秒完成（${ws.codeImport?.files} 个文件 · ${ws.codeImport?.sizeMb} MB）。`;
+    } else if (!ws.dataset) {
+      reply = "代码已导入完成，等你确认基线数据集（探测到的候选在上面那条汇报里）。";
+    } else if (ws.runs.length === 0) {
+      reply = `环境就绪（代码 + ${ws.dataset.name}），BASE 未派发。说「跑基线」开始。`;
     } else {
       const lines = ws.runs.map((r) => {
         const s = runStatus(r);
         if (s === "FINISHED") return `- seed ${r.seed}：FINISHED，macro-F1 ${r.metric?.toFixed(3)}`;
-        if (s === "RUNNING") {
-          const remain = Math.max(0, Math.round((new Date(r.finishAt ?? 0).getTime() - Date.now()) / 1000));
-          return `- seed ${r.seed}：训练中，约 ${remain} 秒后完成`;
-        }
+        if (s === "RUNNING") return `- seed ${r.seed}：训练中，约 ${Math.max(0, Math.round((new Date(r.finishAt ?? 0).getTime() - Date.now()) / 1000))} 秒后完成`;
         return `- seed ${r.seed}：${s}`;
       });
       reply = summary
@@ -290,10 +399,10 @@ export function pushBaselineMessage(issue: Issue, content: string): BaselineMess
     }
   } else {
     reply =
-      ws.runs.length === 0
-        ? "明白。基线验证的流程是：原始代码多 seed 跑一遍建立对比锚点，验收后进方案评审。" +
-          "准备好就说「跑基线」；对环境（conda 复用 / 离线轮子）或数据有要求也先告诉我。"
-        : "收到，我在盯着 run。有结论我会第一时间汇报；你也可以随时问进度。";
+      impStat === "none"
+        ? "明白。基线三步：导入代码 → 确认数据集 → 多 seed 训练验收。" +
+          "说「导入代码」起步；对目标服务器（A6000/4090D）、conda 环境复用或离线轮子有要求先告诉我。"
+        : "收到，我在盯着。有结论我会主动汇报；你也可以随时问进度。";
   }
 
   return pushMsg(ws, "agent", reply);
