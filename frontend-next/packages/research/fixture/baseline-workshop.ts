@@ -16,6 +16,14 @@ import type { Comment } from "@multica/core/types";
 import type { Issue } from "@multica/core/types";
 import { commentsByIssue, projectMetas, type ResearchProjectMeta } from "./data";
 
+/** run 落盘产物（deviation #20 评测适配约定：metrics.json + final.ckpt）。 */
+export interface RunArtifacts {
+  dir: string;
+  metricsJson: boolean;
+  finalCkpt: boolean;
+  trainLog: boolean;
+}
+
 export interface BaselineRun {
   id: string;
   seed: number;
@@ -24,6 +32,17 @@ export interface BaselineRun {
   dispatchedAt: string;
   finishAt: string | null;
   metric: number | null;
+  artifacts: RunArtifacts;
+}
+
+/** 一个数据集的聚合结果（结果文件夹视图）。 */
+export interface DatasetResultView {
+  dataset: string;
+  dir: string;
+  seeds: { seed: number; metric: number | null; artifacts: RunArtifacts }[];
+  /** 完整 = 全部 seed FINISHED 且产物齐全（metrics.json + final.ckpt）。 */
+  complete: boolean;
+  missing: string[];
 }
 
 export interface CodeImport {
@@ -201,6 +220,12 @@ export function getBaselineWorkshop(issue: Issue): BaselineWorkshopState {
         dispatchedAt: "2026-09-13T08:00:00Z",
         finishAt: null,
         metric: null,
+        artifacts: {
+          dir: "projects/issue-3/runs/brun-issue-3-1/",
+          metricsJson: false,
+          finalCkpt: false,
+          trainLog: true,
+        },
       },
     ];
     ws.blocker = {
@@ -242,13 +267,43 @@ function maybeAutoMessages(ws: BaselineWorkshopState): void {
     const summary = baselineSummary(ws.runs);
     if (summary) {
       ws.reported = true;
+      const result = datasetResult(ws);
       pushMsg(ws, "agent",
         `**BASE 训练完成**：${ws.runs.length} 个 seed 全部 FINISHED。\n\n` +
-        ws.runs.map((r) => `- seed ${r.seed}（${r.serverName}）：macro-F1 ${r.metric?.toFixed(3)}`).join("\n") +
+        ws.runs.map((r) => `- seed ${r.seed}（${r.serverName}）：macro-F1 ${r.metric?.toFixed(3)}（${r.artifacts.dir}）`).join("\n") +
         `\n\n均值 **${summary.avg.toFixed(4)}**（区间 ${summary.min.toFixed(3)} ~ ${summary.max.toFixed(3)}），数据集 ${ws.dataset?.name ?? "—"}。` +
+        (result?.complete
+          ? `\n结果文件夹 ${result.dir} 已具备**完整训练结果**（metrics.json + final.ckpt 齐全），满足验收证据条件。`
+          : `\n注意：${result?.missing.join("；")}——结果不完整，暂不满足验收条件。`) +
         `建议按验收线裁决；说「验收通过」或在右侧面板操作。`);
     }
   }
+}
+
+/** 结果文件夹聚合：验收的证据视图（至少一个数据集的完整训练结果）。 */
+export function datasetResult(ws: BaselineWorkshopState): DatasetResultView | null {
+  if (!ws.dataset || ws.runs.length === 0) return null;
+  const seeds = ws.runs.map((r) => ({
+    seed: r.seed,
+    metric: runStatus(r) === "FINISHED" ? r.metric : null,
+    artifacts: r.artifacts,
+  }));
+  const missing: string[] = [];
+  for (const r of ws.runs) {
+    if (runStatus(r) !== "FINISHED") {
+      missing.push(`seed ${r.seed}：run 未完成`);
+      continue;
+    }
+    if (!r.artifacts.metricsJson) missing.push(`seed ${r.seed}：缺 metrics.json`);
+    if (!r.artifacts.finalCkpt) missing.push(`seed ${r.seed}：缺 final.ckpt`);
+  }
+  return {
+    dataset: ws.dataset.name,
+    dir: `projects/${ws.projectId}/runs/`,
+    seeds,
+    complete: missing.length === 0,
+    missing,
+  };
 }
 
 /** 派发 BASE：guard（代码已导入 + 数据集已确认）；幂等。 */
@@ -257,15 +312,24 @@ export function dispatchBaseline(issue: Issue): BaselineRun[] {
   if (ws.runs.length === 0) {
     const now = Date.now();
     const base = baseMetric(issue);
-    ws.runs = SEED_DELAYS_MS.map((delay, i) => ({
-      id: `brun-${issue.id}-${i + 1}`,
-      seed: i + 1,
-      serverName: i === 0 ? "gpu-a-a6000" : "4090D",
-      gpu: "RTX A6000 / 4090D",
-      dispatchedAt: new Date(now).toISOString(),
-      finishAt: new Date(now + delay).toISOString(),
-      metric: Math.round((base + (i === 0 ? 0 : 0.008) + (issue.id.length % 3) * 0.002) * 1000) / 1000,
-    }));
+    ws.runs = SEED_DELAYS_MS.map((delay, i) => {
+      const runId = `brun-${issue.id}-${i + 1}`;
+      return {
+        id: runId,
+        seed: i + 1,
+        serverName: i === 0 ? "gpu-a-a6000" : "4090D",
+        gpu: "RTX A6000 / 4090D",
+        dispatchedAt: new Date(now).toISOString(),
+        finishAt: new Date(now + delay).toISOString(),
+        metric: Math.round((base + (i === 0 ? 0 : 0.008) + (issue.id.length % 3) * 0.002) * 1000) / 1000,
+        artifacts: {
+          dir: `projects/${issue.id}/runs/${runId}/`,
+          metricsJson: true,
+          finalCkpt: true,
+          trainLog: true,
+        },
+      };
+    });
     ws.accepted = null;
     ws.reported = false;
     appendTimeline(issue, `**BASE 已派发**：原始代码多 seed 运行（数据集 ${ws.dataset?.name ?? "—"}，时间驱动模拟）。`, "progress_update");
@@ -278,6 +342,14 @@ export function acceptBaseline(
   threshold: number,
 ): { ok: boolean; reason?: string; summary?: { avg: number; min: number; max: number } } {
   const ws = getBaselineWorkshop(issue);
+  // 验收条件（2026-09-15 口径）：结果文件夹里至少有一个数据集的完整
+  // 训练结果（全部 seed FINISHED 且 metrics.json + final.ckpt 齐全），
+  // 且其均值达验收线——指标以落盘 metrics.json 为准，不信内存数字。
+  const result = datasetResult(ws);
+  if (!result) return { ok: false, reason: "尚无结果文件夹（run 未派发）" };
+  if (!result.complete) {
+    return { ok: false, reason: `结果不完整：${result.missing.join("；")}` };
+  }
   const summary = baselineSummary(ws.runs);
   if (!summary) return { ok: false, reason: "尚有 run 未完成（或处于阻塞）" };
   if (summary.avg < threshold) {
@@ -288,7 +360,8 @@ export function acceptBaseline(
   issue.updated_at = new Date().toISOString();
   appendTimeline(
     issue,
-    `**基线验收通过**：BASE 均值 ${summary.avg.toFixed(4)}（seed 区间 ${summary.min.toFixed(3)} ~ ${summary.max.toFixed(3)}）≥ 验收线 ${threshold}。` +
+    `**基线验收通过**（依据 ${result.dir} 的完整结果：${result.dataset} · ${result.seeds.length} seed · metrics.json + final.ckpt 齐全）：` +
+      `BASE 均值 ${summary.avg.toFixed(4)}（seed 区间 ${summary.min.toFixed(3)} ~ ${summary.max.toFixed(3)}）≥ 验收线 ${threshold}。` +
       "已进入「方案评审」——带着基线数字与 Researcher 讨论改进。",
     "progress_update",
   );
@@ -325,7 +398,9 @@ export function pushBaselineMessage(issue: Issue, content: string): BaselineMess
   const summary = baselineSummary(ws.runs);
   const impStat = importStatus(ws.codeImport);
 
-  const wantsImport = /导入|上传|clone|克隆|同步|开始|start/.test(content);
+  const wantsSimulateMissing = /模拟.*(缺失|丢失)|丢.*ckpt/.test(content);
+  const wantsRestoreArtifacts = /恢复产物|修复产物/.test(content);
+  const wantsImport = !wantsSimulateMissing && !wantsRestoreArtifacts && /导入|上传|clone|克隆|同步|开始|start/.test(content);
   const wantsDispatch = /跑|派发|训练|开跑/.test(content) && !wantsImport;
   const wantsStatus = /怎么样|进度|状态|如何|多久|好了/.test(content);
   const wantsAccept = ws.runs.length > 0 && /验收|通过|达标/.test(content) && !/不|未|驳回/.test(content);
@@ -335,7 +410,19 @@ export function pushBaselineMessage(issue: Issue, content: string): BaselineMess
     : undefined;
 
   let reply: string;
-  if (ws.blocker) {
+  if (wantsSimulateMissing && ws.runs.length > 0) {
+    const victim = ws.runs[ws.runs.length - 1];
+    if (victim) victim.artifacts.finalCkpt = false;
+    ws.reported = false; // 让完成汇报重发并标注缺失
+    reply = `已模拟产物缺失：seed ${victim?.seed} 的 final.ckpt 标记为丢失。现在验收会被结果完整性 guard 拒绝（演示用；说「恢复产物」还原）。`;
+  } else if (wantsRestoreArtifacts && ws.runs.length > 0) {
+    for (const r of ws.runs) {
+      r.artifacts.finalCkpt = true;
+      r.artifacts.metricsJson = true;
+    }
+    ws.reported = false;
+    reply = "产物已恢复齐全（metrics.json + final.ckpt × 全部 seed）。结果文件夹重新满足验收证据条件。";
+  } else if (ws.blocker) {
     reply =
       "现在卡在 REPAIRING 没有自动出路——修复轮的出口取决于你的裁决（右侧「需要你」）。" +
       "如果想放弃这轮 BASE，说「驳回」我回退到准备阶段重来。";
