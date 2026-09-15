@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,20 +84,41 @@ class SshTransport(Transport):
         self._conn: asyncssh.SSHClientConnection | None = None
         self._lock = asyncio.Lock()
         self._tunnels: dict[int, str] = {}
+        self._listeners: list = []
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
         async with self._lock:
             if self._conn is None or self._conn.is_closed():
-                kwargs: dict = {"known_hosts": None}
-                kind = self.credential.get("kind")
-                if kind == "password":
-                    kwargs["password"] = self.credential["secret"]
-                    kwargs["preferred_auth"] = "password"
-                else:
-                    kwargs["client_keys"] = [self.credential["secret"]]  # 私钥路径
                 self._conn = await asyncssh.connect(
-                    self.host, port=self.port, username=self.username, **kwargs)
+                    self.host, port=self.port, username=self.username,
+                    **self._connect_kwargs())
             return self._conn
+
+    def _connect_kwargs(self) -> dict:
+        kwargs: dict = {"known_hosts": None}
+        kind = self.credential.get("kind")
+        if kind == "password":
+            kwargs["password"] = self.credential["secret"]
+            kwargs["preferred_auth"] = "password"
+        else:
+            kwargs["client_keys"] = [self.credential["secret"]]  # 私钥路径
+        return kwargs
+
+    @asynccontextmanager
+    async def _bulk_conn(self):
+        """批量文件传输专用短命连接。
+
+        共享连接与 monitor 的隧道/exec 流量并发时，SFTP 大文件写会无错误
+        悬挂（真机实测：env setup 卡 SYNCING 无超时）。专用连接隔离该类
+        交互，且用完即关，不污染池内长连接。
+        """
+        conn = await asyncssh.connect(
+            self.host, port=self.port, username=self.username,
+            **self._connect_kwargs())
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     async def exec(self, cmd: str, timeout: float = 300) -> ExecResult:
         conn = await self._connect()
@@ -120,35 +142,45 @@ class SshTransport(Transport):
             except (asyncssh.Error, OSError):
                 pass  # 已存在
 
+    # 批量传输硬上限：悬挂转为异常（replica → FAILED），不再永久 SYNCING
+    BULK_TIMEOUT_S = 1800
+
     async def upload_tree(self, local_dir: Path, remote_dir: str) -> None:
         await self.exec(f"mkdir -p {remote_dir}")
-        conn = await self._connect()
         base = self._sftp_path(remote_dir)
-        async with conn.start_sftp_client() as sftp:
-            for src in sorted(local_dir.rglob("*")):
-                rel = src.relative_to(local_dir).as_posix()
-                dst = f"{base}/{rel}"
-                if src.is_dir():
-                    try:
-                        await sftp.mkdir(dst)
-                    except (asyncssh.Error, OSError):
-                        pass
-                else:
-                    await self._sftp_mkdirs(sftp, dst.rsplit("/", 1)[0])
-                    await sftp.put(str(src), dst)
+
+        async def _run() -> None:
+            async with self._bulk_conn() as conn:
+                async with conn.start_sftp_client() as sftp:
+                    for src in sorted(local_dir.rglob("*")):
+                        rel = src.relative_to(local_dir).as_posix()
+                        dst = f"{base}/{rel}"
+                        if src.is_dir():
+                            try:
+                                await sftp.mkdir(dst)
+                            except (asyncssh.Error, OSError):
+                                pass
+                        else:
+                            await self._sftp_mkdirs(sftp, dst.rsplit("/", 1)[0])
+                            await sftp.put(str(src), dst)
+        await asyncio.wait_for(_run(), timeout=self.BULK_TIMEOUT_S)
 
     async def download_file(self, remote_path: str, local_path: Path) -> None:
-        conn = await self._connect()
-        async with conn.start_sftp_client() as sftp:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            await sftp.get(self._sftp_path(remote_path), str(local_path))
+        async def _run() -> None:
+            async with self._bulk_conn() as conn:
+                async with conn.start_sftp_client() as sftp:
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    await sftp.get(self._sftp_path(remote_path), str(local_path))
+        await asyncio.wait_for(_run(), timeout=self.BULK_TIMEOUT_S)
 
     async def upload_file(self, local_path: Path, remote_path: str) -> None:
-        conn = await self._connect()
-        async with conn.start_sftp_client() as sftp:
-            dst = self._sftp_path(remote_path)
-            await self._sftp_mkdirs(sftp, dst.rsplit("/", 1)[0])
-            await sftp.put(str(local_path), dst)
+        async def _run() -> None:
+            async with self._bulk_conn() as conn:
+                async with conn.start_sftp_client() as sftp:
+                    dst = self._sftp_path(remote_path)
+                    await self._sftp_mkdirs(sftp, dst.rsplit("/", 1)[0])
+                    await sftp.put(str(local_path), dst)
+        await asyncio.wait_for(_run(), timeout=self.BULK_TIMEOUT_S)
 
     async def agent_base_url(self, agent_port: int) -> str:
         if agent_port in self._tunnels:
@@ -158,11 +190,13 @@ class SshTransport(Transport):
         local_port = listener.get_port()
         url = f"http://127.0.0.1:{local_port}"
         self._tunnels[agent_port] = url
+        self._listeners.append(listener)
         return url
 
     async def close(self) -> None:
-        for listener in getattr(self, "_listeners", []):
+        for listener in self._listeners:
             listener.close()
+        self._listeners.clear()
         if self._conn and not self._conn.is_closed():
             self._conn.close()
 

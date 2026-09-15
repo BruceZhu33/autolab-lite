@@ -65,6 +65,9 @@ class Runner:
 
     def _run(self, dispatch_id: str, manifest: dict, gpu_index: int):
         env = dict(os.environ)
+        # agent 自身的离线轮子路径不得泄入用户训练进程（真机实测：pylibs 的老
+        # typing_extensions 沾染 conda py3.8 的 torch import 即崩，deviation #23 同类）
+        env.pop("PYTHONPATH", None)
         env_dir = (manifest.get("env") or {}).get("bin_dir")
         if env_dir:
             env["PATH"] = f"{env_dir}:{env.get('PATH', '')}"
