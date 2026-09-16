@@ -149,3 +149,34 @@ def test_timeline_endpoint_merges_layers(client):
     times = [i["occurred_at"] for i in items]
     assert times == sorted(times, reverse=True)
     assert client.get("/api/v1/research/timeline/missing").status_code == 404
+
+
+def test_baseline_endpoint_aggregates(client):
+    conn = client.app.state.autolab.db.connect()
+    _seed(conn, "pB2", "BASELINE_ACCEPTANCE")
+    srv = harness.fx_server(conn, name="gpu-x")
+    proto = harness.fx_protocol(conn, "pB2", freeze=True)
+    cs = harness.fx_snapshot(conn, "pB2")
+    env = harness.fx_env(conn, srv)
+    dv = harness.fx_data(conn, "pB2")
+    harness.fx_replica_ready(conn, dv, srv)
+    harness.fx_recipe(conn)
+    harness.fx_init(conn)
+    run = harness.fx_run(conn, "pB2", role="baseline", status="PLANNED",
+                         proto=proto, cs=cs, env=env, dv=dv)
+    # model_fail 路径进 REPAIRING：PLANNED→ANALYZING→PATCHING→SMOKING→REPAIRING
+    harness.fx_transition(conn, "run", "runs", run,
+                          ["PLANNED", "ANALYZING", "PATCHING", "SMOKING", "REPAIRING"])
+    conn.close()
+
+    r = client.get("/api/v1/research/baseline/pB2")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["project"]["status"] == "BASELINE_ACCEPTANCE"
+    assert d["project"]["stage"] == "baseline"
+    assert len(d["runs"]) == 1 and d["runs"][0]["status"] == "REPAIRING"
+    assert d["blocker"]["kind"] == "repairing_stuck"
+    assert d["accept_guard"]["train_finished"] is False
+    assert d["env"]["code_ready"] is True
+    assert d["acceptance"] is None
+    assert client.get("/api/v1/research/baseline/missing").status_code == 404
