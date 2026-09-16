@@ -56,6 +56,8 @@
 
 | 36 | 2026-09-15 | 契约 openapi（servers 域）——新增端点（用户口径："只显示登记显存总量很鸡肋"） | 新增 `GET /api/v1/servers/{id}/telemetry`：一条 SSH 拉 nvidia-smi（index/name/mem_used/mem_total/util/temp）+ df -BM（真实块设备，剔 tmpfs 与 /dev/loop snap 挂载），GPU 遥测落 **gpus.extra_json**（0001 schema 预留的 A1 实时遥测位，首次启用）；错误码 TELEMETRY_UNREACHABLE/FAILED(502)，SSH 不通时登记数据仍可用 | `routers/servers.py`；单测 4 项（CSV/df 解析、端点回路+extra_json 落库、loop 过滤、NOT_FOUND），sidecar 全量 47/47；真机实测 A6000（37.5G/48G 78% · 100% · 76°C · 根分区 92% 高位）与 4090D（双卡 0% 空闲）；前端 GPU 页 ServerCard 组件化：显存占用列（used/total+进度条，≥85% amber/≥95% red）+ 利用率列（%+温度）+ 磁盘行（mount/used/total/百分比+进度条）+「刷新遥测」按钮（staleTime 30s，不自动轮询——轮询属 monitor worker 后置项） | 手动刷新优先：SSH 拉取有成本；自动遥测轮询（monitor worker 周期写 extra_json + GPU 状态衍生）攒批设计 |
 
+| 37 | 2026-09-16 | 设计 §状态机——RFC-001 正式化（deviation #34 落地，用户批准开工） | 契约 state-machine v1.1-draft：主链翻转为「基线先于评审」，**epoch 双序并存**（新边 setup_done→BASELINE_ACCEPTANCE / accept→REVIEW_GATE / confirm(F5)→SEARCH + 新增 baseline_redo 边；旧 3 边保留供存量），库级边表按并集兜底、顺序裁决在应用层按 `projects.stage_epoch` 分流（migration 0008：新列 + 存量回填 epoch=1 + 幂等补 4 新边）；T-FREEZE 新增 **F5**（accepted baseline run ∧ 绑定 root 协议 ∧ 评测口径一致，口径漂移→baseline_redo） | 实现发现：①RFC 的"bootstrap 协议"无需新增——立项已自动创建 root DRAFT 协议并绑 current_protocol_id，BASE run 创建/验收/F5 root 比对全部天然兼容；②已部署库 0001 是旧 129 边版本，由 0008 INSERT OR IGNORE 补边（全新库 0001 已含全量 133 边，0008 幂等 no-op）；③tx_baseline_acceptance 的 accept no-op 扩展到 SEARCH（epoch2 confirm 后的迟到重放不回退，对齐 R3）。端点新增 `POST /projects/{id}/baseline-redo` | 测试：契约 175/175（harness 主链新序 + F5 正/负例 + r4 fixture 补基线）、sidecar 49/49（新增 F5 反例两例 + baseline_redo guard 用例：幂等/epoch1 拒/非法态拒）；真库验证：0008 应用（27 存量项目回填 epoch=1、4 新边就位）、全新库 0001→0008 幂等（133 边、新项目 epoch=2）、新端点路由注册 ✓ |
+
 
 ## 与契约一致（零偏离）的核心面
 

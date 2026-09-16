@@ -220,6 +220,18 @@ def _freeze_ctx(conn):
     conn.execute("INSERT INTO project_gpus(project_id,gpu_id,status) VALUES(?,?,'ACTIVE')",
                  (pid, "g1"))
     harness.fx_project_reach(conn, pid, "REVIEW_GATE")
+    # F5（RFC-001 新序）：root 协议上验收通过的 baseline run（harness 夹具的 cs/env 等绑定）
+    cs = harness.fx_snapshot(conn, pid)
+    env = harness.fx_env(conn, srv)
+    rec = harness.fx_recipe(conn)
+    init = harness.fx_init(conn)
+    harness.fx_run(conn, pid, status="JUDGED", proto=proto, cs=cs, env=env,
+                   dv=dv, rec=rec, init=init, role="baseline")
+    run_id = conn.execute("SELECT id FROM runs WHERE project_id=? AND role='baseline' "
+                          "ORDER BY rowid DESC LIMIT 1", (pid,)).fetchone()[0]
+    conn.execute("INSERT INTO baseline_acceptances(id,run_id,verdict,patch_class,notes) "
+                 "VALUES(?,?,'accepted','none','parity-fixture')",
+                 (harness._nid("ba"), run_id))
     return {"pid": pid, "proto": proto, "dv": dv, "srv": srv}
 
 
@@ -243,11 +255,81 @@ def test_freeze_guards():
     prev = conn.execute("SELECT state_revision FROM projects WHERE id=?",
                         (ctx["pid"],)).fetchone()[0]
     pid, status = T.tx_freeze(conn, ctx["proto"], 0, prev, assets, plan_constraints)
-    assert status == "BASELINE_ACCEPTANCE"
+    assert status == "SEARCH"  # RFC-001 新序：定稿直通自动迭代
     proto_row = conn.execute("SELECT status FROM plan_protocols WHERE id=?",
                              (ctx["proto"],)).fetchone()
     assert proto_row["status"] == "FROZEN"
     assert rid
+
+
+def _freeze_all_ready(conn):
+    """F1–F4 全满足的冻结环境（不带 F5 基线）——F5 用例的起点。"""
+    ctx = _freeze_ctx(conn)
+    conn.execute("DELETE FROM baseline_acceptances")  # 剥掉 F5
+    for sp in conn.execute("SELECT id FROM splits WHERE proto_id=?", (ctx["proto"],)).fetchall():
+        conn.execute(
+            "INSERT INTO split_validations(id,plan_protocol_id,data_version_id,split_id,"
+            "validator_version,status,validated_at) VALUES(?,?,?,?,?,'PASSED',datetime('now'))",
+            (harness._nid("sv"), ctx["proto"], ctx["dv"], sp["id"], "v1"))
+    harness.fx_replica_ready(conn, ctx["dv"], ctx["srv"])
+    return ctx
+
+
+def test_freeze_f5_requires_accepted_baseline():
+    """RFC-001 F5 反例：无验收基线 / 口径漂移 → 拒绝（提示 baseline_redo）。"""
+    assets = ROOT / "sidecar" / "assets"
+    # 无 accepted baseline → F5 拒
+    conn = fresh_db()
+    ctx = _freeze_all_ready(conn)
+    prev = conn.execute("SELECT state_revision FROM projects WHERE id=?",
+                        (ctx["pid"],)).fetchone()[0]
+    with pytest.raises(TxError, match="F5"):
+        T.tx_freeze(conn, ctx["proto"], 0, prev, assets, plan_constraints)
+    # 口径漂移（另一 evaluator digest 的 plan）→ F5 拒
+    _, digest2 = harness.fx_evaluator(conn, ctx["pid"], ev="ev2")
+    body2 = harness.make_full_plan(bound_dv=ctx["dv"], bound_validator="v1",
+                                   bound_evaluator=digest2)
+    proto2 = harness.fx_protocol(conn, ctx["pid"], proto="proto-f5ev", plan_body=body2,
+                                 parent=ctx["proto"])
+    for sp in conn.execute("SELECT id FROM splits WHERE proto_id=?", (proto2,)).fetchall():
+        conn.execute(
+            "INSERT INTO split_validations(id,plan_protocol_id,data_version_id,split_id,"
+            "validator_version,status,validated_at) VALUES(?,?,?,?,?,'PASSED',datetime('now'))",
+            (harness._nid("sv"), proto2, ctx["dv"], sp["id"], "v1"))
+    prev = conn.execute("SELECT state_revision FROM projects WHERE id=?",
+                        (ctx["pid"],)).fetchone()[0]
+    with pytest.raises(TxError, match="F5"):
+        T.tx_freeze(conn, proto2, 0, prev, assets, plan_constraints)
+
+
+def test_baseline_redo_gate():
+    """RFC-001 §6：REVIEW_GATE→BASELINE_ACCEPTANCE（epoch2 专属）；epoch1/非法态拒；幂等。"""
+    conn = fresh_db()
+    ctx = _freeze_ctx(conn)  # 项目在 REVIEW_GATE
+    rev = conn.execute("SELECT state_revision FROM projects WHERE id=?",
+                       (ctx["pid"],)).fetchone()[0]
+    r = T.tx_baseline_redo(conn, ctx["pid"], rev, note="评测口径变更")
+    assert r["status"] == "BASELINE_ACCEPTANCE" and r["noop"] is False
+    # 幂等：已 BASELINE_ACCEPTANCE → no-op
+    rev2 = conn.execute("SELECT state_revision FROM projects WHERE id=?",
+                        (ctx["pid"],)).fetchone()[0]
+    r2 = T.tx_baseline_redo(conn, ctx["pid"], rev2)
+    assert r2["noop"] is True
+    # epoch1 存量项目 → 拒（旧序无此边语义）
+    conn2 = fresh_db()
+    ctx2 = _freeze_ctx(conn2)
+    conn2.execute("UPDATE projects SET stage_epoch=1 WHERE id=?", (ctx2["pid"],))
+    rev3 = conn2.execute("SELECT state_revision FROM projects WHERE id=?",
+                         (ctx2["pid"],)).fetchone()[0]
+    with pytest.raises(TxError, match="stage_epoch=2"):
+        T.tx_baseline_redo(conn2, ctx2["pid"], rev3)
+    # 非 REVIEW_GATE 态（INIT）→ 拒
+    conn3 = fresh_db()
+    srv3 = harness.fx_server(conn3)
+    pid3 = harness.fx_project(conn3)  # INIT
+    with pytest.raises(TxError, match="REVIEW_GATE"):
+        T.tx_baseline_redo(conn3, pid3, 0)
+    assert srv3
 
 
 # =====================================================================

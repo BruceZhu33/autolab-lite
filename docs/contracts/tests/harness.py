@@ -53,7 +53,10 @@ def _nid(prefix: str) -> str:
     return f"{prefix}-{_seq[0]}"
 
 
-PROJECT_MAIN_CHAIN = ["INIT", "ENV_SETUP", "REVIEW_GATE", "BASELINE_ACCEPTANCE", "SEARCH",
+# RFC-001/deviation #34（v1.1-draft）：新序主链——基线验证先于方案评审。
+# 旧序（setup_done→REVIEW_GATE→confirm→BASELINE_ACCEPTANCE→accept）保留在
+# sm_legal_transitions 并集中供 stage_epoch=1 存量项目使用；本链为契约参考序。
+PROJECT_MAIN_CHAIN = ["INIT", "ENV_SETUP", "BASELINE_ACCEPTANCE", "REVIEW_GATE", "SEARCH",
                        "CONFIRMATION_PREP", "CONFIRMATION_RUNNING", "TEST_RESULT_SEALED"]
 
 
@@ -1215,7 +1218,9 @@ def tx_freeze(conn, proto, next_round=1, project_expected_revision=0):
     F2 逐 split 取**该 validator_version 的最新一条**校验，必须 PASSED（旧 PASSED 盖不过新 FAILED）。
     F3 所需副本集合 = 卡池 ACTIVE 机器 ∩ 项目数据版本——反连接检查缺失/非 READY；空集合拒绝。
     F4 plan 指定的 evaluator_digest 存在且同项目。
-    F5 项目 CAS（REVIEW_GATE→BASELINE_ACCEPTANCE）。
+    F5 基线有效（RFC-001 新序）：存在验收通过的 baseline run，且绑定 root 协议
+       （parent_id IS NULL = 立项原始配置），评测口径与 root 协议一致。
+    项目 CAS（REVIEW_GATE→SEARCH，epoch2 新序）。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1285,6 +1290,25 @@ def tx_freeze(conn, proto, next_round=1, project_expected_revision=0):
         if not conn.execute("SELECT 1 FROM evaluator_snapshots WHERE project_id=? AND digest=?",
                             (pid, bound_evaluator)).fetchone():
             raise TxError("GUARD_UNMET", f"F4 evaluator digest {bound_evaluator} not frozen in project")
+        # F5（RFC-001 新序）：基线有效——accepted baseline run ∧ root 协议绑定 ∧ 口径一致
+        root = conn.execute(
+            "SELECT id, frozen_yaml FROM plan_protocols WHERE project_id=? AND parent_id IS NULL "
+            "ORDER BY ver LIMIT 1", (pid,)).fetchone()
+        ba = conn.execute(
+            "SELECT br.id AS run_id FROM baseline_acceptances ba JOIN runs br ON br.id = ba.run_id "
+            "WHERE br.project_id=? AND br.role='baseline' AND ba.verdict='accepted' "
+            "AND br.plan_protocol_id=? ORDER BY ba.created_at DESC LIMIT 1",
+            (pid, root["id"] if root else "")).fetchone()
+        if ba is None:
+            raise TxError("GUARD_UNMET",
+                          "F5 无绑定 root 协议且验收通过的 baseline run（先基线后评审，RFC-001）")
+        try:
+            root_body = json.loads(root["frozen_yaml"])
+        except (ValueError, TypeError):
+            raise TxError("GUARD_UNMET", "F5 root 协议 frozen_yaml 不可解析")
+        if root_body.get("protected_protocol", {}).get("evaluator_digest_ref") != bound_evaluator:
+            raise TxError("GUARD_UNMET",
+                          "F5 评测口径与 BASE 验收时不一致（evaluator 变化）——先 baseline_redo 重跑基线")
         # 协议冻结 + 项目 CAS
         cur = conn.execute(
             "UPDATE plan_protocols SET status='FROZEN', frozen_at=datetime('now'), effective_round=? "
@@ -1294,14 +1318,14 @@ def tx_freeze(conn, proto, next_round=1, project_expected_revision=0):
         if row["parent_id"]:
             conn.execute("UPDATE plan_protocols SET status='SUPERSEDED' WHERE id=? AND status='FROZEN'",
                          (row["parent_id"],))
-        s_cas(conn, "projects", "project", pid, "REVIEW_GATE", "BASELINE_ACCEPTANCE",
+        s_cas(conn, "projects", "project", pid, "REVIEW_GATE", "SEARCH",
               project_expected_revision, "confirm", actor="user",
               outbox=(f"confirm:{proto}", "plan.frozen"))
         conn.execute(
             "INSERT INTO audit_events(id,actor,action,payload_json) VALUES(?,?,?,?)",
             (_nid("aud"), "user", "plan.freeze", json.dumps({"proto": proto})))
         conn.execute("COMMIT")
-        return pid, "BASELINE_ACCEPTANCE"
+        return pid, "SEARCH"
     except Exception:
         conn.execute("ROLLBACK")
         raise

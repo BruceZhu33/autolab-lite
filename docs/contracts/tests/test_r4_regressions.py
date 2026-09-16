@@ -103,7 +103,8 @@ def test_zero_authorization_gpu_profile_rejected():
 
 # ==================== r4-S4：T-FREEZE 五类弱放行反例 ====================
 def _freeze_ready(conn):
-    """合法冻结环境：三个 split PASSED（v1）+ 全池副本 READY + evaluator（digest-ev1）+ 卡池。"""
+    """合法冻结环境：三个 split PASSED（v1）+ 全池副本 READY + evaluator（digest-ev1）+ 卡池
+    + F5 基线有效（RFC-001 新序：root 协议上有验收通过的 baseline run）。"""
     fx_project_reach(conn, "p1", "REVIEW_GATE")
     conn.execute("INSERT INTO gpus(id,server_id,gpu_index,model_name,vram_mb) VALUES('g1','srv1',0,'A6000',49140)")
     conn.execute("INSERT INTO project_gpus(project_id,gpu_id,status) VALUES('p1','g1','ACTIVE')")
@@ -115,6 +116,11 @@ def _freeze_ready(conn):
                      "validator_version,status,validated_at) "
                      "VALUES(?,?, 'dv1', ?, 'v1','PASSED',datetime('now'))",
                      (_nid_split(conn), "proto1", sp["id"]))
+    # F5：BASE run 绑定 root 协议（proto1，parent NULL）且已验收（RFC-001）
+    fx_run(conn, "p1", "runBase", role="baseline", proto="proto1", status="JUDGED")
+    fx_train_attempt(conn, "runBase", "atB")
+    conn.execute("INSERT INTO baseline_acceptances(id,run_id,verdict,patch_class,notes) "
+                 "VALUES('ba-r4','runBase','accepted','none','fixture')")
     # 卡池校验需要 project_gpus ACTIVE 且副本 READY——见 tx_freeze F3
 
 
@@ -192,11 +198,11 @@ def test_freeze_wrong_evaluator_rejected():
 
 
 def test_freeze_happy_path_with_full_plan():
-    """正例：完整 plan + 全 guard 满足 → 冻结成功且项目迁移。"""
+    """正例：完整 plan + 全 guard 满足（含 F5 基线有效）→ 冻结成功且项目迁移 SEARCH（RFC-001 新序）。"""
     conn = _base(); _freeze_ready(conn)
     rev = conn.execute("SELECT state_revision FROM projects WHERE id='p1'").fetchone()[0]
     pid, status = tx_freeze(conn, "proto1", project_expected_revision=rev)
-    assert (pid, status) == ("p1", "BASELINE_ACCEPTANCE")
+    assert (pid, status) == ("p1", "SEARCH")
     assert conn.execute("SELECT status FROM plan_protocols WHERE id='proto1'").fetchone()[0] == "FROZEN"
 
 
@@ -205,13 +211,9 @@ def test_freeze_batch_derives_items_and_spec_from_plan():
     conn = _base(); _freeze_ready(conn)
     rev = conn.execute("SELECT state_revision FROM projects WHERE id='p1'").fetchone()[0]
     tx_freeze(conn, "proto1", project_expected_revision=rev)
-    # 候选与矩阵
+    # 候选与矩阵（runBase/ba-r4 已由 _freeze_ready 提供——F5 前置）
     conn.execute("INSERT INTO candidates(id,proto_id,selection_rule_ver,selected_run_id,status,selected_at) "
                  "VALUES('c1','proto1','sel@1','run1','SELECTED',datetime('now'))")
-    fx_run(conn, "p1", "runBase", role="baseline", proto="proto1", status="JUDGED")
-    fx_train_attempt(conn, "runBase", "atB")
-    conn.execute("INSERT INTO baseline_acceptances(id,run_id,verdict,patch_class,notes) "
-                 "VALUES('ba-r4','runBase','accepted','none','fixture')")
     conn.execute("INSERT INTO ablation_matrices(id,proto_id,version,body_hash,status) "
                  "VALUES('m1','proto1',1,'h','FROZEN')")
     fx_project_reach(conn, "p1", "CONFIRMATION_PREP")

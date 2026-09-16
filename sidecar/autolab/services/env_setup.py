@@ -377,9 +377,17 @@ async def run_env_setup(state, project_id: str) -> dict:
         ok = all(x["status"] == "READY" for x in replicas) and bool(replicas)
         if ok:
             _register_split_validations(conn, project_id)
+            # RFC-001（deviation #34）：epoch2 新序 setup_done → BASELINE_ACCEPTANCE（BASE 先行）；
+            # epoch1 存量项目沿旧序 → REVIEW_GATE
+            epoch = 1
+            prow = conn.execute("SELECT stage_epoch FROM projects WHERE id=?",
+                                (project_id,)).fetchone()
+            if prow is not None and "stage_epoch" in prow.keys():
+                epoch = prow["stage_epoch"] or 1
             Tx.transition(conn, "project", "projects", project_id,
-                          ["ENV_SETUP", "REVIEW_GATE"], actor="sidecar",
-                          reason={"trigger": "setup_done"})
+                          ["ENV_SETUP", "BASELINE_ACCEPTANCE" if epoch == 2 else "REVIEW_GATE"],
+                          actor="sidecar",
+                          reason={"trigger": "setup_done", "stage_epoch": epoch})
         return ok
 
     all_ok = await to_thread(db, _finish)
