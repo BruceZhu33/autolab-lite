@@ -34,6 +34,7 @@ import { Label } from "@multica/ui/components/ui/label";
 import { PageHeader } from "@multica/views/layout/page-header";
 import { ProjectTimeline } from "@/features/autolab/project-timeline";
 import { stageColor, stageLabel } from "@/features/autolab/stage";
+import { getServer, listServers } from "@autolab/research/sidecar/servers";
 
 interface ProjectView {
   id: string;
@@ -50,7 +51,20 @@ interface ProjectView {
   updatedAt: string;
 }
 
-const EMPTY_FORM = { name: "", direction: "", sourceKind: "local" as "local" | "github", workspacePath: "", paper: "" };
+const EMPTY_FORM = {
+  name: "",
+  direction: "",
+  sourceKind: "local" as "local" | "github",
+  workspacePath: "",
+  paper: "",
+  // 真实立项（sidecar 模式）扩展字段；fixture 模式忽略
+  dataPath: "",
+  gpuIds: [] as string[],
+  budgetHours: "10",
+  trainCommand: "python train.py",
+  evalCommand: "python eval.py",
+  condaEnv: "",
+};
 
 async function fixtureApi<T>(method: string, path: string, body?: unknown): Promise<T> {
   const r = await fetch(path, {
@@ -71,6 +85,54 @@ function StageBadge({ stage }: { stage: string }) {
       <span className="size-1.5 rounded-full" style={{ backgroundColor: stageColor(stage) }} />
       {stageLabel(stage)}
     </Badge>
+  );
+}
+
+/** GPU 卡池勾选（真实立项：读取 sidecar 服务器注册表）。 */
+function GpuPoolPicker({
+  selected,
+  onChange,
+}: {
+  selected: string[];
+  onChange: (ids: string[]) => void;
+}) {
+  const { data: servers } = useQuery({
+    queryKey: ["autolab", "servers"],
+    queryFn: async () => {
+      const list = await listServers();
+      return Promise.all(list.map((s) => getServer(s.id)));
+    },
+    staleTime: 30_000,
+  });
+  const gpus =
+    servers?.flatMap((s) =>
+      (s.gpus ?? []).map((g) => ({ id: g.id, label: `${s.name} · #${g.gpu_index} ${g.model_name}` })),
+    ) ?? [];
+  if (gpus.length === 0) {
+    return (
+      <p className="text-caption text-muted-foreground">
+        无已注册 GPU（先在 GPU 服务器页注册）。
+      </p>
+    );
+  }
+  return (
+    <div className="grid max-h-36 gap-1 overflow-y-auto rounded-md border p-2">
+      {gpus.map((g) => {
+        const on = selected.includes(g.id);
+        return (
+          <label key={g.id} className="flex cursor-pointer items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={on}
+              onChange={() =>
+                onChange(on ? selected.filter((x) => x !== g.id) : [...selected, g.id])
+              }
+            />
+            <span className="truncate font-mono text-caption">{g.label}</span>
+          </label>
+        );
+      })}
+    </div>
   );
 }
 
@@ -102,6 +164,13 @@ export default function ProjectsPage() {
   }, [projects, fromUrl, selectedId]);
   const selected = projects.find((p) => p.id === selectedId) ?? null;
 
+  const { data: cfg } = useQuery({
+    queryKey: ["autolab", "config"],
+    queryFn: () => fetch("/api/autolab-config", { cache: "no-store" }).then((r) => r.json() as Promise<{ data_source?: string }>),
+    staleTime: Infinity,
+  });
+  const realMode = cfg?.data_source === "sidecar";
+
   const create = useMutation({
     mutationFn: (input: typeof EMPTY_FORM) =>
       fixtureApi<ProjectView>("POST", "/api/projects", input),
@@ -131,6 +200,17 @@ export default function ProjectsPage() {
     if (!form.workspacePath.trim()) {
       toast.error(form.sourceKind === "github" ? "GitHub 仓库链接必填" : "本地代码工作区路径必填");
       return;
+    }
+    if (realMode) {
+      // 真实立项（sidecar）必需字段；fixture 演示模式不强制
+      if (!form.dataPath.trim()) {
+        toast.error("数据集目录必填（真实立项：登记数据清单与副本）");
+        return;
+      }
+      if (form.gpuIds.length === 0) {
+        toast.error("GPU 卡池至少选择一块（真实立项绑定执行机）");
+        return;
+      }
     }
     create.mutate(form);
   };
@@ -218,6 +298,59 @@ export default function ProjectsPage() {
                     onChange={(e) => setForm({ ...form, paper: e.target.value })}
                     placeholder="arXiv 链接或标题"
                   />
+                </div>
+                {/* 真实立项字段（sidecar 模式生效；fixture 忽略） */}
+                <div className="grid gap-1.5">
+                  <Label>数据集目录 *（真实立项）</Label>
+                  <Input
+                    value={form.dataPath}
+                    onChange={(e) => setForm({ ...form, dataPath: e.target.value })}
+                    placeholder="/Users/you/work/mynet/data"
+                    className="font-mono text-sm"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label>GPU 卡池 *（真实立项）</Label>
+                  <GpuPoolPicker
+                    selected={form.gpuIds}
+                    onChange={(gpuIds) => setForm({ ...form, gpuIds })}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="grid gap-1.5">
+                    <Label>预算（GPU·h）</Label>
+                    <Input
+                      value={form.budgetHours}
+                      onChange={(e) => setForm({ ...form, budgetHours: e.target.value })}
+                      inputMode="numeric"
+                    />
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label>conda 环境（可选）</Label>
+                    <Input
+                      value={form.condaEnv}
+                      onChange={(e) => setForm({ ...form, condaEnv: e.target.value })}
+                      placeholder="复用服务器现成环境（deviation #14）"
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="grid gap-1.5">
+                    <Label>训练命令</Label>
+                    <Input
+                      value={form.trainCommand}
+                      onChange={(e) => setForm({ ...form, trainCommand: e.target.value })}
+                      className="font-mono text-sm"
+                    />
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label>评测命令</Label>
+                    <Input
+                      value={form.evalCommand}
+                      onChange={(e) => setForm({ ...form, evalCommand: e.target.value })}
+                      className="font-mono text-sm"
+                    />
+                  </div>
                 </div>
               </div>
               <DialogFooter>

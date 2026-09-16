@@ -17,6 +17,15 @@ import {
   realBaselineDispatch,
   realBaselineReject,
 } from "../sidecar/baseline";
+import { realCreateProject, realStartEnvSetup, type RealCreateInput } from "../sidecar/projects";
+import { fetchReviewWorkshop, realReviewFreeze } from "../sidecar/review";
+import { fetchIterateWorkshop, realIterateAction } from "../sidecar/iterate";
+import {
+  fetchArchiveView,
+  fetchConfirmWorkshop,
+  realFinalRead,
+  realGenerateReport,
+} from "../sidecar/confirm";
 import { stageStatuses } from "./data";
 import type { Issue } from "@multica/core/types";
 
@@ -31,7 +40,7 @@ const SIDECAR_BOARD_ENDPOINTS = new Set([
 
 /** 参数化端点（regex → 分发），404（真库无此项目）时落回 fixture（LAB 演示种子）。 */
 type ParamServe = (id: string, body: unknown) => Promise<unknown>;
-const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe }[] = [
+const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe; method?: string }[] = [
   { re: /^\/api\/issues\/([^/]+)$/, serve: (id) => fetchWorkspaceIssue(id) },
   { re: /^\/api\/issues\/([^/]+)\/timeline$/, serve: (id) => fetchTimelineEntries(id) },
   {
@@ -65,6 +74,121 @@ const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe }[] = [
         ? (b.messages[b.messages.length - 1]?.content ?? "当前无新进展。")
         : "真数据不可达。";
       return { id: `sidecar-reply-${Date.now()}`, role: "agent", content: `（真数据应答）${reply}`, createdAt: new Date().toISOString() };
+    },
+  },
+  {
+    // 立项（准备阶段起点）：表单字段映射为真实 ProjectCreate
+    re: /^\/api\/projects$/,
+    method: "POST",
+    serve: (_id, body) => {
+      const f = (body ?? {}) as Partial<RealCreateInput> & {
+        direction?: string; workspacePath?: string;
+        dataPath?: string; gpuIds?: string[]; budgetHours?: number;
+        trainCommand?: string; evalCommand?: string; condaEnv?: string;
+      };
+      return realCreateProject({
+        name: String(f.name ?? "").trim(),
+        direction: f.direction ?? "",
+        workspacePath: String(f.workspacePath ?? "").trim(),
+        dataPath: String(f.dataPath ?? "").trim(),
+        gpuIds: f.gpuIds ?? [],
+        budgetHours: Number(f.budgetHours) > 0 ? Number(f.budgetHours) : 10,
+        trainCommand: f.trainCommand?.trim() || "python train.py",
+        evalCommand: f.evalCommand?.trim() || "python eval.py",
+        condaEnv: f.condaEnv?.trim() || undefined,
+      }).then((row) => ({
+        ...row,
+        identifier: row.name,
+        title: row.name,
+        stage: "prepare",
+      }));
+    },
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/review-workshop$/,
+    serve: (id) => fetchReviewWorkshop(id),
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/review-workshop\/human-pass$/,
+    serve: (id) => softFail(() => realReviewFreeze(id)),
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/review-workshop\/messages$/,
+    serve: async (id) => {
+      const ws = await fetchReviewWorkshop(id).catch(() => null);
+      const reply = ws?.messages[ws.messages.length - 1]?.content ?? "真数据不可达。";
+      return { id: `rv-reply-${Date.now()}`, role: "expert", content: `（真数据应答）${reply}`, createdAt: new Date().toISOString() };
+    },
+  },
+  {
+    // 生成方案：真实 finalize 需要 ACCEPTED 模块链——当前返回引导（Phase 3 模块化评审）
+    re: /^\/api\/projects\/([^/]+)\/review-workshop\/plan$/,
+    serve: async (id) => {
+      const ws = await fetchReviewWorkshop(id).catch(() => null);
+      return {
+        note: "模块化评审（modules → synthesize → finalize）是 Phase 3 产品化范围；当前方案视图读取真实协议。",
+        plan: ws?.plan ?? null,
+      };
+    },
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/iteration-workshop$/,
+    serve: (id) => fetchIterateWorkshop(id),
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/iteration-workshop\/messages$/,
+    serve: (id, body) => {
+      const content = String((body as { content?: string } | null)?.content ?? "");
+      return realIterateAction(id, content).then(async (acted) => {
+        if (acted) return { id: `it-reply-${Date.now()}`, role: "agent", content: acted, createdAt: new Date().toISOString() };
+        const ws = await fetchIterateWorkshop(id).catch(() => null);
+        return {
+          id: `it-reply-${Date.now()}`,
+          role: "agent",
+          content: `（真数据应答）${ws?.messages[0]?.content ?? "真数据不可达。"}`,
+          createdAt: new Date().toISOString(),
+        };
+      });
+    },
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/confirm-workshop$/,
+    serve: (id) => fetchConfirmWorkshop(id),
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/confirm-workshop\/messages$/,
+    serve: (id, body) => {
+      const content = String((body as { content?: string } | null)?.content ?? "");
+      const act = /final-read/.test(content)
+        ? realFinalRead(id)
+        : /生成报告|完成|归档/.test(content)
+          ? realGenerateReport(id)
+          : Promise.resolve("");
+      return act.then(async (acted) => {
+        if (acted) return { id: `cf-reply-${Date.now()}`, role: "agent", content: acted, createdAt: new Date().toISOString() };
+        const ws = await fetchConfirmWorkshop(id).catch(() => null);
+        return {
+          id: `cf-reply-${Date.now()}`,
+          role: "agent",
+          content: `（真数据应答）${ws?.messages[0]?.content ?? "真数据不可达。"}`,
+          createdAt: new Date().toISOString(),
+        };
+      });
+    },
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/archive$/,
+    serve: (id) => fetchArchiveView(id),
+  },
+  {
+    // 准备门（提交基线验证）：PUT /api/issues/:id {status:"baseline"} → 真实 env-setup
+    // （epoch2 环境就绪后 setup_done 落 BASELINE_ACCEPTANCE）
+    re: /^\/api\/issues\/([^/]+)$/,
+    method: "PUT",
+    serve: (id, body) => {
+      const b = (body ?? {}) as { status?: string };
+      if (b.status === "baseline") return realStartEnvSetup(id);
+      return Promise.resolve(null); // 其余 PUT 语义落回 fixture
     },
   },
 ];
@@ -176,8 +300,12 @@ export function installFixtureFetch(): void {
       url.pathname !== "/api/autolab-config";
     if (!isApiPath) return originalFetch(input, init);
 
-    // ---- Phase 2 分流：sidecar 模式下看板/详情/基线工作台端点走真聚合 ----
-    const paramRoute = SIDECAR_PARAM_ROUTES.find((r) => r.re.test(url.pathname));
+    // ---- Phase 2 分流：sidecar 模式下看板/详情/工作台端点走真聚合 ----
+    const paramRoute = SIDECAR_PARAM_ROUTES.find(
+      (r) =>
+        r.re.test(url.pathname) &&
+        (r.method ? r.method === req.method : req.method === "GET" || req.method === "POST"),
+    );
     if (paramRoute && (await resolveDataSource()) === "sidecar") {
       const m = paramRoute.re.exec(url.pathname);
       const id = decodeURIComponent(m?.[1] ?? "");
@@ -189,7 +317,9 @@ export function installFixtureFetch(): void {
           body = undefined;
         }
       }
-      if (id && (req.method === "GET" || req.method === "POST")) {
+      const methodOk =
+        req.method === "GET" || req.method === "POST" || req.method === "PUT";
+      if (methodOk) {
         try {
           const payload = await paramRoute.serve(id, body);
           if (payload !== null && payload !== undefined) return jsonResponse(payload);

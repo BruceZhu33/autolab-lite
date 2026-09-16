@@ -911,6 +911,47 @@ paths:
         "404": {description: project not found}
         '401': {$ref: '#/components/responses/Unauthorized'}
 
+  /api/v1/research/review/{projectId}:
+    get:
+      tags: [Research]
+      summary: |
+        方案评审工作区聚合（Phase 2）：review_turns + 当前协议（定稿目标）+ 模块状态 +
+        F5 锚（已验收基线）。定稿写路径 = POST /plan-protocols/{id}/freeze（T-FREEZE）。
+      operationId: getResearchReview
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: object}}}}
+        "404": {description: project not found}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /api/v1/research/iterate/{projectId}:
+    get:
+      tags: [Research]
+      summary: |
+        自动迭代工作区聚合（Phase 2）：BASE 锚 + search 轮次（指标/delta/JUDGE 采纳）+
+        预算 + 状态派生（idle/running/paused/stalled/concluded）。写路径 =
+        next-round / terminate 真实端点。
+      operationId: getResearchIterate
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: object}}}}
+        "404": {description: project not found}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /api/v1/research/confirm/{projectId}:
+    get:
+      tags: [Research]
+      summary: |
+        最终确认工作区聚合（Phase 2，归档视图复用）：val 最佳/BASE 锚 + 最新批次 +
+        test 一次性释放状态 + 产物清单。写路径 = final-confirmation/read（不变量②）
+        与 reports（REPORTING→REPORTED）。
+      operationId: getResearchConfirm
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: object}}}}
+        "404": {description: project not found}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
   /api/v1/projects/{projectId}/baseline-redo:
     post:
       tags: [Plan]
