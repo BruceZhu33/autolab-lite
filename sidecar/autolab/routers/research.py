@@ -13,6 +13,8 @@ GET /api/v1/research/board——六列看板聚合（RFC-001 §10 映射）：
 """
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Request
 
 from ..db import to_thread
@@ -23,6 +25,160 @@ router = APIRouter(prefix="/api/v1/research")
 @router.get("/board")
 async def board(request: Request):
     return await get_board(request)
+
+
+@router.get("/workspace/{project_id}")
+async def workspace(project_id: str, request: Request):
+    """项目工作区聚合（Phase 2 只读）：详情页/监视面板的单项目全貌。"""
+    state = request.app.state.autolab
+
+    def _q(conn):
+        p = conn.execute(
+            "SELECT p.*, b.consumed_s, b.reserved_s, b.limit_s "
+            "FROM projects p LEFT JOIN budget_accounts b ON b.project_id = p.id "
+            "WHERE p.id=?", (project_id,)).fetchone()
+        if p is None:
+            return None
+        proto = conn.execute(
+            "SELECT id, ver, status, created_at FROM plan_protocols WHERE id=?",
+            (p["current_protocol_id"],)).fetchone() if p["current_protocol_id"] else None
+        pool = conn.execute(
+            "SELECT g.server_id, g.gpu_index, g.model_name FROM project_gpus pg "
+            "JOIN gpus g ON g.id = pg.gpu_id WHERE pg.project_id=? AND pg.status='ACTIVE'",
+            (project_id,)).fetchall()
+        baseline = conn.execute(
+            "SELECT ba.run_id, ba.verdict, ba.patch_class, ba.created_at AS accepted_at "
+            "FROM baseline_acceptances ba JOIN runs r ON r.id = ba.run_id "
+            "WHERE r.project_id=? ORDER BY ba.created_at DESC LIMIT 1",
+            (project_id,)).fetchone()
+        runs = conn.execute(
+            "SELECT id, round_no, role, status, created_at, updated_at FROM runs "
+            "WHERE project_id=? ORDER BY updated_at DESC LIMIT 10",
+            (project_id,)).fetchall()
+        active_attempts = conn.execute(
+            "SELECT COUNT(*) FROM attempts a JOIN runs r ON r.id = a.run_id "
+            "WHERE r.project_id=? AND a.status IN ('ACKED','RUNNING','STOP_REQUESTED')",
+            (project_id,)).fetchone()[0]
+        return {
+            "project": {
+                "id": p["id"], "name": p["name"], "direction_text": p["direction_text"],
+                "stage": stage_of(p["status"], p["paused_from_state"], p["pause_reason"]),
+                "status": p["status"], "stage_epoch": p["stage_epoch"],
+                "pause_reason": p["pause_reason"],
+                "created_at": p["created_at"], "updated_at": p["updated_at"],
+                "base_source_kind": p["base_source_kind"],
+                "base_source_ref": p["base_source_ref"],
+                "budget": ({"consumed_s": p["consumed_s"], "reserved_s": p["reserved_s"],
+                            "limit_s": p["limit_s"]} if p["limit_s"] is not None else None),
+            },
+            "protocol": dict(proto) if proto else None,
+            "gpu_pool": [dict(g) for g in pool],
+            "baseline": dict(baseline) if baseline else None,
+            "recent_runs": [dict(r) for r in runs],
+            "active_attempts": active_attempts,
+        }
+
+    result = await to_thread(state.db, _q)
+    if result is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="project not found")
+    return result
+
+
+_EVENT_LABELS = {
+    "project": "", "run": "run ", "attempt": "attempt ",
+}
+
+
+@router.get("/timeline/{project_id}")
+async def timeline(project_id: str, request: Request, limit: int = 100):
+    """全程时间线（Phase 2 只读）：state_events（project/run/attempt 三层）+
+    基线验收留痕 + 评审对话轮，按时间倒序。评论域（threads/messages）是 Phase 3。"""
+    state = request.app.state.autolab
+    limit = max(1, min(limit, 200))
+
+    def _q(conn):
+        p = conn.execute("SELECT id FROM projects WHERE id=?", (project_id,)).fetchone()
+        if p is None:
+            return None
+        run_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM runs WHERE project_id=?", (project_id,))]
+        attempts_by_run = {
+            a["id"]: a for a in conn.execute(
+                f"SELECT id, run_id FROM attempts WHERE run_id IN "
+                f"({','.join('?' * len(run_ids)) or 'NULL'})", run_ids)} if run_ids else {}
+        agg_label = {"project": "", "run": "run", "attempt": "attempt"}
+
+        def subject(aggregate_type, aggregate_id):
+            if aggregate_type == "project":
+                return ""
+            if aggregate_type == "run":
+                row = conn.execute(
+                    "SELECT round_no, role FROM runs WHERE id=?", (aggregate_id,)).fetchone()
+                return f"run#{row['round_no']}({row['role']}) " if row else "run "
+            att = attempts_by_run.get(aggregate_id)
+            if att:
+                row = conn.execute(
+                    "SELECT round_no, role FROM runs WHERE id=?", (att["run_id"],)).fetchone()
+                return f"run#{row['round_no']} attempt " if row else "attempt "
+            return "attempt "
+
+        items = []
+        for e in conn.execute(
+                "SELECT * FROM state_events WHERE aggregate_type='project' AND aggregate_id=? "
+                "UNION ALL "
+                "SELECT * FROM state_events WHERE aggregate_type='run' AND aggregate_id IN "
+                f"(SELECT id FROM runs WHERE project_id=?) "
+                "UNION ALL "
+                "SELECT * FROM state_events WHERE aggregate_type='attempt' AND aggregate_id IN "
+                f"(SELECT a.id FROM attempts a JOIN runs r ON r.id=a.run_id WHERE r.project_id=?) "
+                "ORDER BY occurred_at DESC LIMIT ?",
+                (project_id, project_id, project_id, limit)).fetchall():
+            items.append({
+                "kind": "state_event",
+                "id": e["id"],
+                "event": e["event"],
+                "from_state": e["from_state"],
+                "to_state": e["to_state"],
+                "aggregate_type": e["aggregate_type"],
+                "subject": subject(e["aggregate_type"], e["aggregate_id"]),
+                "actor": e["actor"],
+                "reason": json.loads(e["reason_json"] or "{}"),
+                "occurred_at": e["occurred_at"],
+            })
+        for ba in conn.execute(
+                "SELECT ba.*, r.round_no FROM baseline_acceptances ba "
+                "JOIN runs r ON r.id = ba.run_id WHERE r.project_id=? "
+                "ORDER BY ba.created_at DESC", (project_id,)).fetchall():
+            items.append({
+                "kind": "baseline_acceptance",
+                "id": ba["id"],
+                "verdict": ba["verdict"],
+                "patch_class": ba["patch_class"],
+                "notes": ba["notes"],
+                "run_round": ba["round_no"],
+                "actor": "user",
+                "occurred_at": ba["created_at"],
+            })
+        for rt in conn.execute(
+                "SELECT * FROM review_turns WHERE project_id=? ORDER BY created_at DESC",
+                (project_id,)).fetchall():
+            items.append({
+                "kind": "review_turn",
+                "id": rt["id"],
+                "stage": rt["stage"],
+                "role": rt["role"],
+                "content": json.loads(rt["content_json"] or "{}"),
+                "occurred_at": rt["created_at"],
+            })
+        items.sort(key=lambda x: x["occurred_at"], reverse=True)
+        return {"items": items[:limit], "next_cursor": None}
+
+    result = await to_thread(state.db, _q)
+    if result is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="project not found")
+    return result
 
 # RFC-001 §10：后端状态 → 六列
 _STAGE_BY_STATUS = {

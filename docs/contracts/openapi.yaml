@@ -866,6 +866,35 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /api/v1/research/workspace/{projectId}:
+    get:
+      tags: [Research]
+      summary: |
+        项目工作区聚合（Phase 2 只读）：BASE 来源/当前协议/卡池/最近 run（≤10）/
+        基线验收/预算/活跃 attempt 数。项目不存在 → 404。
+      operationId: getResearchWorkspace
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: object}}}}
+        "404": {description: project not found}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /api/v1/research/timeline/{projectId}:
+    get:
+      tags: [Research]
+      summary: |
+        全程时间线聚合（Phase 2 只读）：project/run/attempt 三层 state_events +
+        基线验收留痕 + 评审对话轮，按时间倒序（limit≤200，默认 100）。
+        评论域（threads/messages）为 Phase 3 范围。
+      operationId: getResearchTimeline
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - {name: limit, in: query, schema: {type: integer, default: 100, maximum: 200}}
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: object}}}}
+        "404": {description: project not found}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
   /api/v1/projects/{projectId}/baseline-redo:
     post:
       tags: [Plan]
