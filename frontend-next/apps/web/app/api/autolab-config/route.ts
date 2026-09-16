@@ -31,7 +31,15 @@ export async function GET() {
       port: number;
     };
     const token = (await readFile(path.join(dir, "capability_token"), "utf-8")).trim();
-    return NextResponse.json({ baseUrl: `http://127.0.0.1:${runtime.port}`, token });
+    // Phase 2 数据源开关：AUTOLAB_DATA_SOURCE=sidecar 时看板走真 sidecar 聚合，
+    // 其余端点仍由 fixture 兜底（逐域替换，v0.3 §8 Phase 2）
+    const dataSource =
+      process.env.AUTOLAB_DATA_SOURCE === "sidecar" ? "sidecar" : "fixture";
+    return NextResponse.json({
+      baseUrl: `http://127.0.0.1:${runtime.port}`,
+      token,
+      data_source: dataSource,
+    });
   } catch {
     return NextResponse.json({ error: "runtime.json not found" }, { status: 503 });
   }

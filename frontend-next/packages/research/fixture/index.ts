@@ -1,9 +1,92 @@
 /**
  * 安装 fixture fetch：必须在任何 @multica/core 请求发出前调用（WebProviders
  * 首帧即装）。仅浏览器端生效；SSR 直接跳过。
+ *
+ * Phase 2 数据源分流（v0.3 §8）：/api/autolab-config 返回 data_source=sidecar
+ * 时，看板数据端点（GET /api/issues、POST /api/issues/table/rows）改由 sidecar
+ * 聚合适配（../sidecar/board）供数；其余端点仍走内存 fixture（逐域替换）。
  */
 import { fixtureRoutes } from "./handlers";
 import { jsonResponse, matchRoute } from "./router";
+import { getSidecarConfig } from "../sidecar/config";
+import { fetchBoardIssues } from "../sidecar/board";
+import { stageStatuses } from "./data";
+import type { Issue } from "@multica/core/types";
+
+/** 本片已接真 sidecar 的端点（key = `${method} ${pathname}`）。 */
+const SIDECAR_BOARD_ENDPOINTS = new Set([
+  "GET /api/issues",
+  "POST /api/issues/table/rows",
+  "POST /api/issues/table/groups",
+  "POST /api/issues/table/facets",
+]);
+
+let dataSourceCache: "fixture" | "sidecar" | null = null;
+
+async function resolveDataSource(): Promise<"fixture" | "sidecar"> {
+  if (dataSourceCache === null) {
+    try {
+      const cfg = await getSidecarConfig();
+      dataSourceCache = cfg.data_source === "sidecar" ? "sidecar" : "fixture";
+    } catch {
+      dataSourceCache = "fixture";
+    }
+  }
+  return dataSourceCache;
+}
+
+function tableRowsPayload(issues: Issue[], body: unknown) {
+  const req = (body ?? {}) as {
+    group_key?: string;
+    query?: { filters?: { statuses?: string[] } };
+  };
+  const wanted =
+    req.group_key?.startsWith("status:")
+      ? req.group_key.slice("status:".length)
+      : req.query?.filters?.statuses?.[0] ?? null;
+  const scoped = wanted ? issues.filter((i) => i.status === wanted) : issues;
+  return {
+    query_fingerprint: `autolab-sidecar:${wanted ?? "all"}`,
+    group_key: req.group_key ?? null,
+    parent_id: null,
+    total: scoped.length,
+    rows: scoped.map((issue) => ({ issue, direct_child_count: 0 })),
+    branch_total: scoped.length,
+    next_cursor: null,
+  };
+}
+
+function tableGroupsPayload(issues: Issue[]) {
+  return {
+    query_fingerprint: "autolab-sidecar:groups",
+    total: issues.length,
+    groups: [],
+    next_cursor: null,
+  };
+}
+
+function tableFacetsPayload(issues: Issue[], body: unknown) {
+  const req = (body ?? {}) as { facets?: { kind?: string }[] };
+  const kinds = new Set((req.facets ?? []).map((f) => f.kind));
+  const facets: unknown[] = [];
+  if (kinds.has("status")) {
+    facets.push({
+      kind: "status",
+      values: stageStatuses.map((s) => ({
+        key: s.key,
+        count: issues.filter((i) => i.status === s.key).length,
+      })),
+    });
+  }
+  if (kinds.has("working_agents")) {
+    facets.push({ kind: "working_agents", values: [] });
+  }
+  return {
+    query_fingerprint: "autolab-sidecar:facets",
+    total: issues.length,
+    facets,
+  };
+}
 
 let installed = false;
 
@@ -27,6 +110,38 @@ export function installFixtureFetch(): void {
       (url.pathname.startsWith("/api/") || url.pathname.startsWith("/auth/")) &&
       url.pathname !== "/api/autolab-config";
     if (!isApiPath) return originalFetch(input, init);
+
+    // ---- Phase 2 分流：sidecar 模式下看板端点走真聚合 ----
+    if (SIDECAR_BOARD_ENDPOINTS.has(`${req.method} ${url.pathname}`)) {
+      const source = await resolveDataSource();
+      if (source === "sidecar") {
+        try {
+          const issues = await fetchBoardIssues();
+          if (req.method === "GET") {
+            return jsonResponse({ issues, total: issues.length });
+          }
+          let body: unknown = undefined;
+          try {
+            body = await req.json();
+          } catch {
+            body = undefined;
+          }
+          if (url.pathname === "/api/issues/table/rows") {
+            return jsonResponse(tableRowsPayload(issues, body));
+          }
+          if (url.pathname === "/api/issues/table/groups") {
+            return jsonResponse(tableGroupsPayload(issues));
+          }
+          return jsonResponse(tableFacetsPayload(issues, body));
+        } catch (err) {
+          console.error(
+            `[autolab-sidecar] board 聚合失败 ${req.method} ${url.pathname}，回退 fixture`,
+            err,
+          );
+          dataSourceCache = "fixture"; // sidecar 不可达时本会话降级
+        }
+      }
+    }
 
     const matched = matchRoute(fixtureRoutes, req.method, url.pathname);
     if (!matched) {
