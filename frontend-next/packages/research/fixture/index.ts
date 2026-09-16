@@ -26,6 +26,7 @@ import {
   realFinalRead,
   realGenerateReport,
 } from "../sidecar/confirm";
+import { postUserMessage, type WorkshopSurface } from "../sidecar/threads";
 import { stageStatuses } from "./data";
 import type { Issue } from "@multica/core/types";
 
@@ -67,14 +68,7 @@ const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe; method?: string }[]
   },
   {
     re: /^\/api\/projects\/([^/]+)\/baseline-workshop\/messages$/,
-    serve: async (id) => {
-      // Phase 3 前的只读意图应答：以真数据回答进度类问题
-      const b = await fetchBaselineWorkshop(id).catch(() => null);
-      const reply = b
-        ? (b.messages[b.messages.length - 1]?.content ?? "当前无新进展。")
-        : "真数据不可达。";
-      return { id: `sidecar-reply-${Date.now()}`, role: "agent", content: `（真数据应答）${reply}`, createdAt: new Date().toISOString() };
-    },
+    serve: (id, body) => realWorkshopMessage(id, "baseline", body),
   },
   {
     // 立项（准备阶段起点）：表单字段映射为真实 ProjectCreate
@@ -114,11 +108,7 @@ const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe; method?: string }[]
   },
   {
     re: /^\/api\/projects\/([^/]+)\/review-workshop\/messages$/,
-    serve: async (id) => {
-      const ws = await fetchReviewWorkshop(id).catch(() => null);
-      const reply = ws?.messages[ws.messages.length - 1]?.content ?? "真数据不可达。";
-      return { id: `rv-reply-${Date.now()}`, role: "expert", content: `（真数据应答）${reply}`, createdAt: new Date().toISOString() };
-    },
+    serve: (id, body) => realWorkshopMessage(id, "review", body),
   },
   {
     // 生成方案：真实 finalize 需要 ACCEPTED 模块链——当前返回引导（Phase 3 模块化评审）
@@ -139,15 +129,10 @@ const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe; method?: string }[]
     re: /^\/api\/projects\/([^/]+)\/iteration-workshop\/messages$/,
     serve: (id, body) => {
       const content = String((body as { content?: string } | null)?.content ?? "");
+      // 动作意图仍走真实端点（next-round/terminate）；否则评论落库
       return realIterateAction(id, content).then(async (acted) => {
         if (acted) return { id: `it-reply-${Date.now()}`, role: "agent", content: acted, createdAt: new Date().toISOString() };
-        const ws = await fetchIterateWorkshop(id).catch(() => null);
-        return {
-          id: `it-reply-${Date.now()}`,
-          role: "agent",
-          content: `（真数据应答）${ws?.messages[0]?.content ?? "真数据不可达。"}`,
-          createdAt: new Date().toISOString(),
-        };
+        return realWorkshopMessage(id, "iterate", body);
       });
     },
   },
@@ -166,13 +151,7 @@ const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe; method?: string }[]
           : Promise.resolve("");
       return act.then(async (acted) => {
         if (acted) return { id: `cf-reply-${Date.now()}`, role: "agent", content: acted, createdAt: new Date().toISOString() };
-        const ws = await fetchConfirmWorkshop(id).catch(() => null);
-        return {
-          id: `cf-reply-${Date.now()}`,
-          role: "agent",
-          content: `（真数据应答）${ws?.messages[0]?.content ?? "真数据不可达。"}`,
-          createdAt: new Date().toISOString(),
-        };
+        return realWorkshopMessage(id, "confirm", body);
       });
     },
   },
@@ -207,6 +186,36 @@ async function softFail(fn: () => Promise<unknown>): Promise<unknown> {
     const reason = err instanceof Error ? err.message : String(err);
     if (/404|Not Found/i.test(reason)) throw err;
     return { passed: false, reason: reason.slice(0, 300) };
+  }
+}
+
+/** RFC-002：评论落库（Phase 3）——页面消息契约的返回形状适配。
+ *  用户消息同步返回；Agent 回复异步经 WS 失效重取到达（页面 5s 轮询兜底）。 */
+async function realWorkshopMessage(
+  projectId: string,
+  surface: WorkshopSurface,
+  body: unknown,
+): Promise<unknown> {
+  const content = String((body as { content?: string } | null)?.content ?? "").trim();
+  if (!content) {
+    return { id: `wm-empty-${Date.now()}`, role: "agent", content: "（空消息）", createdAt: new Date().toISOString() };
+  }
+  try {
+    const r = await postUserMessage(projectId, surface, content);
+    return {
+      id: r.message.id,
+      role: "agent",
+      content: "已收到（落库）；Agent 回复即将出现在对话区（WS 失效自动刷新）。",
+      createdAt: r.message.created_at ?? new Date().toISOString(),
+    };
+  } catch (err) {
+    if (err instanceof Error && /404|Not Found/i.test(err.message)) throw err;
+    return {
+      id: `wm-err-${Date.now()}`,
+      role: "agent",
+      content: `评论未能落库：${err instanceof Error ? err.message : String(err)}`.slice(0, 300),
+      createdAt: new Date().toISOString(),
+    };
   }
 }
 

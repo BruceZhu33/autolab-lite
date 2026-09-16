@@ -18,10 +18,11 @@ from .context import AppState
 from .db import Database
 from .errors import TxError, tx_error_handler
 from .events import Hub
-from .routers import assistant, meta, projects, research, review, runs, servers, settings, ws
+from .routers import assistant, meta, projects, research, review, runs, servers, settings, threads, ws
 from .security import CapabilityToken, TokenMiddleware
 from .services import dispatcher as dispatcher_svc
 from .services import monitor as monitor_svc
+from .services import threads as threads_svc
 from .ssh.keychain import make_store
 
 
@@ -48,6 +49,8 @@ def create_app(cfg: Config | None = None, port: int | None = None) -> FastAPI:
             hub.publish_threadsafe(state.loop, "system.ready",
                                    {"version": __version__, "migrations": migrated})
         _write_runtime(cfg, port, (cfg.token_path.read_text(encoding="utf-8").strip()))
+        # RFC-002：评论管道重启恢复——遗留 agent_jobs 置 FAILED(restarted)，用户消息保留
+        await threads_svc.sweep_orphan_jobs(state)
         from .services import evaluator as evaluator_svc
         tasks = [
             asyncio.create_task(dispatcher_svc.run_dispatcher(state), name="dispatcher"),
@@ -79,6 +82,7 @@ def create_app(cfg: Config | None = None, port: int | None = None) -> FastAPI:
     app.include_router(assistant.router)
     app.include_router(servers.router)
     app.include_router(research.router)
+    app.include_router(threads.router)
     app.include_router(projects.router)
     app.include_router(runs.router)
     app.include_router(settings.router)

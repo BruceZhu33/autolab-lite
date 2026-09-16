@@ -6,6 +6,7 @@
  * 产品化时按模块评审重做）。
  */
 import { sidecarApi } from "./client";
+import { fetchThreadMessages } from "./threads";
 
 export interface ResearchReviewTurn {
   id: string;
@@ -53,6 +54,7 @@ export async function fetchReviewWorkshop(projectId: string): Promise<{
   freeze: { protocolId: string; stateRevision: number } | null;
 }> {
   const r = await sidecarApi<ResearchReview>("GET", `/api/v1/research/review/${projectId}`);
+  const threadMsgs = await fetchThreadMessages(projectId, "review").catch(() => []);
   const messages = [
     {
       id: `rv-intro-${projectId}`,
@@ -69,6 +71,12 @@ export async function fetchReviewWorkshop(projectId: string): Promise<{
       role: (t.role === "user" ? "user" : "expert") as "user" | "expert",
       content: `[${t.stage}] ${turnText(t)}`,
       createdAt: t.created_at,
+    })),
+    ...threadMsgs.map((m) => ({
+      id: m.id,
+      role: (m.actor_type === "user" ? "user" : "expert") as "user" | "expert",
+      content: m.content_md,
+      createdAt: m.created_at,
     })),
   ];
   const plan = r.protocol
