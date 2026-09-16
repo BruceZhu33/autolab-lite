@@ -83,6 +83,7 @@ export const RESERVED_SLUGS: ReadonlySet<string> = new Set([
   "gpu",
   "review",
   "baseline",
+  "iterate",
   "agents",
   "squads",
   "inbox",

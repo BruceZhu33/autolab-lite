@@ -55,7 +55,7 @@ const STAGE_GATES: Record<string, StageGate> = {
     next: "iterate",
     nextLabel: "自动迭代",
     action: "评审定稿，进入自动迭代",
-    hint: "方案经评分 Agent 评审与人工终审后推进",
+    hint: "方案经评分与人工终审后，进入自主训练闭环（迭代工作区监督）",
     color: "#f59e0b",
   },
   iterate: {

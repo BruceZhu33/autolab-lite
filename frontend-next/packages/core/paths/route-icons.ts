@@ -53,6 +53,7 @@ export type NavLabelKey =
   | "gpu"
   | "review"
   | "baseline"
+  | "iterate"
   | "agents"
   | "squads"
   | "usage"
@@ -71,6 +72,7 @@ export type WorkspacePageKey =
   | "gpu"
   | "review"
   | "baseline"
+  | "iterate"
   | "agents"
   | "squads"
   | "usage"
@@ -104,6 +106,8 @@ export const WORKSPACE_PAGES: Record<WorkspacePageKey, WorkspacePage> = {
   review: { segment: "review", icon: "FileText", navKey: "review" },
   // AutoLab（v0.3 迁移）：基线验证工作区（BASE 派发 / run 监视 / 验收）
   baseline: { segment: "baseline", icon: "FileCode", navKey: "baseline" },
+  // AutoLab（v0.3 迁移）：自主迭代工作区（全自动改码-训练-评测闭环）
+  iterate: { segment: "iterate", icon: "Zap", navKey: "iterate" },
   agents: { segment: "agents", icon: "Bot", navKey: "agents" },
   squads: { segment: "squads", icon: "Users", navKey: "squads" },
   usage: { segment: "usage", icon: "BarChart3", navKey: "usage" },
