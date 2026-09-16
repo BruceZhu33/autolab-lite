@@ -19,7 +19,7 @@ import {
 } from "../sidecar/baseline";
 import { realCreateProject, realStartEnvSetup, type RealCreateInput } from "../sidecar/projects";
 import { fetchReviewWorkshop, realReviewFreeze } from "../sidecar/review";
-import { fetchIterateWorkshop, realIterateAction } from "../sidecar/iterate";
+import { fetchIterateWorkshop } from "../sidecar/iterate";
 import {
   fetchArchiveView,
   fetchConfirmWorkshop,
@@ -127,14 +127,9 @@ const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe; method?: string }[]
   },
   {
     re: /^\/api\/projects\/([^/]+)\/iteration-workshop\/messages$/,
-    serve: (id, body) => {
-      const content = String((body as { content?: string } | null)?.content ?? "");
-      // 动作意图仍走真实端点（next-round/terminate）；否则评论落库
-      return realIterateAction(id, content).then(async (acted) => {
-        if (acted) return { id: `it-reply-${Date.now()}`, role: "agent", content: acted, createdAt: new Date().toISOString() };
-        return realWorkshopMessage(id, "iterate", body);
-      });
-    },
+    // Phase 4（deviation #44）：资源消耗/高影响动作改经 Proposal 中介——评论落库，
+    // Agent 管道解析动作生成 PROPOSED，批准后才执行（guard/预算不可绕过）
+    serve: (id, body) => realWorkshopMessage(id, "iterate", body),
   },
   {
     re: /^\/api\/projects\/([^/]+)\/confirm-workshop$/,
@@ -351,11 +346,16 @@ export function installFixtureFetch(): void {
           if (err instanceof Error && /404|Not Found/i.test(err.message)) {
             // 同上：fixture 兜底
           } else {
+            // sidecar 瞬时不可达（如重启）：返回错误让页面显示，不降级假数据；
+            // 下次请求重新尝试（dataSourceCache 不变）
             console.error(
-              `[autolab-sidecar] 聚合失败 ${req.method} ${url.pathname}，回退 fixture`,
+              `[autolab-sidecar] 聚合失败 ${req.method} ${url.pathname}`,
               err,
             );
-            dataSourceCache = "fixture";
+            return jsonResponse(
+              { error: `sidecar 聚合失败：${err instanceof Error ? err.message : String(err)}`.slice(0, 300) },
+              502,
+            );
           }
         }
       }
@@ -387,11 +387,15 @@ export function installFixtureFetch(): void {
           }
           return jsonResponse(tableFacetsPayload(issues, body));
         } catch (err) {
+          // 瞬时不可达：报错不降级（见 param 分支注释）
           console.error(
-            `[autolab-sidecar] board 聚合失败 ${req.method} ${url.pathname}，回退 fixture`,
+            `[autolab-sidecar] board 聚合失败 ${req.method} ${url.pathname}`,
             err,
           );
-          dataSourceCache = "fixture"; // sidecar 不可达时本会话降级
+          return jsonResponse(
+            { error: `sidecar board 聚合失败：${err instanceof Error ? err.message : String(err)}`.slice(0, 300) },
+            502,
+          );
         }
       }
     }

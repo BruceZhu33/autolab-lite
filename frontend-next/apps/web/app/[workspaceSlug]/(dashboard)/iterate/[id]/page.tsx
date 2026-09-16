@@ -17,6 +17,7 @@ import { toast } from "sonner";
 
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
+import { approveProposal, rejectProposal } from "@autolab/research/sidecar/proposals";
 import { Input } from "@multica/ui/components/ui/input";
 import { PageHeader } from "@multica/views/layout/page-header";
 import { StageTeamBar } from "@/features/autolab/stage-team";
@@ -48,6 +49,15 @@ interface MsgView {
   createdAt: string;
 }
 
+interface ProposalView {
+  id: string;
+  action_type: string;
+  title: string;
+  status: string;
+  stale?: boolean;
+  created_at: string;
+}
+
 interface WorkshopView {
   projectId: string;
   baseline: { avg: number; dataset: string };
@@ -56,6 +66,7 @@ interface WorkshopView {
   budget: { totalH: number; usedH: number };
   blocker: { title: string; reason: string; actions: string[] } | null;
   messages: MsgView[];
+  proposals?: ProposalView[];
 }
 
 async function fixtureApi<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -116,6 +127,26 @@ export default function IterateWorkshopPage({
     void qc.invalidateQueries({ queryKey: ["autolab", "iteration-workshop", id] });
     void qc.invalidateQueries({ queryKey: ["autolab", "fixture-projects"] });
   };
+
+  const decide = useMutation({
+    mutationFn: (input: { id: string; action: "approve" | "reject" }) =>
+      input.action === "approve"
+        ? approveProposal(input.id).then((r) => {
+            if (!r.executed) throw new Error(r.reason ?? `proposal ${r.status}`);
+            return r;
+          })
+        : rejectProposal(input.id),
+    onSuccess: (r, input) => {
+      toast.success(input.action === "approve" ? `Proposal 已执行（${r.status}）` : "已拒绝", {
+        description: JSON.stringify((r as { detail?: unknown }).detail ?? {}).slice(0, 200),
+      });
+      refresh();
+    },
+    onError: (e: Error) => {
+      toast.error("Proposal 执行失败", { description: e.message.slice(0, 300) });
+      refresh();
+    },
+  });
 
   const send = useMutation({
     mutationFn: (content: string) =>
@@ -287,6 +318,26 @@ export default function IterateWorkshopPage({
               </div>
             </div>
           )}
+          {(ws?.proposals ?? []).filter((p) => p.status === "PROPOSED").map((p) => (
+            <div key={p.id} className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
+              <p className="text-caption font-medium text-amber-600">
+                Proposal · {p.title}{p.stale ? "（STALE：项目状态已变化，批准将被拒）" : ""}
+              </p>
+              <p className="mt-1 text-caption text-muted-foreground">
+                动作 {p.action_type} · 来自你的评论（Phase 4：批准后经真实端点执行，预算/guard 不可绕过）
+              </p>
+              <div className="mt-2 flex gap-2">
+                <Button size="sm" disabled={decide.isPending || p.stale}
+                        onClick={() => decide.mutate({ id: p.id, action: "approve" })}>
+                  批准执行
+                </Button>
+                <Button size="sm" variant="outline" disabled={decide.isPending}
+                        onClick={() => decide.mutate({ id: p.id, action: "reject" })}>
+                  拒绝
+                </Button>
+              </div>
+            </div>
+          ))}
 
           {/* 轮次表 */}
           <div className="rounded-lg border">

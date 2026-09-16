@@ -94,7 +94,7 @@ async def process_agent_job(state, job_id: str) -> None:
     def _load(conn):
         job = conn.execute("SELECT * FROM agent_jobs WHERE id=?", (job_id,)).fetchone()
         p = conn.execute(
-            "SELECT p.id,p.name,p.status,p.direction_text,p.stage_epoch,"
+            "SELECT p.id,p.name,p.status,p.direction_text,p.stage_epoch,p.state_revision,"
             "b.consumed_s,b.reserved_s,b.limit_s FROM projects p "
             "LEFT JOIN budget_accounts b ON b.project_id=p.id WHERE p.id=?",
             (job["project_id"],)).fetchone()
@@ -142,6 +142,7 @@ async def process_agent_job(state, job_id: str) -> None:
                 conn.execute(
                     "UPDATE agent_jobs SET status='COMPLETED', finished_at=datetime('now') "
                     "WHERE id=?", (job_id,))
+                _maybe_propose(conn, job_id, job["project_id"], recent, proj)
                 conn.execute("COMMIT")
                 return True
             except Exception:
@@ -178,3 +179,152 @@ async def sweep_orphan_jobs(state) -> int:
             conn.execute("ROLLBACK")
             raise
     return await to_thread(state.db, _sweep)
+
+
+# ------------------------------------------------------------------
+# Action Proposals（RFC-002 §2.4 / v0.3 Phase 4）
+# ------------------------------------------------------------------
+
+# v1 规则解析白名单：评论关键词 → 结构化动作（Phase 4 后段换 LLM 结构化输出）
+_ACTION_RULES: list[tuple[str, str, str, str]] = [
+    # (action_type, 匹配正则, 标题, 影响级)
+    ("next_round", r"下一轮|再来一轮|继续迭代|继续下一", "触发一轮 LLM 改码迭代", "medium"),
+    ("terminate", r"停止项目|终止项目", "终止项目（停止链）", "high"),
+    ("baseline_accept", r"验收通过|基线验收通过|通过验收", "基线验收通过（accept）", "medium"),
+    ("baseline_reject", r"驳回", "驳回基线（回准备）", "medium"),
+]
+
+
+def parse_action(content: str) -> tuple[str, str, str] | None:
+    """(action_type, title, impact) | None——首个命中的白名单动作。"""
+    import re
+    for action_type, pattern, title, impact in _ACTION_RULES:
+        if re.search(pattern, content):
+            return action_type, title, impact
+    return None
+
+
+def _maybe_propose(conn, job_id: str, pid: str,
+                   recent: list[dict], proj: dict) -> None:
+    """对触发评论做动作解析；命中则落 PROPOSED proposal（同一事务）。
+    调用方处于事务内。"""
+    user_msgs = [m for m in recent if m["actor_type"] == "user"]
+    if not user_msgs:
+        return
+    parsed = parse_action(user_msgs[-1]["content_md"])
+    if parsed is None:
+        return
+    action_type, title, impact = parsed
+    conn.execute(
+        "INSERT OR IGNORE INTO action_proposals(id,agent_job_id,project_id,action_type,"
+        "title,rationale_md,payload_json,impact_json,status,expected_project_revision) "
+        "VALUES(?,?,?,?,?,'',json_object('action',?),json_object('level',?),"
+        "'PROPOSED',?)",
+        (nid("ap"), job_id, pid, action_type, title,
+         action_type, impact, proj.get("state_revision") or 0))
+
+
+def proposals_for_project(conn, pid: str, limit: int = 10) -> list[dict]:
+    rows = conn.execute(
+        "SELECT ap.*, p.state_revision AS current_revision FROM action_proposals ap "
+        "JOIN projects p ON p.id = ap.project_id WHERE ap.project_id=? "
+        "ORDER BY ap.created_at DESC LIMIT ?", (pid, limit)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d["status"] == "PROPOSED" and d["expected_project_revision"] != d["current_revision"]:
+            d["stale"] = True  # 读取时派生（RFC-002 §2.4：不写回）
+        else:
+            d["stale"] = False
+        out.append(d)
+    return out
+
+
+async def decide_proposal(state, proposal_id: str, decision: "approve" | "reject",
+                          note: str = "") -> dict:
+    """Proposal 裁决：状态机 CAS + 白名单执行（复用现有 service——预算/guard 不可绕过）。
+    STALE（期望版本落后）→ 拒执行置 STALE。"""
+    db = state.db
+
+    def _claim(conn):
+        row = conn.execute("SELECT * FROM action_proposals WHERE id=?", (proposal_id,)).fetchone()
+        if row is None:
+            raise TxError("NOT_FOUND", proposal_id)
+        if row["status"] != "PROPOSED":
+            raise TxError("STATE_INVALID_TRANSITION", f"proposal {row['status']}")
+        rev = conn.execute("SELECT state_revision FROM projects WHERE id=?",
+                           (row["project_id"],)).fetchone()["state_revision"]
+        stale = row["expected_project_revision"] != rev
+        target = "STALE" if stale else ("APPROVED" if decision == "approve" else "REJECTED")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE action_proposals SET status=?, decided_at=datetime('now') WHERE id=? "
+                "AND status='PROPOSED'", (target, proposal_id))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return dict(row), stale
+
+    row, stale = await to_thread(db, _claim)
+    if stale or decision == "reject":
+        return {"proposal_id": proposal_id, "status": "STALE" if stale else "REJECTED",
+                "executed": False,
+                "reason": "expected_project_revision 落后（STALE），请重新发起" if stale
+                else (note or "用户拒绝")}
+
+    pid = row["project_id"]
+    action_type = row["action_type"]
+    try:
+        if action_type == "next_round":
+            from .llm_loop import next_round
+            result = await next_round(state, pid)
+            detail = {"run_id": result.get("run_id"), "round": result.get("round")}
+        elif action_type == "terminate":
+            from .judge import _terminate_project
+            await _terminate_project(state, pid, reason="proposal 批准终止", outcome="stopped")
+            detail = {"terminated": True}
+        elif action_type == "baseline_accept":
+            rev = await to_thread(db, lambda conn: conn.execute(
+                "SELECT state_revision FROM projects WHERE id=?", (pid,)).fetchone()["state_revision"])
+            result = await to_thread(db, Tx.tx_baseline_acceptance, pid, "accept", rev,
+                                     "none", "proposal 批准验收", None)
+            detail = result
+        elif action_type == "baseline_reject":
+            rev = await to_thread(db, lambda conn: conn.execute(
+                "SELECT state_revision FROM projects WHERE id=?", (pid,)).fetchone()["state_revision"])
+            result = await to_thread(db, Tx.tx_baseline_acceptance, pid, "reject", rev,
+                                     "none", "proposal 批准驳回", None)
+            detail = result
+        else:
+            raise TxError("VAL_SEMANTIC_INVALID", f"未知动作 {action_type}")
+    except Exception as e:  # noqa: BLE001 —— 执行失败是正常路径：置 FAILED 留痕
+        await to_thread(db, _finish, proposal_id, "FAILED",
+                        {"executed": False, "error": str(e)[:300]})
+        return {"proposal_id": proposal_id, "status": "FAILED", "executed": False,
+                "reason": str(e)[:300]}
+
+    await to_thread(db, _finish, proposal_id, "SUCCEEDED",
+                    {"executed": True, **detail})
+    state.hub.publish_threadsafe(state.loop, "action_proposal.state_changed",
+                                 {"proposal_id": proposal_id, "status": "SUCCEEDED"},
+                                 aggregate={"type": "project", "id": pid}, project_id=pid)
+    return {"proposal_id": proposal_id, "status": "SUCCEEDED", "executed": True, "detail": detail}
+
+
+def _finish(conn, proposal_id: str, status: str, result: dict):
+    import json as _json
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE action_proposals SET status=?, executed_result_json=? WHERE id=? "
+            "AND status='APPROVED'",
+            (status, _json.dumps(result, ensure_ascii=False), proposal_id))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+from .. import tx as Tx  # noqa: E402 —— 决策执行复用现有事务（延迟导入避循环）
