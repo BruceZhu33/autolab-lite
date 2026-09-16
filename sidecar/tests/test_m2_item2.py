@@ -156,6 +156,8 @@ def _seed_project(state, conn):
     rev = conn.execute("SELECT state_revision FROM projects WHERE id=?",
                        (fx["pid"],)).fetchone()[0]
     T.tx_baseline_acceptance(conn, fx["pid"], "accept", rev, notes="ok")
+    # RFC-001 新序（epoch2）：accept → REVIEW_GATE；再模拟 confirm 定稿过门 → SEARCH
+    harness.fx_transition(conn, "project", "projects", fx["pid"], ["REVIEW_GATE", "SEARCH"])
     # 真实 BASE：git 仓库（work 副本与快照导出需要）
     base = state.cfg.projects_dir / fx["pid"] / "base"
     base.mkdir(parents=True)

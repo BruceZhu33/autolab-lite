@@ -509,12 +509,15 @@ def _load_plan_schema(assets_dir):
 def tx_freeze(conn, proto: str, next_round: int, project_expected_revision: int, assets_dir,
               plan_constraints):
     """T-FREEZE：F1 完整校验（schema+app constraints+绑定）→ F2 逐 split PASSED →
-    F3 卡池副本 READY（反连接）→ F4 evaluator 冻结在案 → 协议 FROZEN + 项目 CAS。"""
+    F3 卡池副本 READY（反连接）→ F4 evaluator 冻结在案 → 协议 FROZEN + 项目 CAS。
+    stage_epoch=2（RFC-001 新序）：另需 F5 基线有效（accepted BASE run ∧ root 协议绑定
+    ∧ 评测口径一致），定稿直通 SEARCH；epoch=1 存量项目沿旧序落 BASELINE_ACCEPTANCE。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
-            "SELECT p.*, pr.status AS proj_status, pr.state_revision FROM plan_protocols p "
-            "JOIN projects pr ON pr.id = p.project_id WHERE p.id=?", (proto,)).fetchone()
+            "SELECT p.*, pr.status AS proj_status, pr.state_revision, pr.stage_epoch "
+            "FROM plan_protocols p JOIN projects pr ON pr.id = p.project_id WHERE p.id=?",
+            (proto,)).fetchone()
         if row is None:
             raise TxError("NOT_FOUND", proto)
         pid = row["project_id"]
@@ -566,6 +569,32 @@ def tx_freeze(conn, proto: str, next_round: int, project_expected_revision: int,
         if not conn.execute("SELECT 1 FROM evaluator_snapshots WHERE project_id=? AND digest=?",
                             (pid, bound_evaluator)).fetchone():
             raise TxError("GUARD_UNMET", f"F4 evaluator digest {bound_evaluator} not frozen in project")
+        epoch = row["stage_epoch"] if "stage_epoch" in row.keys() else 1
+        target = "SEARCH" if epoch == 2 else "BASELINE_ACCEPTANCE"
+        if epoch == 2:
+            # RFC-001 F5：BASE 绑定 root 协议（parent_id IS NULL = 立项原始配置），
+            # 评测口径以 root 协议的 evaluator 绑定为基准；口径漂移 → baseline_redo。
+            root = conn.execute(
+                "SELECT id, frozen_yaml FROM plan_protocols WHERE project_id=? AND parent_id IS NULL "
+                "ORDER BY ver LIMIT 1", (pid,)).fetchone()
+            ba = conn.execute(
+                "SELECT br.id AS run_id FROM baseline_acceptances ba JOIN runs br ON br.id = ba.run_id "
+                "WHERE br.project_id=? AND br.role='baseline' AND ba.verdict='accepted' "
+                "AND br.plan_protocol_id=? ORDER BY ba.created_at DESC LIMIT 1",
+                (pid, root["id"] if root else "")).fetchone()
+            if ba is None:
+                raise TxError(
+                    "GUARD_UNMET",
+                    "F5 无绑定 root 协议且验收通过的 baseline run（epoch2：先基线后评审，RFC-001）")
+            try:
+                root_body = json.loads(root["frozen_yaml"])
+            except (ValueError, TypeError):
+                raise TxError("GUARD_UNMET", "F5 root 协议 frozen_yaml 不可解析")
+            root_eval = root_body.get("protected_protocol", {}).get("evaluator_digest_ref")
+            if root_eval != bound_evaluator:
+                raise TxError(
+                    "GUARD_UNMET",
+                    "F5 评测口径与 BASE 验收时不一致（evaluator 变化）——先 baseline_redo 重跑基线")
         cur = conn.execute(
             "UPDATE plan_protocols SET status='FROZEN', frozen_at=datetime('now'), effective_round=? "
             "WHERE id=? AND status='DRAFT'", (next_round, proto))
@@ -574,14 +603,14 @@ def tx_freeze(conn, proto: str, next_round: int, project_expected_revision: int,
         if row["parent_id"]:
             conn.execute("UPDATE plan_protocols SET status='SUPERSEDED' WHERE id=? AND status='FROZEN'",
                          (row["parent_id"],))
-        s_cas(conn, "projects", "project", pid, "REVIEW_GATE", "BASELINE_ACCEPTANCE",
+        s_cas(conn, "projects", "project", pid, "REVIEW_GATE", target,
               project_expected_revision, "confirm", actor="user",
               reason={"protocol_id": proto})
         conn.execute(
             "INSERT INTO audit_events(id,actor,action,payload_json) VALUES(?,?,?,?)",
             (nid("aud"), "user", "plan.freeze", json.dumps({"proto": proto})))
         conn.execute("COMMIT")
-        return pid, "BASELINE_ACCEPTANCE"
+        return pid, target
     except Exception:
         conn.execute("ROLLBACK")
         raise
@@ -596,16 +625,21 @@ def tx_baseline_acceptance(conn, pid: str, verdict: str, expected_rev: int,
                            run_id: str | None = None, actor: str = "user"):
     """D33 基线验收：基线 run 训练完成（train attempt FINISHED）为 accept 前提；
     patch_class=method 只能伴随 reject（库级 CHECK r3-S9 双保险）；
-    幂等：项目已到目标态 → no-op 返回。"""
+    幂等：项目已到目标态 → no-op 返回。
+    stage_epoch=2（RFC-001 新序）：accept → REVIEW_GATE（带基线数字进评审）；
+    epoch=1 存量项目沿旧序 accept → SEARCH。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
         if proj is None:
             raise TxError("NOT_FOUND", pid)
-        target = "SEARCH" if verdict == "accept" else "PAUSED"
-        if proj["status"] == target:
+        epoch = proj["stage_epoch"] if "stage_epoch" in proj.keys() else 1
+        target = ("REVIEW_GATE" if epoch == 2 else "SEARCH") if verdict == "accept" else "PAUSED"
+        if proj["status"] == target or (verdict == "accept" and proj["status"] == "SEARCH"):
+            # 幂等/replay（不回退）：已到目标态；或已 SEARCH——两条序的 accept 下游
+            # （epoch2=accept+confirm 均已完成的重放，epoch1=原语义），均 no-op
             conn.execute("COMMIT")
-            return {"project_id": pid, "status": target, "noop": True}
+            return {"project_id": pid, "status": proj["status"], "noop": True}
         if proj["status"] != "BASELINE_ACCEPTANCE":
             raise TxError("STATE_INVALID_TRANSITION",
                           f"project in {proj['status']}（验收仅在 BASELINE_ACCEPTANCE）")
@@ -636,7 +670,7 @@ def tx_baseline_acceptance(conn, pid: str, verdict: str, expected_rev: int,
             "VALUES(?,?,?,?,?)",
             (nid("ba"), run["id"], verdict_db, patch_class, notes))
         if verdict == "accept":
-            s_cas(conn, "projects", "project", pid, "BASELINE_ACCEPTANCE", "SEARCH",
+            s_cas(conn, "projects", "project", pid, "BASELINE_ACCEPTANCE", target,
                   expected_rev, "accept", actor=actor,
                   reason={"run_id": run["id"], "patch_class": patch_class})
             conn.execute("UPDATE projects SET updated_at=datetime('now') WHERE id=?", (pid,))
@@ -654,6 +688,38 @@ def tx_baseline_acceptance(conn, pid: str, verdict: str, expected_rev: int,
                          "patch_class": patch_class}, sort_keys=True)))
         conn.execute("COMMIT")
         return {"project_id": pid, "status": target, "run_id": run["id"], "noop": False}
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def tx_baseline_redo(conn, pid: str, expected_rev: int, note: str = "", actor: str = "user"):
+    """RFC-001 §6：评测口径/数据划分变化致 BASE 失效——REVIEW_GATE→BASELINE_ACCEPTANCE
+    重跑基线（仅 stage_epoch=2）。人工显式触发；旧 acceptance 留档不删（审计链不断）；
+    代码库变更不走此边（=换项目，terminate 重建）。幂等：已在 BASELINE_ACCEPTANCE → no-op。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        proj = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if proj is None:
+            raise TxError("NOT_FOUND", pid)
+        epoch = proj["stage_epoch"] if "stage_epoch" in proj.keys() else 1
+        if epoch != 2:
+            raise TxError("STATE_INVALID_TRANSITION",
+                          "baseline_redo 仅适用 stage_epoch=2（新序）项目")
+        if proj["status"] == "BASELINE_ACCEPTANCE":
+            conn.execute("COMMIT")
+            return {"project_id": pid, "status": "BASELINE_ACCEPTANCE", "noop": True}
+        if proj["status"] != "REVIEW_GATE":
+            raise TxError("STATE_INVALID_TRANSITION",
+                          f"project in {proj['status']}（baseline_redo 仅在 REVIEW_GATE）")
+        s_cas(conn, "projects", "project", pid, "REVIEW_GATE", "BASELINE_ACCEPTANCE",
+              expected_rev, "baseline_redo", actor=actor, reason={"note": note})
+        conn.execute(
+            "INSERT INTO audit_events(id,actor,action,payload_json) VALUES(?,?,?,?)",
+            (nid("aud"), actor, "baseline.invalidated",
+             json.dumps({"project_id": pid, "note": note}, sort_keys=True)))
+        conn.execute("COMMIT")
+        return {"project_id": pid, "status": "BASELINE_ACCEPTANCE", "noop": False}
     except Exception:
         conn.execute("ROLLBACK")
         raise

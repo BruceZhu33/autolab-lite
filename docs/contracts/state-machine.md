@@ -1,14 +1,15 @@
 # AutoLab · 状态迁移契约（三层状态机 · 人读版）
 
-- 版本：v1.0-draft.6（第五轮评审修订版） · 2026-09-13
+- 版本：v1.1-draft（2026-09-16，RFC-001/deviation #34）· 前版 v1.0-draft.6（2026-09-13）
 - **唯一权威载体：[state-machine.yaml](state-machine.yaml)**（复审 O1）。本文件是其导读与自检报告；两者不一致时以 YAML 为准，CI 校验器（`tests/test_state_machine.py`）解析 YAML 并机械执行 §4 规则。
 - 基线：技术设计 v2.7 §4（冻结）· 需求 v0.5.3 · 复审处置 S6/S9/S10/GAP-R1/GAP-R2
+- v1.1 变更：项目主链阶段顺序翻转——**基线验证先于方案评审**（setup_done→BASELINE_ACCEPTANCE→accept→REVIEW_GATE→confirm(F5)→SEARCH）；旧序边保留供 stage_epoch=1 存量项目；新增 baseline_redo 边（口径失效重跑基线）。详见 `../RFC-阶段顺序翻转-基线先于评审.md`。
 
 ## 1. 层次与职责
 
 | 层 | 实体表 | 终态（terminal=true，无出边） | 迁移数 |
 |---|---|---|---|
-| project | projects | REPORTED（唯一项目终态） | 44 |
+| project | projects | REPORTED（唯一项目终态） | 48（v1.1：新序 3 边 + baseline_redo；epoch 双序并存，RFC-001） |
 | run | runs | （无——JUDGED 为 lifecycle_complete 非终态，保留派生/上抛出口，复审 S10 修正） | 21 |
 | attempt | attempts | FINISHED / FAILED / STOP_CONFIRMED / CANCELLED | 16 |
 

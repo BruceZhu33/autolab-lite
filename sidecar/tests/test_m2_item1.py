@@ -43,10 +43,11 @@ def test_baseline_accept_happy():
                         (fx["pid"],)).fetchone()
     r = T.tx_baseline_acceptance(conn, fx["pid"], "accept", proj["state_revision"],
                                  notes="论文 0.82，实测 0.80，差异记录")
-    assert r["status"] == "SEARCH" and r["noop"] is False
+    # RFC-001 新序（epoch2）：accept → REVIEW_GATE（带基线数字进评审）
+    assert r["status"] == "REVIEW_GATE" and r["noop"] is False
     assert conn.execute("SELECT verdict FROM baseline_acceptances WHERE run_id=?",
                         (fx["run"],)).fetchone()[0] == "accepted"
-    # 幂等：已 SEARCH → no-op
+    # 幂等：已 REVIEW_GATE → no-op
     proj2 = conn.execute("SELECT state_revision FROM projects WHERE id=?", (fx["pid"],)).fetchone()
     r2 = T.tx_baseline_acceptance(conn, fx["pid"], "accept", proj2[0])
     assert r2["noop"] is True

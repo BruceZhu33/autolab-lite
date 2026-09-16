@@ -1,6 +1,11 @@
 # =====================================================================
 # AutoLab · 三层状态迁移契约（机器可检查 · 唯一权威载体）
 # 版本：v1.0-draft.6（第五轮评审修订版） · 2026-09-13
+# 修订：v1.1-draft（2026-09-16，RFC-001/deviation #34）——项目主链阶段顺序翻转
+#   「基线验证先于方案评审」，epoch 双序并存：stage_epoch=2 走新序（setup_done→
+#   BASELINE_ACCEPTANCE→accept→REVIEW_GATE→confirm(F5)→SEARCH），stage_epoch=1
+#   存量项目沿旧序（setup_done→REVIEW_GATE→confirm→BASELINE_ACCEPTANCE→accept→SEARCH）；
+#   库级合法边表按并集兜底，顺序裁决在应用层（tx guard 按 stage_epoch 分流）。
 # 基线：技术设计 v2.7 §4（冻结）· 复审处置 S6/S9/S10/GAP-R1/GAP-R2(保守)/O1
 # 规则（校验器 tests/test_state_machine.py 执行）：
 #   R1 每个 terminal:false 状态至少一条出边；所有 from/to 必须是已定义状态
@@ -22,8 +27,8 @@ layers:
     states:
     - {name: INIT, terminal: false, note: 立项完成（BASE 快照+论文+卡池+数据登记就位）}
     - {name: ENV_SETUP, terminal: false, waiting: true, takeover: 人工重试（A11 部分失败只修复失败步骤）, takeover_events: [terminate]}
-    - {name: REVIEW_GATE, terminal: false, waiting: true, takeover: 人工（D21 定稿闸门，不自动跳过）, takeover_events: [terminate]}
-    - {name: BASELINE_ACCEPTANCE, terminal: false, waiting: true, takeover: 人工（D33 验收）, takeover_events: [accept, reject, terminate]}
+    - {name: REVIEW_GATE, terminal: false, waiting: true, takeover: 人工（D21 定稿闸门，不自动跳过）, takeover_events: [terminate], note: "epoch2 位于基线验收之后——专家带 BASE 数字定稿（RFC-001）"}
+    - {name: BASELINE_ACCEPTANCE, terminal: false, waiting: true, takeover: 人工（D33 验收）, takeover_events: [accept, reject, terminate], note: "epoch2 环境就绪即入——BASE 绑定原始代码库（root 协议），先于评审（RFC-001）"}
     - {name: SEARCH, terminal: false}
     - {name: CONFIRMATION_PREP, terminal: false}
     - {name: CONFIRMATION_RUNNING, terminal: false}
@@ -46,12 +51,31 @@ layers:
       replay: 状态已是 ENV_SETUP → no-op
     - from: [ENV_SETUP]
       event: setup_done
+      to: BASELINE_ACCEPTANCE
+      guard: "全部卡池机器 code+env+data 就绪（data_replicas=READY）"
+      tx: "S-CAS(project)"
+      outbox: [project.state_changed]
+      on_failure: 保持 ENV_SETUP（部分失败重试只修复失败步骤 A11）
+      replay: no-op
+      note: "stage_epoch=2 现行序：BASE 先行（RFC-001/deviation #34）"
+    - from: [ENV_SETUP]
+      event: setup_done
       to: REVIEW_GATE
       guard: "全部卡池机器 code+env+data 就绪（data_replicas=READY）"
       tx: "S-CAS(project)"
       outbox: [project.state_changed]
       on_failure: 保持 ENV_SETUP（部分失败重试只修复失败步骤 A11）
       replay: no-op
+      note: "stage_epoch=1 存量旧序（库级并集兜底，应用层按 epoch 分流）"
+    - from: [REVIEW_GATE]
+      event: confirm
+      to: SEARCH
+      guard: "D21：plan_frozen ∧ split_validation=PASSED(四元组) ∧ 所需 data_replicas=READY ∧ evaluator_snapshot_frozen ∧ F5 基线有效（存在 accepted baseline run ∧ 绑定 root 协议=原始代码库 ∧ 评测口径一致）"
+      tx: "T-FREEZE（含 S-CAS(project)）"
+      outbox: [project.state_changed, plan.frozen]
+      on_failure: "GUARD_UNMET 返回未满足项清单（口径变化 → baseline_redo）"
+      replay: 幂等
+      note: "stage_epoch=2 现行序：定稿直通自动迭代（RFC-001）"
     - from: [REVIEW_GATE]
       event: confirm
       to: BASELINE_ACCEPTANCE
@@ -60,6 +84,16 @@ layers:
       outbox: [project.state_changed, plan.frozen]
       on_failure: "GUARD_UNMET 返回未满足项清单"
       replay: 幂等
+      note: "stage_epoch=1 存量旧序"
+    - from: [BASELINE_ACCEPTANCE]
+      event: accept
+      to: REVIEW_GATE
+      guard: "D33：训练行为正常 ∧ 协议一致 ∧ 配置合理；patch_class=method 时禁止 accept"
+      tx: "S-CAS(project) + baseline_acceptances 插入"
+      outbox: [project.state_changed]
+      on_failure: 保持
+      replay: 已 REVIEW_GATE → no-op
+      note: "stage_epoch=2 现行序：验收后带基线数字进评审（RFC-001）"
     - from: [BASELINE_ACCEPTANCE]
       event: accept
       to: SEARCH
@@ -68,6 +102,16 @@ layers:
       outbox: [project.state_changed]
       on_failure: 保持
       replay: 已 SEARCH → no-op
+      note: "stage_epoch=1 存量旧序"
+    - from: [REVIEW_GATE]
+      event: baseline_redo
+      to: BASELINE_ACCEPTANCE
+      guard: "人工显式触发：评测口径/数据划分变化致 BASE 失效（epoch2）；重跑成本低于整项目重建"
+      tx: "S-CAS(project) + audit 留痕（baseline.invalidated）"
+      outbox: [project.state_changed, baseline.invalidated]
+      on_failure: 保持
+      replay: 幂等
+      note: "stage_epoch=2（RFC-001 §6）：仅口径失效重跑；代码库变更=换项目走 terminate"
     - from: [BASELINE_ACCEPTANCE]
       event: reject
       to: PAUSED

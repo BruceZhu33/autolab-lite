@@ -58,6 +58,7 @@ INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('at
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('attempt', 'SUBMITTED', 'snapshot_reconciled', 'FINISHED');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('attempt', 'SUBMITTED', 'snapshot_reconciled', 'STOP_CONFIRMED');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('attempt', 'SUBMITTED', 'stop', 'STOP_REQUESTED');
+INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'BASELINE_ACCEPTANCE', 'accept', 'REVIEW_GATE');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'BASELINE_ACCEPTANCE', 'accept', 'SEARCH');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'BASELINE_ACCEPTANCE', 'pause', 'PAUSED');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'BASELINE_ACCEPTANCE', 'reject', 'PAUSED');
@@ -71,6 +72,7 @@ INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('pr
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'CONFIRMATION_RUNNING', 'protocol_or_method_changed', 'PAUSED');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'CONFIRMATION_RUNNING', 'terminate', 'FINISHING');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'CONFIRMATION_RUNNING', 'terminate', 'STOPPING');
+INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'ENV_SETUP', 'setup_done', 'BASELINE_ACCEPTANCE');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'ENV_SETUP', 'setup_done', 'REVIEW_GATE');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'ENV_SETUP', 'terminate', 'FINISHING');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'ENV_SETUP', 'terminate', 'STOPPING');
@@ -102,7 +104,9 @@ INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('pr
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'REPORTING', 'report_failed', 'REPORTING');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'REPORTING', 'report_failed_escalate', 'PAUSED');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'REPORTING', 'terminate', 'REPORTING');
+INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'REVIEW_GATE', 'baseline_redo', 'BASELINE_ACCEPTANCE');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'REVIEW_GATE', 'confirm', 'BASELINE_ACCEPTANCE');
+INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'REVIEW_GATE', 'confirm', 'SEARCH');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'REVIEW_GATE', 'terminate', 'FINISHING');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'REVIEW_GATE', 'terminate', 'STOPPING');
 INSERT INTO sm_legal_transitions(layer, from_state, event, to_state) VALUES ('project', 'SEARCH', 'candidate_selected', 'CONFIRMATION_PREP');

@@ -667,7 +667,7 @@ paths:
     post:
       tags: [Plan]
       summary: |-
-        冻结协议（REVIEW_GATE +confirm，D21）。guard 全部读取**数据库实况**：plan 完整校验（JSON Schema + app constraints）∧ 绑定 validator 的 PASSED 校验（plan.bound_*）∧ 卡池全机副本 READY（空池拒）∧ plan 绑定 evaluator 已冻结。
+        冻结协议（REVIEW_GATE +confirm，D21）。guard 全部读取**数据库实况**：plan 完整校验（JSON Schema + app constraints）∧ 绑定 validator 的 PASSED 校验（plan.bound_*）∧ 卡池全机副本 READY（空池拒）∧ plan 绑定 evaluator 已冻结 ∧ F5 基线有效（RFC-001 新序 stage_epoch=2：存在验收通过的 baseline run ∧ 绑定 root 协议 ∧ 评测口径一致；口径漂移走 baseline-redo）。
       operationId: freezePlanProtocol
       parameters: [$ref: "#/components/parameters/ProtocolId", $ref: "#/components/parameters/IdempotencyKey"]
       requestBody:
@@ -682,7 +682,7 @@ paths:
                 expected_state_revision: {type: integer}
                 next_round: {type: integer}
       responses:
-        "200": {description: 已冻结（项目进入 BASELINE_ACCEPTANCE）, content: {application/json: {schema: {$ref: "#/components/schemas/PlanProtocol"}}}}
+        "200": {description: 已冻结（stage_epoch=2 项目进入 SEARCH；epoch=1 存量项目进入 BASELINE_ACCEPTANCE）, content: {application/json: {schema: {$ref: "#/components/schemas/PlanProtocol"}}}}
         "409": {$ref: "#/components/responses/Conflict"}
         '401':
           $ref: '#/components/responses/Unauthorized'
@@ -818,7 +818,8 @@ paths:
       tags: [Plan]
       summary: |
         Round 0 基线验收（BASELINE_ACCEPTANCE +accept/--reject，D33）。
-        accept→SEARCH；reject→PAUSED(manual_baseline)。环境兼容补丁与方法修改分离留档。
+        stage_epoch=2（RFC-001 新序）accept→REVIEW_GATE（带基线数字进评审）；epoch=1 存量 accept→SEARCH；
+        reject→PAUSED(manual_baseline)。环境兼容补丁与方法修改分离留档。
       operationId: submitBaselineAcceptance
       parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
       requestBody:
@@ -835,6 +836,33 @@ paths:
                 notes: {type: string, description: 与论文数值差异的可解释性记录}
       responses:
         "200": {description: 已受理, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
+        "409": {$ref: "#/components/responses/Conflict"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/projects/{projectId}/baseline-redo:
+    post:
+      tags: [Plan]
+      summary: |
+        重跑基线（REVIEW_GATE +baseline_redo→BASELINE_ACCEPTANCE，RFC-001 §6）。
+        仅 stage_epoch=2：评测口径/数据划分变化致 BASE 失效时人工显式触发；
+        代码库变更不走此边（=换项目，terminate 重建）。旧 acceptance 留档不删。
+      operationId: requestBaselineRedo
+      parameters: [$ref: "#/components/parameters/ProjectId", $ref: "#/components/parameters/IdempotencyKey"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_state_revision]
+              properties:
+                expected_state_revision: {type: integer}
+                note: {type: string, description: 失效原因留痕（口径变更说明）}
+      responses:
+        "200": {description: 已回到 BASELINE_ACCEPTANCE（幂等 no-op 返回当前态）, content: {application/json: {schema: {$ref: "#/components/schemas/Project"}}}}
         "409": {$ref: "#/components/responses/Conflict"}
         '401':
           $ref: '#/components/responses/Unauthorized'

@@ -239,7 +239,8 @@ class BaselineAcceptance(BaseModel):
 
 @router.post("/projects/{project_id}/baseline-acceptance")
 async def baseline_acceptance(project_id: str, req: BaselineAcceptance, request: Request):
-    """D33 Round 0 基线验收：accept→SEARCH / reject→PAUSED(manual_baseline)。"""
+    """D33 Round 0 基线验收：epoch2 accept→REVIEW_GATE（RFC-001 新序）/ epoch1 accept→SEARCH；
+    reject→PAUSED(manual_baseline)。"""
     state = request.app.state.autolab
     result = await to_thread(
         state.db, Tx.tx_baseline_acceptance, project_id, req.verdict,
@@ -248,6 +249,26 @@ async def baseline_acceptance(project_id: str, req: BaselineAcceptance, request:
         state.loop, "project.state_changed",
         {"to": result["status"], "event": f"baseline_{req.verdict}"},
         aggregate={"type": "project", "id": project_id}, project_id=project_id)
+    return result
+
+
+class BaselineRedo(BaseModel):
+    expected_state_revision: int = Field(ge=0)
+    note: str = ""
+
+
+@router.post("/projects/{project_id}/baseline-redo")
+async def baseline_redo(project_id: str, req: BaselineRedo, request: Request):
+    """RFC-001 §6：评测口径/数据划分变化致 BASE 失效——REVIEW_GATE→BASELINE_ACCEPTANCE
+    重跑基线（仅 stage_epoch=2；人工显式触发）。"""
+    state = request.app.state.autolab
+    result = await to_thread(
+        state.db, Tx.tx_baseline_redo, project_id, req.expected_state_revision, req.note)
+    if not result.get("noop"):
+        state.hub.publish_threadsafe(
+            state.loop, "project.state_changed",
+            {"to": result["status"], "event": "baseline_redo"},
+            aggregate={"type": "project", "id": project_id}, project_id=project_id)
     return result
 
 
