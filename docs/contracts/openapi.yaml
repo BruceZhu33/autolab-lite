@@ -842,6 +842,30 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
 
+  /api/v1/research/board:
+    get:
+      tags: [Research]
+      summary: |
+        六列看板聚合（v0.3 Phase 2 只读；RFC-001 §10 映射）。返回全部科研项目的
+        stage（prepare/baseline/review/iterate/confirm/done）+ 卡态语义位 flags
+        （needs_user/awaiting_decision/agent_working/has_report）+ 预算三数 +
+        active_attempts。PAUSED 按 paused_from_state 归列（manual_baseline→prepare）。
+      operationId: getResearchBoard
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
   /api/v1/projects/{projectId}/baseline-redo:
     post:
       tags: [Plan]

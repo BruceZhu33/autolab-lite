@@ -13,6 +13,8 @@
 export interface SidecarConfig {
   baseUrl: string;
   token: string;
+  /** Phase 2 数据源模式：sidecar=看板走真聚合端点；fixture=内存剧本（默认） */
+  data_source?: "fixture" | "sidecar";
 }
 
 declare global {
@@ -21,7 +23,7 @@ declare global {
   }
 }
 
-const FALLBACK: SidecarConfig = { baseUrl: "http://127.0.0.1:39876", token: "" };
+const FALLBACK: SidecarConfig = { baseUrl: "http://127.0.0.1:39876", token: "", data_source: "fixture" };
 
 let cached: SidecarConfig | null = null;
 
