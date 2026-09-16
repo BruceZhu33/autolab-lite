@@ -5,6 +5,7 @@
  * 指令定向（directive）与全自动轮次推进是 Phase 3 LLM 循环产品化范围。
  */
 import { sidecarApi } from "./client";
+import { fetchThreadMessages } from "./threads";
 
 export interface ResearchIterateRound {
   round: number;
@@ -53,6 +54,7 @@ export async function fetchIterateWorkshop(projectId: string): Promise<{
   messages: { id: string; role: "user" | "agent"; content: string; createdAt: string }[];
 }> {
   const r = await sidecarApi<ResearchIterate>("GET", `/api/v1/research/iterate/${projectId}`);
+  const threadMsgs = await fetchThreadMessages(projectId, "iterate").catch(() => []);
   const rounds = r.rounds.map((x) => ({
     round: x.round,
     direction: `${STATUS_ZH[x.status] ?? x.status}${x.metric !== null ? ` · 指标 ${x.metric.toFixed(4)}` : ""}`,
@@ -89,6 +91,12 @@ export async function fetchIterateWorkshop(projectId: string): Promise<{
         content: `迭代工作台已接真数据（Phase 2）。${summary}`,
         createdAt: r.project.updated_at,
       },
+      ...threadMsgs.map((m) => ({
+        id: m.id,
+        role: (m.actor_type === "user" ? "user" : "agent") as "user" | "agent",
+        content: m.content_md,
+        createdAt: m.created_at,
+      })),
     ],
   };
 }

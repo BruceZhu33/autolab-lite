@@ -4,6 +4,7 @@
  * 报告生成（REPORTING→REPORTED）走真实端点。
  */
 import { sidecarApi } from "./client";
+import { fetchThreadMessages } from "./threads";
 
 export interface ResearchConfirm {
   project: {
@@ -35,6 +36,7 @@ export async function fetchConfirmWorkshop(projectId: string): Promise<{
   messages: { id: string; role: "user" | "agent"; content: string; createdAt: string }[];
 }> {
   const c = await sidecarApi<ResearchConfirm>("GET", `/api/v1/research/confirm/${projectId}`);
+  const threadMsgs = await fetchThreadMessages(projectId, "confirm").catch(() => []);
   const finalReadDone = c.release !== null;
   const reported = c.project.status === "REPORTED";
   const intro =
@@ -65,7 +67,15 @@ export async function fetchConfirmWorkshop(projectId: string): Promise<{
           summary: `BASE ${fmt(c.baseline)} → 最终 ${fmt(c.release?.metric ?? null)}；归档产物 ${c.artifacts.length} 项。`,
         }
       : null,
-    messages: [{ id: `cf-intro-${projectId}`, role: "agent", content: intro, createdAt: c.project.updated_at }],
+    messages: [
+      { id: `cf-intro-${projectId}`, role: "agent" as const, content: intro, createdAt: c.project.updated_at },
+      ...threadMsgs.map((m) => ({
+        id: m.id,
+        role: (m.actor_type === "user" ? "user" : "agent") as "user" | "agent",
+        content: m.content_md,
+        createdAt: m.created_at,
+      })),
+    ],
   };
 }
 

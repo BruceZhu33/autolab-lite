@@ -486,8 +486,11 @@ async def timeline(project_id: str, request: Request, limit: int = 100):
                 "occurred_at": ba["created_at"],
             })
         for rt in conn.execute(
-                "SELECT * FROM review_turns WHERE project_id=? ORDER BY created_at DESC",
+                "SELECT * FROM review_turns rt WHERE rt.project_id=? AND NOT EXISTS ("
+                "  SELECT 1 FROM messages m WHERE m.client_key = 'rt-' || rt.id) "
+                "ORDER BY rt.created_at DESC",
                 (project_id,)).fetchall():
+            # RFC-002：review_turns 已 backfill 进 messages——此处只投影未被迁移的行
             items.append({
                 "kind": "review_turn",
                 "id": rt["id"],
@@ -495,6 +498,31 @@ async def timeline(project_id: str, request: Request, limit: int = 100):
                 "role": rt["role"],
                 "content": json.loads(rt["content_json"] or "{}"),
                 "occurred_at": rt["created_at"],
+            })
+        # RFC-002：messages（用户与 Agent 可见产出）+ agent_jobs（回复状态）投影
+        for m in conn.execute(
+                "SELECT m.id, m.thread_id, m.actor_type, m.kind, m.content_md, m.created_at, "
+                "t.subject_id AS surface FROM messages m JOIN threads t ON t.id = m.thread_id "
+                "WHERE t.project_id=? ORDER BY m.created_at DESC", (project_id,)).fetchall():
+            items.append({
+                "kind": "message",
+                "id": m["id"],
+                "surface": m["surface"],
+                "actor_type": m["actor_type"],
+                "message_kind": m["kind"],
+                "content": m["content_md"],
+                "occurred_at": m["created_at"],
+            })
+        for j in conn.execute(
+                "SELECT id, status, error_json, created_at, finished_at FROM agent_jobs "
+                "WHERE project_id=? AND status IN ('RUNNING','FAILED') "
+                "ORDER BY created_at DESC LIMIT 10", (project_id,)).fetchall():
+            items.append({
+                "kind": "agent_job",
+                "id": j["id"],
+                "status": j["status"],
+                "error": json.loads(j["error_json"] or "null"),
+                "occurred_at": j["finished_at"] or j["created_at"],
             })
         items.sort(key=lambda x: x["occurred_at"], reverse=True)
         return {"items": items[:limit], "next_cursor": None}

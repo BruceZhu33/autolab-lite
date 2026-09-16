@@ -10,6 +10,7 @@ import type {
 } from "../fixture/baseline-workshop";
 import { sidecarApi } from "./client";
 import { fetchTimelineEntries } from "./workspace";
+import { fetchThreadMessages } from "./threads";
 
 export interface ResearchBaselineRun {
   id: string;
@@ -127,6 +128,7 @@ export async function fetchBaselineWorkshop(projectId: string): Promise<Baseline
           .flatMap((s) => (s.endsWith("：") ? [] : [s])),
       }
     : null;
+  const threadMsgs = await fetchThreadMessages(projectId, "baseline").catch(() => []);
   const messages: BaselineMessage[] = [
     {
       id: `bl-intro-${projectId}`,
@@ -138,6 +140,12 @@ export async function fetchBaselineWorkshop(projectId: string): Promise<Baseline
       createdAt: b.project.created_at,
     },
     ...(await timelineMessages(projectId)),
+    ...threadMsgs.map((m) => ({
+      id: m.id,
+      role: (m.actor_type === "user" ? "user" : "agent") as "user" | "agent",
+      content: m.content_md,
+      createdAt: m.created_at,
+    })),
     {
       id: `bl-now-${projectId}`,
       role: "agent",
