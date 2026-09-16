@@ -39,6 +39,7 @@ import {
   pushBaselineMessage,
   rejectBaseline,
 } from "./baseline-workshop";
+import { getIterWorkshop, pushIterMessage } from "./iteration-workshop";
 
 function actorName(id: string): string {
   if (id === user.id) return user.name;
@@ -535,6 +536,27 @@ export const fixtureRoutes: FixtureRoute[] = [
       const input = (body ?? {}) as { reason?: string };
       rejectBaseline(issue, input.reason ?? "");
       return { rejected: true };
+    },
+  },
+
+  // ---- 自动迭代工作区（迭代模块核心端点）----
+  {
+    method: "GET",
+    pattern: "/api/projects/:id/iteration-workshop",
+    handler: ({ params }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      return getIterWorkshop(issue);
+    },
+  },
+  {
+    method: "POST",
+    pattern: "/api/projects/:id/iteration-workshop/messages",
+    handler: ({ params, body }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const input = (body ?? {}) as { content?: string };
+      return pushIterMessage(issue, (input.content ?? "").trim());
     },
   },
 

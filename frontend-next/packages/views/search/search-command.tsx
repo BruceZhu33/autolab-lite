@@ -99,6 +99,7 @@ const PAGE_KEYWORDS: Record<WorkspacePageKey, string[]> = {
   gpu: ["gpu", "server", "servers", "agent", "deploy", "upgrade", "服务器", "部署", "升级"],
   review: ["review", "proposal", "score", "评审", "方案", "评分"],
   baseline: ["baseline", "base", "run", "acceptance", "基线", "验收"],
+  iterate: ["iterate", "iteration", "training", "loop", "迭代", "训练"],
   agents: ["agents", "bots", "ai", "智能体"],
   squads: ["squads", "teams", "小队", "团队"],
   usage: ["usage", "analytics", "stats", "metrics", "统计", "分析", "用量"],

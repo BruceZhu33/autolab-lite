@@ -32,8 +32,19 @@ import {
   putLlmConfig,
   testLlmConfig,
   type AssistantMessage,
+  type AssistantProbe,
 } from "@autolab/research/sidecar/assistant";
 import { SidecarApiError } from "@autolab/research/sidecar/client";
+
+/** UI 消息 = 传输消息 + 本轮探测徽标（assistant 专有，随历史留存）。 */
+interface ChatMessage extends AssistantMessage {
+  probes?: AssistantProbe[];
+}
+
+const PROBE_LABEL: Record<string, string> = {
+  "gpu-telemetry": "nvidia-smi",
+  "disk-free": "df -h",
+};
 
 const SUGGESTIONS = [
   "服务器现在什么状态？",
@@ -51,8 +62,16 @@ function describeChatError(e: unknown): { code: string; message: string } {
         "LLM 未配置——点右上「配置 LLM」填 Base URL / Model / API Key（与迭代分析共用 round_analysis 使用点）。",
       LLM_NETWORK: "连不上 LLM 端点：检查 Base URL 与本机网络。",
       LLM_AUTH: "API Key 被拒绝（401/403）：检查 key 是否有效。",
-      LLM_RATE_LIMIT: "LLM 限流（429）：稍等片刻再问。",
     };
+    if (e.code === "LLM_RATE_LIMIT") {
+      // 429 ≠ 一定限流：bigmodel 1113（余额不足/无资源包）也走 429，
+      // 后端已透传上游码——有详情就说真实原因，别再误导「稍等再问」
+      const detail = e.message.replace(/^429\s*/, "");
+      if (detail && detail !== "rate limited") {
+        return { code: e.code, message: `LLM 端点拒绝（429）：${detail}` };
+      }
+      return { code: e.code, message: "LLM 限流（429）：稍等片刻再问。" };
+    }
     return { code: e.code, message: M[e.code] ?? `${e.code}: ${e.message}` };
   }
   return {
@@ -73,7 +92,7 @@ export interface AssistantChatProps {
 export function AssistantChat({ storageKey, tag, className }: AssistantChatProps) {
   const qc = useQueryClient();
   // 历史对话挂载后从 sessionStorage 恢复（SSR 首帧渲染空列表，避免水合不匹配）
-  const [messages, setMessages] = useState<AssistantMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [hydrated, setHydrated] = useState(false);
   const [draft, setDraft] = useState("");
   const [thinking, setThinking] = useState(false);
@@ -93,7 +112,7 @@ export function AssistantChat({ storageKey, tag, className }: AssistantChatProps
   useEffect(() => {
     try {
       const raw = window.sessionStorage.getItem(storageKey);
-      const parsed = raw ? (JSON.parse(raw) as AssistantMessage[]) : [];
+      const parsed = raw ? (JSON.parse(raw) as ChatMessage[]) : [];
       if (Array.isArray(parsed) && parsed.length > 0) setMessages(parsed);
     } catch {
       // 损坏的历史不留存也不报错
@@ -149,14 +168,17 @@ export function AssistantChat({ storageKey, tag, className }: AssistantChatProps
   const send = async (raw: string) => {
     const content = raw.trim();
     if (!content || thinking) return;
-    const next: AssistantMessage[] = [...messages, { role: "user", content }];
+    const next: ChatMessage[] = [...messages, { role: "user", content }];
     setMessages(next);
     setDraft("");
     setChatError(null);
     setThinking(true);
     try {
       const r = await chatAssistant(next.slice(-20));
-      setMessages([...next, { role: "assistant", content: r.reply }]);
+      setMessages([
+        ...next,
+        { role: "assistant", content: r.reply, probes: r.probes?.length ? r.probes : undefined },
+      ]);
       void qc.invalidateQueries({ queryKey: ["autolab", "assistant-status"] });
     } catch (e) {
       setChatError(describeChatError(e));
@@ -235,6 +257,23 @@ export function AssistantChat({ storageKey, tag, className }: AssistantChatProps
                   <Markdown mode="minimal" className="mt-1 min-w-0 text-sm leading-relaxed">
                     {m.content}
                   </Markdown>
+                  {m.probes && m.probes.length > 0 && (
+                    <p className="mt-1.5 flex flex-wrap gap-1.5">
+                      {m.probes.map((p, j) => (
+                        <span
+                          key={j}
+                          className={`rounded border px-1.5 font-mono text-[10px] leading-4 ${
+                            p.ok
+                              ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-600"
+                              : "border-destructive/30 bg-destructive/5 text-destructive"
+                          }`}
+                          title={p.ok ? "sidecar 已 SSH 执行并回传结果" : "探测失败（见回复说明）"}
+                        >
+                          {PROBE_LABEL[p.tool] ?? p.tool} @ {p.server} {p.ok ? "✓" : "✗"}
+                        </span>
+                      ))}
+                    </p>
+                  )}
                 </div>
               </div>
             ),
