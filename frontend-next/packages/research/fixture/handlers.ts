@@ -658,7 +658,8 @@ export const fixtureRoutes: FixtureRoute[] = [
       const input = (body ?? {}) as { decisions?: Record<string, "ok" | "change"> };
       const verdict = setHumanDecision(issue, input.decisions ?? {});
       if (verdict.ok) {
-        issue.status = "baseline";
+        // deviation #34：评审在基线之后，定稿直通自动迭代
+        issue.status = "iterate";
         issue.updated_at = new Date().toISOString();
         return { passed: true };
       }

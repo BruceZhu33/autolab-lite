@@ -179,7 +179,7 @@ export default function ReviewWorkshopPage({
       ),
     onSuccess: (r) => {
       if (r.passed) {
-        toast.success("方案评审通过", { description: "项目已进入「基线验证」。" });
+        toast.success("方案评审通过", { description: "项目已进入「自动迭代」。" });
       } else {
         toast.error("未通过", { description: r.reason });
       }
@@ -458,7 +458,7 @@ export default function ReviewWorkshopPage({
                   onClick={() => humanPass.mutate()}
                   disabled={humanPass.isPending || Object.keys(decisions).length === 0}
                 >
-                  通过方案评审，进入基线验证
+                  通过方案评审，进入自动迭代
                 </Button>
               </div>
             )}
