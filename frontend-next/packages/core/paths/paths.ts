@@ -71,6 +71,11 @@ function workspaceScoped(slug: string) {
     // AutoLab（v0.3 迁移）：自动迭代模块（列表 + 项目迭代工作区）
     iterate: () => `${ws}/iterate`,
     iterateDetail: (id: string) => `${ws}/iterate/${encode(id)}`,
+    // AutoLab（v0.3 迁移）：最终确认（final-read + 报告）与已完成归档
+    confirm: () => `${ws}/confirm`,
+    confirmDetail: (id: string) => `${ws}/confirm/${encode(id)}`,
+    reported: () => `${ws}/reported`,
+    reportedDetail: (id: string) => `${ws}/reported/${encode(id)}`,
     runtimes: () => `${ws}/runtimes`,
     runtimeDetail: (id: string) => `${ws}/runtimes/${encode(id)}`,
     runtimeSettings: (machineId: string, runtimeId: string) =>

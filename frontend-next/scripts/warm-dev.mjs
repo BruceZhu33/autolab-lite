@@ -15,6 +15,8 @@ const ROUTES = [
   "/autolab/baseline",
   "/autolab/review",
   "/autolab/iterate",
+  "/autolab/confirm",
+  "/autolab/reported",
   "/autolab/gpu",
   "/autolab/agents",
   "/autolab/skills",
@@ -25,6 +27,8 @@ const ROUTES = [
   "/autolab/baseline/issue-3",
   "/autolab/review/issue-4",
   "/autolab/iterate/issue-1",
+  "/autolab/confirm/issue-7",
+  "/autolab/reported/issue-2",
   "/autolab/agents/agent-autolab",
   "/autolab/agents/new/manual",
 ];

@@ -84,6 +84,37 @@ export function deleteServer(id: string): Promise<DeleteServerResult> {
   return sidecarApi<DeleteServerResult>("DELETE", `/api/v1/servers/${id}`);
 }
 
+// —— 实时遥测（A1：sidecar SSH 拉 nvidia-smi + df，GPU 部分落 gpus.extra_json）——
+
+export interface GpuTelemetry {
+  gpu_index: number;
+  model_name: string;
+  memory_used_mb: number;
+  memory_total_mb: number;
+  utilization_pct: number;
+  temperature_c: number;
+}
+
+export interface DiskTelemetry {
+  device: string;
+  total_mb: number;
+  used_mb: number;
+  avail_mb: number;
+  use_pct: number;
+  mount: string;
+}
+
+export interface ServerTelemetry {
+  server_id: string;
+  at: string;
+  gpus: GpuTelemetry[];
+  disks: DiskTelemetry[];
+}
+
+export function getServerTelemetry(id: string): Promise<ServerTelemetry> {
+  return sidecarApi<ServerTelemetry>("GET", `/api/v1/servers/${id}/telemetry`);
+}
+
 /** agent 版本号藏在 capabilities JSON 里（旧 UI 同款解析）。 */
 export function agentVersion(s: ServerDetail): string | null {
   try {

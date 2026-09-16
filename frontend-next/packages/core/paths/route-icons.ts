@@ -35,6 +35,7 @@ export type RouteIconName =
   | "Settings"
   | "File"
   | "FileText"
+  | "FileCheck"
   | "FileImage"
   | "FileCode"
   | "FileArchive"
@@ -54,6 +55,8 @@ export type NavLabelKey =
   | "review"
   | "baseline"
   | "iterate"
+  | "confirm"
+  | "reported"
   | "agents"
   | "squads"
   | "usage"
@@ -73,6 +76,8 @@ export type WorkspacePageKey =
   | "review"
   | "baseline"
   | "iterate"
+  | "confirm"
+  | "reported"
   | "agents"
   | "squads"
   | "usage"
@@ -108,6 +113,10 @@ export const WORKSPACE_PAGES: Record<WorkspacePageKey, WorkspacePage> = {
   baseline: { segment: "baseline", icon: "FileCode", navKey: "baseline" },
   // AutoLab（v0.3 迁移）：自主迭代工作区（全自动改码-训练-评测闭环）
   iterate: { segment: "iterate", icon: "Zap", navKey: "iterate" },
+  // AutoLab（v0.3 迁移）：最终确认（final-read 一次性释放 + 报告）
+  confirm: { segment: "confirm", icon: "FileCheck", navKey: "confirm" },
+  // AutoLab（v0.3 迁移）：已完成归档（报告 + 时间线回放）
+  reported: { segment: "reported", icon: "FileArchive", navKey: "reported" },
   agents: { segment: "agents", icon: "Bot", navKey: "agents" },
   squads: { segment: "squads", icon: "Users", navKey: "squads" },
   usage: { segment: "usage", icon: "BarChart3", navKey: "usage" },

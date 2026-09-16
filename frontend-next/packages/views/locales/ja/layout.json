@@ -10,6 +10,8 @@
     "review": "レビュー",
     "baseline": "ベースライン検証",
     "iterate": "自動反復",
+    "confirm": "最終確認",
+    "reported": "完了",
     "agents": "エージェント",
     "squads": "スクワッド",
     "usage": "分析",

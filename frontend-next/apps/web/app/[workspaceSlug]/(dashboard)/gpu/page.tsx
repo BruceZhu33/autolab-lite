@@ -5,15 +5,15 @@
  * 数据经 @autolab/research/sidecar 直连本机 sidecar（capability token 鉴权），
  * 不经过 Multica fixture。视觉沿 Multica 页面语言（PageHeader + 边框行 + Badge）。
  *
- * 布局与基线/评审工作区同构（左对话右执行面板）：左侧是平台助手
- * （features/autolab/assistant-chat，与 /chat 全局页共用；sidecar 每轮
- * 注入实时快照，LLM 复用 round_analysis 使用点），右侧是服务器管理。
- * 2026-09-15 用户口径：GPU 页撤掉内嵌助手（与 /chat 全局页重复），
- * 恢复单栏服务器管理；助手统一走 /chat。
+ * 2026-09-15 用户口径：服务器卡不能只显示登记显存总量——接入实时遥测
+ * （sidecar GET /servers/{id}/telemetry：SSH 拉 nvidia-smi + df；GPU 遥测
+ * 落 gpus.extra_json，A1 预留位）。手动刷新为主（staleTime 30s），不做
+ * 自动轮询——SSH 拉取有成本，轮询属 monitor worker 的活（后置项）。
+ * 平台助手统一在 /chat 全局页（deviation #35）。
  */
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { RefreshCw, Server } from "lucide-react";
+import { Activity, RefreshCw, Server } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@multica/ui/components/ui/badge";
@@ -39,14 +39,17 @@ import {
 } from "@multica/ui/components/ui/alert-dialog";
 import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
+import { Progress } from "@multica/ui/components/ui/progress";
 import { PageHeader } from "@multica/views/layout/page-header";
 import {
   agentVersion,
   deleteServer,
   describeOpResult,
+  getServerTelemetry,
   listServerDetails,
   registerServer,
   serverOp,
+  type GpuTelemetry,
   type ServerDetail,
   type ServerOp,
 } from "@autolab/research/sidecar/servers";
@@ -76,6 +79,149 @@ function transportLabel(s: ServerDetail): string {
   const agent = s.agent_port ? ` · agent:${s.agent_port}` : " · 无 agent";
   const ver = agentVersion(s) ? ` · agent v${agentVersion(s)}` : "";
   return `${base}${agent}${ver}`;
+}
+
+function fmtMem(mb: number): string {
+  const gb = mb / 1024;
+  return gb >= 1024 ? `${(gb / 1024).toFixed(1)}T` : `${gb.toFixed(1)}G`;
+}
+
+function memColor(pct: number): string {
+  if (pct >= 95) return "text-destructive";
+  if (pct >= 85) return "text-amber-600";
+  return "text-foreground";
+}
+
+function ServerCard({
+  s,
+  busy,
+  act,
+  setUpgradeTarget,
+  setDeleteTarget,
+}: {
+  s: ServerDetail;
+  busy: string | null;
+  act: (s: ServerDetail, op: ServerOp, body?: unknown) => Promise<void>;
+  setUpgradeTarget: (s: ServerDetail) => void;
+  setDeleteTarget: (s: ServerDetail) => void;
+}) {
+  const qc = useQueryClient();
+  const { data: tel, isPending, isFetching, isError, error, refetch } = useQuery({
+    queryKey: ["autolab", "telemetry", s.id],
+    queryFn: () => getServerTelemetry(s.id),
+    staleTime: 30_000,
+    retry: false,
+  });
+
+  const telFor = (idx: number): GpuTelemetry | undefined =>
+    tel?.gpus.find((g) => g.gpu_index === idx);
+
+  return (
+    <div className="space-y-3 rounded-lg border p-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <Badge variant="outline" className="gap-1.5">
+          <span className={`size-1.5 rounded-full ${STATUS_DOT[s.status] ?? "bg-muted"}`} />
+          {s.name}
+        </Badge>
+        <span className="font-mono text-xs text-muted-foreground">{transportLabel(s)}</span>
+        <span className="ml-auto flex flex-wrap gap-2">
+          <Button size="sm" variant="outline" disabled={isFetching}
+                  onClick={() => void refetch().then(() => qc.invalidateQueries({ queryKey: ["autolab", "telemetry", s.id] }))}>
+            <Activity className="size-3.5" />
+            {isFetching ? "遥测中…" : "刷新遥测"}
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy === `${s.id}:connectivity-test`}
+                  onClick={() => void act(s, "connectivity-test")}>连通性测试</Button>
+          <Button size="sm" variant="outline" disabled={!s.agent_port || busy === `${s.id}:agent/probe`}
+                  onClick={() => void act(s, "agent/probe")}>agent 探活</Button>
+          <Button size="sm" variant="outline" disabled={busy === `${s.id}:agent/install`}
+                  onClick={() => void act(s, "agent/install")}>部署 / 修复 Agent</Button>
+          <Button size="sm" variant="ghost" disabled={busy === `${s.id}:agent/upgrade`}
+                  onClick={() => setUpgradeTarget(s)}>升级</Button>
+          <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive"
+                  disabled={busy === `${s.id}:delete`}
+                  onClick={() => setDeleteTarget(s)}>删除</Button>
+        </span>
+      </div>
+
+      {s.gpus.length > 0 && (
+        <div className="overflow-hidden rounded-md border">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/50 text-caption text-muted-foreground">
+              <tr>
+                <th className="px-3 py-1.5 text-left font-normal">#</th>
+                <th className="px-3 py-1.5 text-left font-normal">型号</th>
+                <th className="px-3 py-1.5 text-left font-normal">显存占用</th>
+                <th className="px-3 py-1.5 text-left font-normal">利用率</th>
+                <th className="px-3 py-1.5 text-left font-normal">状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {s.gpus.map((g) => {
+                const t = telFor(g.gpu_index);
+                const usedPct = t && t.memory_total_mb > 0
+                  ? Math.round((t.memory_used_mb / t.memory_total_mb) * 100) : null;
+                return (
+                  <tr key={g.id} className="border-t">
+                    <td className="px-3 py-1.5 font-mono text-xs">{g.gpu_index}</td>
+                    <td className="px-3 py-1.5">{g.model_name}</td>
+                    <td className="px-3 py-1.5">
+                      {t ? (
+                        <span className="flex items-center gap-2">
+                          <span className={`font-mono text-xs tabular-nums ${memColor(usedPct ?? 0)}`}>
+                            {fmtMem(t.memory_used_mb)} / {fmtMem(t.memory_total_mb)}
+                          </span>
+                          <Progress className="h-1 w-20" value={usedPct ?? 0} />
+                        </span>
+                      ) : (
+                        <span className="font-mono text-xs text-muted-foreground">
+                          — / {fmtMem(g.vram_mb)}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-1.5 font-mono text-xs tabular-nums">
+                      {t ? `${t.utilization_pct}%${t.temperature_c ? ` · ${t.temperature_c}°C` : ""}` : "—"}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      <Badge variant={g.status === "IDLE" ? "secondary" : "default"}>{g.status}</Badge>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* 磁盘占用（df -BM 真实块设备） */}
+      {tel?.disks && tel.disks.length > 0 && (
+        <div className="space-y-1">
+          {tel.disks.map((d) => (
+            <div key={d.device} className="flex items-center gap-2 font-mono text-caption text-muted-foreground">
+              <span className="w-24 truncate" title={d.device}>{d.mount}</span>
+              <span className="tabular-nums">{fmtMem(d.used_mb)} / {fmtMem(d.total_mb)}</span>
+              <span className={`w-9 text-right tabular-nums ${d.use_pct >= 95 ? "text-destructive" : d.use_pct >= 85 ? "text-amber-600" : ""}`}>
+                {d.use_pct}%
+              </span>
+              <Progress className="h-1 w-28" value={d.use_pct} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {isPending && (
+        <p className="flex items-center gap-1.5 text-caption text-muted-foreground">
+          <RefreshCw className="size-3 animate-spin" /> 遥测获取中…
+        </p>
+      )}
+      {isError && (
+        <p className="text-caption text-amber-600">
+          遥测不可用（{error instanceof SidecarApiError ? error.message : String(error)}）——
+          SSH 不通时登记数据仍可用，可点「连通性测试」排查。
+        </p>
+      )}
+    </div>
+  );
 }
 
 export default function GpuPage() {
@@ -181,7 +327,7 @@ export default function GpuPage() {
           </span>
         ) : null}
         <p className="ml-2 hidden min-w-0 truncate text-caption text-muted-foreground md:block">
-          注册 GPU 服务器 · 连通性测试 · gpu-agent 部署与升级
+          注册 GPU 服务器 · 连通性测试 · 实时遥测 · gpu-agent 部署与升级
         </p>
         <div className="ml-auto">
           <Dialog open={open} onOpenChange={setOpen}>
@@ -286,54 +432,14 @@ export default function GpuPage() {
           )}
 
           {servers?.map((s) => (
-            <div key={s.id} className="space-y-3 rounded-lg border p-4">
-              <div className="flex flex-wrap items-center gap-3">
-                <Badge variant="outline" className="gap-1.5">
-                  <span className={`size-1.5 rounded-full ${STATUS_DOT[s.status] ?? "bg-muted"}`} />
-                  {s.name}
-                </Badge>
-                <span className="font-mono text-xs text-muted-foreground">{transportLabel(s)}</span>
-                <span className="ml-auto flex flex-wrap gap-2">
-                  <Button size="sm" variant="outline" disabled={busy === `${s.id}:connectivity-test`}
-                          onClick={() => void act(s, "connectivity-test")}>连通性测试</Button>
-                  <Button size="sm" variant="outline" disabled={!s.agent_port || busy === `${s.id}:agent/probe`}
-                          onClick={() => void act(s, "agent/probe")}>agent 探活</Button>
-                  <Button size="sm" variant="outline" disabled={busy === `${s.id}:agent/install`}
-                          onClick={() => void act(s, "agent/install")}>部署 / 修复 Agent</Button>
-                  <Button size="sm" variant="ghost" disabled={busy === `${s.id}:agent/upgrade`}
-                          onClick={() => setUpgradeTarget(s)}>升级</Button>
-                  <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive"
-                          disabled={busy === `${s.id}:delete`}
-                          onClick={() => setDeleteTarget(s)}>删除</Button>
-                </span>
-              </div>
-              {s.gpus.length > 0 && (
-                <div className="overflow-hidden rounded-md border">
-                  <table className="w-full text-sm">
-                    <thead className="bg-muted/50 text-caption text-muted-foreground">
-                      <tr>
-                        <th className="px-3 py-1.5 text-left font-normal">#</th>
-                        <th className="px-3 py-1.5 text-left font-normal">型号</th>
-                        <th className="px-3 py-1.5 text-left font-normal">显存</th>
-                        <th className="px-3 py-1.5 text-left font-normal">状态</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {s.gpus.map((g) => (
-                        <tr key={g.id} className="border-t">
-                          <td className="px-3 py-1.5 font-mono text-xs">{g.gpu_index}</td>
-                          <td className="px-3 py-1.5">{g.model_name}</td>
-                          <td className="px-3 py-1.5 font-mono text-xs">{(g.vram_mb / 1024).toFixed(0)} GB</td>
-                          <td className="px-3 py-1.5">
-                            <Badge variant={g.status === "IDLE" ? "secondary" : "default"}>{g.status}</Badge>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
+            <ServerCard
+              key={s.id}
+              s={s}
+              busy={busy}
+              act={act}
+              setUpgradeTarget={setUpgradeTarget}
+              setDeleteTarget={setDeleteTarget}
+            />
           ))}
       </div>
 

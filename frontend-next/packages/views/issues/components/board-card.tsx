@@ -41,7 +41,8 @@ function formatDate(date: string, locale: string): string {
  * 基线验证 → 基线工作区（BASE 派发/run 监视/验收）；
  * 方案评审 → 评审页（自由对话/评分/人工终审）；
  * 自动迭代 → 迭代工作区（轮次/指标趋势/预算/监督干预）；
- * 最终确认/已完成暂留通用工作台（Phase 2 建对应模块后接管）。
+ * 最终确认 → 确认工作区（final-read 一次性释放 + 报告）；
+ * 已完成 → 归档视图（报告 + 全程时间线回放）。
  */
 function autolabStageWorkspaceHref(
   p: { projects: () => string; issueDetail: (id: string) => string },
@@ -57,6 +58,10 @@ function autolabStageWorkspaceHref(
       return `${wsBase}/review/${encodeURIComponent(issue.id)}`;
     case "iterate":
       return `${wsBase}/iterate/${encodeURIComponent(issue.id)}`;
+    case "confirm":
+      return `${wsBase}/confirm/${encodeURIComponent(issue.id)}`;
+    case "reported":
+      return `${wsBase}/reported/${encodeURIComponent(issue.id)}`;
     default:
       return p.issueDetail(issue.id);
   }

@@ -12,6 +12,13 @@ export interface AssistantMessage {
   content: string;
 }
 
+/** 本轮回答执行过的只读探测（sidecar 白名单工具，SSH 到注册服务器）。 */
+export interface AssistantProbe {
+  tool: string;
+  server: string;
+  ok: boolean;
+}
+
 export interface AssistantContextSummary {
   snapshot_at: string;
   servers: number;
@@ -28,6 +35,7 @@ export interface AssistantContextSummary {
 export interface AssistantChatResult {
   reply: string;
   context: AssistantContextSummary;
+  probes?: AssistantProbe[];
 }
 
 export interface AssistantLlmView {
