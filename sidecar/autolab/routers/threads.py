@@ -57,6 +57,26 @@ async def list_messages(project_id: str, surface: str, request: Request):
         raise
 
 
+@router.post("/action-proposals/{proposal_id}/approve")
+async def approve_proposal(proposal_id: str, request: Request):
+    """Phase 4：批准 → 白名单执行（现有 service，预算/guard 不可绕过）+ STALE 检查。"""
+    state = request.app.state.autolab
+    return await threads_svc.decide_proposal(state, proposal_id, "approve")
+
+
+@router.post("/action-proposals/{proposal_id}/reject")
+async def reject_proposal(proposal_id: str, request: Request):
+    state = request.app.state.autolab
+    return await threads_svc.decide_proposal(state, proposal_id, "reject")
+
+
+@router.get("/projects/{project_id}/action-proposals")
+async def list_proposals(project_id: str, request: Request):
+    state = request.app.state.autolab
+    return {"proposals": await to_thread(
+        state.db, threads_svc.proposals_for_project, project_id)}
+
+
 @router.post("/agent-jobs/{job_id}/cancel")
 async def cancel_job(job_id: str, request: Request):
     state = request.app.state.autolab

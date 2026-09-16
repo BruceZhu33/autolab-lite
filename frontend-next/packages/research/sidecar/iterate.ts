@@ -6,6 +6,7 @@
  */
 import { sidecarApi } from "./client";
 import { fetchThreadMessages } from "./threads";
+import type { ActionProposal } from "./proposals";
 
 export interface ResearchIterateRound {
   round: number;
@@ -30,6 +31,7 @@ export interface ResearchIterate {
   active_attempts: number;
   best_metric: number | null;
   blocker: { kind: string; detail: string } | null;
+  proposals?: ActionProposal[];
 }
 
 const STATUS_ZH: Record<string, string> = {
@@ -51,6 +53,7 @@ export async function fetchIterateWorkshop(projectId: string): Promise<{
   bestMetric: number | null;
   directive: null;
   blocker: { title: string; reason: string; actions: string[] } | null;
+  proposals?: { id: string; action_type: string; title: string; status: string; stale?: boolean; created_at: string }[];
   messages: { id: string; role: "user" | "agent"; content: string; createdAt: string }[];
 }> {
   const r = await sidecarApi<ResearchIterate>("GET", `/api/v1/research/iterate/${projectId}`);
@@ -84,6 +87,7 @@ export async function fetchIterateWorkshop(projectId: string): Promise<{
     bestMetric: r.best_metric,
     directive: null,
     blocker: r.blocker ? { title: "需要你", reason: r.blocker.detail, actions: [] } : null,
+    proposals: r.proposals ?? [],
     messages: [
       {
         id: `it-intro-${projectId}`,

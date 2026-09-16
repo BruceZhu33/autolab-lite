@@ -18,6 +18,7 @@ import json
 from fastapi import APIRouter, Request
 
 from ..db import to_thread
+from ..services.threads import proposals_for_project as _proposals_of
 
 router = APIRouter(prefix="/api/v1/research")
 
@@ -243,6 +244,7 @@ async def iterate_workspace(project_id: str, request: Request):
             "blocker": ({"kind": "eval_stalled",
                          "detail": f"EVAL_QUEUED 停滞超过 {EVAL_STALLED_HOURS} 小时（deviation #32①）"}
                         if stalled is not None else None),
+            "proposals": _proposals_of(conn, project_id),
         }
 
     result = await to_thread(state.db, _q)
@@ -512,6 +514,19 @@ async def timeline(project_id: str, request: Request, limit: int = 100):
                 "message_kind": m["kind"],
                 "content": m["content_md"],
                 "occurred_at": m["created_at"],
+            })
+        for ap in conn.execute(
+                "SELECT id, action_type, title, status, created_at, decided_at "
+                "FROM action_proposals WHERE project_id=? AND status IN "
+                "('PROPOSED','APPROVED','SUCCEEDED','FAILED','STALE') "
+                "ORDER BY created_at DESC LIMIT 10", (project_id,)).fetchall():
+            items.append({
+                "kind": "action_proposal",
+                "id": ap["id"],
+                "action_type": ap["action_type"],
+                "title": ap["title"],
+                "status": ap["status"],
+                "occurred_at": ap["decided_at"] or ap["created_at"],
             })
         for j in conn.execute(
                 "SELECT id, status, error_json, created_at, finished_at FROM agent_jobs "

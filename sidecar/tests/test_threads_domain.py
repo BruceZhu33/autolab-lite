@@ -123,3 +123,58 @@ def test_agent_job_llm_not_configured_and_sweep(tmp_path, monkeypatch):
         with pytest.raises(sqlite3.IntegrityError):
             c.execute("UPDATE agent_jobs SET status='RUNNING' WHERE id='job-x'")
         break
+
+
+def test_action_proposal_parse_and_stale(tmp_path, monkeypatch):
+    for client, c in _run(tmp_path, monkeypatch):
+        _mk_project(c)
+        parsed = threads_svc.parse_action("下一轮试试 mixup")
+        assert parsed is not None and parsed[0] == "next_round"
+        assert threads_svc.parse_action("随便聊聊") is None
+        # 手工落一条 PROPOSED + 版本落后的 STALE 判定
+        c.execute(
+            "INSERT INTO action_proposals(id,project_id,action_type,title,status,"
+            "expected_project_revision) VALUES('ap-1','p1','next_round','下一轮',"
+            "'PROPOSED',999)")
+        c.commit()
+        props = threads_svc.proposals_for_project(c, "p1")
+        assert props[0]["stale"] is True
+        # 决策：STALE → 拒执行
+        import asyncio
+        import types
+        state = types.SimpleNamespace(db=client.app.state.autolab.db,
+                                      hub=types.SimpleNamespace(publish_threadsafe=lambda *a, **k: None),
+                                      loop=None)
+        r = asyncio.run(threads_svc.decide_proposal(state, "ap-1", "approve"))
+        assert r["executed"] is False and r["status"] == "STALE"
+        break
+
+
+def test_action_proposal_reject_flow(tmp_path, monkeypatch):
+    for client, c in _run(tmp_path, monkeypatch):
+        _mk_project(c)
+        c.execute(
+            "INSERT INTO action_proposals(id,project_id,action_type,title,status,"
+            "expected_project_revision) VALUES('ap-2','p1','terminate','终止',"
+            "'PROPOSED',0)")
+        c.commit()
+        # p1 当前 revision=0（SEARCH 推进后 state_revision>0？fx 走链会加——对齐）
+        rev = c.execute("SELECT state_revision FROM projects WHERE id='p1'").fetchone()[0]
+        c.execute("UPDATE action_proposals SET expected_project_revision=? WHERE id='ap-2'", (rev,))
+        c.commit()
+        import asyncio
+        import types
+        state = types.SimpleNamespace(db=client.app.state.autolab.db,
+                                      hub=types.SimpleNamespace(publish_threadsafe=lambda *a, **k: None),
+                                      loop=None)
+        r = asyncio.run(threads_svc.decide_proposal(state, "ap-2", "reject"))
+        assert r["executed"] is False and r["status"] == "REJECTED"
+        st = c.execute("SELECT status FROM action_proposals WHERE id='ap-2'").fetchone()[0]
+        assert st == "REJECTED"
+        # 已决策不可重复决策
+        try:
+            asyncio.run(threads_svc.decide_proposal(state, "ap-2", "approve"))
+            raise AssertionError("expected STATE_INVALID_TRANSITION")
+        except Exception as e:
+            assert "STATE_INVALID_TRANSITION" in str(e) or "proposal" in str(e)
+        break

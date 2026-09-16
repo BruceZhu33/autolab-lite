@@ -18,7 +18,8 @@
     "./sidecar/iterate": "./sidecar/iterate.ts",
     "./sidecar/confirm": "./sidecar/confirm.ts",
     "./sidecar/ws": "./sidecar/ws.ts",
-    "./sidecar/threads": "./sidecar/threads.ts"
+    "./sidecar/threads": "./sidecar/threads.ts",
+    "./sidecar/proposals": "./sidecar/proposals.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
