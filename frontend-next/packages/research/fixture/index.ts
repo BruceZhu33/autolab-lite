@@ -9,13 +9,20 @@
 import { fixtureRoutes } from "./handlers";
 import { jsonResponse, matchRoute } from "./router";
 import { getSidecarConfig } from "../sidecar/config";
-import { fetchBoardIssues } from "../sidecar/board";
+import { fetchBoardIssues, fetchProjectViews } from "../sidecar/board";
 import { fetchTimelineEntries, fetchWorkspaceIssue } from "../sidecar/workspace";
+import {
+  fetchBaselineWorkshop,
+  realBaselineAccept,
+  realBaselineDispatch,
+  realBaselineReject,
+} from "../sidecar/baseline";
 import { stageStatuses } from "./data";
 import type { Issue } from "@multica/core/types";
 
 /** 本片已接真 sidecar 的端点（key = `${method} ${pathname}`）。 */
 const SIDECAR_BOARD_ENDPOINTS = new Set([
+  "GET /api/projects",
   "GET /api/issues",
   "POST /api/issues/table/rows",
   "POST /api/issues/table/groups",
@@ -23,10 +30,61 @@ const SIDECAR_BOARD_ENDPOINTS = new Set([
 ]);
 
 /** 参数化端点（regex → 分发），404（真库无此项目）时落回 fixture（LAB 演示种子）。 */
-const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: (id: string) => Promise<unknown> }[] = [
+type ParamServe = (id: string, body: unknown) => Promise<unknown>;
+const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: ParamServe }[] = [
   { re: /^\/api\/issues\/([^/]+)$/, serve: (id) => fetchWorkspaceIssue(id) },
   { re: /^\/api\/issues\/([^/]+)\/timeline$/, serve: (id) => fetchTimelineEntries(id) },
+  {
+    re: /^\/api\/projects\/([^/]+)\/baseline-workshop$/,
+    serve: (id) => fetchBaselineWorkshop(id),
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/baseline-workshop\/accept$/,
+    serve: (id) => softFail(async () => {
+      const rev = await currentRevision(id);
+      return realBaselineAccept(id, rev);
+    }),
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/baseline-workshop\/reject$/,
+    serve: (id) => softFail(async () => {
+      const rev = await currentRevision(id);
+      return realBaselineReject(id, rev);
+    }),
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/baseline-workshop\/dispatch$/,
+    serve: (id) => realBaselineDispatch(id),
+  },
+  {
+    re: /^\/api\/projects\/([^/]+)\/baseline-workshop\/messages$/,
+    serve: async (id) => {
+      // Phase 3 前的只读意图应答：以真数据回答进度类问题
+      const b = await fetchBaselineWorkshop(id).catch(() => null);
+      const reply = b
+        ? (b.messages[b.messages.length - 1]?.content ?? "当前无新进展。")
+        : "真数据不可达。";
+      return { id: `sidecar-reply-${Date.now()}`, role: "agent", content: `（真数据应答）${reply}`, createdAt: new Date().toISOString() };
+    },
+  },
 ];
+
+async function currentRevision(projectId: string): Promise<number> {
+  const b = await fetchBaselineWorkshop(projectId).catch(() => null);
+  return (b as { project?: { state_revision?: number } } | null)?.project?.state_revision ?? 0;
+}
+
+/** 真实写端点失败 → 页面契约的 {passed:false, reason}（guard 拒绝是正常路径）。
+ *  404（真库无此项目）继续上抛，由外层落回 fixture 处理 LAB 演示种子。 */
+async function softFail(fn: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return await fn();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    if (/404|Not Found/i.test(reason)) throw err;
+    return { passed: false, reason: reason.slice(0, 300) };
+  }
+}
 
 let dataSourceCache: "fixture" | "sidecar" | null = null;
 
@@ -118,22 +176,30 @@ export function installFixtureFetch(): void {
       url.pathname !== "/api/autolab-config";
     if (!isApiPath) return originalFetch(input, init);
 
-    // ---- Phase 2 分流：sidecar 模式下看板端点走真聚合 ----
-    if (req.method === "GET") {
-      const paramRoute = SIDECAR_PARAM_ROUTES.find((r) => r.re.test(url.pathname));
-      if (paramRoute && (await resolveDataSource()) === "sidecar") {
-        const m = paramRoute.re.exec(url.pathname);
-        const id = decodeURIComponent(m?.[1] ?? "");
+    // ---- Phase 2 分流：sidecar 模式下看板/详情/基线工作台端点走真聚合 ----
+    const paramRoute = SIDECAR_PARAM_ROUTES.find((r) => r.re.test(url.pathname));
+    if (paramRoute && (await resolveDataSource()) === "sidecar") {
+      const m = paramRoute.re.exec(url.pathname);
+      const id = decodeURIComponent(m?.[1] ?? "");
+      let body: unknown = undefined;
+      if (req.method !== "GET" && req.method !== "HEAD") {
         try {
-          const payload = await paramRoute.serve(id);
-          if (payload !== null) return jsonResponse(payload);
+          body = await req.json();
+        } catch {
+          body = undefined;
+        }
+      }
+      if (id && (req.method === "GET" || req.method === "POST")) {
+        try {
+          const payload = await paramRoute.serve(id, body);
+          if (payload !== null && payload !== undefined) return jsonResponse(payload);
           // 404（真库无此项目，如 LAB 演示种子 id）→ 落回 fixture
         } catch (err) {
           if (err instanceof Error && /404|Not Found/i.test(err.message)) {
             // 同上：fixture 兜底
           } else {
             console.error(
-              `[autolab-sidecar] 详情聚合失败 ${req.method} ${url.pathname}，回退 fixture`,
+              `[autolab-sidecar] 聚合失败 ${req.method} ${url.pathname}，回退 fixture`,
               err,
             );
             dataSourceCache = "fixture";
@@ -145,6 +211,10 @@ export function installFixtureFetch(): void {
       const source = await resolveDataSource();
       if (source === "sidecar") {
         try {
+          if (url.pathname === "/api/projects" && req.method === "GET") {
+            const projects = await fetchProjectViews();
+            return jsonResponse({ projects, total: projects.length });
+          }
           const issues = await fetchBoardIssues();
           if (req.method === "GET") {
             return jsonResponse({ issues, total: issues.length });

@@ -83,3 +83,24 @@ export async function fetchBoardIssues(): Promise<Issue[]> {
   const r = await sidecarApi<ResearchBoardResponse>("GET", "/api/v1/research/board");
   return r.projects.map((p, i) => boardProjectToIssue(p, i));
 }
+
+/** 真库项目列表 → Projects 页 ProjectView 形状（读；写路径仍 fixture，Phase 3）。 */
+export async function fetchProjectViews(): Promise<Record<string, unknown>[]> {
+  const r = await sidecarApi<ResearchBoardResponse>("GET", "/api/v1/research/board");
+  return r.projects.map((p) => ({
+    id: p.id,
+    identifier: p.name,
+    title: p.name,
+    stage: p.stage === "done" ? "reported" : p.stage,
+    priority: p.flags.needs_user ? "high" : "medium",
+    sourceKind: "local",
+    direction: p.direction_text || "",
+    workspacePath: p.budget
+      ? `预算 C${Math.round(p.budget.consumed_s / 3600)}h + R${Math.round(p.budget.reserved_s / 3600)}h / ${Math.round(p.budget.limit_s / 3600)}h`
+      : "",
+    paper: null,
+    codebase: null,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+  }));
+}

@@ -85,6 +85,104 @@ async def workspace(project_id: str, request: Request):
     return result
 
 
+@router.get("/baseline/{project_id}")
+async def baseline_workspace(project_id: str, request: Request):
+    """基线验证工作区聚合（Phase 2 第三片）：env 就绪 + BASE runs/attempts/指标 +
+    验收状态与 D33 guard + 卡态。写路径走既有真实端点（runs 创建 / baseline-acceptance）。"""
+    state = request.app.state.autolab
+
+    def _metric_of(conn, run_id: str):
+        row = conn.execute(
+            "SELECT value FROM evaluation_results er "
+            "JOIN evaluation_requests eq ON eq.id = er.evaluation_request_id "
+            "WHERE eq.run_id=? ORDER BY er.created_at DESC LIMIT 1", (run_id,)).fetchone()
+        return row["value"] if row else None
+
+    def _q(conn):
+        p = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if p is None:
+            return None
+        replicas = conn.execute(
+            "SELECT r.*, dv.id AS dv_id, dv.logical_name FROM data_replicas r "
+            "JOIN data_versions dv ON dv.id = r.data_version_id WHERE dv.project_id=?",
+            (project_id,)).fetchall()
+        envs = conn.execute(
+            "SELECT s.name AS server_name FROM environment_versions e "
+            "JOIN servers s ON s.id = e.server_id WHERE s.id IN "
+            "(SELECT server_id FROM project_gpus pg JOIN gpus g ON g.id = pg.gpu_id "
+            " WHERE pg.project_id=? AND pg.status='ACTIVE') AND e.status='READY'",
+            (project_id,)).fetchall()
+        runs = conn.execute(
+            "SELECT id, round_no, status, created_at, updated_at, env_version_id "
+            "FROM runs WHERE project_id=? AND role='baseline' ORDER BY round_no",
+            (project_id,)).fetchall()
+        run_views = []
+        for r in runs:
+            att = conn.execute(
+                "SELECT id, status FROM attempts WHERE run_id=? "
+                "ORDER BY created_at DESC LIMIT 1", (r["id"],)).fetchone()
+            srv = None
+            if r["env_version_id"]:
+                e2 = conn.execute(
+                    "SELECT s.name FROM environment_versions ev JOIN servers s "
+                    "ON s.id = ev.server_id WHERE ev.id=?", (r["env_version_id"],)).fetchone()
+                srv = e2["name"] if e2 else None
+            run_views.append({
+                "id": r["id"], "round_no": r["round_no"], "status": r["status"],
+                "server": srv or (envs[0]["server_name"] if envs else None),
+                "metric": _metric_of(conn, r["id"]),
+                "train_status": att["status"] if att else None,
+                "created_at": r["created_at"], "updated_at": r["updated_at"],
+            })
+        acceptance = conn.execute(
+            "SELECT ba.verdict, ba.patch_class, ba.notes, ba.created_at "
+            "FROM baseline_acceptances ba JOIN runs r ON r.id = ba.run_id "
+            "WHERE r.project_id=? ORDER BY ba.created_at DESC LIMIT 1",
+            (project_id,)).fetchone()
+        latest = run_views[-1] if run_views else None
+        blocker = None
+        stuck = conn.execute(
+            "SELECT status FROM runs WHERE project_id=? AND role='baseline' AND "
+            "status IN ('REPAIRING','METRIC_MISSING') ORDER BY updated_at DESC LIMIT 1",
+            (project_id,)).fetchone()
+        stalled = conn.execute(
+            "SELECT id FROM runs WHERE project_id=? AND role='baseline' AND "
+            "status='EVAL_QUEUED' AND updated_at < datetime('now', ?) LIMIT 1",
+            (project_id, f"-{EVAL_STALLED_HOURS} hours")).fetchone()
+        if stuck is not None:
+            blocker = {"kind": "repairing_stuck",
+                       "detail": f"BASE run 停在 {stuck['status']}（无自动出口，deviation #32）"}
+        elif stalled is not None:
+            blocker = {"kind": "eval_stalled",
+                       "detail": f"EVAL_QUEUED 停滞超过 {EVAL_STALLED_HOURS} 小时（deviation #32①）"}
+        return {
+            "project": {
+                "id": p["id"], "name": p["name"], "status": p["status"],
+                "stage": stage_of(p["status"], p["paused_from_state"], p["pause_reason"]),
+                "stage_epoch": p["stage_epoch"], "state_revision": p["state_revision"],
+                "base_source_kind": p["base_source_kind"], "base_source_ref": p["base_source_ref"],
+                "created_at": p["created_at"], "updated_at": p["updated_at"],
+            },
+            "env": {
+                "code_ready": bool(replicas) and all(x["status"] == "READY" for x in replicas),
+                "replicas": [{"server": x["server_id"], "status": x["status"]} for x in replicas],
+                "env_ready": bool(envs),
+                "data_versions": [{"id": x["dv_id"], "path": x["logical_name"]} for x in replicas],
+            },
+            "runs": run_views,
+            "acceptance": dict(acceptance) if acceptance else None,
+            "accept_guard": {"train_finished":
+                             latest is not None and latest["train_status"] == "FINISHED"},
+            "blocker": blocker,
+        }
+
+    result = await to_thread(state.db, _q)
+    if result is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="project not found")
+    return result
+
+
 _EVENT_LABELS = {
     "project": "", "run": "run ", "attempt": "attempt ",
 }

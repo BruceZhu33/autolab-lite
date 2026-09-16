@@ -48,9 +48,12 @@ function autolabStageWorkspaceHref(
   p: { projects: () => string; issueDetail: (id: string) => string },
   issue: Issue,
 ): string {
-  // Phase 2（sidecar 真项目）：阶段工作台仍是 fixture 域——真项目先路由到
-  // 通用详情页（真时间线 + 状态条）；模块页逐片接真后按阶段分流回来。
+  // Phase 2（sidecar 真项目）：基线验证工作台已接真——按阶段回基线页；
+  // 其余阶段仍路由到通用详情页（真时间线 + 状态条），模块页逐片接真后放开。
   if (issue.metadata?.real_sidecar === true) {
+    if (issue.status === "baseline") {
+      return `${p.projects().slice(0, -"/projects".length)}/baseline/${encodeURIComponent(issue.id)}`;
+    }
     return p.issueDetail(issue.id);
   }
   const wsBase = p.projects().slice(0, -"/projects".length);

@@ -895,6 +895,22 @@ paths:
         "404": {description: project not found}
         '401': {$ref: '#/components/responses/Unauthorized'}
 
+  /api/v1/research/baseline/{projectId}:
+    get:
+      tags: [Research]
+      summary: |
+        基线验证工作区聚合（Phase 2 第三片）：env 就绪（副本 READY/环境 READY/数据版本）+
+        BASE runs（状态/服务器/train attempt/evaluation_results 指标）+ 验收记录 +
+        D33 guard（train_finished）+ 卡态（repairing_stuck/eval_stalled）+
+        state_revision（供写端点乐观锁）。写路径走既有真实端点
+        （POST /projects/{id}/runs role=baseline、/baseline-acceptance）。
+      operationId: getResearchBaseline
+      parameters: [$ref: "#/components/parameters/ProjectId"]
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {type: object}}}}
+        "404": {description: project not found}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
   /api/v1/projects/{projectId}/baseline-redo:
     post:
       tags: [Plan]
