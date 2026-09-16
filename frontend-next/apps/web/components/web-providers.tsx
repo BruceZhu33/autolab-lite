@@ -8,6 +8,7 @@ import { useWelcomeStore } from "@multica/core/onboarding";
 import { installFixtureFetch } from "@autolab/research/fixture";
 import packageJson from "../package.json";
 import { WebNavigationProvider } from "@/platform/navigation";
+import { SidecarInvalidationBridge } from "@/components/sidecar-invalidation-bridge";
 import { WebScrollRestorationProvider } from "@/platform/scroll-restoration";
 import {
   setLoggedInCookie,
@@ -95,6 +96,7 @@ export function WebProviders({
       localeAdapter={localeAdapter}
       syncUserLocale={syncUserLocale}
     >
+      <SidecarInvalidationBridge />
       <WebNavigationProvider>
         <WebScrollRestorationProvider>{children}</WebScrollRestorationProvider>
       </WebNavigationProvider>
