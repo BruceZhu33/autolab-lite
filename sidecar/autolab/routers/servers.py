@@ -1,11 +1,13 @@
-"""服务器路由：注册 / 列表 / 连通性测试 / GPU 探测（P1 后端）。"""
+"""服务器路由：注册 / 列表 / 连通性测试 / GPU 探测 / 实时遥测（P1 后端）。"""
 from __future__ import annotations
 
 import json
 import re
 import secrets
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..db import to_thread
@@ -324,3 +326,111 @@ async def agent_upgrade(server_id: str, req: AgentInstallRequest, request: Reque
         {"server_id": server_id, "agent_ver": result["agent_ver"]},
         aggregate={"type": "sync", "id": server_id})
     return result
+
+
+# —— 实时遥测（A1：GPU 利用率/已用显存 + 磁盘占用；用户口径 2026-09-15：
+#    服务器卡只显示登记显存总量很鸡肋）。一条 SSH 拉齐两块输出，GPU 部分
+#    落 gpus.extra_json（schema 预留的实时遥测位）。
+
+_TELEMETRY_CMD = (
+    "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,"
+    "temperature.gpu --format=csv,noheader,nounits; echo __DF__; "
+    "df -BM --output=source,size,used,avail,pcent,target 2>/dev/null | grep '^/dev/' || true"
+)
+
+
+def _parse_gpu_telemetry(stdout: str) -> list[dict]:
+    """nvidia-smi CSV（nounits）：index,name,mem_used,mem_total,util,temp。"""
+    out = []
+    for line in stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6 or not parts[0].isdigit():
+            continue
+        try:
+            out.append({
+                "gpu_index": int(parts[0]),
+                "model_name": parts[1],
+                "memory_used_mb": int(parts[2]),
+                "memory_total_mb": int(parts[3]),
+                "utilization_pct": int(parts[4]),
+                "temperature_c": int(parts[5]),
+            })
+        except ValueError:
+            continue
+    return out
+
+
+def _parse_df(stdout: str) -> list[dict]:
+    """df -BM --output：只收真实块设备（/dev/ 开头且非 loop——snap 挂载是噪声）。"""
+    out = []
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or not parts[0].startswith("/dev/") \
+                or parts[0].startswith("/dev/loop"):
+            continue
+        try:
+            out.append({
+                "device": parts[0],
+                "total_mb": int(parts[1].rstrip("M")),
+                "used_mb": int(parts[2].rstrip("M")),
+                "avail_mb": int(parts[3].rstrip("M")),
+                "use_pct": int(parts[4].rstrip("%")),
+                "mount": " ".join(parts[5:]),
+            })
+        except ValueError:
+            continue
+    return out
+
+
+@router.get("/{server_id}/telemetry")
+async def server_telemetry(server_id: str, request: Request):
+    state = request.app.state.autolab
+
+    def _load(conn):
+        row = conn.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()
+        if row is None:
+            raise TxError("NOT_FOUND", server_id)
+        return dict(row)
+    server = await to_thread(state.db, _load)
+
+    transport = make_transport(server, state.creds.get(server["credential_ref"]))
+    try:
+        r = await transport.exec(_TELEMETRY_CMD, timeout=20)
+    except Exception as e:  # noqa: BLE001 —— SSH 不通等：遥测是尽力而为面
+        return JSONResponse(status_code=502, content={"error": {
+            "code": "TELEMETRY_UNREACHABLE", "message": str(e)[:200]}})
+    finally:
+        import contextlib
+        with contextlib.suppress(Exception):
+            await transport.close()
+
+    if r.rc != 0 and not r.stdout.strip():
+        return JSONResponse(status_code=502, content={"error": {
+            "code": "TELEMETRY_FAILED",
+            "message": (r.stderr or f"rc={r.rc}").strip()[:200]}})
+
+    gpu_part, _, df_part = r.stdout.partition("__DF__")
+    gpus = _parse_gpu_telemetry(gpu_part)
+    disks = _parse_df(df_part)
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    if gpus:
+        def _persist(conn):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for g in gpus:
+                    conn.execute(
+                        "UPDATE gpus SET extra_json=? WHERE server_id=? AND gpu_index=?",
+                        (json.dumps({
+                            "memory_used_mb": g["memory_used_mb"],
+                            "utilization_pct": g["utilization_pct"],
+                            "temperature_c": g["temperature_c"],
+                            "telemetry_at": at,
+                        }), server_id, g["gpu_index"]))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        await to_thread(state.db, _persist)
+
+    return {"server_id": server_id, "at": at, "gpus": gpus, "disks": disks}
