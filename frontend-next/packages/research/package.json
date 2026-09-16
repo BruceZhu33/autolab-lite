@@ -16,7 +16,8 @@
     "./sidecar/projects": "./sidecar/projects.ts",
     "./sidecar/review": "./sidecar/review.ts",
     "./sidecar/iterate": "./sidecar/iterate.ts",
-    "./sidecar/confirm": "./sidecar/confirm.ts"
+    "./sidecar/confirm": "./sidecar/confirm.ts",
+    "./sidecar/ws": "./sidecar/ws.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

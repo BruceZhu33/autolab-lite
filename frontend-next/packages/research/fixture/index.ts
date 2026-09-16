@@ -245,6 +245,20 @@ function tableRowsPayload(issues: Issue[], body: unknown) {
   };
 }
 
+function logSidecarReq(method: string, pathname: string, body: unknown) {
+  // 与 fixture 路径共用的诊断环形缓冲（__autolabFixtureReqs）
+  const line = `${method} ${pathname} ${JSON.stringify(body)?.slice(0, 300)}`;
+  console.info(`[autolab-sidecar] ${line}`);
+  try {
+    const key = "__autolabFixtureReqs";
+    const prev = JSON.parse(window.localStorage.getItem(key) ?? "[]") as string[];
+    prev.push(line);
+    window.localStorage.setItem(key, JSON.stringify(prev.slice(-50)));
+  } catch {
+    // 诊断用途，失败可忽略。
+  }
+}
+
 function tableGroupsPayload(issues: Issue[]) {
   return {
     query_fingerprint: "autolab-sidecar:groups",
@@ -356,6 +370,7 @@ export function installFixtureFetch(): void {
             body = undefined;
           }
           if (url.pathname === "/api/issues/table/rows") {
+            logSidecarReq(req.method, url.pathname, body);
             return jsonResponse(tableRowsPayload(issues, body));
           }
           if (url.pathname === "/api/issues/table/groups") {
