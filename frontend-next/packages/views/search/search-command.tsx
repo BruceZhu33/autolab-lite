@@ -100,6 +100,8 @@ const PAGE_KEYWORDS: Record<WorkspacePageKey, string[]> = {
   review: ["review", "proposal", "score", "评审", "方案", "评分"],
   baseline: ["baseline", "base", "run", "acceptance", "基线", "验收"],
   iterate: ["iterate", "iteration", "training", "loop", "迭代", "训练"],
+  confirm: ["confirm", "final", "final-read", "report", "确认", "报告", "释放"],
+  reported: ["done", "reported", "archive", "完成", "归档"],
   agents: ["agents", "bots", "ai", "智能体"],
   squads: ["squads", "teams", "小队", "团队"],
   usage: ["usage", "analytics", "stats", "metrics", "统计", "分析", "用量"],

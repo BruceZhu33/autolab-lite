@@ -68,8 +68,8 @@ const STAGE_GATES: Record<string, StageGate> = {
   confirm: {
     next: "reported",
     nextLabel: "已完成",
-    action: "final-read 完成，产出报告",
-    hint: "test 集一次性释放后定稿报告",
+    action: "前往最终确认工作区",
+    hint: "final-read（一次性）→ 报告 → 完成归档（在确认工作区操作）",
     color: "#10b981",
   },
 };

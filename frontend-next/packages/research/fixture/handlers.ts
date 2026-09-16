@@ -40,6 +40,13 @@ import {
   rejectBaseline,
 } from "./baseline-workshop";
 import { getIterWorkshop, pushIterMessage } from "./iteration-workshop";
+import {
+  confirmWorkshops,
+  getConfirmWorkshop,
+  pushConfirmMessage,
+  finalReadDone,
+  finalReadRunning,
+} from "./confirm-workshop";
 
 function actorName(id: string): string {
   if (id === user.id) return user.name;
@@ -557,6 +564,56 @@ export const fixtureRoutes: FixtureRoute[] = [
       if (!issue) return { error: "issue not found" };
       const input = (body ?? {}) as { content?: string };
       return pushIterMessage(issue, (input.content ?? "").trim());
+    },
+  },
+
+  // ---- 最终确认工作区 ----
+  {
+    method: "GET",
+    pattern: "/api/projects/:id/confirm-workshop",
+    handler: ({ params }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const ws = getConfirmWorkshop(issue);
+      return {
+        ...ws,
+        finalReadDone: finalReadDone(ws.finalRead),
+        finalReadRunning: finalReadRunning(ws.finalRead),
+      };
+    },
+  },
+  {
+    method: "POST",
+    pattern: "/api/projects/:id/confirm-workshop/messages",
+    handler: ({ params, body }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const input = (body ?? {}) as { content?: string };
+      return pushConfirmMessage(issue, (input.content ?? "").trim());
+    },
+  },
+
+  // ---- 已完成（归档只读视图）----
+  {
+    method: "GET",
+    pattern: "/api/projects/:id/archive",
+    handler: ({ params }) => {
+      const issue = findIssue(params.id ?? "");
+      if (!issue) return { error: "issue not found" };
+      const cw = confirmWorkshops[issue.id];
+      const finalMetric = cw?.report?.finalMetric ?? 0.912;
+      const baseline = cw?.baseline ?? 0.874;
+      return {
+        projectId: issue.id,
+        reportedAt: issue.updated_at,
+        finalMetric,
+        baseline,
+        reportPath: cw?.report?.path ?? `gpu-a-a6000:~/autolab/work/${issue.id}/report/`,
+        summary:
+          cw?.report?.summary ??
+          `BASE ${baseline.toFixed(4)} → 最终 ${finalMetric.toFixed(4)}（Δ+${(finalMetric - baseline).toFixed(4)}）。` +
+          "全链产物（快照/指标/报告）归档于服务器工作区，时间线可回放。",
+      };
     },
   },
 

@@ -120,6 +120,8 @@ type NavKey =
   | "review"
   | "baseline"
   | "iterate"
+  | "confirm"
+  | "reported"
   | "agents"
   | "squads"
   | "usage"
@@ -140,6 +142,8 @@ type NavLabelKey =
   | "review"
   | "baseline"
   | "iterate"
+  | "confirm"
+  | "reported"
   | "agents"
   | "squads"
   | "usage"
@@ -169,6 +173,9 @@ const workNav: { key: NavKey; labelKey: NavLabelKey }[] = [
   { key: "iterate", labelKey: "iterate" },
   // AutoLab（v0.3 迁移）：方案评审工作区（Agent 协作最深的现场）
   { key: "review", labelKey: "review" },
+  // AutoLab（v0.3 迁移）：最终确认（final-read + 报告）与已完成归档
+  { key: "confirm", labelKey: "confirm" },
+  { key: "reported", labelKey: "reported" },
 ];
 
 // AutoLab（v0.3 迁移）：单人形态只保留 Agents / Skills
