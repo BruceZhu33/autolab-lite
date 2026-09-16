@@ -6,13 +6,19 @@
   助手与迭代分析共用一份 key，不新加 use_point——llm_settings 的 CHECK
   约束冻结在 0005 四个使用点，扩列走攒批修订）。
 - GET /api/v1/assistant/status：轻量上下文摘要 + LLM 配置态（前端徽标用）。
+- 只读诊断工具（用户口径 2026-09-15："只看快照不如自己去看"）：模型可请求
+  白名单探测（nvidia-smi / df -h），后端用注册凭据经 SSH 执行、结果回传
+  给模型出最终回答。命令由后端拼装——模型只能选「工具+服务器名」，
+  不存在命令注入面；每轮最多 2 个探测。
 
 快照是回答「现在什么状态」的唯一事实来源：助手端不猜、不编指标；
 正式指标以落盘产物为准（deviation #20）。
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
@@ -23,6 +29,7 @@ from .. import __version__
 from ..db import to_thread
 from ..llm import client as llm_client
 from ..llm.client import LLMError
+from ..ssh.transport import make_transport
 
 router = APIRouter(prefix="/api/v1")
 
@@ -35,6 +42,14 @@ _ACTIVE_ATTEMPT_STATUS = (
 
 MAX_HISTORY = 20      # 送入 LLM 的最近对话条数
 MAX_SNAPSHOT_EVENTS = 12
+MAX_PROBES = 2        # 每轮对话允许的探测次数
+
+# 只读诊断工具白名单：模型只给 (tool, server)，命令串由后端拼——不收模型命令
+_PROBE_TOOLS: dict[str, str] = {
+    "gpu-telemetry": "nvidia-smi",
+    "disk-free": "df -h",
+}
+_PROBE_RE = re.compile(r"\[\[probe:([a-z0-9-]+)\|([^\]|]+)\]\]")
 
 
 class ChatMessage(BaseModel):
@@ -111,26 +126,75 @@ def _summary(snap: dict) -> dict:
 
 def _system_prompt(snap: dict) -> str:
     return (
-        "你是 AutoLab 平台助手，嵌入在产品「GPU 服务器」页面的对话面板里，"
-        "角色对标 ZCode 这类编码助手的产品侧助手。\n"
+        "你是 AutoLab 平台的全局助手（/chat 对话页），角色对标 ZCode 这类编码助手的产品侧助手。\n"
         "\n"
         "职责：\n"
         "- 回答平台当前状态相关问题：GPU 服务器注册/连通/agent 部署状态、GPU 占用、"
         "在途训练 run、项目阶段、近期状态事件。\n"
         "- 也承担常规 AI 助手问答（概念解释、命令/代码建议、排障思路等）。\n"
         "\n"
+        "只读诊断工具（快照没有的实时遥测用这个，别让用户自己上服务器看）：\n"
+        "- 需要某台服务器的事实测数据时，回复中单独成行输出标记（这一轮只输出标记行，不写别的）：\n"
+        "  [[probe:gpu-telemetry|服务器名]]  → nvidia-smi 全量输出（显存/利用率/进程）\n"
+        "  [[probe:disk-free|服务器名]]      → df -h（磁盘占用）\n"
+        "- 平台会用注册凭据 SSH 执行并把结果回传给你，你再基于结果给最终回答（引用具体数字）。\n"
+        "- 每轮最多 2 个标记（多余的会被忽略）；服务器名必须用快照里的注册名。\n"
+        "\n"
         "规则：\n"
-        "- 用户问「现在什么状态」「有什么在跑」时，依据下方实时快照回答，给出具体数字和名称。\n"
+        "- 用户问「现在什么状态」「有什么在跑」时，先依据下方实时快照回答，给出具体数字和名称。\n"
         "- 快照里没有的信息不要编造；训练指标以落盘产物为准（metrics.json / final.ckpt），"
         "内存数字与猜测不算数。\n"
-        "- 你不能直接操作服务器；需要操作时指引用户点页面按钮"
-        "（注册服务器 / 连通性测试 / agent 探活 / 部署 / 升级 / 删除）。\n"
-        "- 用简体中文回答，简洁分点；给命令示例时标注在哪台机器上执行。\n"
+        "- 变更类操作（部署/升级/删除/派发训练）你做不了，指引用户点页面按钮。\n"
+        "- 用简体中文回答，简洁分点。\n"
         "\n"
         f"实时快照（生成时间 {snap['snapshot_at']}）：\n"
         + json.dumps({k: v for k, v in snap.items() if k != "snapshot_at"},
                      ensure_ascii=False, default=str)
     )
+
+
+async def _run_probe(state, tool: str, server_name: str) -> dict:
+    """执行白名单探测：命令由后端拼装，凭据来自注册钥匙串。失败不炸对话，
+    作为工具结果回传给模型（它会在最终回答里向用户解释）。"""
+    cmd = _PROBE_TOOLS.get(tool)
+    if cmd is None:
+        return {"tool": tool, "server": server_name, "ok": False,
+                "error": f"未知工具（可用：{'/'.join(_PROBE_TOOLS)}）"}
+
+    def _load(conn):
+        row = conn.execute("SELECT * FROM servers WHERE name=?",
+                           (server_name.strip(),)).fetchone()
+        return dict(row) if row else None
+    row = await to_thread(state.db, _load)
+    if row is None:
+        return {"tool": tool, "server": server_name, "ok": False,
+                "error": "服务器未注册（用快照里的注册名）"}
+
+    transport = make_transport(row, state.creds.get(row["credential_ref"]))
+    try:
+        r = await transport.exec(cmd, timeout=20)
+        out = (r.stdout or "").strip()
+        if r.rc != 0 and not out:
+            return {"tool": tool, "server": server_name, "ok": False,
+                    "error": (r.stderr or f"rc={r.rc}").strip()[:200]}
+        return {"tool": tool, "server": server_name, "ok": True, "output": out[:4000]}
+    except Exception as e:  # noqa: BLE001 —— SSH 不通等：作为工具结果反馈
+        return {"tool": tool, "server": server_name, "ok": False, "error": str(e)[:200]}
+    finally:
+        with contextlib.suppress(Exception):
+            await transport.close()
+
+
+def _parse_probes(reply: str) -> list[tuple[str, str]]:
+    """提取去重后的 (tool, server) 标记，保序、封顶 MAX_PROBES。"""
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for tool, server in _PROBE_RE.findall(reply):
+        pair = (tool, server.strip())
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out[:MAX_PROBES]
 
 
 def _llm_view(state) -> dict:
@@ -168,14 +232,35 @@ async def assistant_chat(req: ChatIn, request: Request):
         {"role": m.role, "content": m.content} for m in req.messages[-MAX_HISTORY:]
     ]
     try:
-        reply = await llm_client.chat(settings, messages, timeout=90.0, max_tokens=1024)
+        # 推理型模型（glm-4.7 等）的思考计入 max_tokens 预算，给足余量防空回复
+        reply = await llm_client.chat(settings, messages, timeout=90.0, max_tokens=4096)
     except LLMError as e:
         return JSONResponse(status_code=502, content={"error": {
             "code": e.code, "message": e.message[:300]}})
 
+    # 工具回合：模型请求探测 → SSH 执行 → 带结果重问一轮出最终回答
+    probes: list[dict] = []
+    wanted = _parse_probes(reply)
+    if wanted:
+        for tool, server in wanted:
+            probes.append(await _run_probe(state, tool, server))
+        messages = messages + [
+            {"role": "assistant", "content": reply},
+            {"role": "user", "content":
+                "平台工具执行结果（JSON；ok=false 时向用户说明失败原因，别编数字）：\n"
+                + json.dumps(probes, ensure_ascii=False)},
+        ]
+        try:
+            reply = await llm_client.chat(settings, messages, timeout=90.0, max_tokens=4096)
+        except LLMError as e:
+            return JSONResponse(status_code=502, content={"error": {
+                "code": e.code, "message": e.message[:300]}})
+
     view = _summary(snap)
     view["model"] = settings.model
-    return {"reply": reply, "context": view}
+    return {"reply": reply, "context": view,
+            "probes": [{"tool": p["tool"], "server": p["server"], "ok": p["ok"]}
+                       for p in probes]}
 
 
 def _snapshot_with_ts(conn) -> dict:

@@ -1,6 +1,8 @@
 """OpenAI 兼容薄客户端（TD7）。"""
 from __future__ import annotations
 
+import json
+
 import httpx
 
 
@@ -52,19 +54,35 @@ async def chat(settings: LLMSettings, messages: list[dict], timeout: float = 120
     if r.status_code in (401, 403):
         raise LLMError("LLM_AUTH", f"HTTP {r.status_code}（检查 API Key）")
     if r.status_code == 429:
-        raise LLMError("LLM_RATE_LIMIT", "429 rate limited")
+        # 429 ≠ 一定是限流：bigmodel 1113（余额不足）也走 429，必须透传上游码
+        raise LLMError("LLM_RATE_LIMIT", f"429 {upstream_error_detail(r.text)}")
     if r.status_code >= 400:
-        raise LLMError("LLM_API", f"HTTP {r.status_code}: {r.text[:200]}")
+        raise LLMError("LLM_API", f"HTTP {r.status_code}: {upstream_error_detail(r.text)}")
     try:
         return r.json()["choices"][0]["message"]["content"]
     except (KeyError, IndexError, ValueError) as e:
         raise LLMError("LLM_RESPONSE", f"响应结构异常: {e}") from e
 
 
+def upstream_error_detail(body: str) -> str:
+    """上游错误体 → 可读摘要（OpenAI 兼容 {error:{code,message}} 优先）。"""
+    try:
+        e = (json.loads(body) or {}).get("error") or {}
+        code, msg = e.get("code"), e.get("message")
+        if code and msg:
+            return f"[{code}] {msg}"
+        if msg:
+            return str(msg)
+    except ValueError:
+        pass
+    return body[:200] or "(无响应体)"
+
+
 async def ping(settings: LLMSettings) -> dict:
     try:
+        # 推理型模型思考计入预算，8 tokens 会被吃光导致 reply 恒空
         text = await chat(settings, [{"role": "user", "content": "回复：ok"}],
-                          timeout=30, max_tokens=8)
+                          timeout=30, max_tokens=256)
         return {"ok": True, "reply": text.strip()[:80], "model": settings.model}
     except LLMError as e:
         return {"ok": False, "error": f"{e.code}: {e.message}"}

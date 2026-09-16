@@ -119,3 +119,60 @@ def test_invalid_role_rejected(client):
     r = client.post("/api/v1/assistant/chat",
                     json={"messages": [{"role": "system", "content": "越权"}]})
     assert r.status_code == 422
+
+
+# —— 只读诊断工具（probe）——
+
+def test_parse_probes_dedupe_and_cap():
+    from autolab.routers.assistant import _parse_probes
+    reply = ("[[probe:gpu-telemetry|gpu-a]]\n"
+             "[[probe:gpu-telemetry| gpu-a ]]\n"          # 去重（空白归一）
+             "[[probe:disk-free|gpu-b]]\n"
+             "[[probe:disk-free|gpu-c]]\n"                  # 超出 MAX_PROBES=2 被裁
+             "正文里的 [[probe:not-a-tool|x]] 不匹配白名单外也照收——由 _run_probe 拒绝")
+    assert _parse_probes(reply) == [("gpu-telemetry", "gpu-a"), ("disk-free", "gpu-b")]
+
+
+def test_run_probe_guards(client):
+    import asyncio
+    from autolab.routers import assistant as assistant_mod
+    state = client.app.state.autolab
+    unknown_tool = asyncio.new_event_loop().run_until_complete(
+        assistant_mod._run_probe(state, "rm-rf", "gpu-a"))
+    assert unknown_tool["ok"] is False and "未知工具" in unknown_tool["error"]
+    unknown_server = asyncio.new_event_loop().run_until_complete(
+        assistant_mod._run_probe(state, "gpu-telemetry", "no-such-server"))
+    assert unknown_server["ok"] is False and "未注册" in unknown_server["error"]
+
+
+def test_chat_probe_two_round_flow(client, monkeypatch):
+    from autolab.routers import assistant as assistant_mod
+    _configure_llm(client)
+    _seed_infra(client)
+    captured: list[list[dict]] = []
+
+    async def fake_chat(settings, messages, timeout=120, max_tokens=None):
+        captured.append(messages)
+        if len(captured) == 1:
+            return "[[probe:gpu-telemetry|gpu-a]]"
+        return "gpu-a 的 A6000 已用 44730 MiB / 49140 MiB。"
+
+    async def fake_probe(state, tool, server):
+        assert (tool, server) == ("gpu-telemetry", "gpu-a")
+        return {"tool": tool, "server": server, "ok": True,
+                "output": "|  0  NVIDIA RTX A6000  44730MiB / 49140MiB |"}
+
+    monkeypatch.setattr(llm_client, "chat", fake_chat)
+    monkeypatch.setattr(assistant_mod, "_run_probe", fake_probe)
+
+    r = client.post("/api/v1/assistant/chat",
+                    json={"messages": [{"role": "user", "content": "A6000 显存占用多少？"}]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["reply"].startswith("gpu-a 的 A6000")
+    assert body["probes"] == [{"tool": "gpu-telemetry", "server": "gpu-a", "ok": True}]
+
+    # 第二轮：标记回复进 assistant 位，工具结果进 user 位
+    round2 = captured[1]
+    assert round2[-2] == {"role": "assistant", "content": "[[probe:gpu-telemetry|gpu-a]]"}
+    assert "44730MiB" in round2[-1]["content"] and round2[-1]["role"] == "user"
