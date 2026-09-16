@@ -48,6 +48,11 @@ function autolabStageWorkspaceHref(
   p: { projects: () => string; issueDetail: (id: string) => string },
   issue: Issue,
 ): string {
+  // Phase 2（sidecar 真项目）：阶段工作台仍是 fixture 域——真项目先路由到
+  // 通用详情页（真时间线 + 状态条）；模块页逐片接真后按阶段分流回来。
+  if (issue.metadata?.real_sidecar === true) {
+    return p.issueDetail(issue.id);
+  }
   const wsBase = p.projects().slice(0, -"/projects".length);
   switch (issue.status) {
     case "prepare":

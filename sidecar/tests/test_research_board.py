@@ -104,3 +104,48 @@ def test_board_endpoint_aggregates(client):
     assert projects["pD"]["stage"] == "baseline"
     assert projects["pD"]["flags"]["awaiting_decision"] is True
     assert projects["pA"]["stage_epoch"] == 2  # 新库默认新序
+
+
+def test_workspace_endpoint(client):
+    conn = client.app.state.autolab.db.connect()
+    _seed(conn, "pW", "SEARCH")
+    conn.close()
+
+    r = client.get("/api/v1/research/workspace/pW")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["project"]["id"] == "pW"
+    assert d["project"]["stage"] == "iterate"
+    assert d["project"]["base_source_kind"] == "local"
+    assert d["recent_runs"] == []
+    assert d["baseline"] is None
+    assert client.get("/api/v1/research/workspace/missing").status_code == 404
+
+
+def test_timeline_endpoint_merges_layers(client):
+    conn = client.app.state.autolab.db.connect()
+    _seed(conn, "pT", "SEARCH")
+    # 项目层事件来自合法链推进；补一条 run 层事件验证三层合并
+    srv = harness.fx_server(conn)
+    proto = harness.fx_protocol(conn, "pT", freeze=True)
+    cs = harness.fx_snapshot(conn, "pT")
+    env = harness.fx_env(conn, srv)
+    dv = harness.fx_data(conn, "pT")
+    harness.fx_replica_ready(conn, dv, srv)
+    harness.fx_recipe(conn)
+    harness.fx_init(conn)
+    harness.fx_budget(conn, "pT", limit_s=1000)
+    run = harness.fx_run(conn, "pT", status="PLANNED", proto=proto, cs=cs, env=env, dv=dv)
+    harness.fx_run_reach(conn, run, "TRAINING")
+    conn.close()
+
+    r = client.get("/api/v1/research/timeline/pT")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    kinds = {(i["kind"], i.get("aggregate_type")) for i in items}
+    assert ("state_event", "project") in kinds
+    assert ("state_event", "run") in kinds
+    # 倒序：时间线首项时间不早于末项
+    times = [i["occurred_at"] for i in items]
+    assert times == sorted(times, reverse=True)
+    assert client.get("/api/v1/research/timeline/missing").status_code == 404

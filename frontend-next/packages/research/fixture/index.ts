@@ -10,6 +10,7 @@ import { fixtureRoutes } from "./handlers";
 import { jsonResponse, matchRoute } from "./router";
 import { getSidecarConfig } from "../sidecar/config";
 import { fetchBoardIssues } from "../sidecar/board";
+import { fetchTimelineEntries, fetchWorkspaceIssue } from "../sidecar/workspace";
 import { stageStatuses } from "./data";
 import type { Issue } from "@multica/core/types";
 
@@ -20,6 +21,12 @@ const SIDECAR_BOARD_ENDPOINTS = new Set([
   "POST /api/issues/table/groups",
   "POST /api/issues/table/facets",
 ]);
+
+/** 参数化端点（regex → 分发），404（真库无此项目）时落回 fixture（LAB 演示种子）。 */
+const SIDECAR_PARAM_ROUTES: { re: RegExp; serve: (id: string) => Promise<unknown> }[] = [
+  { re: /^\/api\/issues\/([^/]+)$/, serve: (id) => fetchWorkspaceIssue(id) },
+  { re: /^\/api\/issues\/([^/]+)\/timeline$/, serve: (id) => fetchTimelineEntries(id) },
+];
 
 let dataSourceCache: "fixture" | "sidecar" | null = null;
 
@@ -112,6 +119,28 @@ export function installFixtureFetch(): void {
     if (!isApiPath) return originalFetch(input, init);
 
     // ---- Phase 2 分流：sidecar 模式下看板端点走真聚合 ----
+    if (req.method === "GET") {
+      const paramRoute = SIDECAR_PARAM_ROUTES.find((r) => r.re.test(url.pathname));
+      if (paramRoute && (await resolveDataSource()) === "sidecar") {
+        const m = paramRoute.re.exec(url.pathname);
+        const id = decodeURIComponent(m?.[1] ?? "");
+        try {
+          const payload = await paramRoute.serve(id);
+          if (payload !== null) return jsonResponse(payload);
+          // 404（真库无此项目，如 LAB 演示种子 id）→ 落回 fixture
+        } catch (err) {
+          if (err instanceof Error && /404|Not Found/i.test(err.message)) {
+            // 同上：fixture 兜底
+          } else {
+            console.error(
+              `[autolab-sidecar] 详情聚合失败 ${req.method} ${url.pathname}，回退 fixture`,
+              err,
+            );
+            dataSourceCache = "fixture";
+          }
+        }
+      }
+    }
     if (SIDECAR_BOARD_ENDPOINTS.has(`${req.method} ${url.pathname}`)) {
       const source = await resolveDataSource();
       if (source === "sidecar") {

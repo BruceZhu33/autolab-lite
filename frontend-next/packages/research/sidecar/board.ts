@@ -69,7 +69,7 @@ export function boardProjectToIssue(p: ResearchBoardProject, seq = 0): Issue {
     stage: null,
     start_date: null,
     due_date: null,
-    metadata: {},
+    metadata: { real_sidecar: true },
     properties: {},
     priority: p.flags.needs_user ? "high" : "medium",
     labels: labelIds.map(labelById),
