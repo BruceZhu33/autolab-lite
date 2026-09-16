@@ -48,12 +48,21 @@ function autolabStageWorkspaceHref(
   p: { projects: () => string; issueDetail: (id: string) => string },
   issue: Issue,
 ): string {
-  // Phase 2（sidecar 真项目）：基线验证工作台已接真——按阶段回基线页；
-  // 其余阶段仍路由到通用详情页（真时间线 + 状态条），模块页逐片接真后放开。
+  // Phase 2（sidecar 真项目）：六个阶段工作台全部接真——按阶段路由。
   if (issue.metadata?.real_sidecar === true) {
-    if (issue.status === "baseline") {
-      return `${p.projects().slice(0, -"/projects".length)}/baseline/${encodeURIComponent(issue.id)}`;
+    if (issue.status === "prepare") {
+      return `${p.projects()}?project=${encodeURIComponent(issue.id)}`;
     }
+    const wsBase = p.projects().slice(0, -"/projects".length);
+    const stagePath: Record<string, string> = {
+      baseline: "baseline",
+      review: "review",
+      iterate: "iterate",
+      confirm: "confirm",
+      reported: "reported",
+    };
+    const seg = stagePath[issue.status];
+    if (seg) return `${wsBase}/${seg}/${encodeURIComponent(issue.id)}`;
     return p.issueDetail(issue.id);
   }
   const wsBase = p.projects().slice(0, -"/projects".length);

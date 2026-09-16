@@ -9,7 +9,14 @@
     "./sidecar/config": "./sidecar/config.ts",
     "./sidecar/client": "./sidecar/client.ts",
     "./sidecar/servers": "./sidecar/servers.ts",
-    "./sidecar/assistant": "./sidecar/assistant.ts"
+    "./sidecar/assistant": "./sidecar/assistant.ts",
+    "./sidecar/board": "./sidecar/board.ts",
+    "./sidecar/workspace": "./sidecar/workspace.ts",
+    "./sidecar/baseline": "./sidecar/baseline.ts",
+    "./sidecar/projects": "./sidecar/projects.ts",
+    "./sidecar/review": "./sidecar/review.ts",
+    "./sidecar/iterate": "./sidecar/iterate.ts",
+    "./sidecar/confirm": "./sidecar/confirm.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

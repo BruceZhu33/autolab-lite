@@ -85,6 +85,233 @@ async def workspace(project_id: str, request: Request):
     return result
 
 
+@router.get("/confirm/{project_id}")
+async def confirm_workspace(project_id: str, request: Request):
+    """最终确认工作区聚合（Phase 2 第七片）：val 最佳/BASE 锚 + 批次与一次性释放
+    状态 + 报告归档。写路径：final-confirmation/read（T-FINAL-READ 不变量②）与
+    reports（REPORTING→REPORTED）真实端点；归档视图复用本端点。"""
+    state = request.app.state.autolab
+
+    def _metric_of(conn, run_id: str, scope: str | None = None):
+        q = ("SELECT er.value FROM evaluation_results er JOIN evaluation_requests eq "
+             "ON eq.id = er.evaluation_request_id WHERE eq.run_id=?")
+        args: tuple = (run_id,)
+        if scope:
+            q += " AND eq.scope=?"
+            args = (run_id, scope)
+        q += " ORDER BY er.created_at DESC LIMIT 1"
+        row = conn.execute(q, args).fetchone()
+        return row["value"] if row else None
+
+    def _q(conn):
+        p = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if p is None:
+            return None
+        base = conn.execute(
+            "SELECT br.id FROM baseline_acceptances ba JOIN runs br ON br.id = ba.run_id "
+            "WHERE br.project_id=? AND ba.verdict='accepted' "
+            "ORDER BY ba.created_at DESC LIMIT 1", (project_id,)).fetchone()
+        base_metric = _metric_of(conn, base["id"]) if base else None
+        best = conn.execute(
+            "SELECT er.value, r.round_no FROM evaluation_results er "
+            "JOIN evaluation_requests eq ON eq.id = er.evaluation_request_id "
+            "JOIN runs r ON r.id = eq.run_id WHERE r.project_id=? AND eq.scope='val' "
+            "ORDER BY er.value DESC LIMIT 1", (project_id,)).fetchone()
+        # 最新批次（final-read 目标）
+        batch = conn.execute(
+            "SELECT b.id, b.status, b.created_at FROM batches b "
+            "JOIN candidates c ON c.id = b.candidate_id "
+            "JOIN plan_protocols pp ON pp.id = c.proto_id "
+            "WHERE pp.project_id=? AND b.status != 'CANCELLED' "
+            "ORDER BY b.created_at DESC LIMIT 1", (project_id,)).fetchone()
+        release = None
+        if batch is not None:
+            rel = conn.execute(
+                "SELECT outcome, release_payload_json, released_at FROM test_result_releases "
+                "WHERE batch_id=?", (batch["id"],)).fetchone()
+            if rel is not None:
+                try:
+                    payload = json.loads(rel["release_payload_json"])
+                except (ValueError, TypeError):
+                    payload = {}
+                release = {
+                    "outcome": rel["outcome"],
+                    "metric": payload.get("final_metric") if isinstance(payload, dict) else None,
+                    "released_at": rel["released_at"],
+                }
+        artifacts = conn.execute(
+            "SELECT a.kind, a.path, a.created_at FROM artifacts a "
+            "JOIN attempts at2 ON at2.id = a.attempt_id "
+            "JOIN runs r ON r.id = at2.run_id WHERE r.project_id=? "
+            "ORDER BY a.created_at DESC LIMIT 10", (project_id,)).fetchall()
+        return {
+            "project": {
+                "id": p["id"], "name": p["name"], "status": p["status"],
+                "stage": stage_of(p["status"], p["paused_from_state"], p["pause_reason"]),
+                "stage_epoch": p["stage_epoch"], "state_revision": p["state_revision"],
+                "outcome": p["outcome"],
+                "created_at": p["created_at"], "updated_at": p["updated_at"],
+            },
+            "baseline": base_metric,
+            "best_val": best["value"] if best else None,
+            "best_round": best["round_no"] if best else None,
+            "batch": dict(batch) if batch else None,
+            "release": release,
+            "artifacts": [dict(a) for a in artifacts],
+        }
+
+    result = await to_thread(state.db, _q)
+    if result is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="project not found")
+    return result
+
+
+@router.get("/iterate/{project_id}")
+async def iterate_workspace(project_id: str, request: Request):
+    """自动迭代工作区聚合（Phase 2 第六片）：BASE 锚 + search 轮次（指标/delta/采纳）+
+    预算 + 状态派生（running/stalled/concluded）。写路径：next-round / terminate 真实端点。"""
+    state = request.app.state.autolab
+
+    def _metric_of(conn, run_id: str):
+        row = conn.execute(
+            "SELECT er.value FROM evaluation_results er JOIN evaluation_requests eq "
+            "ON eq.id = er.evaluation_request_id WHERE eq.run_id=? "
+            "ORDER BY er.created_at DESC LIMIT 1", (run_id,)).fetchone()
+        return row["value"] if row else None
+
+    def _q(conn):
+        p = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if p is None:
+            return None
+        base = conn.execute(
+            "SELECT br.id, ba.created_at FROM baseline_acceptances ba "
+            "JOIN runs br ON br.id = ba.run_id WHERE br.project_id=? AND ba.verdict='accepted' "
+            "ORDER BY ba.created_at DESC LIMIT 1", (project_id,)).fetchone()
+        base_metric = _metric_of(conn, base["id"]) if base else None
+        runs = conn.execute(
+            "SELECT id, round_no, status, created_at, updated_at FROM runs "
+            "WHERE project_id=? AND role='search' ORDER BY round_no", (project_id,)).fetchall()
+        rounds = []
+        for r in runs:
+            m = _metric_of(conn, r["id"])
+            rounds.append({
+                "round": r["round_no"],
+                "status": r["status"],
+                "metric": m,
+                "delta": (m - base_metric) if (m is not None and base_metric is not None) else None,
+                "adopted": r["status"] == "JUDGED",
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            })
+        budget = conn.execute(
+            "SELECT consumed_s, reserved_s, limit_s FROM budget_accounts WHERE project_id=?",
+            (project_id,)).fetchone()
+        active = conn.execute(
+            "SELECT COUNT(*) FROM attempts a JOIN runs r ON r.id = a.run_id "
+            "WHERE r.project_id=? AND a.status IN ('ACKED','RUNNING','STOP_REQUESTED')",
+            (project_id,)).fetchone()[0]
+        stalled = conn.execute(
+            "SELECT id FROM runs WHERE project_id=? AND status='EVAL_QUEUED' "
+            "AND updated_at < datetime('now', ?) LIMIT 1",
+            (project_id, f"-{EVAL_STALLED_HOURS} hours")).fetchone()
+        if p["status"] in ("PAUSED", "STOPPING", "STOP_PENDING_CONFIRMATION"):
+            iter_status = "paused"
+        elif p["status"] in ("TEST_RESULT_SEALED", "FINISHING", "REPORTING", "REPORTED"):
+            iter_status = "concluded"
+        elif stalled is not None:
+            iter_status = "stalled"
+        elif active > 0 or any(r["status"] not in ("JUDGED",) for r in rounds):
+            iter_status = "running"
+        else:
+            iter_status = "idle"
+        best = max((r["metric"] for r in rounds if r["metric"] is not None), default=None)
+        return {
+            "project": {
+                "id": p["id"], "name": p["name"], "status": p["status"],
+                "stage": stage_of(p["status"], p["paused_from_state"], p["pause_reason"]),
+                "stage_epoch": p["stage_epoch"], "state_revision": p["state_revision"],
+                "created_at": p["created_at"], "updated_at": p["updated_at"],
+            },
+            "baseline": {"metric": base_metric, "accepted_at": base["created_at"] if base else None},
+            "rounds": rounds,
+            "budget": ({"consumed_s": budget["consumed_s"], "reserved_s": budget["reserved_s"],
+                        "limit_s": budget["limit_s"]} if budget else None),
+            "iter_status": iter_status,
+            "active_attempts": active,
+            "best_metric": best,
+            "blocker": ({"kind": "eval_stalled",
+                         "detail": f"EVAL_QUEUED 停滞超过 {EVAL_STALLED_HOURS} 小时（deviation #32①）"}
+                        if stalled is not None else None),
+        }
+
+    result = await to_thread(state.db, _q)
+    if result is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="project not found")
+    return result
+
+
+@router.get("/review/{project_id}")
+async def review_workspace(project_id: str, request: Request):
+    """方案评审工作区聚合（Phase 2 第五片）：review_turns + 当前协议（定稿目标）+
+    模块状态 + F5 锚（已验收基线）。写路径：human-pass → 真实 T-FREEZE（F5 把关）。"""
+    state = request.app.state.autolab
+
+    def _q(conn):
+        p = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if p is None:
+            return None
+        turns = conn.execute(
+            "SELECT id, stage, role, content_json, created_at FROM review_turns "
+            "WHERE project_id=? ORDER BY created_at", (project_id,)).fetchall()
+        proto = None
+        if p["current_protocol_id"]:
+            proto = conn.execute(
+                "SELECT id, ver, status, created_at FROM plan_protocols WHERE id=?",
+                (p["current_protocol_id"],)).fetchone()
+        root = conn.execute(
+            "SELECT id FROM plan_protocols WHERE project_id=? AND parent_id IS NULL "
+            "ORDER BY ver LIMIT 1", (project_id,)).fetchone()
+        baseline = conn.execute(
+            "SELECT ba.verdict, ba.created_at, br.id AS run_id FROM baseline_acceptances ba "
+            "JOIN runs br ON br.id = ba.run_id WHERE br.project_id=? AND ba.verdict='accepted' "
+            "ORDER BY ba.created_at DESC LIMIT 1", (project_id,)).fetchone()
+        baseline_metric = None
+        if baseline is not None:
+            baseline_metric = conn.execute(
+                "SELECT er.value FROM evaluation_results er JOIN evaluation_requests eq "
+                "ON eq.id = er.evaluation_request_id WHERE eq.run_id=? "
+                "ORDER BY er.created_at DESC LIMIT 1", (baseline["run_id"],)).fetchone()
+        modules = conn.execute(
+            "SELECT identity, status FROM modules WHERE project_id=? ORDER BY created_at",
+            (project_id,)).fetchall()
+        return {
+            "project": {
+                "id": p["id"], "name": p["name"], "status": p["status"],
+                "stage": stage_of(p["status"], p["paused_from_state"], p["pause_reason"]),
+                "stage_epoch": p["stage_epoch"], "state_revision": p["state_revision"],
+                "direction_text": p["direction_text"],
+                "created_at": p["created_at"], "updated_at": p["updated_at"],
+            },
+            "turns": [dict(t) for t in turns],
+            "protocol": dict(proto) if proto else None,
+            "root_protocol_id": root["id"] if root else None,
+            "baseline": {
+                "accepted": baseline is not None,
+                "metric": baseline_metric["value"] if baseline_metric else None,
+                "at": baseline["created_at"] if baseline else None,
+            },
+            "modules": [dict(m) for m in modules],
+        }
+
+    result = await to_thread(state.db, _q)
+    if result is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="project not found")
+    return result
+
+
 @router.get("/baseline/{project_id}")
 async def baseline_workspace(project_id: str, request: Request):
     """基线验证工作区聚合（Phase 2 第三片）：env 就绪 + BASE runs/attempts/指标 +
