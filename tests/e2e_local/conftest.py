@@ -173,3 +173,58 @@ def run_cli(args: list[str], stack_dict: dict, *, test_mode: bool = True) -> dic
     assert result.exit_code == 0, f"CLI {args} failed:\n{result.output}\n{result.exception}"
     lines = [ln for ln in result.output.strip().splitlines() if ln.startswith("{")]
     return json.loads(lines[-1])
+
+
+SLOW_TRAIN_SCRIPT = """
+import json, os, sys, time
+
+seed = sys.argv[sys.argv.index("--seed") + 1]
+out = os.environ["AUTOLAB_OUTPUT_DIR"]
+os.makedirs(out, exist_ok=True)
+deadline = time.time() + 6
+i = 0
+while time.time() < deadline:
+    print(f"[seed {seed}] alive {i}", flush=True)
+    with open(out + "/heartbeat.log", "a") as fh:
+        fh.write("tick" + chr(10))
+    time.sleep(0.3)
+    i += 1
+with open(out + "/metrics.json", "w") as fh:
+    json.dump({"val_dice": 0.5}, fh)
+print("done", flush=True)
+"""
+
+
+def spawn_control(stack_dict, drop_first_dispatch: bool = False) -> Proc:
+    import os
+
+    env = dict(os.environ)
+    env.pop("AUTOLAB_TEST_MODE", None)
+    if drop_first_dispatch:
+        env["AUTOLAB_TEST_DROP_FIRST_DISPATCH"] = "1"
+    proc = Proc(subprocess.Popen(
+        [sys.executable, "-m", "autolab_control", "serve",
+         "--db", stack_dict["db"], "--credentials", stack_dict["credentials"],
+         "--poll-interval", "0.1"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT), env=env,
+    ), "control-2")
+    proc.wait_for("scheduler started")
+    return proc
+
+
+def spawn_runner(stack_dict) -> Proc:
+    config = stack_dict["tmp_path"] / "runner.json"
+    proc = Proc(subprocess.Popen(
+        [sys.executable, "-m", "autolab_runner", "--config", str(config)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT),
+    ), "runner-2")
+    with httpx.Client(timeout=httpx.Timeout(2.0)) as probe:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if probe.get(f"http://127.0.0.1:{stack_dict['port']}/healthz").status_code == 200:
+                    return proc
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.05)
+    raise AssertionError("restarted runner never became healthy")

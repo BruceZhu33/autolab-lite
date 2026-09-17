@@ -46,8 +46,9 @@ uv run autolab plan approve <plan-id> --expect-spec-hash <hash>
 uv run autolab job list / show / logs
 ```
 
-## 已知限制（当前迭代）
+## 当前范围（M0–M2 已完成）
 
-- M1 只有 local transport（伪 GPU 槽位）；SSH、真实 GPU、MCP、Web 均未实现。
-- CI 尚未建立；Runner 的 Python 3.10 兼容目前靠语法约束与本地审查保证，
-  待 CI 落地后在 3.10 上跑测试矩阵。
+- 本地闭环 + 取消/停止链（TERM→grace→KILL，幂等）、失败重试（保留原 Job）、
+  Control 崩溃恢复、Runner 重启收养（退出码丢失如实记录为 runner 类失败）。
+- 仍是 local transport（伪 GPU 槽位）；SSH/真实 GPU（M3）、MCP（M4）、Web UI（M5）未做。
+- CI 尚未建立；Runner 的 Python 3.10 兼容目前靠语法约束与本地审查保证。

@@ -109,7 +109,7 @@ class Scheduler:
                     continue
                 try:
                     remote_id = job["remote_job_id"] or job["id"]
-                    snapshot = transport.snapshot(remote_id, events_after=job["last_runner_event_seq"])
+                    snapshot = transport.snapshot(remote_id, events_after=0)
                 except RunnerUnreachable:
                     self._mark_reachability(job["server_id"], reachable=False)
                     continue
@@ -164,7 +164,7 @@ class Scheduler:
                 continue
             try:
                 remote_id = job["remote_job_id"] or job["id"]
-                snapshot = transport.snapshot(remote_id, events_after=job["last_runner_event_seq"])
+                snapshot = transport.snapshot(remote_id, events_after=0)
             except RunnerUnreachable:
                 self._mark_reachability(job["server_id"], reachable=False)
                 self._bump_uncertain(job_id)

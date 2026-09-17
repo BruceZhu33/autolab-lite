@@ -87,3 +87,34 @@
   引导使用 `inherit` 或 `prefix`。
 - 理由：环境名到远端解释器路径的解析依赖 M3 的 SSH/服务器语义；M1 本地
   transport 下静默忽略或猜路径都比显式失败更危险。
+
+## D-011 · Runner 重启后收养进程的退出码语义
+
+- 日期：2026-09-17
+- 决定：Runner 启动时对「RUNNING 且有 PID」的任务做进程身份核验：进程仍在则
+  收养（按身份令牌轮询直到消失），进程已不在则直接定论。两种情况的退出码
+  都无法回收（孤儿进程已被 init 收割），如实记为 `FAILED`，
+  `failure_class=runner`，摘要注明 "exit code not captured"。
+- 理由：Runner 崩溃后无法 `wait()` 别人的孤儿进程；伪造退出码或写成
+  SUCCEEDED 都比诚实记录更危险。控制端 observation 机制保证这不会被当成
+  用户代码失败。
+- 附带：停止请求与看护线程的竞态用进程内 `_stopping` 标志解决——停止在途时
+  看护线程让位，终态提交权归停止处理器（TERM 导致的 -15 退出码不会被记成
+  user_code 失败）。
+
+## D-012 · 事件消费按 (instance, seq) 去重，不按裸 seq 过滤
+
+- 日期：2026-09-17
+- 决定：Control 拉取 Runner snapshot 时不再使用 `events_after` 游标过滤，而是
+  全量拉取该 job 的事件，依赖 `(runner_instance_id, event_seq)` 唯一约束去重。
+- 理由：Runner 重启轮换 instance id 后事件序号从 1 重新计数，裸 seq 游标会把
+  新实例的低序号终态事件全部滤掉（E2E 暴露：重启后任务在 Control 侧永远
+  无法到达终态）。单任务事件量极小（<20 条），全量拉取代价可忽略。
+
+## D-013 · Runner 不可达时不消耗重试次数
+
+- 日期：2026-09-17
+- 决定：调度器在派发前检查服务器可达性缓存；已知不可达时用
+  `return_to_queued` 退回队列并退还本次 attempt（dispatch_attempts-1）。
+- 理由：服务器临时离线不是任务失败；让 outage 烧完 3 次重试把任务打成
+  FAILED 违反「未知结果不得直接标 FAILED」的精神。
