@@ -125,11 +125,21 @@ def test_m1_three_job_serial_flow(stack):
     started = [e for j in jobs for e in repo.job_events(j["id"]) if e["event_type"] == "job.started"]
     assert len(started) == 3
 
-    # artifacts: metrics + checkpoint per job, hashes correct, metric extracted
-    for job in jobs:
-        artifacts = repo.job_artifacts(job["id"])
-        by_kind = {a["kind"]: a for a in artifacts}
-        assert set(by_kind) == {"metrics", "checkpoint"}
+    # artifacts: metrics + checkpoint per job, hashes correct, metric extracted.
+    # artifact.discovered events land after the terminal event (late by design),
+    # and metric extraction runs on the following scheduler tick — poll for it.
+    def all_artifacts_ready():
+        ready = []
+        for job in jobs:
+            by_kind = {a["kind"]: a for a in repo.job_artifacts(job["id"])}
+            if set(by_kind) == {"metrics", "checkpoint"} and \
+                    by_kind["metrics"]["metadata"].get("metric_values"):
+                ready.append(by_kind)
+        return ready if len(ready) == len(jobs) else None
+
+    artifact_sets = wait_for(all_artifacts_ready, timeout=30,
+                             message="artifacts registered and metrics extracted")
+    for job, by_kind in zip(jobs, artifact_sets, strict=False):
         seed = int(json.loads(job["params_json"])["seed"])
         expected = f"weights-{seed}".encode()
         assert by_kind["checkpoint"]["sha256"] == hashlib.sha256(expected).hexdigest()

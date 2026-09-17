@@ -55,3 +55,35 @@
   `AUTOLAB_TEST_DROP_FIRST_DISPATCH=1` 使 transport 仅对首次派发携带该头。
 - 理由：E2E 场景 7 要求真实双进程下注入「Runner 已受理但 Control 响应超时」，
   需要一个双方都显式声明的注入点；5xx 語义上即「结果未知」，与真实超时同路径。
+
+## D-007 · servers 表增加 gpu_slots 列
+
+- 日期：2026-09-17
+- 决定：`servers.gpu_slots INTEGER NOT NULL DEFAULT 1`（仍在 7 表边界内）。
+- 理由：GPU Lease 获取需要知道服务器索引空间；把容量强制写进每个 Plan 的
+  `eligible_gpu_indices` 会把调度权从 Control 泄漏到 Plan 作者。该值是登记
+  服务器时的一次性描述，与 Runner 配置的 `gpu_slots` 对应。
+
+## D-008 · jobs 表增加 dispatch_attempts 列
+
+- 日期：2026-09-17
+- 决定：`jobs.dispatch_attempts INTEGER NOT NULL DEFAULT 0`，上限 3 次。
+- 理由：08 号方案要求「明确、有限的恢复策略，不做无限自动重试」；重试计数
+  是实现该上限的最小运行事实，放在 jobs 行内而不是新表。
+
+## D-009 · Manifest 的 created_at 由 job 行派生，保证重放字节稳定
+
+- 日期：2026-09-17
+- 决定：`build_manifest` 的 `created_at` 取 `jobs.queued_at`（解析失败才用
+  当前时间），派发重放与 E2E 手工重放都会重建出 payload_hash 相同的 Manifest。
+- 理由：E2E 暴露的真实缺陷——同一 dispatch_id 重放时若 created_at 取当前
+  时间，载荷 hash 变化，Runner 按协议返回 409 dispatch_conflict，把幂等重放
+  误判为冲突。字节稳定是 dispatch 幂等正确性的前提。
+
+## D-010 · conda/venv 环境在 M1 显式拒绝
+
+- 日期：2026-09-17
+- 决定：Manifest 构建遇到 `environment.kind ∈ {conda, venv}` 时抛出明确错误，
+  引导使用 `inherit` 或 `prefix`。
+- 理由：环境名到远端解释器路径的解析依赖 M3 的 SSH/服务器语义；M1 本地
+  transport 下静默忽略或猜路径都比显式失败更危险。
