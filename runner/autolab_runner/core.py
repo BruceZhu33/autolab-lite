@@ -21,7 +21,7 @@ from autolab_protocol import (
 from . import procs
 from .config import RunnerConfig
 from .paths import PathViolation, resolve_within_allowed
-from .storage import RunnerStorage, utc_now
+from .storage import TERMINAL_STATUSES, RunnerStorage, utc_now
 
 
 class AcceptError(Exception):
@@ -55,6 +55,7 @@ class RunnerCore:
         self.storage = storage
         self._procs: dict[str, tuple[object, str]] = {}  # job_id -> (Popen, start token)
         self._watchers: dict[str, threading.Thread] = {}
+        self._stopping: set[str] = set()  # stop in flight: watcher must not finalize
 
     # ------------------------------------------------------------- acceptance
 
@@ -224,6 +225,10 @@ class RunnerCore:
             )
             self._cleanup(manifest.job_id)
             return
+        if manifest.job_id in self._stopping:
+            # the stop handler owns the terminal commit for this process
+            self._cleanup(manifest.job_id)
+            return
         exit_code: int | None = proc.returncode
         if exit_code == 0:
             self.storage.commit_job_event(
@@ -290,6 +295,7 @@ class RunnerCore:
             )
 
     def _cleanup(self, job_id: str) -> None:
+        self._stopping.discard(job_id)
         self._procs.pop(job_id, None)
         self._watchers.pop(job_id, None)
 
@@ -344,3 +350,82 @@ class RunnerCore:
             "size": size,
             "eof": True,
         }
+
+    # ------------------------------------------------------------------- stop
+
+    def stop_job(self, job_id: str) -> dict | None:
+        """Idempotent stop: TERM→grace→KILL the process group, then commit
+        job.cancelled. Terminal jobs are returned unchanged."""
+
+        job = self.storage.job(job_id)
+        if job is None:
+            return None
+        if job["status"] in TERMINAL_STATUSES:
+            return self.snapshot(job_id) or dict(job)
+        self._stopping.add(job_id)
+        manifest = ManifestV1.model_validate(json.loads(job["manifest_json"]))
+        grace = manifest.execution.termination_grace_seconds
+        log_path = Path(job["log_path"])
+        self.storage.commit_job_event(
+            job_id=job_id, event_type="job.stop_requested",
+            payload={"log_cursor": self._log_size(log_path)},
+        )
+        entry = self._procs.get(job_id)
+        if entry is not None:
+            proc, token = entry
+            result = procs.terminate_group(proc, token, grace)
+        elif job.get("pid") and job.get("process_start_token"):
+            result = procs.stop_by_identity(job["pid"], job["process_start_token"], grace)
+        else:
+            result = "no-process"
+        self.storage.commit_job_event(
+            job_id=job_id, event_type="job.cancelled",
+            payload={"log_cursor": self._log_size(log_path), "stop_result": result},
+            status="CANCELLED", finished=True, failure_class=None,
+            failure_summary=f"stopped by control ({result})",
+        )
+        self._cleanup(job_id)
+        return self.snapshot(job_id) or dict(job)
+
+    def adopt_orphaned_jobs(self) -> int:
+        """Boot-time reconciliation for jobs whose watcher died with the
+        previous runner process. Live processes are re-watched by identity;
+        their eventual exit code cannot be reaped and is recorded as lost."""
+
+        adopted = 0
+        for job in self.storage.non_terminal_jobs_with_pid():
+            token = job["process_start_token"] or ""
+            alive = procs.process_start_token(job["pid"]) not in ("unknown",) and \
+                procs.process_start_token(job["pid"]) == token
+            if not alive:
+                self.storage.commit_job_event(
+                    job_id=job["job_id"], event_type="job.failed",
+                    payload={"exit_code": None, "failure_class": "runner",
+                             "failure_summary": "runner restarted; process already gone, exit code not captured",
+                             "log_cursor": self._log_size(Path(job["log_path"]))},
+                    status="FAILED", finished=True, failure_class="runner",
+                    failure_summary="runner restarted; process already gone, exit code not captured",
+                )
+                continue
+            adopted += 1
+            threading.Thread(
+                target=self._watch_adopted, args=(job["job_id"], job["pid"], token,
+                                                  Path(job["log_path"])),
+                name=f"adopt-{job['job_id']}", daemon=True,
+            ).start()
+        return adopted
+
+    def _watch_adopted(self, job_id: str, pid: int, token: str, log_path: Path) -> None:
+        import time as _time
+
+        while procs.process_start_token(pid) == token:
+            _time.sleep(0.5)
+        self.storage.commit_job_event(
+            job_id=job_id, event_type="job.failed",
+            payload={"exit_code": None, "failure_class": "runner",
+                     "failure_summary": "process finished while runner was down; exit code not captured",
+                     "log_cursor": self._log_size(log_path)},
+            status="FAILED", finished=True, failure_class="runner",
+            failure_summary="process finished while runner was down; exit code not captured",
+        )
+        self._cleanup(job_id)

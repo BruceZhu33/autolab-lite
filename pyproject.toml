@@ -38,3 +38,5 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 # typer's argument-default idiom trips B008
 "packages/client/autolab_client/cli.py" = ["B008"]
+# reuses the test_repo fixture; param name shadows the import on purpose
+"apps/control/tests/test_m2_repo.py" = ["F811"]

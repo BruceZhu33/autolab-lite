@@ -398,3 +398,55 @@ def test_drop_response_header_simulates_accept_then_500(client, roots):
     assert replay.status_code == 200 and replay.json()["replayed"] is True
     done = wait_for_status(client, "job-drop-0001", TERMINAL)
     assert len([e for e in done["events"] if e["event_type"] == "job.started"]) == 1
+
+
+def test_stop_endpoint_cancels_running_job(client, roots):
+    script = write_script(roots["project"], "sleep_stop.py", SLEEP_JOB_SCRIPT)
+    out_dir = roots["outputs"] / "stop"
+    out_dir.mkdir()
+    manifest = make_manifest(
+        roots, dispatch_id="dispatch-stop-0001", job_id="job-stop-0001",
+        argv=[sys.executable, str(script), str(out_dir)], output_root=out_dir,
+    )
+    post_manifest(client, manifest)
+    wait_for_status(client, "job-stop-0001", {"RUNNING"})
+
+    response = client.post("/jobs/job-stop-0001/stop",
+                           headers={"Authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+    snapshot = wait_for_status(client, "job-stop-0001", TERMINAL)
+    types = [e["event_type"] for e in snapshot["events"]]
+    assert "job.stop_requested" in types and "job.cancelled" in types
+
+    # idempotent on a terminal job
+    again = client.post("/jobs/job-stop-0001/stop", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert again.status_code == 200 and again.json()["status"] == "CANCELLED"
+
+    # the whole process group is silent afterwards
+    heartbeat = out_dir / "heartbeat.log"
+    import time as _t
+    deadline = _t.monotonic() + 4
+    last = -1
+    while _t.monotonic() < deadline:
+        if not heartbeat.exists():
+            break  # child never even wrote its first tick: killed instantly
+        size = heartbeat.stat().st_size
+        if size == last:
+            break
+        last = size
+        _t.sleep(0.3)
+    _t.sleep(0.4)
+    if heartbeat.exists():
+        assert heartbeat.stat().st_size == last
+
+
+def test_stop_unknown_job_404(client):
+    response = client.post("/jobs/job-nope-0001/stop",
+                           headers={"Authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 404
+
+
+def test_stop_requires_token(client):
+    response = client.post("/jobs/whatever-0001/stop")
+    assert response.status_code == 401

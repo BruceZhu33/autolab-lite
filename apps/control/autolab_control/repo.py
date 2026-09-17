@@ -588,3 +588,113 @@ class Repo:
             return "UNKNOWN"
         age = (datetime.now(timezone.utc) - last).total_seconds()
         return "CONFIRMED" if age <= stale_after_seconds else "STALE"
+
+    # ------------------------------------------------------- cancel and retry
+
+    def request_cancel(self, job_id: str) -> dict[str, Any]:
+        """QUEUED → CANCELLED immediately; live jobs enter CANCELLING and the
+        scheduler issues the stop chain. Terminal jobs are returned unchanged."""
+
+        conn = self.db.connect()
+        try:
+            with self.db.tx(conn):
+                row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row is None:
+                    raise RepoError(f"job {job_id} not found")
+                if row["status"] in TERMINAL_JOB_STATUSES:
+                    return dict(row)
+                if row["status"] == "QUEUED":
+                    conn.execute(
+                        "UPDATE jobs SET status = 'CANCELLED', finished_at = ?, updated_at = ?"
+                        " WHERE id = ?",
+                        (utc_now(), utc_now(), job_id),
+                    )
+                else:  # DISPATCHING | RUNNING | CANCELLING
+                    conn.execute(
+                        "UPDATE jobs SET status = 'CANCELLING', updated_at = ? WHERE id = ?",
+                        (utc_now(), job_id),
+                    )
+                updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                return dict(updated)
+        finally:
+            conn.close()
+
+    def finalize_cancel(self, job_id: str, *, reason: str) -> dict[str, Any]:
+        """Runner never heard of the job: nothing to stop, cancel outright."""
+
+        conn = self.db.connect()
+        try:
+            with self.db.tx(conn):
+                row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row is None:
+                    raise RepoError(f"job {job_id} not found")
+                if row["status"] not in TERMINAL_JOB_STATUSES:
+                    conn.execute(
+                        "UPDATE gpu_leases SET status = 'RELEASED', released_at = ? WHERE job_id = ?"
+                        " AND status IN ('HELD', 'RELEASING')",
+                        (utc_now(), job_id),
+                    )
+                    conn.execute(
+                        "UPDATE jobs SET status = 'CANCELLED', failure_summary = ?,"
+                        " finished_at = ?, updated_at = ? WHERE id = ?",
+                        (reason, utc_now(), utc_now(), job_id),
+                    )
+                updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                return dict(updated)
+        finally:
+            conn.close()
+
+    def retry_job(self, job_id: str) -> dict[str, Any]:
+        """New QUEUED job with the same params; the failed original is kept."""
+
+        conn = self.db.connect()
+        try:
+            with self.db.tx(conn):
+                row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row is None:
+                    raise RepoError(f"job {job_id} not found")
+                if row["status"] not in ("FAILED", "CANCELLED", "TIMED_OUT"):
+                    raise RepoError(f"job {job_id} is {row['status']}; only terminal failures can be retried")
+                next_ordinal = conn.execute(
+                    "SELECT COALESCE(MAX(ordinal), 0) + 1 AS n FROM jobs WHERE plan_revision_id = ?",
+                    (row["plan_revision_id"],),
+                ).fetchone()["n"]
+                new_job_id = new_id("job")
+                conn.execute(
+                    "INSERT INTO jobs (id, plan_revision_id, ordinal, params_json, server_id,"
+                    " status, retry_of_job_id, queued_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?)",
+                    (new_job_id, row["plan_revision_id"], next_ordinal, row["params_json"],
+                     row["server_id"], job_id, utc_now(), utc_now()),
+                )
+                created = conn.execute("SELECT * FROM jobs WHERE id = ?", (new_job_id,)).fetchone()
+                return dict(created)
+        finally:
+            conn.close()
+
+    def return_to_queued(self, job_id: str, *, reason: str) -> dict[str, Any]:
+        """Release the lease and go back to QUEUED WITHOUT consuming a retry
+        attempt (used when the runner is unreachable: dispatch never happened)."""
+
+        conn = self.db.connect()
+        try:
+            with self.db.tx(conn):
+                row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row is None:
+                    raise RepoError(f"job {job_id} not found")
+                if row["status"] != "DISPATCHING":
+                    raise RepoError(f"job {job_id} is {row['status']}, not DISPATCHING")
+                conn.execute(
+                    "UPDATE gpu_leases SET status = 'RELEASED', released_at = ? WHERE job_id = ?"
+                    " AND status IN ('HELD', 'RELEASING')",
+                    (utc_now(), job_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET status = 'QUEUED', gpu_indices_json = NULL,"
+                    " dispatch_attempts = MAX(dispatch_attempts - 1, 0), updated_at = ? WHERE id = ?",
+                    (utc_now(), job_id),
+                )
+                updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                return dict(updated)
+        finally:
+            conn.close()

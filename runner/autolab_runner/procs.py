@@ -125,3 +125,31 @@ def group_has_no_children_left(proc: subprocess.Popen) -> bool:
         return proc.poll() is not None  # leader dead but group signalable = zombies exist
     except (ProcessLookupError, PermissionError, OSError):
         return True
+
+
+def stop_by_identity(pid: int, expected_token: str, grace_seconds: float) -> str:
+    """Stop a recorded process when no Popen handle exists (e.g. adopted
+    after a runner restart). Same identity rule: token must match first."""
+
+    try:
+        current = process_start_token(pid)
+    except Exception:  # pragma: no cover - ps failure
+        return "stale-pid"
+    if current == "unknown" or current != expected_token:
+        return "stale-pid"
+    import time as _time
+
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return "already-exited"
+    deadline = _time.monotonic() + grace_seconds
+    while _time.monotonic() < deadline:
+        if process_start_token(pid) == "unknown":
+            return "term"
+        _time.sleep(0.05)
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return "already-exited"
+    return "kill"

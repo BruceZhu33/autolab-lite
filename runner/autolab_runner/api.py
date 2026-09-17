@@ -25,6 +25,11 @@ def create_app(config: RunnerConfig, storage: RunnerStorage | None = None) -> Fa
     app.state.storage = storage
     app.state.core = core
 
+    @app.on_event("startup")
+    def _adopt_orphans() -> None:
+        # jobs whose watcher died with the previous runner process
+        core.adopt_orphaned_jobs()
+
     def require_token(authorization: str = Header(default="")) -> None:
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not token:
@@ -91,6 +96,20 @@ def create_app(config: RunnerConfig, storage: RunnerStorage | None = None) -> Fa
         if snapshot is None:
             raise HTTPException(status_code=404, detail={"reason": "job_not_found"})
         return snapshot
+
+    @app.post("/jobs/{job_id}/stop", status_code=200)
+    def stop_job(
+        job_id: str,
+        authorization: str = Header(default=""),
+    ) -> dict[str, Any]:
+        require_token(authorization)
+        result = core.stop_job(job_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail={"reason": "job_not_found"})
+        return {
+            "job_id": result["job_id"], "status": result["status"],
+            "last_event_seq": result["last_event_seq"],
+        }
 
     @app.get("/jobs/{job_id}/logs")
     def get_logs(

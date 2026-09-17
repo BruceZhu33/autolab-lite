@@ -83,6 +83,7 @@ class Scheduler:
 
     def tick(self) -> None:
         self._poll_observed_jobs()
+        self._stop_cancelling_jobs()
         self._reconcile_dispatching_jobs()
         self._dispatch_new_jobs()
         self._extract_metrics()
@@ -101,7 +102,7 @@ class Scheduler:
     # ------------------------------------------------------------ poll phase
 
     def _poll_observed_jobs(self) -> None:
-        for status in ("DISPATCHING", "RUNNING"):
+        for status in ("DISPATCHING", "RUNNING", "CANCELLING"):
             for job in self.repo.list_jobs(status=status):
                 transport = self._transport_for_server_id(job["server_id"])
                 if transport is None:
@@ -129,6 +130,26 @@ class Scheduler:
                 print(f"autolab-control: dropping malformed event for {job['id']}: {exc}", flush=True)
                 continue
             self.repo.ingest_event(event)
+
+    # ------------------------------------------------------------ stop phase
+
+    def _stop_cancelling_jobs(self) -> None:
+        for job in self.repo.list_jobs(status="CANCELLING"):
+            transport = self._transport_for_server_id(job["server_id"])
+            if transport is None:
+                continue
+            remote_id = job["remote_job_id"] or job["id"]
+            try:
+                outcome = transport.stop(remote_id)
+            except RunnerUnreachable:
+                self._mark_reachability(job["server_id"], reachable=False)
+                continue  # stays CANCELLING: "stop sent" is never "stopped"
+            self._mark_reachability(job["server_id"], reachable=True)
+            if outcome == "not_found":
+                # dispatch never landed on the runner: nothing to stop
+                self.repo.finalize_cancel(job["id"], reason="runner has no record; cancelled before arrival")
+            # 'stopped': the runner emits job.stop_requested + job.cancelled,
+            # which the poll phase ingests; 'uncertain' retries next tick
 
     # -------------------------------------------------------- reconcile phase
 
@@ -185,6 +206,10 @@ class Scheduler:
                 self.repo.requeue_after_rejected_dispatch(
                     job["id"], reason="no runner credentials", permanent=True
                 )
+                continue
+            if self._reachable.get(job["server_id"]) is False:
+                # runner known unreachable: hold the job, do not burn attempts
+                self.repo.return_to_queued(job["id"], reason="runner unreachable")
                 continue
             manifest = build_manifest(acquired, self._project_for(job))
             result = transport.dispatch(manifest)

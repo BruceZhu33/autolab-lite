@@ -122,3 +122,18 @@ class RunnerTransport:
             raise RunnerUnreachable(str(exc)) from exc
         response.raise_for_status()
         return response.json()
+
+    def stop(self, job_id: str) -> str:
+        """'stopped' | 'not_found' | 'uncertain'."""
+
+        try:
+            response = self._client.post(
+                f"{self.base_url}/jobs/{job_id}/stop", headers=self._headers()
+            )
+        except httpx.HTTPError as exc:
+            raise RunnerUnreachable(str(exc)) from exc
+        if response.status_code == 404:
+            return "not_found"
+        if response.status_code == 200:
+            return "stopped"
+        raise RunnerUnreachable(f"runner returned {response.status_code} for stop")

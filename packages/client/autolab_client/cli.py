@@ -18,7 +18,7 @@ from pathlib import Path
 import typer
 from autolab_control.credentials import CredentialStore
 from autolab_control.db import Database
-from autolab_control.repo import PlanHashMismatch, Repo
+from autolab_control.repo import PlanHashMismatch, Repo, RepoError
 from autolab_control.transport import RunnerTransport
 from autolab_protocol import (
     CodeAnchor,
@@ -419,6 +419,27 @@ def job_logs(
         transport.close()
     _out(payload)
     typer.echo(payload["text"], nl=False)
+
+
+@job_app.command("cancel")
+def job_cancel(job_id: str, db: str = DbOption):
+    try:
+        job = _repo(db).request_cancel(job_id)
+    except RepoError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    _out({"job": job_id, "status": job["status"],
+          "note": "cancelling; watch job show until CANCELLED" if job["status"] == "CANCELLING" else ""})
+
+
+@job_app.command("retry")
+def job_retry(job_id: str, db: str = DbOption):
+    try:
+        job = _repo(db).retry_job(job_id)
+    except RepoError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    _out({"job": job})
 
 
 if __name__ == "__main__":

@@ -249,3 +249,11 @@ class RunnerStorage:
             "occurred_at": occurred_at,
             "payload": payload,
         }
+
+    def non_terminal_jobs_with_pid(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE status NOT IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT')"
+                " AND pid IS NOT NULL"
+            ).fetchall()
+        return [dict(r) for r in rows]
