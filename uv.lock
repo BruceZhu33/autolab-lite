@@ -83,17 +83,21 @@ version = "0.1.0"
 source = { editable = "apps/control" }
 dependencies = [
     { name = "autolab-protocol" },
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "paramiko" },
     { name = "pydantic" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "autolab-protocol", editable = "packages/protocol" },
+    { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "paramiko", specifier = ">=3.4" },
     { name = "pydantic", specifier = ">=2.5" },
+    { name = "uvicorn", specifier = ">=0.29" },
 ]
 
 [[package]]

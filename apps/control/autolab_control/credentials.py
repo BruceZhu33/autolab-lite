@@ -42,14 +42,23 @@ class CredentialStore:
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
 
-    def put(self, ref: str, runner_token: str, manifest_hmac_key: str) -> None:
+    def put_entry(self, ref: str, entry: dict[str, str]) -> None:
         data = self._load()
-        data[ref] = {"runner_token": runner_token, "manifest_hmac_key": manifest_hmac_key}
+        data[ref] = entry
         self._save(data)
 
-    def get(self, ref: str) -> dict[str, str]:
-        data = self._load()
-        entry = data.get(ref)
-        if not entry or "runner_token" not in entry or "manifest_hmac_key" not in entry:
+    def get_entry(self, ref: str) -> dict[str, str]:
+        entry = self._load().get(ref)
+        if not entry:
             raise CredentialError(f"no credentials stored under ref {ref!r}")
+        return entry
+
+    def put(self, ref: str, runner_token: str, manifest_hmac_key: str) -> None:
+        self.put_entry(ref, {"runner_token": runner_token,
+                             "manifest_hmac_key": manifest_hmac_key})
+
+    def get(self, ref: str) -> dict[str, str]:
+        entry = self.get_entry(ref)
+        if "runner_token" not in entry or "manifest_hmac_key" not in entry:
+            raise CredentialError(f"ref {ref!r} has no runner credentials")
         return entry
