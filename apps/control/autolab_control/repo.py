@@ -698,3 +698,60 @@ class Repo:
                 return dict(updated)
         finally:
             conn.close()
+
+    # ------------------------------------------------- approval request (M4)
+
+    def request_plan_approval(self, plan_id: str, *, requester: str = "agent") -> dict[str, Any]:
+        """Agent-scope action: mark the plan as awaiting human approval.
+        This never approves anything — only the local owner CLI/UI can."""
+
+        conn = self.db.connect()
+        try:
+            with self.db.tx(conn):
+                row = conn.execute("SELECT * FROM plan_revisions WHERE id = ?", (plan_id,)).fetchone()
+                if row is None:
+                    raise RepoError(f"plan {plan_id} not found")
+                conn.execute(
+                    "UPDATE plan_revisions SET approval_requested_at = ? WHERE id = ?"
+                    " AND approval_requested_at IS NULL",
+                    (utc_now(), plan_id),
+                )
+                updated = conn.execute("SELECT * FROM plan_revisions WHERE id = ?", (plan_id,)).fetchone()
+                return dict(updated)
+        finally:
+            conn.close()
+
+    def approval_status(self, plan_id: str) -> dict[str, Any]:
+        plan = self.get_plan(plan_id)
+        if plan is None:
+            raise RepoError(f"plan {plan_id} not found")
+        return {
+            "plan_id": plan_id,
+            "status": plan["status"],
+            "spec_hash": plan["spec_hash"],
+            "requested_at": plan["approval_requested_at"],
+            "approved_at": plan["approved_at"],
+            "approved_by": plan["approved_by"],
+        }
+
+    def jobs_needing_polling(self, *, terminal_grace_seconds: float = 30.0) -> list[dict[str, Any]]:
+        """Active jobs plus recently-finished ones: artifact.discovered events
+        legitimately land AFTER the terminal event, so polling must continue
+        briefly past terminal (ingest dedupes, no side effects)."""
+
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=terminal_grace_seconds)).isoformat(
+            timespec="milliseconds").replace("+00:00", "Z")
+        conn = self.db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status IN ('DISPATCHING','RUNNING','CANCELLING')"
+                " OR (status IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT')"
+                "      AND finished_at IS NOT NULL AND finished_at >= ?)"
+                " ORDER BY queued_at",
+                (cutoff,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()

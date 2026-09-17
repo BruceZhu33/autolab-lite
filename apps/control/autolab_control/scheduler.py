@@ -102,8 +102,7 @@ class Scheduler:
     # ------------------------------------------------------------ poll phase
 
     def _poll_observed_jobs(self) -> None:
-        for status in ("DISPATCHING", "RUNNING", "CANCELLING"):
-            for job in self.repo.list_jobs(status=status):
+        for job in self.repo.jobs_needing_polling():
                 transport = self._transport_for_server_id(job["server_id"])
                 if transport is None:
                     continue

@@ -6,11 +6,13 @@ requires-python = ">=3.10"
 dependencies = [
     "autolab-protocol",
     "autolab-control",
+    "mcp>=1.2",
     "typer>=0.12",
 ]
 
 [project.scripts]
 autolab = "autolab_client.cli:app"
+autolab-mcp = "autolab_client.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]
