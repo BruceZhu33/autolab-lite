@@ -1,1 +1,65 @@
+"""AutoLab v1 protocol package."""
+
+from .canonical import (
+    canonical_bytes,
+    manifest_signature,
+    model_canonical_bytes,
+    payload_hash,
+    sha256_file,
+    sha256_hex,
+    spec_hash,
+    verify_manifest_signature,
+)
+from .expansion import ExpandedJob, ExpansionError, expand_jobs, render_output_subdir, render_template
+from .models import (
+    ArtifactV1,
+    CodeAnchor,
+    ExplicitJobs,
+    ManifestEnvironment,
+    ManifestExecution,
+    ManifestOutputs,
+    ManifestProject,
+    ManifestV1,
+    MatrixJobs,
+    MetricDefinition,
+    MetricSource,
+    PlanEnvironment,
+    PlanOutputs,
+    PlanResources,
+    PlanSpecV1,
+    RunnerEventV1,
+)
+
 __version__ = "0.1.0"
+
+__all__ = [
+    "ArtifactV1",
+    "CodeAnchor",
+    "ExpandedJob",
+    "ExpansionError",
+    "ExplicitJobs",
+    "ManifestEnvironment",
+    "ManifestExecution",
+    "ManifestOutputs",
+    "ManifestProject",
+    "ManifestV1",
+    "MatrixJobs",
+    "MetricDefinition",
+    "MetricSource",
+    "PlanEnvironment",
+    "PlanOutputs",
+    "PlanResources",
+    "PlanSpecV1",
+    "RunnerEventV1",
+    "canonical_bytes",
+    "expand_jobs",
+    "manifest_signature",
+    "model_canonical_bytes",
+    "payload_hash",
+    "render_output_subdir",
+    "render_template",
+    "sha256_file",
+    "sha256_hex",
+    "spec_hash",
+    "verify_manifest_signature",
+]
