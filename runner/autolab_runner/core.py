@@ -1,0 +1,324 @@
+"""Runner core: idempotent accept, spawn, watchdog, artifact discovery."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+
+from autolab_protocol import (
+    ArtifactV1,
+    ManifestV1,
+    RunnerEventV1,
+    payload_hash,
+    sha256_file,
+    verify_manifest_signature,
+)
+
+from . import procs
+from .config import RunnerConfig
+from .paths import PathViolation, resolve_within_allowed
+from .storage import RunnerStorage, utc_now
+
+
+class AcceptError(Exception):
+    """Definite rejection with an HTTP status and machine-readable reason."""
+
+    def __init__(self, status_code: int, reason: str, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.reason = reason
+        self.detail = detail
+
+
+_KIND_BY_SUFFIX = {
+    ".ckpt": "checkpoint", ".pt": "checkpoint", ".pth": "checkpoint",
+    ".safetensors": "checkpoint",
+    ".log": "log", ".txt": "log",
+    ".md": "report", ".pdf": "report", ".html": "report",
+}
+_MAX_ARTIFACTS = 100
+
+
+@dataclass
+class AcceptResult:
+    job: dict
+    replayed: bool
+
+
+class RunnerCore:
+    def __init__(self, config: RunnerConfig, storage: RunnerStorage):
+        self.config = config
+        self.storage = storage
+        self._procs: dict[str, tuple[object, str]] = {}  # job_id -> (Popen, start token)
+        self._watchers: dict[str, threading.Thread] = {}
+
+    # ------------------------------------------------------------- acceptance
+
+    def accept(self, manifest: ManifestV1, signature: str) -> AcceptResult:
+        if not verify_manifest_signature(self.config.manifest_hmac_key, manifest, signature):
+            raise AcceptError(403, "bad_signature", "manifest signature verification failed")
+
+        digest = payload_hash(manifest)
+        existing = self.storage.job_by_dispatch(manifest.dispatch_id)
+        if existing is not None:
+            if existing["payload_hash"] != digest:
+                raise AcceptError(
+                    409, "dispatch_conflict",
+                    f"dispatch_id {manifest.dispatch_id} already accepted with a different payload",
+                )
+            return AcceptResult(job=existing, replayed=True)
+        if self.storage.job(manifest.job_id) is not None:
+            raise AcceptError(
+                409, "job_conflict",
+                f"job_id {manifest.job_id} already exists under another dispatch",
+            )
+
+        workdir = self._resolve_workdir(manifest)
+        output_root = self._resolve_output_root(manifest)
+        self._check_gpus(manifest)
+
+        log_path = Path(self.config.data_dir) / "logs" / f"{manifest.job_id}.log"
+        inserted = self.storage.try_insert_job(
+            job_id=manifest.job_id,
+            dispatch_id=manifest.dispatch_id,
+            payload_hash=digest,
+            manifest_json=json.dumps(manifest.model_dump(mode="json")),
+            gpu_indices=manifest.execution.gpu_indices,
+            output_root=str(output_root),
+            log_path=str(log_path),
+        )
+        if not inserted:  # lost an insert race with the same dispatch: replay
+            existing = self.storage.job_by_dispatch(manifest.dispatch_id)
+            if existing is not None and existing["payload_hash"] == digest:
+                return AcceptResult(job=existing, replayed=True)
+            raise AcceptError(409, "dispatch_conflict", "dispatch accepted concurrently with different payload")
+
+        self._launch(manifest, workdir, output_root, log_path)
+        job = self.storage.job(manifest.job_id)
+        assert job is not None
+        return AcceptResult(job=job, replayed=False)
+
+    def _resolve_workdir(self, manifest: ManifestV1) -> Path:
+        try:
+            workdir = resolve_within_allowed(
+                manifest.project.workdir, self.config.allowed_work_roots, what="project workdir"
+            )
+        except PathViolation as exc:
+            raise AcceptError(400, "workdir_outside_roots", str(exc)) from exc
+        if not workdir.is_dir():
+            raise AcceptError(400, "workdir_missing", f"workdir {workdir} does not exist")
+        return workdir
+
+    def _resolve_output_root(self, manifest: ManifestV1) -> Path:
+        try:
+            output_root = resolve_within_allowed(
+                manifest.outputs.root, self.config.allowed_output_roots, what="output root"
+            )
+        except PathViolation as exc:
+            raise AcceptError(400, "output_outside_roots", str(exc)) from exc
+        output_root.mkdir(parents=True, exist_ok=True)
+        return output_root
+
+    def _check_gpus(self, manifest: ManifestV1) -> None:
+        for index in manifest.execution.gpu_indices:
+            if index >= self.config.gpu_slots:
+                raise AcceptError(
+                    400, "gpu_index_out_of_range",
+                    f"gpu index {index} not within {self.config.gpu_slots} configured slot(s)",
+                )
+        busy = self.storage.active_gpu_indices() & set(manifest.execution.gpu_indices)
+        if busy:
+            # the runner never queues: GPU arbitration belongs to Control
+            raise AcceptError(
+                409, "gpu_busy", f"gpu slot(s) {sorted(busy)} already occupied by an active job"
+            )
+
+    # -------------------------------------------------------------- execution
+
+    def _launch(self, manifest: ManifestV1, workdir: Path, output_root: Path, log_path: Path) -> None:
+        env = dict(os.environ)
+        prepend = manifest.execution.environment.prepend_path
+        if prepend:
+            env["PATH"] = os.pathsep.join(prepend) + os.pathsep + env.get("PATH", "")
+        env.update(manifest.execution.environment.variables)
+        try:
+            proc, token = procs.spawn_process(
+                manifest.execution.argv, cwd=str(workdir), log_path=log_path, env=env
+            )
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            self.storage.commit_job_event(
+                job_id=manifest.job_id,
+                event_type="job.failed",
+                payload={
+                    "exit_code": None, "failure_class": "environment",
+                    "failure_summary": f"failed to spawn: {exc}", "log_cursor": 0,
+                },
+                status="FAILED", finished=True, failure_class="environment",
+                failure_summary=f"failed to spawn: {exc}",
+            )
+            return
+        self._procs[manifest.job_id] = (proc, token)
+        self.storage.commit_job_event(
+            job_id=manifest.job_id,
+            event_type="job.started",
+            payload={
+                "pid": proc.pid,
+                "process_start_time": token,
+                "log_cursor": log_path.stat().st_size if log_path.exists() else 0,
+            },
+            status="RUNNING", pid=proc.pid, process_start_token=token, started=True,
+        )
+        watcher = threading.Thread(
+            target=self._watch, args=(manifest, proc, token, output_root, log_path),
+            name=f"watch-{manifest.job_id}", daemon=True,
+        )
+        self._watchers[manifest.job_id] = watcher
+        watcher.start()
+
+    def _watch(
+        self,
+        manifest: ManifestV1,
+        proc: subprocess.Popen,
+        token: str,
+        output_root: Path,
+        log_path: Path,
+    ) -> None:
+        try:
+            proc.wait(timeout=manifest.execution.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            result = procs.terminate_group(
+                proc, token, manifest.execution.termination_grace_seconds
+            )
+            self.storage.commit_job_event(
+                job_id=manifest.job_id,
+                event_type="job.timed_out",
+                payload={"log_cursor": self._log_size(log_path), "stop_result": result},
+                status="TIMED_OUT", finished=True, failure_class="resource",
+                failure_summary=f"timeout after {manifest.execution.timeout_seconds}s",
+            )
+            self._cleanup(manifest.job_id)
+            return
+        exit_code: int | None = proc.returncode
+        if exit_code == 0:
+            self.storage.commit_job_event(
+                job_id=manifest.job_id,
+                event_type="job.succeeded",
+                payload={"exit_code": 0, "log_cursor": self._log_size(log_path)},
+                status="SUCCEEDED", exit_code=0, finished=True,
+            )
+        else:
+            self.storage.commit_job_event(
+                job_id=manifest.job_id,
+                event_type="job.failed",
+                payload={
+                    "exit_code": exit_code, "failure_class": "user_code",
+                    "failure_summary": f"process exited with code {exit_code}",
+                    "log_cursor": self._log_size(log_path),
+                },
+                status="FAILED", exit_code=exit_code, finished=True,
+                failure_class="user_code",
+                failure_summary=f"process exited with code {exit_code}",
+            )
+        self._discover_artifacts(manifest, output_root)
+        self._cleanup(manifest.job_id)
+
+    def _discover_artifacts(self, manifest: ManifestV1, output_root: Path) -> None:
+        metric_paths = {source.path for source in manifest.outputs.metrics}
+        seen: set[Path] = set()
+        found: list[Path] = []
+        for pattern in manifest.outputs.artifacts:
+            for path in sorted(output_root.glob(pattern)):
+                real = path
+                if real in seen or not real.is_file():
+                    continue
+                seen.add(real)
+                found.append(real)
+                if len(found) >= _MAX_ARTIFACTS:
+                    break
+            if len(found) >= _MAX_ARTIFACTS:
+                break
+        for number, path in enumerate(found, start=1):
+            try:
+                digest, size = sha256_file(path)
+            except OSError:
+                continue
+            relative = path.relative_to(output_root).as_posix()
+            kind = "metrics" if relative in metric_paths else _KIND_BY_SUFFIX.get(path.suffix, "other")
+            artifact = ArtifactV1(
+                schema_version=1,
+                artifact_id=f"artifact-{manifest.job_id}-{number:03d}",
+                job_id=manifest.job_id,
+                kind=kind,
+                location_kind="remote",
+                remote_path=str(path),
+                local_cache_path=None,
+                sha256=digest,
+                size_bytes=size,
+                metadata={"relative_path": relative},
+                created_at=utc_now().replace("Z", "+00:00"),
+            )
+            self.storage.commit_job_event(
+                job_id=manifest.job_id,
+                event_type="artifact.discovered",
+                payload={"artifact": artifact.model_dump(mode="json")},
+            )
+
+    def _cleanup(self, job_id: str) -> None:
+        self._procs.pop(job_id, None)
+        self._watchers.pop(job_id, None)
+
+    @staticmethod
+    def _log_size(log_path: Path) -> int:
+        try:
+            return log_path.stat().st_size
+        except OSError:
+            return 0
+
+    # ----------------------------------------------------------------- reads
+
+    def snapshot(self, job_id: str, events_after: int = 0) -> dict | None:
+        job = self.storage.job(job_id)
+        if job is None:
+            return None
+        events = self.storage.events(job_id, after_seq=events_after)
+        for event in events:  # contract-shaped events on the wire
+            RunnerEventV1.model_validate(event)
+        return {
+            "job_id": job["job_id"],
+            "dispatch_id": job["dispatch_id"],
+            "status": job["status"],
+            "runner_instance_id": self.storage.runner_instance_id,
+            "exit_code": job["exit_code"],
+            "failure_class": job["failure_class"],
+            "failure_summary": job["failure_summary"],
+            "created_at": job["created_at"],
+            "started_at": job["started_at"],
+            "finished_at": job["finished_at"],
+            "last_event_seq": job["last_event_seq"],
+            "events": events,
+        }
+
+    def logs(self, job_id: str, cursor: int) -> dict | None:
+        job = self.storage.job(job_id)
+        if job is None:
+            return None
+        log_path = Path(job["log_path"])
+        try:
+            size = log_path.stat().st_size
+        except OSError:
+            return {"text": "", "cursor": cursor, "size": 0, "eof": True}
+        if cursor > size:  # log truncated/rotated: report from start
+            cursor = 0
+        with open(log_path, "rb") as fh:
+            fh.seek(cursor)
+            chunk = fh.read()
+        return {
+            "text": chunk.decode("utf-8", errors="replace"),
+            "cursor": size,
+            "size": size,
+            "eof": True,
+        }
