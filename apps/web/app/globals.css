@@ -1,0 +1,37 @@
+@import "tailwindcss";
+@import "./tokens.css";
+@import "./base.css";
+
+/* AutoLab console: dark-first, dense workbench (Multica-derived tokens, D-001) */
+:root {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--app-shell);
+  color: var(--surface-foreground);
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+
+.autolab-card {
+  border-radius: 10px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface);
+  box-shadow: var(--surface-shadow);
+}
+
+.autolab-chip {
+  border-radius: 999px;
+  border: 1px solid var(--surface-border);
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 18px;
+}

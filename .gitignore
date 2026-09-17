@@ -24,6 +24,10 @@ dist/
 build/
 *.egg-info/
 
+node_modules/
+.next/
+next-env.d.ts
+
 # editors / os
 .DS_Store
 .idea/

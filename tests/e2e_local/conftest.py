@@ -124,15 +124,26 @@ def stack(tmp_path, request):
     ), "runner")
     db_path = tmp_path / "control.db"
     credentials = tmp_path / "credentials.json"
+    from autolab_control.credentials import CredentialStore
+    from autolab_control.http_api import API_REF
+
+    if getattr(request, "param", {}).get("http"):
+        store = CredentialStore(credentials)
+        store.put_entry(API_REF, {"owner_token": "e2e-owner-token",
+                                  "agent_token": "e2e-agent-token"})
 
     control_env = dict(os.environ)
     control_env.pop("AUTOLAB_TEST_MODE", None)
     if getattr(request, "param", {}).get("drop_first_dispatch"):
         control_env["AUTOLAB_TEST_DROP_FIRST_DISPATCH"] = "1"
+    serve_argv = [sys.executable, "-m", "autolab_control", "serve",
+                  "--db", str(db_path), "--credentials", str(credentials),
+                  "--poll-interval", "0.1"]
+    if getattr(request, "param", {}).get("http"):
+        serve_argv += ["--http-port", "8710"]
     control_proc = Proc(subprocess.Popen(
-        [sys.executable, "-m", "autolab_control", "serve",
-         "--db", str(db_path), "--credentials", str(credentials), "--poll-interval", "0.1"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT), env=control_env,
+        serve_argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cwd=str(REPO_ROOT), env=control_env,
     ), "control")
 
     try:

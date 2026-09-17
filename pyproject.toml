@@ -14,7 +14,7 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["packages/*", "apps/*", "runner"]
+members = ["packages/*", "apps/control", "runner"]
 
 [tool.uv.sources]
 autolab-protocol = { workspace = true }

@@ -140,6 +140,29 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                 "artifacts": repo.job_artifacts(job_id),
                 "events": repo.job_events(job_id)}
 
+    @app.get("/api/jobs/{job_id}/logs")
+    def job_logs(job_id: str, cursor: int = 0,
+                 _: str = Depends(require("agent"))) -> dict:
+        job = repo.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        server = repo.get_server(job["server_id"])
+        if server is None:
+            raise HTTPException(status_code=409, detail="job has no server")
+        creds = credentials.get(server["runner_token_ref"])
+        from .transport import RunnerTransport
+
+        transport = RunnerTransport(
+            base_url=f"http://{server['host']}:{server['runner_port']}",
+            runner_token=creds["runner_token"], manifest_hmac_key=creds["manifest_hmac_key"],
+        )
+        try:
+            return transport.logs(job["remote_job_id"] or job["id"], cursor=cursor)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"runner unreachable: {exc}") from exc
+        finally:
+            transport.close()
+
     @app.get("/api/servers")
     def servers(_: str = Depends(require("agent"))) -> list[dict]:
         out = []

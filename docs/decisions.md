@@ -118,3 +118,22 @@
   `return_to_queued` 退回队列并退还本次 attempt（dispatch_attempts-1）。
 - 理由：服务器临时离线不是任务失败；让 outage 烧完 3 次重试把任务打成
   FAILED 违反「未知结果不得直接标 FAILED」的精神。
+
+## D-014 · Web 壳的迁移基础与边界（M5，许可路径 D-001）
+
+- 日期：2026-09-17
+- 决定：apps/web 是独立 Next.js 15 + Tailwind v4 工程；从自有 frontend-next
+  副本按 07 号清单只迁移设计资产（packages/ui/styles/tokens.css、base.css
+  连同 LICENSE/NOTICE），Shell/看板/GPU/Run 组件按 AutoLab 的
+  BoardCardView/ServerCardView 投影自研；不引入 @multica/core、shadcn 链、
+  Issue/成员/Presence 内核。生产 bundle 由 E2E 断言不含 Multica 领域符号。
+- 理由：保留已验证的信息密度与视觉语言（用户喜欢的部分），同时满足
+  「看板直接消费 BoardCardView[]、一次请求、无全局失效」的验收。
+
+## D-015 · Control HTTP API 的鉴权与状态边界（M5）
+
+- 日期：2026-09-17
+- 决定：loopback FastAPI 挂在 serve 进程内（--http-port），bearer token 分
+  owner/agent scope（credentials 文件 `control:api` 条目）；所有端点都是
+  SQLite 事实的纯投影，唯一写入口是 owner-scope 的 approve。MCP 保持
+  agent 写路径，Web 是 owner 读+批准入口。

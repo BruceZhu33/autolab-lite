@@ -46,9 +46,21 @@ uv run autolab plan approve <plan-id> --expect-spec-hash <hash>
 uv run autolab job list / show / logs
 ```
 
-## 当前范围（M0–M2 已完成）
+## 当前范围（M0–M5 已完成）
 
-- 本地闭环 + 取消/停止链（TERM→grace→KILL，幂等）、失败重试（保留原 Job）、
-  Control 崩溃恢复、Runner 重启收养（退出码丢失如实记录为 runner 类失败）。
-- 仍是 local transport（伪 GPU 槽位）；SSH/真实 GPU（M3）、MCP（M4）、Web UI（M5）未做。
+- 本地闭环 + 取消/停止链 + 重试 + Control/Runner 重启恢复（M0–M2）。
+- M3：受限项目工作区（CAS 写）、TOFU 钉住的 SSH/SFTP、pidfile 精确停止的 Runner
+  部署、GPU 探测、哈希校验的产物拉取。真实 GPU 服务器上的验收项待有真机时执行。
+- M4：本地 stdio MCP server（`autolab-mcp`，18 个 agent 工具，无批准入口），
+  审批请求/状态事务；三轮实验闭环与第二会话在 E2E 中验证。
+- M5：Control loopback HTTP API（owner/agent scope）+ Next.js 薄控制台
+  （Board/Runs/GPU Servers，Multica 派生 tokens，见 apps/web/LICENSE）。
+
+```bash
+# 薄控制台
+cd apps/web && npm install && npm run build && npm run start   # http://127.0.0.1:3430
+# Control 同时开 HTTP API：
+uv run autolab-control serve --db … --credentials … --http-port 8710
+```
+
 - CI 尚未建立；Runner 的 Python 3.10 兼容目前靠语法约束与本地审查保证。
