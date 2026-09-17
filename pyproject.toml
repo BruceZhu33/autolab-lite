@@ -1,0 +1,35 @@
+[project]
+name = "autolab-lite"
+version = "0.1.0"
+description = "AutoLab Lite: personal GPU experiment workbench (control plane, runner, protocol, CLI)"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "httpx>=0.27",
+]
+
+[tool.uv.workspace]
+members = ["packages/*", "apps/*", "runner"]
+
+[tool.uv.sources]
+autolab-protocol = { workspace = true }
+autolab-control = { workspace = true }
+autolab-client = { workspace = true }
+autolab-runner = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["packages", "apps", "runner", "tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

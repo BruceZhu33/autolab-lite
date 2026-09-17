@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autolab.local/contracts/plan-spec-v1.schema.json",
+  "title": "AutoLab PlanSpecV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_id",
+    "experiment_ref",
+    "experiment_hash",
+    "hypothesis",
+    "change_from_previous",
+    "baseline",
+    "metrics",
+    "success_criteria",
+    "risk_and_fallback",
+    "code_anchor",
+    "command_template",
+    "job_definition",
+    "resources",
+    "timeout_seconds",
+    "outputs"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "project_id": { "$ref": "#/$defs/id" },
+    "experiment_ref": {
+      "type": "string",
+      "pattern": "^\\.autolab/experiments/EXP-[0-9]{4,}\\.md$"
+    },
+    "experiment_hash": { "$ref": "#/$defs/sha256" },
+    "parent_plan_revision_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/id" },
+        { "type": "null" }
+      ]
+    },
+    "hypothesis": { "$ref": "#/$defs/nonEmptyText" },
+    "change_from_previous": { "$ref": "#/$defs/nonEmptyText" },
+    "baseline": { "$ref": "#/$defs/nonEmptyText" },
+    "metrics": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/metricDefinition" }
+    },
+    "success_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonEmptyText" }
+    },
+    "risk_and_fallback": { "$ref": "#/$defs/nonEmptyText" },
+    "code_anchor": { "$ref": "#/$defs/codeAnchor" },
+    "command_template": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["inherit", "conda", "venv", "prefix"] },
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "command_prefix": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "job_definition": {
+      "oneOf": [
+        { "$ref": "#/$defs/matrixJobs" },
+        { "$ref": "#/$defs/explicitJobs" }
+      ]
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gpu_count", "max_parallel"],
+      "properties": {
+        "server_id": { "$ref": "#/$defs/id" },
+        "gpu_count": { "type": "integer", "minimum": 1 },
+        "eligible_gpu_indices": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "max_parallel": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "timeout_seconds": { "type": "integer", "minimum": 1 },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subdir_template", "artifacts", "metrics"],
+      "properties": {
+        "subdir_template": { "$ref": "#/$defs/relativePath" },
+        "artifacts": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "metrics": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/metricSource" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "nonEmptyText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20000
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "codeAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "git_commit": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{7,64}$"
+        },
+        "branch": { "type": "string", "minLength": 1 },
+        "dirty_patch_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        },
+        "non_git_fingerprint": { "$ref": "#/$defs/sha256" }
+      },
+      "anyOf": [
+        { "required": ["git_commit"] },
+        { "required": ["non_git_fingerprint"] }
+      ]
+    },
+    "metricDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "direction"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "direction": { "enum": ["maximize", "minimize", "target"] },
+        "target": { "type": "number" },
+        "unit": { "type": "string" }
+      }
+    },
+    "metricSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": { "enum": ["json", "csv", "regex"] },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "selector": { "type": "string" }
+      }
+    },
+    "matrixJobs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "parameters"],
+      "properties": {
+        "kind": { "const": "matrix" },
+        "parameters": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": ["string", "number", "integer", "boolean"]
+            }
+          }
+        }
+      }
+    },
+    "explicitJobs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "jobs"],
+      "properties": {
+        "kind": { "const": "explicit" },
+        "jobs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": {
+              "type": ["string", "number", "integer", "boolean"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

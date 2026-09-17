@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "dispatch_id": "dispatch-demo-0001",
+  "job_id": "job-demo-0001",
+  "plan_revision_id": "planrev-demo-0001",
+  "project": {
+    "project_id": "proj-demo",
+    "workdir": "/srv/projects/demo",
+    "code_anchor": {
+      "git_commit": "0123456789abcdef0123456789abcdef01234567",
+      "branch": "main",
+      "dirty_patch_sha256": null
+    }
+  },
+  "execution": {
+    "argv": ["python", "train.py", "--dataset", "dataset-x", "--seed", "1", "--lr", "0.0001"],
+    "environment": {
+      "prepend_path": ["/opt/conda/envs/torch/bin"],
+      "variables": { "AUTOLAB_JOB_ID": "job-demo-0001" }
+    },
+    "gpu_indices": [0],
+    "timeout_seconds": 14400,
+    "termination_grace_seconds": 15
+  },
+  "outputs": {
+    "root": "/srv/autolab-output/job-demo-0001",
+    "artifacts": ["checkpoints/*.ckpt", "metrics.json"],
+    "metrics": [
+      { "kind": "json", "path": "metrics.json", "selector": "val_dice" }
+    ]
+  },
+  "created_at": "2026-09-17T10:00:00Z"
+}

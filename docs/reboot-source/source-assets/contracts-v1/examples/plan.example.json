@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "project_id": "proj-demo",
+  "experiment_ref": ".autolab/experiments/EXP-0001.md",
+  "experiment_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "parent_plan_revision_id": null,
+  "hypothesis": "Learning rate 1e-4 improves validation Dice without increasing instability.",
+  "change_from_previous": "Change learning rate from 3e-4 to 1e-4.",
+  "baseline": "Revision 0 validation Dice 0.8050.",
+  "metrics": [
+    { "name": "val_dice", "direction": "maximize" }
+  ],
+  "success_criteria": [
+    "Mean val_dice is at least 0.8100 and no seed is below 0.8000."
+  ],
+  "risk_and_fallback": "If training diverges, retain the baseline and inspect the first 500 steps.",
+  "code_anchor": {
+    "git_commit": "0123456789abcdef0123456789abcdef01234567",
+    "branch": "main",
+    "dirty_patch_sha256": null
+  },
+  "command_template": [
+    "python",
+    "train.py",
+    "--dataset",
+    "{{dataset}}",
+    "--seed",
+    "{{seed}}",
+    "--lr",
+    "0.0001"
+  ],
+  "environment": { "kind": "conda", "name": "torch" },
+  "job_definition": {
+    "kind": "matrix",
+    "parameters": {
+      "dataset": ["dataset-x", "dataset-y"],
+      "seed": [1, 2, 3]
+    }
+  },
+  "resources": {
+    "server_id": "server-demo",
+    "gpu_count": 1,
+    "eligible_gpu_indices": [0, 1],
+    "max_parallel": 2
+  },
+  "timeout_seconds": 14400,
+  "outputs": {
+    "subdir_template": "{{job_id}}",
+    "artifacts": ["checkpoints/*.ckpt", "metrics.json"],
+    "metrics": [
+      { "kind": "json", "path": "metrics.json", "selector": "val_dice" }
+    ]
+  }
+}

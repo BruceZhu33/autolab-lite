@@ -1,0 +1,30 @@
+# secrets, runtime state, outputs — never commit
+.env
+.env.*
+*.key
+*.token
+credentials*.json
+
+# databases, logs, artifacts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+logs/
+output*/
+.autolab-run/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "runner_instance_id": "runner-demo-01",
+  "event_seq": 2,
+  "dispatch_id": "dispatch-demo-0001",
+  "job_id": "job-demo-0001",
+  "event_type": "job.started",
+  "occurred_at": "2026-09-17T10:00:02Z",
+  "payload": {
+    "pid": 12345,
+    "process_start_time": "4829183",
+    "log_cursor": 0
+  }
+}

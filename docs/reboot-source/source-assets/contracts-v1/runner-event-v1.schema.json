@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autolab.local/contracts/runner-event-v1.schema.json",
+  "title": "AutoLab RunnerEventV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "runner_instance_id",
+    "event_seq",
+    "dispatch_id",
+    "job_id",
+    "event_type",
+    "occurred_at",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "runner_instance_id": { "$ref": "#/$defs/id" },
+    "event_seq": { "type": "integer", "minimum": 1 },
+    "dispatch_id": { "$ref": "#/$defs/id" },
+    "job_id": { "$ref": "#/$defs/id" },
+    "event_type": {
+      "enum": [
+        "job.accepted",
+        "job.started",
+        "job.stop_requested",
+        "job.succeeded",
+        "job.failed",
+        "job.cancelled",
+        "job.timed_out",
+        "artifact.discovered"
+      ]
+    },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "pid": { "type": "integer", "minimum": 1 },
+        "process_start_time": { "type": "string" },
+        "exit_code": { "type": ["integer", "null"] },
+        "failure_class": {
+          "enum": ["user_code", "environment", "resource", "runner", "unknown"]
+        },
+        "failure_summary": { "type": "string", "maxLength": 4000 },
+        "log_cursor": { "type": "integer", "minimum": 0 },
+        "artifact": { "$ref": "artifact-v1.schema.json" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "event_type": { "const": "job.started" } } },
+      "then": { "properties": { "payload": { "required": ["pid", "process_start_time", "log_cursor"] } } }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "job.succeeded" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "required": ["exit_code", "log_cursor"],
+            "properties": { "exit_code": { "const": 0 } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "job.failed" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "required": ["exit_code", "failure_class", "failure_summary", "log_cursor"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": { "enum": ["job.cancelled", "job.timed_out"] }
+        }
+      },
+      "then": { "properties": { "payload": { "required": ["log_cursor"] } } }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "artifact.discovered" } } },
+      "then": { "properties": { "payload": { "required": ["artifact"] } } }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

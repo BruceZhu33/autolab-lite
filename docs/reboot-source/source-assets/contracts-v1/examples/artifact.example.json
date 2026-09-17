@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "artifact_id": "artifact-demo-0001",
+  "job_id": "job-demo-0001",
+  "kind": "metrics",
+  "location_kind": "remote",
+  "remote_path": "/srv/autolab-output/job-demo-0001/metrics.json",
+  "local_cache_path": null,
+  "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "size_bytes": 128,
+  "metadata": { "format": "json" },
+  "created_at": "2026-09-17T11:00:00Z"
+}
