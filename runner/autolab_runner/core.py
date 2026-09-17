@@ -63,23 +63,23 @@ class RunnerCore:
             raise AcceptError(403, "bad_signature", "manifest signature verification failed")
 
         digest = payload_hash(manifest)
-        existing = self.storage.job_by_dispatch(manifest.dispatch_id)
-        if existing is not None:
-            if existing["payload_hash"] != digest:
-                raise AcceptError(
-                    409, "dispatch_conflict",
-                    f"dispatch_id {manifest.dispatch_id} already accepted with a different payload",
-                )
-            return AcceptResult(job=existing, replayed=True)
-        if self.storage.job(manifest.job_id) is not None:
-            raise AcceptError(
-                409, "job_conflict",
-                f"job_id {manifest.job_id} already exists under another dispatch",
-            )
+        replay = self._replay_or_conflict(manifest, digest)
+        if replay is not None:
+            return replay
 
         workdir = self._resolve_workdir(manifest)
         output_root = self._resolve_output_root(manifest)
-        self._check_gpus(manifest)
+        try:
+            self._check_gpus(manifest)
+        except AcceptError as exc:
+            # a concurrent request with the same dispatch may have inserted the
+            # job between our existence check and the gpu check: that is a
+            # replay, not contention with a foreign job
+            if exc.reason == "gpu_busy":
+                replay = self._replay_or_conflict(manifest, digest)
+                if replay is not None:
+                    return replay
+            raise
 
         log_path = Path(self.config.data_dir) / "logs" / f"{manifest.job_id}.log"
         inserted = self.storage.try_insert_job(
@@ -91,16 +91,38 @@ class RunnerCore:
             output_root=str(output_root),
             log_path=str(log_path),
         )
-        if not inserted:  # lost an insert race with the same dispatch: replay
-            existing = self.storage.job_by_dispatch(manifest.dispatch_id)
-            if existing is not None and existing["payload_hash"] == digest:
-                return AcceptResult(job=existing, replayed=True)
+        if not inserted:  # lost the insert race: same dispatch replay or real conflict
+            replay = self._replay_or_conflict(manifest, digest)
+            if replay is not None:
+                return replay
             raise AcceptError(409, "dispatch_conflict", "dispatch accepted concurrently with different payload")
 
         self._launch(manifest, workdir, output_root, log_path)
         job = self.storage.job(manifest.job_id)
         assert job is not None
         return AcceptResult(job=job, replayed=False)
+
+    def _replay_or_conflict(self, manifest: ManifestV1, digest: str) -> AcceptResult | None:
+        """None when this dispatch is unknown; replay result when identical;
+        raises on payload/job-id conflicts."""
+
+        existing = self.storage.job_by_dispatch(manifest.dispatch_id)
+        if existing is None:
+            same_job = self.storage.job(manifest.job_id)
+            if same_job is None:
+                return None
+            if same_job["dispatch_id"] != manifest.dispatch_id:
+                raise AcceptError(
+                    409, "job_conflict",
+                    f"job_id {manifest.job_id} already exists under another dispatch",
+                )
+            existing = same_job
+        if existing["payload_hash"] != digest:
+            raise AcceptError(
+                409, "dispatch_conflict",
+                f"dispatch_id {manifest.dispatch_id} already accepted with a different payload",
+            )
+        return AcceptResult(job=existing, replayed=True)
 
     def _resolve_workdir(self, manifest: ManifestV1) -> Path:
         try:

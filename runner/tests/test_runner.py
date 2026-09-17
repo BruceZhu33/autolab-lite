@@ -116,6 +116,13 @@ def test_accept_run_succeed_with_artifacts_and_logs(client, roots):
     assert body["replayed"] is False
 
     snapshot = wait_for_status(client, "job-ok-0001", {"SUCCEEDED"})
+    # artifact discovery events land right after the terminal event (late by design)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        snapshot = auth_GET(client, "/jobs/job-ok-0001").json()
+        if sum(1 for e in snapshot["events"] if e["event_type"] == "artifact.discovered") == 2:
+            break
+        time.sleep(0.05)
     event_types = [e["event_type"] for e in snapshot["events"]]
     assert event_types[:3] == ["job.accepted", "job.started", "job.succeeded"]
     assert event_types.count("artifact.discovered") == 2
