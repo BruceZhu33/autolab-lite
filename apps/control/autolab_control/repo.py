@@ -391,9 +391,12 @@ class Repo:
         finally:
             conn.close()
 
-    def requeue_after_rejected_dispatch(self, job_id: str, *, reason: str) -> dict[str, Any]:
+    def requeue_after_rejected_dispatch(
+        self, job_id: str, *, reason: str, permanent: bool = False
+    ) -> dict[str, Any]:
         """Definite rejection (e.g. runner 409 busy): release leases, back to
-        QUEUED after bounded attempts, else FAILED. Keeps dispatch_id."""
+        QUEUED after bounded attempts, else FAILED. Permanent rejections fail
+        immediately. Keeps dispatch_id."""
 
         conn = self.db.connect()
         try:
@@ -409,11 +412,11 @@ class Repo:
                     (utc_now(), job_id),
                 )
                 attempts = row["dispatch_attempts"]
-                if attempts >= MAX_DISPATCH_ATTEMPTS:
+                if permanent or attempts >= MAX_DISPATCH_ATTEMPTS:
                     conn.execute(
                         "UPDATE jobs SET status = 'FAILED', failure_summary = ?,"
                         " finished_at = ?, updated_at = ? WHERE id = ?",
-                        (f"dispatch rejected {attempts} times: {reason}", utc_now(), utc_now(), job_id),
+                        (f"dispatch rejected: {reason}", utc_now(), utc_now(), job_id),
                     )
                 else:
                     conn.execute(
