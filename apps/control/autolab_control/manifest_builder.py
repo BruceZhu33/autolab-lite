@@ -70,8 +70,20 @@ def build_manifest(acquired: AcquiredJob, project: dict[str, Any]) -> ManifestV1
             artifacts=spec.outputs.artifacts,
             metrics=spec.outputs.metrics,
         ),
-        created_at=datetime.now(timezone.utc),
+        # derived from the job row so replaying a dispatch rebuilds a
+        # byte-identical manifest (same payload_hash) for the same dispatch_id
+        created_at=_stable_created_at(job),
     )
+
+
+def _stable_created_at(job: dict[str, Any]) -> datetime:
+    raw = job.get("queued_at")
+    if raw:
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
 
 
 def job_params(job: dict[str, Any]) -> dict[str, Any]:

@@ -12,7 +12,15 @@ from autolab_protocol import ArtifactV1, ManifestV1, PlanSpecV1, RunnerEventV1
 from jsonschema import Draft202012Validator
 from pydantic import TypeAdapter, ValidationError
 
-from .conftest import CONTRACTS_DIR, mutated
+
+def mutated(payload: dict, drop_key: str) -> dict:
+    import copy
+    clone = copy.deepcopy(payload)
+    clone.pop(drop_key)
+    return clone
+
+
+CONTRACTS_DIR = Path(__file__).resolve().parents[3] / "docs" / "reboot-source" / "source-assets" / "contracts-v1"
 
 SCHEMAS = {
     "plan": (CONTRACTS_DIR / "plan-spec-v1.schema.json", PlanSpecV1, "plan.example.json"),

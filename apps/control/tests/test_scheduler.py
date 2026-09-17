@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from autolab_control.db import Database
-from autolab_control.repo import Repo
+from autolab_control.repo import AcquiredJob, Repo
 from autolab_control.scheduler import Scheduler, parse_metric
 from autolab_control.transport import DispatchResult, RunnerUnreachable
 from autolab_protocol import PlanSpecV1, RunnerEventV1
@@ -236,3 +236,30 @@ def test_parse_metric_kinds():
     assert parse_metric("step,loss\n1,0.5\n2,0.25\n", "csv", "loss") == 0.25
     with pytest.raises(ValueError):
         parse_metric('{"a": "text"}', "json", "a")
+
+
+def test_manifest_rebuild_is_byte_stable(env):
+    """Same dispatch_id must always rebuild an identical payload (hash-wise),
+    so replays after uncertain outcomes never look like conflicts."""
+    from autolab_control.manifest_builder import build_manifest
+    from autolab_protocol import payload_hash
+
+    approve(env, make_spec(env, seeds=(1,)))
+    fake = FakeTransport(script=[DispatchResult("accepted")])
+    scheduler_with(env, fake).tick()
+    repo = env["repo"]
+    job = repo.list_jobs()[0]
+    plan = repo.get_plan(job["plan_revision_id"])
+    spec = PlanSpecV1.model_validate(json.loads(plan["spec_json"]))
+    project = repo.get_project(plan["project_id"])
+
+    first = build_manifest(
+        AcquiredJob(job=job, spec=spec, gpu_indices=json.loads(job["gpu_indices_json"])), project
+    )
+    # simulate a later rebuild from the same row (what reconcile does)
+    refetched = repo.get_job(job["id"])
+    second = build_manifest(
+        AcquiredJob(job=refetched, spec=spec, gpu_indices=json.loads(refetched["gpu_indices_json"])),
+        project,
+    )
+    assert payload_hash(first) == payload_hash(second)

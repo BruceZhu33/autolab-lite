@@ -14,8 +14,7 @@ import pytest
 from autolab_runner.config import RunnerConfig
 from autolab_runner.procs import ProcessIdentityError, spawn_process, terminate_group
 from autolab_runner.storage import RunnerStorage
-
-from .conftest import (
+from runner_helpers import (
     FAIL_JOB_SCRIPT,
     GOOD_JOB_SCRIPT,
     SLEEP_JOB_SCRIPT,
