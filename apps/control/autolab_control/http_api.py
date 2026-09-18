@@ -31,6 +31,19 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
 
     app = FastAPI(title="autolab-control", version="1")
 
+    from fastapi.middleware.cors import CORSMiddleware
+
+    # thin local console origins only; the API itself stays loopback
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://127.0.0.1:3430", "http://localhost:3430",
+            "http://127.0.0.1:3000", "http://localhost:3000",
+        ],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     def require(scope: str):
         def check(authorization: str = Header(default="")) -> str:
             scheme, _, token = authorization.partition(" ")
