@@ -94,6 +94,8 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                                   "value": next(iter(values.values()))}
             cards.append({
                 "projectId": project["id"],
+                "planId": latest["id"],
+                "specHash": latest["spec_hash"],
                 "title": project["name"],
                 "summary": latest["summary"] or f"revision {latest['revision_no']}",
                 "column": column,

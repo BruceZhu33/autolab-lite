@@ -2,6 +2,8 @@
 
 export type BoardCardView = {
   projectId: string;
+  planId: string;
+  specHash: string;
   title: string;
   summary: string;
   column: "needs_plan" | "queued" | "running" | "needs_attention" | "recently_completed";
@@ -88,6 +90,16 @@ export const fetchJobDetail = (id: string) =>
     artifacts: Array<{ id: string; kind: string; sha256: string; remote_path: string; metadata: Record<string, unknown> }>;
     events: Array<{ event_type: string; event_seq: number }>;
   }>(`/api/jobs/${id}`);
+
+export async function approvePlan(planId: string, expectSpecHash: string) {
+  const response = await fetch(`${API_URL}/api/owner/plans/${planId}/approve`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiToken()}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ expect_spec_hash: expectSpecHash }),
+  });
+  if (!response.ok) throw new Error(`approve -> ${response.status}: ${await response.text()}`);
+  return response.json() as Promise<{ status: string; jobs: string[] }>;
+}
 
 export async function fetchJobLogs(id: string, cursor = 0) {
   return get<{ text: string; cursor: number; size: number }>(

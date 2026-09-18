@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { PageHeader } from "@/components/shell";
-import { fetchBoard, type BoardCardView } from "@/lib/api";
+import { approvePlan, fetchBoard, type BoardCardView } from "@/lib/api";
 
 const COLUMNS: Array<{ key: BoardCardView["column"]; label: string }> = [
   { key: "needs_plan", label: "Needs plan" },
@@ -22,6 +22,20 @@ const TONE_CLASS: Record<string, string> = {
 export default function BoardPage() {
   const [cards, setCards] = useState<BoardCardView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [approveNote, setApproveNote] = useState<string | null>(null);
+
+  async function approve(card: BoardCardView) {
+    const typed = window.prompt(
+      `批准 ${card.title} 的 plan ${card.planId.slice(0, 18)}…\n粘贴完整 spec hash 以确认：\n${card.specHash}`,
+    );
+    if (!typed) return;
+    try {
+      const result = await approvePlan(card.planId, typed.trim());
+      setApproveNote(`approved: ${result.status} (${result.jobs.length} jobs)`);
+    } catch (e) {
+      setApproveNote(`approve failed: ${(e as Error).message}`);
+    }
+  }
 
   useEffect(() => {
     let alive = true;
@@ -40,6 +54,9 @@ export default function BoardPage() {
   return (
     <div>
       <PageHeader title="Board" sub="Plan/job projection — columns are derived, never stored" />
+      {approveNote ? (
+        <p className="autolab-card mb-3 p-2 text-[12px] text-[var(--muted-foreground)]">{approveNote}</p>
+      ) : null}
       {error ? (
         <p className="autolab-card p-3 text-[var(--destructive)]">{error}</p>
       ) : cards === null ? (
@@ -75,6 +92,15 @@ export default function BoardPage() {
                           </span>
                         ) : null}
                       </div>
+                      {card.column === "needs_plan" ? (
+                        <button
+                          type="button"
+                          onClick={() => approve(card)}
+                          className="mt-2 rounded-md border border-[var(--surface-border)] px-2 py-1 text-[11px] font-medium hover:bg-[var(--surface-hover)]"
+                        >
+                          批准（粘贴 spec hash）
+                        </button>
+                      ) : null}
                       <p className="mt-2 text-[11px] text-[var(--muted-foreground)]">
                         jobs {card.jobs.done}/{card.jobs.total}
                         {card.jobs.running ? ` · ${card.jobs.running} running` : ""}
