@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import { Shell } from "@/components/shell";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { DashboardLayout } from "@/vendor/views/layout/dashboard-layout";
+import { queryClient } from "@/lib/query";
 
 export const metadata: Metadata = {
   title: "AutoLab",
@@ -11,7 +13,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className="dark">
       <body>
-        <Shell>{children}</Shell>
+        <QueryClientProvider client={queryClient}>
+          <DashboardLayout>{children}</DashboardLayout>
+        </QueryClientProvider>
       </body>
     </html>
   );
