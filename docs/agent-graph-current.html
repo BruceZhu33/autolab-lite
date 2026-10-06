@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>AutoLab · Agent 服务层现状图(2026-09-24 大改后)</title>
+<style>
+  :root{--bg:#0a0f16;--panel:#101823;--panel2:#0d1319;--border:#223146;--text:#dce5f0;
+        --dim:#8494a8;--brand:#4f8ef7;--brand2:#7ba4f7;--green:#3ecf8e;--yellow:#e8b93e;
+        --purple:#a78bfa;--red:#f87171}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font:15px/1.75 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:36px 20px}
+  .wrap{max-width:1120px;margin:0 auto}
+  h1{font-size:26px;letter-spacing:.5px}
+  h2{font-size:19px;margin:46px 0 6px;display:flex;align-items:center;gap:10px}
+  h2 .no{font:700 11px/1 ui-monospace,monospace;color:var(--brand);border:1px solid rgba(79,142,247,.45);border-radius:999px;padding:5px 9px;letter-spacing:1px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:12px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px;margin:10px 0}
+  .grid{display:grid;gap:12px}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  .kv{font-size:13px;color:var(--dim)} .kv b{color:var(--text)}
+  code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;background:#0d1319;border:1px solid var(--border);padding:1.5px 6px;border-radius:6px;color:var(--brand2)}
+  .tag{display:inline-block;font:600 11px/1 ui-monospace,monospace;padding:4px 9px;border-radius:999px;margin:2px 4px 2px 0}
+  .t-new{color:var(--green);border:1px solid rgba(62,207,142,.45)}
+  .t-same{color:var(--dim);border:1px solid var(--border)}
+  .t-rigid{color:var(--yellow);border:1px solid rgba(232,185,62,.45)}
+  svg text{font-family:-apple-system,"PingFang SC",sans-serif}
+  .node{fill:var(--panel2);stroke:var(--border);stroke-width:1.4;rx:12}
+  .node-label{fill:var(--text);font-size:13.5px;font-weight:600}
+  .node-sub{fill:var(--dim);font-size:10.5px}
+  .edge{stroke:#3a4757;stroke-width:1.5;fill:none}
+  .arrow{fill:#3a4757}
+  .imgwrap{background:#0d1319;border:1px solid var(--border);border-radius:12px;padding:10px;text-align:center}
+  .foot{margin-top:52px;color:var(--dim);font-size:12.5px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Agent 服务层现状图</h1>
+<p class="sub">2026-09-24 大改后 · 只读理解产物,未改任何代码 · 拓扑出处 <code>agent_session.py::_build_session_graph</code> · <b style="color:var(--green)">169 测试全绿</b></p>
+
+<div class="card">
+<span class="tag t-same">拓扑未变</span><span class="tag t-new">checkpointer 落盘</span><span class="tag t-new">interrupt 分步驱动</span><span class="tag t-new">人工注入/停止</span><span class="tag t-new">断点续跑</span><span class="tag t-new">第 5 角色 strategy</span><span class="tag t-new">submit_result 结构化通道</span><span class="tag t-new">记忆回路 digest</span><span class="tag t-rigid">预算/白名单/补丁门(不变)</span>
+<div class="kv" style="margin-top:8px">一句话:LangGraph 图还是那张 4 节点 ReAct 环,但从"<b>一次性 app.invoke 的黑盒</b>"变成了"<b>分步驱动、每步落盘、可停可注入、崩溃可续、轮末有策略层的有状态服务</b>"——langgraph 的能力(checkpointer / interrupt / stream / get_state)这次全部打开了。</div>
+</div>
+
+<!-- ============ 1. 图本体 ============ -->
+<h2><span class="no">01</span>LangGraph 图本体:拓扑没变,编译参数变了</h2>
+<p class="sub">graph.get_graph() 官方导出(与上一版完全一致)+ 两个新编译参数</p>
+<div class="card" style="display:flex;gap:18px;flex-wrap:wrap;align-items:center">
+  <div class="imgwrap" style="flex:0 0 330px"><img src="data:image/png;base64,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" style="width:100%" alt="官方导出:__start__ → agent ⇄ tools → __end__"/></div>
+  <div style="flex:1;min-width:300px">
+    <div class="kv" style="line-height:2.1">
+      <div>▶ <b>compile(checkpointer=SqliteSaver)</b> <span class="tag t-new">新</span>——每个 super-step 后状态落 <code>agent_checkpoints.sqlite</code>(主 DB 同目录;依赖缺失回落 InMemorySaver,功能不缺席)</div>
+      <div>▶ <b>interrupt_before=['agent']</b> <span class="tag t-new">新</span>——每次进入 agent 节点前<b>暂停</b>,把"何时步进"的控制权交给外面的驱动循环</div>
+      <div>▶ thread_id = session_id <span class="tag t-new">新</span>——同会话重入即从断点恢复,消息历史不丢</div>
+      <div>▶ START → agent ⇄ tools → END,route() 条件边(有 tool_calls→tools;墙钟≤20s 或无调用→END)<span class="tag t-same">不变</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 2. 驱动循环 ============ -->
+<h2><span class="no">02</span>核心变化:外面套了一个"驱动循环"(run_session)</h2>
+<p class="sub">图不再一口气 invoke 到 END——驱动循环每个步进点检查一遍:收工了吗?有人叫停吗?有新指令吗?预算还够吗?</p>
+<div class="card">
+<svg viewBox="0 0 1080 470" style="width:100%;height:auto">
+  <defs><marker id="m" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" class="arrow"/></marker></defs>
+
+  <!-- 步进循环主环 -->
+  <g>
+    <rect class="node" x="60" y="60" width="230" height="92" rx="12"/>
+    <text class="node-label" x="175" y="92" text-anchor="middle">① snapshot.next 空?</text>
+    <text class="node-sub" x="175" y="114" text-anchor="middle">route 已 END → 出环收尾</text>
+    <text class="node-sub" x="175" y="132" text-anchor="middle">app.get_state(config)</text>
+  </g>
+  <path class="edge" d="M290,106 L350,106" marker-end="url(#m)"/>
+
+  <g>
+    <rect class="node" x="352" y="60" width="230" height="92" rx="12"/>
+    <text class="node-label" x="467" y="92" text-anchor="middle">② submit_result 已交?</text>
+    <text class="node-sub" x="467" y="114" text-anchor="middle">结构化结果在手 → 出环</text>
+    <text class="node-sub" x="467" y="132" text-anchor="middle">(不再步进,省 tokens)</text>
+  </g>
+  <path class="edge" d="M582,106 L642,106" marker-end="url(#m)"/>
+
+  <g>
+    <rect class="node" x="644" y="60" width="230" height="92" rx="12" style="stroke:var(--yellow)"/>
+    <text class="node-label" x="759" y="88" text-anchor="middle">③ drain 收件箱(人工介入点)</text>
+    <text class="node-sub" x="759" y="110" text-anchor="middle">stop 请求 → status=stopped 出环</text>
+    <text class="node-sub" x="759" y="128" text-anchor="middle">inject 消息 → update_state 追加</text>
+    <text class="node-sub" x="759" y="146" text-anchor="middle">HumanMessage 进上下文</text>
+  </g>
+  <path class="edge" d="M759,152 L759,205" marker-end="url(#m)"/>
+
+  <g>
+    <rect class="node" x="644" y="207" width="230" height="80" rx="12" style="stroke:var(--yellow)"/>
+    <text class="node-label" x="759" y="236" text-anchor="middle">④ 墙钟 ≤20s?</text>
+    <text class="node-sub" x="759" y="258" text-anchor="middle">预算见底 → 出环(best-effort 收尾)</text>
+    <text class="node-sub" x="759" y="274" text-anchor="middle">事件 phase=wall_clock_budget</text>
+  </g>
+  <path class="edge" d="M644,247 L585,247" marker-end="url(#m)"/>
+
+  <g>
+    <rect class="node" x="340" y="207" width="245" height="80" rx="12" style="stroke:var(--green)"/>
+    <text class="node-label" x="462" y="236" text-anchor="middle">⑤ app.stream(None) 步进一步</text>
+    <text class="node-sub" x="462" y="258" text-anchor="middle">agent 或 tools 恰好跑一个 super-step</text>
+    <text class="node-sub" x="462" y="274" text-anchor="middle">updates 事件逐条落 DB(时间线)</text>
+  </g>
+  <path class="edge" d="M340,247 L175,247 L175,152" marker-end="url(#m)"/>
+  <text class="node-sub" x="255" y="238" text-anchor="middle">回到 ① 下一轮检查</text>
+
+  <!-- 落点说明 -->
+  <g>
+    <rect class="node" x="60" y="330" width="460" height="110" rx="12" style="stroke:var(--purple);stroke-dasharray:6 4"/>
+    <text class="node-label" x="290" y="360" text-anchor="middle">每个 super-step 的双写</text>
+    <text class="node-sub" x="290" y="384" text-anchor="middle">💾 checkpointer → agent_checkpoints.sqlite(状态快照,续跑用)</text>
+    <text class="node-sub" x="290" y="404" text-anchor="middle">📜 _record_step → agent_session_events(ai / tool_call / tool_result)</text>
+    <text class="node-sub" x="290" y="424" text-anchor="middle">—— UI 实时时间线的直接数据源(live-session-card)</text>
+  </g>
+  <g>
+    <rect class="node" x="560" y="330" width="460" height="110" rx="12"/>
+    <text class="node-label" x="790" y="360" text-anchor="middle">收尾(status ∈ done / stopped / exhausted / error)</text>
+    <text class="node-sub" x="790" y="384" text-anchor="middle">最后一条 AI 消息(拼 text 块) + submit_result manifest 优先</text>
+    <text class="node-sub" x="790" y="404" text-anchor="middle">tokens 从 usage_metadata 累计;result_json 落 agent_sessions</text>
+    <text class="node-sub" x="790" y="424" text-anchor="middle">transcript.jsonl 照旧落工作区(审计资产)</text>
+  </g>
+</svg>
+</div>
+
+<!-- ============ 3. 会话注册表 ============ -->
+<h2><span class="no">03</span>会话注册表:会话从"函数调用"变成"DB 实体"</h2>
+<p class="sub">三张自管表(_ensure_registry 建表,FakeRepo 无 DB 时全链路 no-op 降级)+ 4 个 HTTP 端点 + 前端卡片</p>
+<div class="grid g3">
+  <div class="card">
+    <div class="kv"><b style="font-size:15px">agent_sessions</b><br/>会话主表:status 生命周期<br/>
+    <code>running → done | stopped | exhausted | error</code><br/>
+    role / session_key / task_digest / tool_calls / tokens_in·out / result_json(结论+改动+冒烟)</div>
+  </div>
+  <div class="card">
+    <div class="kv"><b style="font-size:15px">agent_session_events</b><br/>时间线(每条 ≤6000 字符)<br/>
+    <code>status(started/resumed/…)</code> <code>ai</code> <code>tool_call</code> <code>tool_result</code> <code>inject</code><br/>
+    驱动循环步进时实时写入 → 前端轮询即"直播"</div>
+  </div>
+  <div class="card">
+    <div class="kv"><b style="font-size:15px">agent_session_inbox</b><br/>人工介入队列(consumed_at 标记消费)<br/>
+    <code>inject</code>:owner 消息,下个步进点进上下文(≤2000 字)<br/>
+    <code>stop</code>:当前工具步跑完即收尾退出</div>
+  </div>
+</div>
+<div class="card" style="margin-top:12px">
+  <div class="kv">
+    <b>HTTP 面(Control)</b>:<code>GET /api/projects/{id}/agent-sessions</code> · <code>GET /api/agent-sessions/{id}</code>(含事件) · <code>POST …/inject</code> · <code>POST …/stop</code> &nbsp;|&nbsp;
+    <b>前端</b>:<code>live-session-card.tsx</code>(进行中会话的实时卡片:思考/工具调用/观察流式展开,可注入可停止)
+  </div>
+</div>
+
+<!-- ============ 4. 断点续跑 ============ -->
+<h2><span class="no">04</span>断点续跑:Control 崩溃/重启,循环不重烧 tokens</h2>
+<p class="sub">checkpointer(SQLite)× session_key(loop:{id}:implement)× 状态机重入,三件事拼成恢复链</p>
+<div class="card">
+<svg viewBox="0 0 1080 200" style="width:100%;height:auto">
+  <defs><marker id="m2" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" class="arrow"/></marker></defs>
+  <line x1="60" y1="100" x2="1020" y2="100" stroke="var(--brand)" stroke-width="4" stroke-linecap="round"/>
+  <g><circle cx="95" cy="100" r="13" fill="#0d1319" stroke="var(--red)" stroke-width="2.5"/><text class="node-sub" x="95" y="76" text-anchor="middle" fill="var(--red)">Control 崩溃</text></g>
+  <path class="edge" d="M108,100 L165,100" marker-end="url(#m2)"/>
+  <g><circle cx="195" cy="100" r="13" fill="#0d1319" stroke="var(--brand)" stroke-width="2.5"/><text class="node-sub" x="195" y="70" text-anchor="middle">重启扫描</text><text class="node-sub" x="195" y="138" text-anchor="middle">mark_orphans_interrupted</text></g>
+  <path class="edge" d="M208,100 L265,100" marker-end="url(#m2)"/>
+  <g><circle cx="295" cy="100" r="13" fill="#0d1319" stroke="var(--brand)" stroke-width="2.5"/><text class="node-sub" x="295" y="70" text-anchor="middle">循环线程重入</text><text class="node-sub" x="295" y="138" text-anchor="middle">phase=implement(DB 里没丢)</text></g>
+  <path class="edge" d="M308,100 L365,100" marker-end="url(#m2)"/>
+  <g><circle cx="395" cy="100" r="13" fill="#0d1319" stroke="var(--brand)" stroke-width="2.5"/><text class="node-sub" x="395" y="70" text-anchor="middle">找会话</text><text class="node-sub" x="395" y="138" text-anchor="middle">find_resumable_session(key)</text></g>
+  <path class="edge" d="M408,100 L465,100" marker-end="url(#m2)"/>
+  <g><circle cx="540" cy="100" r="17" fill="rgba(79,142,247,.25)" stroke="var(--brand2)" stroke-width="3.5"/><text class="node-sub" x="540" y="66" text-anchor="middle" fill="var(--brand2)">同 session_id 重入</text><text class="node-sub" x="540" y="146" text-anchor="middle">get_state 有消息 → 不重播种</text></g>
+  <path class="edge" d="M557,100 L615,100" marker-end="url(#m2)"/>
+  <g><circle cx="665" cy="100" r="17" fill="rgba(62,207,142,.18)" stroke="var(--green)" stroke-width="3.5"/><text class="node-sub" x="665" y="66" text-anchor="middle" fill="var(--green)">checkpoint 恢复</text><text class="node-sub" x="665" y="146" text-anchor="middle">旧任务/观察仍在上下文</text></g>
+  <path class="edge" d="M682,100 L740,100" marker-end="url(#m2)"/>
+  <g><circle cx="800" cy="100" r="17" fill="rgba(62,207,142,.18)" stroke="var(--green)" stroke-width="3.5"/><text class="node-sub" x="800" y="66" text-anchor="middle" fill="var(--green)">继续步进</text><text class="node-sub" x="800" y="146" text-anchor="middle">事件 phase=resumed 留痕</text></g>
+  <g><text class="node-sub" x="955" y="94" text-anchor="middle" fill="var(--green)">预算剩余量在 DB/</text><text class="node-sub" x="955" y="112" text-anchor="middle" fill="var(--green)">checkpoint 外另行累计</text></g>
+</svg>
+</div>
+
+<!-- ============ 5. strategy ============ -->
+<h2><span class="no">05</span>第 5 角色 strategy:轮末从"固定反馈"升级为"方向内策略层"(D-020)</h2>
+<p class="sub">conclude 相位在"继续循环"时先跑策略会话;失败回落模板,循环永不因新层挂死</p>
+<div class="card">
+<svg viewBox="0 0 1080 430" style="width:100%;height:auto">
+  <defs><marker id="m3" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" class="arrow"/></marker></defs>
+
+  <!-- 循环相位带 -->
+  <g>
+    <rect class="node" x="40" y="80" width="150" height="70" rx="12"/><text class="node-label" x="115" y="108" text-anchor="middle">implement</text><text class="node-sub" x="115" y="130" text-anchor="middle">implementer 会话</text>
+    <rect class="node" x="210" y="80" width="120" height="70" rx="12"/><text class="node-label" x="270" y="108" text-anchor="middle">plan</text><text class="node-sub" x="270" y="130" text-anchor="middle">硬校验</text>
+    <rect class="node" x="350" y="80" width="140" height="70" rx="12"/><text class="node-label" x="420" y="108" text-anchor="middle">await_jobs</text><text class="node-sub" x="420" y="130" text-anchor="middle">GPU 训练</text>
+    <rect class="node" x="510" y="80" width="150" height="70" rx="12" style="stroke:var(--purple)"/><text class="node-label" x="585" y="108" text-anchor="middle">conclude</text><text class="node-sub" x="585" y="130" text-anchor="middle">Δ 判定 + 反馈</text>
+    <path class="edge" d="M190,115 L208,115" marker-end="url(#m3)"/><path class="edge" d="M330,115 L348,115" marker-end="url(#m3)"/><path class="edge" d="M490,115 L508,115" marker-end="url(#m3)"/>
+  </g>
+
+  <!-- strategy 会话 -->
+  <path class="edge" d="M585,150 L585,195" marker-end="url(#m3)" style="stroke:var(--purple)"/>
+  <g>
+    <rect class="node" x="440" y="197" width="290" height="96" rx="12" style="stroke:var(--purple)"/>
+    <text class="node-label" x="585" y="225" text-anchor="middle">🧭 strategy 会话(新增第 5 角色)</text>
+    <text class="node-sub" x="585" y="247" text-anchor="middle">输入:owner 钉的 direction + 全部轮次证据 + 漂移信号</text>
+    <text class="node-sub" x="585" y="265" text-anchor="middle">只读工具(read/grep/probe)+ submit_result</text>
+    <text class="node-sub" x="585" y="283" text-anchor="middle">预算 10轮/6min/写0(纯只读)</text>
+  </g>
+
+  <!-- 三条出路 -->
+  <path class="edge" d="M440,245 L340,245 L340,300" marker-end="url(#m3)" style="stroke:var(--green)"/>
+  <g>
+    <rect class="node" x="60" y="302" width="290" height="86" rx="12" style="stroke:var(--green)"/>
+    <text class="node-label" x="205" y="330" text-anchor="middle">✅ adopted:RoundDirective</text>
+    <text class="node-sub" x="205" y="352" text-anchor="middle">goal(单一可证伪假设)/approach/avoid/abandon</text>
+    <text class="node-sub" x="205" y="370" text-anchor="middle">→ loop_decisions 落库,注入下轮 implement 任务上下文</text>
+  </g>
+  <path class="edge" d="M585,293 L585,330" marker-end="url(#m3)" style="stroke:var(--yellow)"/>
+  <g>
+    <rect class="node" x="370" y="332" width="240" height="76" rx="12" style="stroke:var(--yellow)"/>
+    <text class="node-label" x="490" y="360" text-anchor="middle">⚠ 越方向 → awaiting</text>
+    <text class="node-sub" x="490" y="380" text-anchor="middle">in_scope=false 或落点漂移 → 暂停等 owner</text>
+    <text class="node-sub" x="490" y="396" text-anchor="middle">放行重入不重跑策略(C 期)</text>
+  </g>
+  <path class="edge" d="M730,245 L830,245 L830,300" marker-end="url(#m3)" style="stroke:var(--dim);stroke-dasharray:5 4"/>
+  <g>
+    <rect class="node" x="700" y="302" width="300" height="86" rx="12" style="stroke-dasharray:5 4"/>
+    <text class="node-label" x="850" y="330" text-anchor="middle">↩ fallback:任何失败</text>
+    <text class="node-sub" x="850" y="352" text-anchor="middle">记 fallback 决策行(可考"这轮为何没用 Directive")</text>
+    <text class="node-sub" x="850" y="370" text-anchor="middle">下轮反馈回落固定模板,循环不挂死</text>
+  </g>
+
+  <!-- 记忆回路 -->
+  <path class="edge" d="M205,302 L205,55 L115,55 L115,78" marker-end="url(#m3)" style="stroke:var(--brand);stroke-dasharray:5 4"/>
+  <text class="node-sub" x="330" y="46" text-anchor="middle" fill="var(--brand2)">记忆回路:recent_session_digest(上次会话结论+改动清单读回下轮任务,不原样重复)· verdict=stop_dead_end 只是建议,终止仍由硬规则裁决</text>
+</svg>
+</div>
+
+<!-- ============ 6. 角色矩阵 ============ -->
+<h2><span class="no">06</span>五角色 × 工具面(第 10 个工具 submit_result)</h2>
+<div class="card">
+<table style="width:100%;border-collapse:collapse;font-size:12.5px">
+  <tr style="color:var(--dim);text-align:left"><th style="padding:6px 8px">角色</th><th>上岗点</th><th>预算</th><th>工具白名单</th><th>结果通道</th></tr>
+  <tr><td style="padding:7px 8px"><b>implementer</b></td><td>循环 implement 相位</td><td>24轮/15min/写8/冒烟2</td><td>全 10 个</td><td>submit_result(manifest:variants…)</td></tr>
+  <tr style="color:#c3cddb"><td style="padding:7px 8px"><b>debugger</b></td><td>baseline 崩溃修复</td><td>14轮/12min/写4/冒烟1</td><td>全 10 个</td><td>submit_result(summary+root_cause)</td></tr>
+  <tr><td style="padding:7px 8px"><b>analyzer</b></td><td>②开工前 + ③评审对话</td><td>12轮/7min/写0</td><td>只读</td><td>final_text(变体清单)</td></tr>
+  <tr style="color:#c3cddb"><td style="padding:7px 8px"><b>reviewer</b></td><td>③评分(每个勾选 Agent)</td><td>10轮/6min/写0</td><td>只读</td><td>final_text(verdict+文件:行号)</td></tr>
+  <tr><td style="padding:7px 8px"><b style="color:var(--purple)">strategy</b> <span class="tag t-new">新</span></td><td>循环 conclude 相位(轮末)</td><td>10轮/6min/写0</td><td>只读+submit_result</td><td>submit_result(RoundDirective)</td></tr>
+</table>
+<div class="kv" style="margin-top:10px"><b>submit_result 纪律</b>:JSON 对象文本,非法 JSON 被拒并要求重交(工具内校验);会话驱动循环看到已提交即收尾,不再吃多余轮次;模型没调工具时仍回落"最终文本提取 ```json```"老路径(GLM 抖动保底)。</div>
+</div>
+
+<div class="foot">读码来源:agent_session.py(1496 行)/ iteration_loop.py / http_api.py / live-session-card.tsx · 官方拓扑 PNG 由 graph.get_graph().draw_mermaid_png() 生成 · 本页为只读理解产物,未修改任何代码</div>
+</div>
+</body>
+</html>
