@@ -1,5 +1,5 @@
-import type { IssuePriority } from "@multica/core/types";
-import { PRIORITY_CONFIG } from "@multica/core/issues/config";
+import type { IssuePriority } from "./priority";
+import { PRIORITY_CONFIG } from "./priority";
 
 /**
  * Priority glyphs, two families on purpose:

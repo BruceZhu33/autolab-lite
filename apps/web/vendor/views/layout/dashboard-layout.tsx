@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
 import { SidebarInset, SidebarProvider } from "~/vendor/ui/components/ui/sidebar";
 import { AppSidebar } from "./app-sidebar";
 
@@ -16,7 +16,9 @@ interface DashboardLayoutProps {
 export function DashboardLayout({ children }: DashboardLayoutProps) {
   return (
     <SidebarProvider>
-      <AppSidebar />
+      <Suspense fallback={null}>
+        <AppSidebar />
+      </Suspense>
       <SidebarInset>{children}</SidebarInset>
     </SidebarProvider>
   );

@@ -43,6 +43,7 @@
   ],
   "exclude": [
     "node_modules",
-    "vendor/views/issues"
+    "**/*.test.ts",
+    "**/*.test.tsx"
   ]
 }

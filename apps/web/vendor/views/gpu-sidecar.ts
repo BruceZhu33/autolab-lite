@@ -1,7 +1,8 @@
 /**
- * Control-API adapter for the migrated Multica GPU page. Reads map to
- * GET /api/servers; management ops are not yet backed by Control and fail
- * with an actionable message instead of pretending.
+ * Control-API adapter for the GPU Servers page. Reads map to
+ * GET /api/servers (per-server real telemetry: local nvidia-smi / SSH
+ * nvidia-smi); owner writes map to /api/owner/servers*.
+ * Runner 远程部署(agent install/upgrade)尚未接入,保持诚实报错。
  */
 
 export type ServerOp =
@@ -40,7 +41,11 @@ export interface ServerDetail {
 }
 
 export class SidecarApiError extends Error {
-  code = "NOT_WIRED";
+  code: string;
+  constructor(message: string, code = "NOT_WIRED") {
+    super(message);
+    this.code = code;
+  }
 }
 
 const API_URL =
@@ -52,16 +57,43 @@ function token(): string {
   return window.localStorage.getItem("autolab.api_token") || "";
 }
 
-async function apiGet<T>(path: string): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
-    headers: { Authorization: `Bearer ${token()}` },
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token()}`,
+      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(init?.headers ?? {}),
+    },
     cache: "no-store",
   });
-  if (response.status === 401 || response.status === 403) {
+  if (response.status === 401) {
     if (typeof window !== "undefined") window.localStorage.removeItem("autolab.api_token");
-    throw new SidecarApiError("unauthorized: check the AutoLab API token");
+    throw new SidecarApiError("未授权：token 缺失或已失效，请在 Settings 重新设置", "UNAUTHORIZED");
   }
-  if (!response.ok) throw new SidecarApiError(`${path} -> ${response.status}`);
+  if (response.status === 403) {
+    // agent token 对读接口仍有效；只提示权限不足，不清 token（清了会让列表 5 秒后也挂掉）
+    throw new SidecarApiError(
+      "权限不足：该操作需要 owner 权限 token（当前可能是 agent token），请在 Settings 更换",
+      "FORBIDDEN",
+    );
+  }
+  if (!response.ok) {
+    let detail = `${path} -> ${response.status}`;
+    let code = "NOT_WIRED";
+    try {
+      const body = await response.json();
+      const d = body?.detail;
+      if (typeof d === "string") {
+        detail = d;
+      } else if (d && typeof d === "object") {
+        detail = String((d as { message?: string }).message ?? JSON.stringify(d));
+        const c = (d as { code?: unknown }).code;
+        if (typeof c === "string") code = c;
+      }
+    } catch { /* keep status line */ }
+    throw new SidecarApiError(detail, code);
+  }
   return response.json() as Promise<T>;
 }
 
@@ -69,6 +101,10 @@ type ApiServer = {
   id: string;
   name: string;
   transport_mode: string;
+  host: string | null;
+  port: number | null;
+  username: string | null;
+  runner_port: number | null;
   status_hint: string | null;
   gpu_slots: number;
   gpu_slot_source: string;
@@ -85,9 +121,9 @@ function toDetail(server: ApiServer): ServerDetail {
   return {
     id: server.id,
     name: server.name,
-    host: server.transport_mode === "local" ? "127.0.0.1" : null,
-    port: null,
-    username: null,
+    host: server.host ?? (server.transport_mode === "local" ? "127.0.0.1" : null),
+    port: server.port ?? null,
+    username: server.username ?? null,
     transport_mode: server.transport_mode === "ssh" ? "ssh" : "local",
     status:
       server.status_hint === "reachable"
@@ -95,7 +131,7 @@ function toDetail(server: ApiServer): ServerDetail {
         : server.status_hint === "unreachable"
           ? "UNREACHABLE"
           : "UNKNOWN",
-    agent_port: null,
+    agent_port: server.runner_port || null,
     agent_version: null,
     gpus: (server.gpus ?? []).map((g) => ({
       index: g.gpu_index,
@@ -115,7 +151,7 @@ function toDetail(server: ApiServer): ServerDetail {
 }
 
 export async function listServerDetails(): Promise<ServerDetail[]> {
-  const servers = await apiGet<ApiServer[]>("/api/servers");
+  const servers = await request<ApiServer[]>("/api/servers");
   return servers.map(toDetail);
 }
 
@@ -130,7 +166,7 @@ export interface DiskTelemetry {
 export async function getServerTelemetry(
   _id: string,
 ): Promise<{ gpus: GpuTelemetry[]; disks: DiskTelemetry[] } | null> {
-  const servers = await apiGet<ApiServer[]>("/api/servers");
+  const servers = await request<ApiServer[]>("/api/servers");
   const found = servers.find((s) => s.id === _id);
   if (!found) return null;
   return { gpus: toDetail(found).gpus, disks: [] };
@@ -146,22 +182,91 @@ export interface OpResultView {
   detail?: string;
 }
 
-export function describeOpResult(_op: ServerOp, result: unknown): OpResultView {
-  return { ok: true, title: "完成", detail: String(result ?? "") };
+const OP_LABELS: Record<ServerOp, string> = {
+  "connectivity-test": "连通性测试",
+  "agent/probe": "Runner 探活",
+  "agent/install": "Runner 部署",
+  "agent/upgrade": "Runner 升级",
+};
+
+export function describeOpResult(op: ServerOp, result: unknown): OpResultView {
+  const label = OP_LABELS[op] ?? op;
+  if (op === "connectivity-test") {
+    const r = result as { reachable?: boolean; detail?: string };
+    return {
+      ok: !!r?.reachable,
+      title: r?.reachable ? `${label}通过` : `${label}失败`,
+      detail: r?.detail,
+    };
+  }
+  if (op === "agent/probe") {
+    const r = result as { version?: string; runner_instance_id?: string };
+    return {
+      ok: true,
+      title: `${label}正常`,
+      detail: `版本 ${r?.version ?? "?"} · 实例 ${r?.runner_instance_id ?? "?"}`,
+    };
+  }
+  if (op === "agent/install" || op === "agent/upgrade") {
+    const r = result as { pid?: number; port?: number; version?: string };
+    return {
+      ok: true,
+      title: `${label}完成`,
+      detail: `PID ${r?.pid} · 端口 ${r?.port} · 版本 ${r?.version ?? "?"}`,
+    };
+  }
+  return { ok: true, title: `${label}完成`, detail: String(result ?? "") };
 }
 
-export async function serverOp(_id: string, op: ServerOp, _body?: unknown): Promise<unknown> {
-  throw new SidecarApiError(
-    `${op} 尚未接入 Control：本地服务器用 \`autolab server add-local\` 登记，SSH 服务器走 M3 部署流程`,
+export async function serverOp(id: string, op: ServerOp, _body?: unknown): Promise<unknown> {
+  const path = op === "agent/install" || op === "agent/upgrade"
+    ? "agent/install" // 升级 = 重新部署(强制重装 wheel + 轮换凭据)
+    : op;
+  return request<Record<string, unknown>>(
+    `/api/owner/servers/${encodeURIComponent(id)}/${path}`,
+    { method: "POST" },
   );
 }
 
-export async function registerServer(_form: unknown): Promise<{ name: string }> {
-  throw new SidecarApiError(
-    "注册接口尚未接入 Control：本地服务器用 `autolab server add-local` 登记",
-  );
+export interface RegisterServerForm {
+  name: string;
+  transport_mode: "ssh" | "local";
+  host: string;
+  port: string;
+  username: string;
+  auth_kind: "key" | "password";
+  secret: string;
+  agent_port: string;
+  agent_token: string;
+  manifest_hmac_key?: string;
 }
 
-export async function deleteServer(_id: string): Promise<{ name: string }> {
-  throw new SidecarApiError("删除服务器尚未接入 Control");
+export async function registerServer(form: RegisterServerForm): Promise<{ name: string }> {
+  const body: Record<string, unknown> = {
+    name: form.name,
+    transport_mode: form.transport_mode,
+    runner_port: form.agent_port ? Number(form.agent_port) : 0,
+  };
+  if (form.agent_token) body.runner_token = form.agent_token;
+  if (form.manifest_hmac_key) body.manifest_hmac_key = form.manifest_hmac_key;
+  if (form.transport_mode === "ssh") {
+    body.host = form.host;
+    body.ssh_port = form.port ? Number(form.port) : 22;
+    body.username = form.username;
+    body.auth_kind = form.auth_kind;
+    body.secret = form.secret;
+  }
+  const result = await request<{ server: { name: string } }>("/api/owner/servers", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  return { name: result.server.name };
+}
+
+export async function deleteServer(id: string): Promise<{ name: string }> {
+  const result = await request<{ name: string }>(
+    `/api/owner/servers/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+  return { name: result.name };
 }

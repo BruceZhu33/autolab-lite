@@ -1,9 +1,6 @@
 "use client";
 
-import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
-
 import { useState, useCallback, useMemo, useEffect, useRef, memo } from "react";
-import { useQuery } from "@tanstack/react-query";
 import {
   DndContext,
   DragOverlay,
@@ -15,466 +12,79 @@ import {
   type DragOverEvent,
 } from "@dnd-kit/core";
 import { arrayMove } from "@dnd-kit/sortable";
-import { toast } from "sonner";
-import type {
-  Issue,
-  IssueAssigneeType,
-  IssueStatus,
-  Project,
-  IssueProperty,
-} from "@multica/core/types";
-import { useViewStore } from "@multica/core/issues/stores/view-store-context";
-import { propertyIdFromViewKey } from "@multica/core/issues/stores/view-store";
-import { propertyListOptions, useSetIssueProperty, useUnsetIssueProperty } from "@multica/core/properties";
-import { useWorkspaceId } from "@multica/core/hooks";
-import type { IssueGrouping } from "@multica/core/issues/stores/view-store";
-import { useActorName } from "@multica/core/workspace/hooks";
+import type { Issue, ChildProgress } from "./types";
+import { BOARD_STATUSES } from "./status";
+import { useViewStore } from "./view-store";
 import { BoardColumn, BOARD_CARD_WIDTH, type BoardColumnGroup } from "./board-column";
-import { BoardCardContent } from "./board-card";
+import { BoardCardContent, type StageAdvanceHandler } from "./board-card";
 import { HiddenColumnsPanel, HiddenColumnRow } from "./hidden-columns-panel";
-import { InfiniteScrollSentinel } from "./infinite-scroll-sentinel";
-import { ListLoadMoreFooter } from "./list-load-more-footer";
-import type { ChildProgress } from "./list-row";
-import type { IssueCreateDefaults } from "../surface/types";
-import type {
-  IssueStatusPageState,
-  IssueStatusPagination,
-} from "../surface/use-issue-status-branches";
-import type {
-  IssueGroupBranches,
-  IssueGroupPageState,
-} from "../surface/use-issue-group-branches";
 import { useDragSettle } from "./use-drag-settle";
 import { useBoardDragPan } from "./use-board-drag-pan";
-import { useT } from "../../i18n";
 import {
   type DragMoveUpdates,
   makeKanbanCollision,
   statusGroupId,
-  assigneeGroupId,
   buildColumns,
   computePosition,
   findColumn,
   getMoveAnchors,
-  insertIdByPosition,
   issueMatchesGroup,
   getMoveUpdates,
-  propertyGroupId,
-  projectGroupId,
-} from "../utils/drag-utils";
-
-function isStatusGroup(
-  group: BoardColumnGroup,
-): group is BoardColumnGroup & { status: IssueStatus } {
-  return group.status !== undefined;
-}
-
-interface ProjectColumnLabels {
-  noProject: string;
-  /** A project id the projects query cannot resolve — deleted, or not visible
-   *  to this member. Shares the Table's wording so one board column and one
-   *  table group row never describe the same project differently. */
-  unavailableProject: string;
-}
-
-interface BuildGroupsContext extends ProjectColumnLabels {
-  getActorName: (type: string, id: string) => string;
-  groupingProperty: IssueProperty | null;
-  projectMap: Map<string, Project> | undefined;
-  noAssigneeLabel: string;
-  noValueLabel: string;
-}
-
-/**
- * One project column. Shared by the client fallback (columns derived from
- * loaded cards) and the server path (columns derived from group descriptors)
- * so the two can never describe the same project differently.
- */
-function projectColumn(
-  id: string,
-  projectId: string | null,
-  projectMap: Map<string, Project> | undefined,
-  labels: ProjectColumnLabels,
-  totalCount?: number,
-): BoardColumnGroup {
-  const project = projectId ? projectMap?.get(projectId) ?? null : null;
-  return {
-    id,
-    title: projectId
-      ? project?.title ?? labels.unavailableProject
-      : labels.noProject,
-    projectId,
-    project,
-    totalCount,
-    createData: { project_id: projectId },
-  };
-}
-
-/**
- * Keep the "No project" column present as a drop target — clearing a card's
- * project by dragging has to stay possible even in a workspace where every
- * card currently has one. A board with no columns at all is left alone: that
- * is the surface's empty state, not a board missing one column.
- */
-function withNoProjectColumn(
-  columns: BoardColumnGroup[],
-  projectMap: Map<string, Project> | undefined,
-  labels: ProjectColumnLabels,
-): BoardColumnGroup[] {
-  if (columns.length === 0) return columns;
-  if (columns.some((column) => column.projectId === null)) return columns;
-  // No-project sorts first server-side, so it is always in the first page of
-  // descriptors when it exists — an absent one cannot arrive with a later page.
-  return [
-    projectColumn(projectGroupId(null), null, projectMap, labels, 0),
-    ...columns,
-  ];
-}
-
-function buildGroups(
-  issues: Issue[],
-  visibleStatuses: IssueStatus[],
-  grouping: IssueGrouping,
-  {
-    getActorName,
-    groupingProperty,
-    projectMap,
-    noAssigneeLabel,
-    noValueLabel,
-    ...projectLabels
-  }: BuildGroupsContext,
-): BoardColumnGroup[] {
-  if (grouping === "status") {
-    return visibleStatuses.map((status) => ({
-      id: statusGroupId(status),
-      title: status,
-      status,
-      createData: { status: status },
-    }));
-  }
-
-  // Select-property board: one column per option (definition order) plus a
-  // trailing "No value" column. Empty columns stay visible — they are drop
-  // targets for assigning the value.
-  if (groupingProperty) {
-    const columns: BoardColumnGroup[] = (groupingProperty.config.options ?? []).map(
-      (option) => ({
-        id: propertyGroupId(groupingProperty.id, option.id),
-        title: option.name,
-        propertyId: groupingProperty.id,
-        propertyOptionId: option.id,
-        propertyOptionColor: option.color,
-      }),
-    );
-    columns.push({
-      id: propertyGroupId(groupingProperty.id, null),
-      title: noValueLabel,
-      propertyId: groupingProperty.id,
-      propertyOptionId: null,
-    });
-    return columns;
-  }
-
-  // Project board: one column per project the loaded cards reference, plus the
-  // "No project" column. Ordering mirrors the server's group order (no-project
-  // first, then project title) so the client fallback and the paged server
-  // columns cannot disagree.
-  if (grouping === "project") {
-    const columns = new Map<string, BoardColumnGroup>();
-    for (const issue of issues) {
-      const projectId = issue.project_id ?? null;
-      const id = projectGroupId(projectId);
-      if (columns.has(id)) continue;
-      columns.set(id, projectColumn(id, projectId, projectMap, projectLabels));
-    }
-    const ordered = Array.from(columns.values()).toSorted((a, b) => {
-      if (a.projectId === null) return b.projectId === null ? 0 : -1;
-      if (b.projectId === null) return 1;
-      return a.title.localeCompare(b.title);
-    });
-    return withNoProjectColumn(ordered, projectMap, projectLabels);
-  }
-
-  const groups = new Map<string, BoardColumnGroup>();
-  for (const issue of issues) {
-    const id = assigneeGroupId(issue.assignee_type, issue.assignee_id);
-    if (groups.has(id)) continue;
-
-    if (issue.assignee_type && issue.assignee_id) {
-      groups.set(id, {
-        id,
-        title: getActorName(issue.assignee_type, issue.assignee_id),
-        assigneeType: issue.assignee_type,
-        assigneeId: issue.assignee_id,
-        createData: {
-          assignee_type: issue.assignee_type,
-          assignee_id: issue.assignee_id,
-        },
-      });
-      continue;
-    }
-
-    groups.set(id, {
-      id,
-      title: noAssigneeLabel,
-      assigneeType: null,
-      assigneeId: null,
-      createData: {
-        assignee_type: null,
-        assignee_id: null,
-      },
-    });
-  }
-
-  const order: Record<string, number> = {
-    member: 0,
-    agent: 1,
-    squad: 2,
-    none: 3,
-  };
-
-  return Array.from(groups.values()).toSorted((a, b) => {
-    const aOrder = order[a.assigneeType ?? "none"] ?? 99;
-    const bOrder = order[b.assigneeType ?? "none"] ?? 99;
-    if (aOrder !== bOrder) return aOrder - bOrder;
-    return a.title.localeCompare(b.title);
-  });
-}
+} from "./utils/drag-utils";
 
 const EMPTY_PROGRESS_MAP = new Map<string, ChildProgress>();
 const EMPTY_IDS: string[] = [];
 
+function buildGroups(visibleStatuses: string[]): BoardColumnGroup[] {
+  return visibleStatuses.map((status) => ({
+    id: statusGroupId(status),
+    title: status,
+    status,
+  }));
+}
+
+/**
+ * 高密度横向看板(自原 Multica BoardView 裁剪):
+ * 只保留 status 分组 + position 手动排序;无服务端分页、无自定义属性列、
+ * 无 create 入口。列位置由 Plan/Job 投影产生,onMoveIssue 由调用方决定
+ * 是否写回(P0 仅有本地预览 + 提示,不伪造运行状态)。
+ */
 function BoardViewImpl({
   issues,
-  visibleStatuses,
-  hiddenStatuses,
   onMoveIssue,
   childProgressMap = EMPTY_PROGRESS_MAP,
-  projectMap,
-  projectId,
-  onCreateIssue,
-  statusPagination,
-  groupBranches,
+  onAdvance,
+  stageFilter,
 }: {
   issues: Issue[];
-  visibleStatuses: IssueStatus[];
-  hiddenStatuses: IssueStatus[];
   onMoveIssue: (issueId: string, updates: DragMoveUpdates, onSettled?: () => void) => void;
   childProgressMap?: Map<string, ChildProgress>;
-  projectMap?: Map<string, Project>;
-  /** When set, the per-column "+" pre-fills the project on the create form. */
-  projectId?: string;
-  onCreateIssue?: (defaults: IssueCreateDefaults) => void;
-  statusPagination?: IssueStatusPagination;
-  groupBranches?: IssueGroupBranches;
+  onAdvance?: StageAdvanceHandler;
+  /** Work 栏目下钻:只显示对应阶段列。 */
+  stageFilter?: string | null;
 }) {
-  const { t } = useT("issues");
-  const storeGrouping = useViewStore((s) => s.grouping);
   const sortBy = useViewStore((s) => s.sortBy);
-  const boardWsId = useWorkspaceId();
-  const catalog = useIssueStatuses(boardWsId);
-  const { data: workspaceProperties = [] } = useQuery(propertyListOptions(boardWsId));
-  const groupingPropertyId = propertyIdFromViewKey(storeGrouping);
-  const groupingProperty = groupingPropertyId
-    ? workspaceProperties.find((p) => p.id === groupingPropertyId && p.type === "select") ?? null
-    : null;
-  // A persisted `property:<id>` grouping whose definition is gone (archived,
-  // deleted, other workspace) falls back to status columns.
-  const grouping: IssueGrouping =
-    groupingPropertyId && !groupingProperty ? "status" : storeGrouping;
-  const groupingOptionIds = useMemo(
+  const hiddenStatuses = useViewStore((s) => s.hiddenStatuses);
+  const visibleStatuses = useMemo(
     () =>
-      groupingProperty
-        ? new Set((groupingProperty.config.options ?? []).map((option) => option.id))
-        : undefined,
-    [groupingProperty],
+      BOARD_STATUSES
+        .filter((s) => !hiddenStatuses.includes(s.key))
+        .filter((s) => !stageFilter || s.key === stageFilter)
+        .map((s) => s.key),
+    [hiddenStatuses, stageFilter],
   );
-  const setIssuePropertyMutation = useSetIssueProperty();
-  const unsetIssuePropertyMutation = useUnsetIssueProperty();
-  const applyPropertyGroupValue = useCallback(
-    (group: BoardColumnGroup, issueId: string) => {
-      if (group.propertyId === undefined) return;
-      // Surface failures like status/assignee drags do (use-issue-surface-
-      // actions): the mutation rolls the card back, but without a toast the
-      // snap-back reads as a UI glitch instead of a rejected write.
-      const onError = (err: unknown) => {
-        toast.error(
-          err instanceof Error && err.message
-            ? err.message
-            : t(($) => $.page.move_failed),
-        );
-      };
-      if (group.propertyOptionId === null) {
-        unsetIssuePropertyMutation.mutate(
-          { issueId, propertyId: group.propertyId },
-          { onError },
-        );
-      } else if (group.propertyOptionId !== undefined) {
-        setIssuePropertyMutation.mutate(
-          {
-            issueId,
-            propertyId: group.propertyId,
-            value: group.propertyOptionId,
-          },
-          { onError },
-        );
-      }
-    },
-    [setIssuePropertyMutation, t, unsetIssuePropertyMutation],
-  );
-  const sortFieldKey = sortBy === "created_at" ? "created" : sortBy;
-  const sortPropertyId = propertyIdFromViewKey(sortBy);
-  const sortLabel = sortBy !== "position"
-    ? t(($) => $.board.ordered_by, {
-        field: sortPropertyId
-          ? workspaceProperties.find((p) => p.id === sortPropertyId)?.name ?? ""
-          : t(($) => $.display[`sort_${sortFieldKey}` as keyof typeof $.display]),
-      })
-    : null;
-  const { getActorName } = useActorName();
-  const groupedIssues = useMemo(
-    () => (groupBranches?.enabled ? groupBranches.issues : issues),
-    [groupBranches, issues],
-  );
-  const hydratedAssigneeGroups = useMemo<BoardColumnGroup[] | undefined>(() => {
-    if (grouping === "assignee" && groupBranches?.enabled) {
-      return groupBranches.descriptors.flatMap((descriptor): BoardColumnGroup[] => {
-        if (descriptor.value.kind !== "assignee") return [];
-        const actorRef = descriptor.value.actor;
-        const actor: { type: IssueAssigneeType; id: string } | null =
-          actorRef &&
-          (actorRef.type === "member" ||
-            actorRef.type === "agent" ||
-            actorRef.type === "squad")
-            ? { type: actorRef.type, id: actorRef.id }
-            : null;
-        return [{
-          id: descriptor.key,
-          title: actor
-            ? getActorName(actor.type, actor.id)
-            : t(($) => $.filters.no_assignee),
-          assigneeType: actor?.type ?? null,
-          assigneeId: actor?.id ?? null,
-          totalCount: descriptor.count,
-          createData: {
-            assignee_type: actor?.type ?? null,
-            assignee_id: actor?.id ?? null,
-          },
-        }];
-      });
-    }
-    return undefined;
-  }, [getActorName, groupBranches, grouping, t]);
-  const projectColumnLabels = useMemo<ProjectColumnLabels>(
-    () => ({
-      noProject: t(($) => $.swimlane.no_project),
-      unavailableProject: t(($) => $.table.value_unavailable),
-    }),
-    [t],
-  );
-  const hydratedProjectGroups = useMemo<BoardColumnGroup[] | undefined>(() => {
-    if (grouping !== "project" || !groupBranches?.enabled) return undefined;
-    const columns = groupBranches.descriptors.flatMap(
-      (descriptor): BoardColumnGroup[] =>
-        descriptor.value.kind === "project"
-          ? [
-              projectColumn(
-                // The descriptor key, not our own: it is what `groupPagination`
-                // is keyed by. `projectGroupId` reproduces it exactly, which is
-                // what lets cards bucket into these columns at all.
-                descriptor.key,
-                descriptor.value.project_id ?? null,
-                projectMap,
-                projectColumnLabels,
-                descriptor.count,
-              ),
-            ]
-          : [],
-    );
-    return withNoProjectColumn(columns, projectMap, projectColumnLabels);
-  }, [groupBranches, grouping, projectColumnLabels, projectMap]);
-  const groupPagination = useMemo(() => {
-    if (!groupBranches?.enabled) return undefined;
-    const grouped = new Map<string, IssueGroupPageState[]>();
-    for (const descriptor of groupBranches.descriptors) {
-      const page = groupBranches.pagination[descriptor.key];
-      if (!page) continue;
-      let id = descriptor.key;
-      if (descriptor.value.kind === "property") {
-        const value = descriptor.value;
-        id =
-          value.value_state === "value" && typeof value.value === "string"
-            ? propertyGroupId(value.property_id, value.value)
-            : propertyGroupId(value.property_id, null);
-      }
-      const pages = grouped.get(id) ?? [];
-      pages.push(page);
-      grouped.set(id, pages);
-    }
-    return Object.fromEntries(
-      Array.from(grouped, ([id, pages]) => [
-        id,
-        {
-          total: pages.reduce((sum, page) => sum + page.total, 0),
-          loaded: pages.reduce((sum, page) => sum + page.loaded, 0),
-          hasMore: pages.some((page) => page.hasMore),
-          isLoading: pages.some((page) => page.isLoading),
-          isFetching: pages.some((page) => page.isFetching),
-          isError: pages.some((page) => page.isError),
-          loadMore: () => {
-            for (const page of pages) {
-              if (page.hasMore) page.loadMore();
-            }
-          },
-          retry: () => {
-            for (const page of pages) {
-              if (page.isError) page.retry();
-            }
-          },
-        },
-      ]),
-    ) as Record<string, IssueGroupPageState>;
-  }, [groupBranches]);
-  const groups = useMemo(
-    () => {
-      const built =
-        hydratedAssigneeGroups ??
-        hydratedProjectGroups ??
-        buildGroups(issues, visibleStatuses, grouping, {
-          getActorName,
-          groupingProperty,
-          projectMap,
-          noAssigneeLabel: t(($) => $.filters.no_assignee),
-          noValueLabel: t(($) => $.board.no_value),
-          ...projectColumnLabels,
-        });
-      return built.map((group) => ({
-        ...group,
-        totalCount: groupPagination?.[group.id]?.total ?? group.totalCount,
-      }));
-    },
-    [hydratedAssigneeGroups, hydratedProjectGroups, issues, visibleStatuses, grouping, getActorName, groupingProperty, projectMap, projectColumnLabels, groupPagination, t],
-  );
-  const groupIds = useMemo(
-    () => new Set(groups.map((group) => group.id)),
-    [groups],
-  );
-  const groupMap = useMemo(
-    () => new Map(groups.map((group) => [group.id, group])),
-    [groups],
-  );
-  const collisionDetection = useMemo(
-    () => makeKanbanCollision(groupIds),
-    [groupIds],
-  );
+
+  const groups = useMemo(() => buildGroups(visibleStatuses), [visibleStatuses]);
+  const groupIds = useMemo(() => new Set(groups.map((group) => group.id)), [groups]);
+  const groupMap = useMemo(() => new Map(groups.map((group) => [group.id, group])), [groups]);
+  const collisionDetection = useMemo(() => makeKanbanCollision(groupIds), [groupIds]);
 
   // --- Drag state ---
   const [activeIssue, setActiveIssue] = useState<Issue | null>(null);
   // Shared drag/settle primitive: owns the local column mirror, the
   // dragging/settling locks, the post-move animation-frame throttle, and the
-  // settle callback. Shared with list-view (and swimlane) so the surfaces
-  // can't drift apart. Local columns follow TQ between drags via the resync
-  // effect below; during a drag/settle they are frozen by the locks.
+  // settle callback. Local columns follow the query cache between drags via
+  // the resync effect below; during a drag/settle they are frozen by the locks.
   const {
     columns,
     setColumns,
@@ -484,22 +94,22 @@ function BoardViewImpl({
     recentlyMovedRef,
     settleVersion,
     beginSettle,
-  } = useDragSettle(() => buildColumns(groupedIssues, groups, grouping, groupingOptionIds));
+  } = useDragSettle(() => buildColumns(issues, groups));
 
   useEffect(() => {
     if (!isDraggingRef.current && !isSettlingRef.current) {
-      setColumns(buildColumns(groupedIssues, groups, grouping, groupingOptionIds));
+      setColumns(buildColumns(issues, groups));
     }
-  }, [groupedIssues, groups, grouping, groupingOptionIds, settleVersion, setColumns, isDraggingRef, isSettlingRef]);
+  }, [issues, groups, settleVersion, setColumns, isDraggingRef, isSettlingRef]);
 
   // --- Issue map ---
   // Frozen during drag so BoardColumn/DraggableBoardCard props stay
-  // referentially stable even if a TQ refetch lands mid-drag.
+  // referentially stable even if a refetch lands mid-drag.
   const issueMap = useMemo(() => {
     const map = new Map<string, Issue>();
-    for (const issue of groupedIssues) map.set(issue.id, issue);
+    for (const issue of issues) map.set(issue.id, issue);
     return map;
-  }, [groupedIssues]);
+  }, [issues]);
 
   const issueMapRef = useRef(issueMap);
   if (!isDraggingRef.current && !isSettlingRef.current) {
@@ -509,10 +119,10 @@ function BoardViewImpl({
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: { distance: 5 },
-    })
+    }),
   );
 
-  // #6700: drag empty board background with the left button to pan horizontally
+  // drag empty board background with the left button to pan horizontally
   // (Trello/Linear). Card drags start on `[data-board-card]` and are ignored.
   const pan = useBoardDragPan<HTMLDivElement>();
 
@@ -533,14 +143,12 @@ function BoardViewImpl({
       const activeId = active.id as string;
       const overId = over.id as string;
 
+      if (sortBy !== "position") return;
+
       setColumns((prev) => {
         const activeCol = findColumn(prev, activeId, groupIds);
         const overCol = findColumn(prev, overId, groupIds);
         if (!activeCol || !overCol || activeCol === overCol) return prev;
-        const targetStatus = groups.find((group) => group.id === overCol)?.status;
-        if (targetStatus && catalog.entryOf(targetStatus)?.archived_at) return prev;
-
-        if (sortBy !== "position") return prev;
 
         recentlyMovedRef.current = true;
         const oldIds = prev[activeCol]!.filter((id) => id !== activeId);
@@ -551,7 +159,7 @@ function BoardViewImpl({
         return { ...prev, [activeCol]: oldIds, [overCol]: newIds };
       });
     },
-    [groupIds, groups, catalog, sortBy, recentlyMovedRef, setColumns],
+    [groupIds, sortBy, recentlyMovedRef, setColumns],
   );
 
   const handleDragEnd = useCallback(
@@ -560,8 +168,7 @@ function BoardViewImpl({
       isDraggingRef.current = false;
       setActiveIssue(null);
 
-      const resetColumns = () =>
-        setColumns(buildColumns(groupedIssues, groups, grouping, groupingOptionIds));
+      const resetColumns = () => setColumns(buildColumns(issues, groups));
 
       if (!over) {
         resetColumns();
@@ -605,56 +212,9 @@ function BoardViewImpl({
         return;
       }
 
-      const map = issueMapRef.current;
-      if (finalGroup.status && map.get(activeId)?.status !== finalGroup.status && catalog.entryOf(finalGroup.status)?.archived_at) {
-        resetColumns();
-        return;
-      }
-
-      if (sortBy !== "position") {
-        // Cross-column: only update group (status/assignee), keep original position.
-        const currentIssue = map.get(activeId);
-        if (!currentIssue || issueMatchesGroup(currentIssue, finalGroup)) {
-          resetColumns();
-          if (activeId !== overId) {
-            toast.info(t(($) => $.board.manual_reorder_hint), {
-              id: "issue-manual-reorder-hint",
-            });
-          }
-          return;
-        }
-        // Optimistically move the card into the target column *now*. Without
-        // this, the sortBy != "position" path never touches local columns on
-        // drop, so onDragOver having been a no-op leaves the card in its origin
-        // column for the whole request — it only jumps across when the mutation
-        // settles. That is the "snaps back to origin, then moves" glitch.
-        // Placement mirrors the cache (insertByPosition) so the settle rebuild
-        // from TanStack Query is a visual no-op.
-        const targetIds = insertIdByPosition(
-          (cols[overCol] ?? []).filter((id) => id !== activeId),
-          activeId,
-          currentIssue.position,
-          map,
-        );
-        setColumns((prev) => {
-          const fromIds = (prev[activeCol] ?? []).filter((cid) => cid !== activeId);
-          return { ...prev, [activeCol]: fromIds, [overCol]: targetIds };
-        });
-        onMoveIssue(
-          activeId,
-          {
-            ...getMoveUpdates(finalGroup, currentIssue.position, currentIssue),
-            ...getMoveAnchors(targetIds, activeId),
-          },
-          beginSettle(),
-        );
-        applyPropertyGroupValue(finalGroup, activeId);
-        return;
-      }
-
-      const finalIds = finalColumns[finalCol]!;
-      const newPosition = computePosition(finalIds, activeId, map);
-      const currentIssue = map.get(activeId);
+      const finalIds = finalColumns[finalCol] ?? [];
+      const newPosition = computePosition(finalIds, activeId, issueMapRef.current);
+      const currentIssue = issueMapRef.current.get(activeId);
 
       if (
         currentIssue &&
@@ -665,10 +225,8 @@ function BoardViewImpl({
       }
 
       // beginSettle() holds the lock and returns the onSettled callback that
-      // releases it and resyncs local columns from the cache: a no-op on
-      // success (onSuccess already patched the moved card in place), the revert
-      // on error (onError restored the snapshot). Without it a failed move would
-      // strand the card at the drop target, since onSettled no longer refetches.
+      // releases it and resyncs local columns from the query cache: a no-op on
+      // success, the revert on error.
       onMoveIssue(
         activeId,
         {
@@ -677,20 +235,18 @@ function BoardViewImpl({
         },
         beginSettle(),
       );
-      applyPropertyGroupValue(finalGroup, activeId);
     },
-    [groupedIssues, groups, grouping, groupingOptionIds, onMoveIssue, groupIds, groupMap, sortBy, beginSettle, columnsRef, isDraggingRef, setColumns, applyPropertyGroupValue, catalog, t],
+    [issues, groups, onMoveIssue, groupIds, groupMap, sortBy, beginSettle, columnsRef, isDraggingRef, setColumns],
   );
 
   // An aborted drag (pointercancel, window resize, tab hide, Escape) fires
   // onDragCancel instead of onDragEnd. Releasing the drag lock here keeps the
-  // column mirror resyncing with the cache afterwards — see the same handler in
-  // list-view for the touch path that makes this routine (MUL-6240).
+  // column mirror resyncing with the cache afterwards.
   const handleDragCancel = useCallback(() => {
     isDraggingRef.current = false;
     setActiveIssue(null);
-    setColumns(buildColumns(groupedIssues, groups, grouping, groupingOptionIds));
-  }, [groupedIssues, groups, grouping, groupingOptionIds, setColumns, isDraggingRef]);
+    setColumns(buildColumns(issues, groups));
+  }, [issues, groups, setColumns, isDraggingRef]);
 
   return (
     <DndContext
@@ -711,94 +267,46 @@ function BoardViewImpl({
         className="flex flex-1 min-h-0 gap-4 overflow-x-auto p-2"
       >
         {groups.length === 0 ? (
-          groupBranches?.isError ? (
-            <button
-              type="button"
-              className="flex min-w-full flex-1 items-center justify-center text-body text-destructive hover:underline"
-              onClick={groupBranches.retryGroups}
-            >
-              {t(($) => $.table.load_more_failed_retry)}
-            </button>
-          ) : (
-            <div className="flex min-w-full flex-1 items-center justify-center text-body text-muted-foreground">
-              {t(($) => $.board.empty_grouping)}
-            </div>
-          )
-        ) : (
-          groups.map((group) =>
-            isStatusGroup(group) ? (
-              <ServerPaginatedBoardColumn
-                key={group.id}
-                group={group}
-                issueIds={columns[group.id] ?? EMPTY_IDS}
-                issueMap={issueMapRef.current}
-                childProgressMap={childProgressMap}
-                projectMap={projectMap}
-                page={statusPagination?.[group.status]}
-                projectId={projectId}
-                onCreateIssue={onCreateIssue}
-                sortLabel={sortLabel}
-              />
-            ) : (
-              groupPagination?.[group.id] ? (
-                <ServerPaginatedBoardColumn
-                  key={group.id}
-                  group={group}
-                  issueIds={columns[group.id] ?? EMPTY_IDS}
-                  issueMap={issueMapRef.current}
-                  childProgressMap={childProgressMap}
-                  projectMap={projectMap}
-                  page={groupPagination[group.id]!}
-                  projectId={projectId}
-                  onCreateIssue={onCreateIssue}
-                  sortLabel={sortLabel}
-                />
-              ) : (
-                <BoardColumn
-                  key={group.id}
-                  group={group}
-                  issueIds={columns[group.id] ?? EMPTY_IDS}
-                  issueMap={issueMapRef.current}
-                  childProgressMap={childProgressMap}
-                  projectMap={projectMap}
-                  projectId={projectId}
-                  onCreateIssue={onCreateIssue}
-                  totalCount={group.totalCount}
-                  sortLabel={sortLabel}
-                />
-              )
-            ),
-          )
-        )}
-        {groupBranches?.hasMoreGroups && (
-          <div className="flex w-8 shrink-0 items-center justify-center">
-            <InfiniteScrollSentinel
-              onVisible={groupBranches.loadMoreGroups}
-              loading={groupBranches.isLoadingMoreGroups}
-            />
+          <div className="flex min-w-full flex-1 items-center justify-center text-body text-muted-foreground">
+            所有列均已隐藏,可在右侧行恢复
           </div>
+        ) : (
+          groups.map((group) => (
+            <BoardColumn
+              key={group.id}
+              group={group}
+              issueIds={columns[group.id] ?? EMPTY_IDS}
+              issueMap={issueMapRef.current}
+              childProgressMap={childProgressMap}
+              totalCount={columns[group.id]?.length ?? 0}
+              onAdvance={onAdvance}
+            />
+          ))
         )}
 
-
-        {grouping === "status" && hiddenStatuses.length > 0 && (
-          <BoardHiddenColumnsPanel
+        {hiddenStatuses.length > 0 && (
+          <HiddenColumnsPanel
             hiddenStatuses={hiddenStatuses}
-            statusPagination={statusPagination}
+            renderRow={(status) => (
+              <HiddenColumnRow
+                key={status}
+                status={status}
+                total={(columns[statusGroupId(status)] ?? []).length}
+              />
+            )}
           />
         )}
       </div>
 
       <DragOverlay dropAnimation={null}>
         {activeIssue ? (
-          <div style={{ width: BOARD_CARD_WIDTH }} className="rotate-1 cursor-grabbing opacity-90 shadow-lg shadow-black/10">
+          <div
+            style={{ width: BOARD_CARD_WIDTH }}
+            className="rotate-1 cursor-grabbing opacity-90 shadow-lg shadow-black/10"
+          >
             <BoardCardContent
               issue={activeIssue}
               childProgress={childProgressMap.get(activeIssue.id)}
-              project={
-                activeIssue.project_id
-                  ? projectMap?.get(activeIssue.project_id)
-                  : undefined
-              }
             />
           </div>
         ) : null}
@@ -807,80 +315,8 @@ function BoardViewImpl({
   );
 }
 
-
-const ServerPaginatedBoardColumn = memo(function ServerPaginatedBoardColumn({
-  group,
-  issueIds,
-  issueMap,
-  childProgressMap,
-  projectMap,
-  page,
-  projectId,
-  onCreateIssue,
-  sortLabel,
-}: {
-  group: BoardColumnGroup;
-  issueIds: string[];
-  issueMap: Map<string, Issue>;
-  childProgressMap?: Map<string, ChildProgress>;
-  projectMap?: Map<string, Project>;
-  page?: IssueStatusPageState | IssueGroupPageState;
-  projectId?: string;
-  onCreateIssue?: (defaults: IssueCreateDefaults) => void;
-  sortLabel?: string | null;
-}) {
-  const footer = page ? (
-    <ListLoadMoreFooter
-      hasMore={page.hasMore}
-      isLoading={page.isLoading || page.isFetching}
-      total={page.total}
-      onLoadMore={page.loadMore}
-      isError={page.isError}
-      onRetry={page.retry}
-    />
-  ) : undefined;
-  return (
-    <BoardColumn
-      group={group}
-      issueIds={issueIds}
-      issueMap={issueMap}
-      childProgressMap={childProgressMap}
-      projectMap={projectMap}
-      totalCount={page?.total ?? group.totalCount}
-      projectId={projectId}
-      onCreateIssue={onCreateIssue}
-      sortLabel={sortLabel}
-      footer={footer}
-    />
-  );
-});
-
-
-function BoardHiddenColumnsPanel({
-  hiddenStatuses,
-  statusPagination,
-}: {
-  hiddenStatuses: IssueStatus[];
-  statusPagination?: IssueStatusPagination;
-}) {
-  return (
-    <HiddenColumnsPanel
-      hiddenStatuses={hiddenStatuses}
-      renderRow={(status) => (
-        <HiddenColumnRow
-          key={status}
-          status={status}
-          total={statusPagination?.[status]?.total}
-        />
-      )}
-    />
-  );
-}
-
 /**
- * Memoized: the surface controller re-renders on loading-flag flips (e.g. a
- * query enabling when the view changes) — without memo every such flip
- * re-rendered this entire view tree (hundreds of ms). All props are
- * referentially stable useMemo/useCallback outputs from the controller.
+ * Memoized: polling refetches re-render the page tree — without memo every
+ * such flip re-rendered this entire view tree.
  */
 export const BoardView = memo(BoardViewImpl);
