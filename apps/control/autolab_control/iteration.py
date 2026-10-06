@@ -209,11 +209,11 @@ def _extract_json_block(text: str) -> Any:
 
 # ------------------------------------------------------------- LLM 编排
 
-_PLAN_SYSTEM_PROMPT = """你是 AutoLab 的自动迭代 Agent。任务:读入已采纳方案的评审报告与项目事实,为下一轮迭代实验生成一份可直接执行的实验计划,输出为一个 JSON 对象。
+_PLAN_SYSTEM_PROMPT = """你是 AutoLab 的自动迭代 Agent。任务:读入执行依据(项目方向,或老项目已采纳方案的评审报告)与项目事实,为下一轮迭代实验生成一份可直接执行的实验计划,输出为一个 JSON 对象。
 
 必须遵守:
 1. 只输出一个 ```json``` 代码块,不要输出任何其他文字。
-2. 改动以现有工作区代码为载体(评审报告即执行计划);报告/材料里没有的事实不要编造,不确定的字段按 Baseline 事实保守取值。
+2. 改动以现有工作区代码为载体(执行依据即改进计划);依据/材料里没有的事实不要编造,不确定的字段按 Baseline 事实保守取值。
 3. command 是一条 shell 命令,工作目录为项目工作区;矩阵参数用 {{参数名}} 引用,且每个参数名必须出现在 job_definition.parameters 的键里;command 引用的每个参数都必须在 job_definition 中定义。
 4. 训练/评估脚本必须把指标 JSON 写到 $AUTOLAB_OUTPUT_DIR/<metric_source.path>(系统已注入该环境变量,参考 Baseline 的运行方式)。
 5. 不要在 command 里激活 conda / 改环境变量(系统会按 Baseline 配置自动包装)。
@@ -313,6 +313,20 @@ def _llm_plan_draft(credentials: CredentialStore, context: str,
                         + ",草案却用了 " + "、".join(str(s) for s in beyond)
                         + "。多 seed 对单 seed 基线是不公平比较,"
                         "矩阵的 seed 必须与基线完全一致(要多种子先给基线补)。")
+        # 空参数值会在 manifest 展开成空 argv(对照档陷阱):起草时就拦,
+        # "无开关"对照用省略该 flag 表达,不要给空字符串档位
+        empty_vals = [
+            f"{name}={v!r}" for name, values in
+            (draft.get("job_definition", {}).get("parameters") or {}).items()
+            if isinstance(values, list)
+            for v in values if isinstance(v, str) and not v.strip()
+        ]
+        if empty_vals:
+            raise IterationError(
+                "矩阵参数值不得为空字符串(展开会生成空命令行参数):"
+                + "、".join(empty_vals[:5])
+                + "。要表达\"无该开关\"的对照档,请写不含该 flag 的取值"
+                  "(如 \"--aug\" 与无 aug 字样各一档,分两个参数组合)。")
 
     messages = [{"role": "user", "content": build_plan_user_prompt(context)}]
     last_error = ""
@@ -336,7 +350,7 @@ def _llm_plan_draft(credentials: CredentialStore, context: str,
             continue
     raise IterationError(
         f"模型两次输出均无法解析为实验计划:{last_error[:200]}。"
-        "可重试,或先在方案评审页完善评审报告。"
+        "可重试,或先在方向页完善方向陈述。"
     )
 
 
