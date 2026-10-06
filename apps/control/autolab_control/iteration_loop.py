@@ -613,6 +613,10 @@ class LoopManager:
             }[loop["phase"]]
             handler(loop)
         except Exception as exc:  # 任何一步失败:终结循环并留下原因,绝不明灭
+            import traceback
+
+            print("autolab-control: loop advance failed:", file=__import__("sys").stderr)
+            traceback.print_exc()
             _update_loop(self.repo, loop_id, status="failed",
                          stop_reason=f"循环异常终止:{str(exc)[:200]}")
             # 终态原因同步进证据层(failures.md):下个会话/循环才读得到死因

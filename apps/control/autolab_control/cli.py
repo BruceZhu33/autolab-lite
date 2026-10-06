@@ -62,6 +62,22 @@ def main(argv: list[str] | None = None) -> int:
                       file=sys.stderr, flush=True)
                 args.http_port = 0
             if args.http_port:
+                # 端口预检:绑定失败(常驻 demo 还活着/端口被占)必须立刻退出
+                # 整个进程——否则 uvicorn 线程死了、LoopManager/scheduler 还在,
+                # 留下一个"无 HTTP 但每 2s 推进循环"的僵尸进程,与新进程双写
+                # 同一循环(实测事故:双进程各跑一轮、旧代码覆盖新代码的结果)。
+                import socket as _socket
+
+                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 0)
+                try:
+                    probe.bind(("127.0.0.1", args.http_port))
+                except OSError as exc:
+                    print(f"autolab-control: http port {args.http_port} unavailable ({exc});"
+                          " another control instance? refusing to start", file=sys.stderr, flush=True)
+                    return 2
+                finally:
+                    probe.close()
                 app = create_api_app(repo, credentials)
                 api_thread = _t.Thread(
                     target=uvicorn.run, args=(app,),

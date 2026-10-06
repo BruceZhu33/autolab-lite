@@ -25,6 +25,10 @@ def build_manifest(acquired: AcquiredJob, project: dict[str, Any]) -> ManifestV1
     params = dict(job_params(job))
 
     argv = [render_template(entry, params) for entry in spec.command_template]
+    # 矩阵参数里合法的"空档"(如对照组 extra="")展开后是空串;shell 语义里
+    # 空参数本就不存在,而协议的 ManifestExecution 校验拒绝空 argv 元素。
+    # 在构造前清洗,避免派发无限重试(job 永远 DISPATCHING 的实测事故)。
+    argv = [a for a in argv if a != ""]
     environment = ManifestEnvironment()
     if spec.environment is not None:
         if spec.environment.command_prefix:
