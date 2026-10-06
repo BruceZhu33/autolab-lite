@@ -30,6 +30,20 @@ def main(argv: list[str] | None = None) -> int:
         repo = Repo(Database(args.db))
         CredentialStore(args.credentials)  # validates privacy early
         scheduler = Scheduler(repo, args.credentials, poll_interval=args.poll_interval)
+        from .iteration_loop import LoopManager
+
+        loop_manager = LoopManager(repo, args.credentials)
+        loop_thread = threading.Thread(
+            target=loop_manager.run_forever, daemon=True, name="iteration-loop")
+        loop_thread.start()
+        print("autolab-control: iteration loop manager started", flush=True)
+        from .baseline_queue import BaselineQueueManager
+
+        queue_manager = BaselineQueueManager(repo, args.credentials)
+        queue_thread = threading.Thread(
+            target=queue_manager.run_forever, daemon=True, name="baseline-queue")
+        queue_thread.start()
+        print("autolab-control: baseline queue manager started", flush=True)
         stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         signal.signal(signal.SIGINT, lambda *_: stop.set())
