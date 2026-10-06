@@ -18,20 +18,4 @@ body {
   background: var(--app-shell);
   color: var(--surface-foreground);
   font-family: var(--font-sans);
-  font-size: 13px;
-}
-
-.autolab-card {
-  border-radius: 10px;
-  border: 1px solid var(--surface-border);
-  background: var(--surface);
-  box-shadow: var(--surface-shadow);
-}
-
-.autolab-chip {
-  border-radius: 999px;
-  border: 1px solid var(--surface-border);
-  padding: 1px 8px;
-  font-size: 11px;
-  line-height: 18px;
 }

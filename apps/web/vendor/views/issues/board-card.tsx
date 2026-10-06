@@ -1,381 +1,144 @@
 "use client";
 
-import { useCallback, memo } from "react";
-import { AppLink } from "../../navigation";
+import { memo } from "react";
+import Link from "next/link";
 import { useSortable, defaultAnimateLayoutChanges } from "@dnd-kit/sortable";
 import type { AnimateLayoutChanges } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type { Issue, IssueProperty, Project, UpdateIssueRequest } from "@multica/core/types";
-import { useQuery } from "@tanstack/react-query";
-import { useWorkspaceId } from "@multica/core/hooks";
-import { propertyListOptions } from "@multica/core/properties";
-import { CustomPropertyValueDisplay } from "./pickers/custom-property-picker";
+import { Activity, ArrowRight, Flame } from "lucide-react";
+import type { ChildProgress, Issue } from "./types";
 import { descriptionPreview } from "./description-preview";
-import { formatDateOnly, isPastDateOnly } from "@multica/core/issues/date";
-import { CalendarClock, CalendarDays } from "lucide-react";
-import { ActorAvatar } from "../../common/actor-avatar";
-import { PropertyIcon } from "../../common/property-icon";
-import { useWorkspacePaths } from "@multica/core/paths";
-import { useActorName } from "@multica/core/workspace/hooks";
-import { useLocale, useT, useTimeAgo } from "../../i18n";
-import { ProjectIcon } from "../../projects/components/project-icon";
-import { PriorityIcon } from "./priority-icon";
-import { PriorityPicker, AssigneePicker, StartDatePicker, DueDatePicker } from "./pickers";
-import { useViewStore } from "@multica/core/issues/stores/view-store-context";
-import { propertyIdFromViewKey } from "@multica/core/issues/stores/view-store";
+import { timeAgo } from "./time";
+import { useViewStore } from "./view-store";
 import { ProgressRing } from "./progress-ring";
-import type { ChildProgress } from "./list-row";
-import { IssueActionsContextMenu } from "../actions";
-import { LabelChip } from "../../labels/label-chip";
-import { IssueAgentActivityIndicator } from "./issue-agent-activity-indicator";
-import { CustomStatusChip, useIsCustomStatus } from "./custom-status-chip";
-import { useIssueSurfaceActionsOptional } from "../surface/actions-context";
-function formatDate(date: string, locale: string): string {
-  return formatDateOnly(date, { month: "short", day: "numeric" }, locale);
+import { LabelChip } from "./label-chip";
+
+export type StageAdvanceHandler = (issueId: string, to: "done") => void;
+
+function formatMetricValue(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
 }
 
 /**
- * AutoLab（v0.3 迁移）：看板卡片按阶段路由到 Work 模块——卡片是流程地图
- * 的入口，点击进入该阶段的工作现场而不是通用评论页。
- * 准备 → Projects（选中该项目：核对代码库/补充材料/过准备门）；
- * 基线验证 → 基线工作区（BASE 派发/run 监视/验收）；
- * 方案评审 → 评审页（自由对话/评分/人工终审）；
- * 自动迭代 → 迭代工作区（轮次/指标趋势/预算/监督干预）；
- * 最终确认 → 确认工作区（final-read 一次性释放 + 报告）；
- * 已完成 → 归档视图（报告 + 全程时间线回放）。
+ * 看板卡片(AutoLab 投影版):默认回答 01-产品需求 FR-9 的六个问题——
+ * 项目是什么、最新计划、Job 进度、使用哪张 GPU、最新指标、是否需要用户处理。
+ * 相对原 Multica 卡片:去掉 pickers/右键菜单/Agent 活动指示/自定义属性,
+ * 卡片不可编辑,点击整卡进入 Plan 工作区。
  */
-function autolabStageWorkspaceHref(
-  p: { projects: () => string; issueDetail: (id: string) => string },
-  issue: Issue,
-): string {
-  // Phase 2（sidecar 真项目）：六个阶段工作台全部接真——按阶段路由。
-  if (issue.metadata?.real_sidecar === true) {
-    if (issue.status === "prepare") {
-      return `${p.projects()}?project=${encodeURIComponent(issue.id)}`;
-    }
-    const wsBase = p.projects().slice(0, -"/projects".length);
-    const stagePath: Record<string, string> = {
-      baseline: "baseline",
-      review: "review",
-      iterate: "iterate",
-      confirm: "confirm",
-      reported: "reported",
-    };
-    const seg = stagePath[issue.status];
-    if (seg) return `${wsBase}/${seg}/${encodeURIComponent(issue.id)}`;
-    return p.issueDetail(issue.id);
-  }
-  const wsBase = p.projects().slice(0, -"/projects".length);
-  switch (issue.status) {
-    case "prepare":
-      return `${p.projects()}?project=${encodeURIComponent(issue.id)}`;
-    case "baseline":
-      return `${wsBase}/baseline/${encodeURIComponent(issue.id)}`;
-    case "review":
-      return `${wsBase}/review/${encodeURIComponent(issue.id)}`;
-    case "iterate":
-      return `${wsBase}/iterate/${encodeURIComponent(issue.id)}`;
-    case "confirm":
-      return `${wsBase}/confirm/${encodeURIComponent(issue.id)}`;
-    case "reported":
-      return `${wsBase}/reported/${encodeURIComponent(issue.id)}`;
-    default:
-      return p.issueDetail(issue.id);
-  }
-}
-
-/** Stops event from bubbling to Link/drag handlers */
-function PickerWrapper({ children, className }: { children: React.ReactNode; className?: string }) {
-  const stop = (e: React.SyntheticEvent) => {
-    e.stopPropagation();
-    e.preventDefault();
-  };
-  return (
-    <div onClick={stop} onMouseDown={stop} onPointerDown={stop} className={className}>
-      {children}
-    </div>
-  );
-}
-
 export const BoardCardContent = memo(function BoardCardContent({
   issue,
-  editable = false,
   childProgress,
-  project,
+  onAdvance,
 }: {
   issue: Issue;
-  editable?: boolean;
   childProgress?: ChildProgress;
-  project?: Project;
+  onAdvance?: StageAdvanceHandler;
 }) {
-  const { t } = useT("issues");
-  const locale = useLocale();
-  const timeAgo = useTimeAgo();
-  const storeProperties = useViewStore((s) => s.cardProperties);
-  const cardPropertyIds = useViewStore((s) => s.cardPropertyIds);
-  const viewMode = useViewStore((s) => s.viewMode);
-  const grouping = useViewStore((s) => s.grouping);
-  const swimlaneGrouping = useViewStore((s) => s.swimlaneGrouping);
-  const cardGrouping =
-    viewMode === "board"
-      ? grouping
-      : viewMode === "swimlane"
-        ? swimlaneGrouping
-        : null;
-  const groupedPropertyId = cardGrouping
-    ? propertyIdFromViewKey(cardGrouping)
-    : null;
-  const cardWsId = useWorkspaceId();
-  const { data: workspaceProperties = [] } = useQuery(propertyListOptions(cardWsId));
-  // Custom properties toggled on in Display options, in toggle order, only
-  // when this issue actually carries a value.
-  const cardCustomProperties = cardPropertyIds
-    .filter((id) => id !== groupedPropertyId)
-    .map((id) => workspaceProperties.find((p) => p.id === id))
-    .filter((p): p is IssueProperty => !!p && issue.properties?.[p.id] !== undefined);
+  const showDescription = useViewStore((s) => s.cardProperties.description) && issue.description;
+  const showLabels = useViewStore((s) => s.cardProperties.labels) && issue.labels.length > 0;
+  const showChildProgress = useViewStore((s) => s.cardProperties.childProgress) && childProgress;
   const labels = issue.labels ?? [];
-
-  const surfaceActions = useIssueSurfaceActionsOptional();
-  const handleUpdate = useCallback(
-    (updates: Partial<UpdateIssueRequest>) => {
-      surfaceActions?.updateIssue(issue.id, updates, {
-        errorMessage: t(($) => $.card.update_failed),
-      });
-    },
-    [issue.id, surfaceActions, t],
-  );
-  const canEdit = editable && !!surfaceActions;
-
-  const hasAssignee = !!issue.assignee_type && !!issue.assignee_id;
-  const showPriority = storeProperties.priority && issue.priority !== "none";
-  const showDescription = storeProperties.description && issue.description;
-  const showAssigneeSection =
-    storeProperties.assignee && cardGrouping !== "assignee" && hasAssignee;
-  const showStartDate = storeProperties.startDate && issue.start_date;
-  const showDueDate = storeProperties.dueDate && issue.due_date;
-  const showProject =
-    storeProperties.project && cardGrouping !== "project" && project;
-  const showChildProgress = storeProperties.childProgress && childProgress;
-  const showLabels = storeProperties.labels && labels.length > 0;
-  // Keeps the chip row from rendering an empty flex container when the status
-  // chip is the only thing in it and it decides to render nothing.
-  const showCustomStatus = useIsCustomStatus(issue.status);
-
-  const showAssigneeName = showAssigneeSection && hasAssignee && !showStartDate && !showDueDate;
-  const showUpdatedHint = showAssigneeName && !showChildProgress;
-  const { getActorName } = useActorName();
-  const assigneeName =
-    showAssigneeName && issue.assignee_type && issue.assignee_id
-      ? getActorName(issue.assignee_type, issue.assignee_id)
-      : null;
-
-  const priorityLabel = t(($) => $.priority[issue.priority]);
-  const priorityIconNode = showPriority ? (
-    canEdit ? (
-      <PickerWrapper className="flex">
-        <PriorityPicker
-          priority={issue.priority}
-          onUpdate={handleUpdate}
-          triggerRender={
-            <button
-              type="button"
-              aria-label={priorityLabel}
-              className="inline-flex size-5 shrink-0 items-center justify-center rounded-xs hover:bg-muted/60"
-            >
-              <PriorityIcon priority={issue.priority} />
-            </button>
-          }
-        />
-      </PickerWrapper>
-    ) : (
-      <span
-        aria-label={priorityLabel}
-        className="inline-flex size-5 shrink-0 items-center justify-center"
-      >
-        <PriorityIcon priority={issue.priority} />
-      </span>
-    )
-  ) : null;
-
-  // The parent row gives this container the leftover space; min-w-0 and
-  // max-w-full make the nested picker trigger respect that limit.
-  const assigneeContainerClass = assigneeName
-    ? "flex min-w-0 max-w-full items-center"
-    : "inline-flex items-center";
-
-  const assigneeInner = hasAssignee ? (
-    <span className="flex min-w-0 max-w-full items-center gap-1.5">
-      <ActorAvatar
-        actorType={issue.assignee_type!}
-        actorId={issue.assignee_id!}
-        size="sm"
-        enableHoverCard
-        profileLink={false}
-        className="shrink-0"
-      />
-      {assigneeName && (
-        <span className="min-w-0 truncate text-caption text-foreground">{assigneeName}</span>
-      )}
-    </span>
-  ) : (
-    <span className="text-caption text-muted-foreground">{t(($) => $.pickers.assignee.trigger_unassigned)}</span>
-  );
-
-  const assigneeNode = showAssigneeSection ? (
-    canEdit ? (
-      <PickerWrapper className={assigneeContainerClass}>
-        <AssigneePicker
-          assigneeType={issue.assignee_type}
-          assigneeId={issue.assignee_id}
-          onUpdate={handleUpdate}
-          trigger={assigneeInner}
-        />
-      </PickerWrapper>
-    ) : (
-      <span className={assigneeContainerClass}>{assigneeInner}</span>
-    )
-  ) : null;
-
-  const showMetaRow = showAssigneeSection || showStartDate || showDueDate || showChildProgress;
-  const showRightMeta = !!showStartDate || !!showDueDate || !!showChildProgress || showUpdatedHint;
+  const metric = issue.latestMetric ?? null;
 
   return (
-    <div className="rounded-lg border-[0.5px] border-surface-border bg-surface py-3 px-2.5 shadow-[var(--surface-shadow)] transition-colors group-hover/card:border-foreground/15 group-hover/card:bg-surface-hover group-data-[popup-open]/card:border-foreground/15 group-data-[popup-open]/card:bg-surface-hover">
-      {/* Row 1: priority + identifier (left), agent activity + assignee (right) */}
+    <div
+      className="min-h-[8.5rem] rounded-lg border-[0.5px] border-surface-border bg-surface py-3 px-2.5 shadow-[var(--surface-shadow)] transition-colors group-hover/card:border-foreground/15 group-hover/card:bg-surface-hover"
+      style={issue.tint ? {
+        backgroundColor: issue.tint.bg,
+        borderLeft: `3px solid ${issue.tint.edge}`,
+      } : undefined}>
+      {/* Row 1: identifier (left), updated time (right) */}
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 min-w-0">
-          {priorityIconNode}
-          <p className="text-caption text-muted-foreground truncate">{issue.identifier}</p>
-        </div>
-        <IssueAgentActivityIndicator issueId={issue.id} />
+        <p className="text-caption text-muted-foreground truncate">{issue.identifier}</p>
+        <span className="shrink-0 text-caption text-muted-foreground" title={issue.updated_at}>
+          {timeAgo(issue.updated_at)}
+        </span>
       </div>
 
       {/* Row 2: Title */}
-      <p className="mt-1 text-body font-medium leading-snug line-clamp-2">
-        {issue.title}
-      </p>
+      <p className="mt-1 text-body font-medium leading-snug line-clamp-2">{issue.title}</p>
 
       {showDescription && (() => {
         const preview = descriptionPreview(issue.description!);
         if (!preview) return null;
         return (
-          <p className="mt-1 text-caption text-muted-foreground line-clamp-1">
-            {preview}
-          </p>
+          <p className="mt-1 text-caption text-muted-foreground line-clamp-1">{preview}</p>
         );
       })()}
 
-      {/* Chip row: status + project + labels + custom property values.
-          The status chip renders only for a CUSTOM status — the column header
-          already names the category. (MUL-6243) */}
-      {(showCustomStatus || showProject || showLabels || cardCustomProperties.length > 0) && (
+      {/* Chip row: badges + gpu labels + latest metric */}
+      {(showLabels || metric) && (
         <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
-          <CustomStatusChip status={issue.status} />
-          {showProject && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-muted/60 px-1.5 py-0.5 text-micro text-muted-foreground max-w-[160px]">
-              <ProjectIcon project={project} size="sm" />
-              <span className="truncate">{project!.title}</span>
-            </span>
-          )}
-          {showLabels && labels.slice(0, 2).map((label) => (
+          {showLabels && labels.slice(0, 3).map((label) => (
             <LabelChip key={label.id} label={label} />
           ))}
-          {showLabels && labels.length > 2 && (
-            <span className="text-micro text-muted-foreground">
-              +{labels.length - 2}
+          {showLabels && labels.length > 3 && (
+            <span className="text-micro text-muted-foreground">+{labels.length - 3}</span>
+          )}
+          {metric && (
+            <span
+              className="inline-flex max-w-[160px] items-center gap-1 rounded-full bg-muted/60 px-1.5 py-0.5 text-micro font-medium tabular-nums text-muted-foreground"
+              title={`最新指标 ${metric.name}${metric.delta !== undefined ? `(Δ ${metric.delta > 0 ? "+" : ""}${formatMetricValue(metric.delta)})` : ""}`}
+            >
+              <Activity className="size-3 shrink-0 text-success" />
+              <span className="truncate">
+                {metric.name}: {formatMetricValue(metric.value)}
+                {metric.delta !== undefined && (
+                  <span className={metric.delta >= 0 ? "text-success" : "text-destructive"}>
+                    {" "}
+                    {metric.delta >= 0 ? "↑" : "↓"}
+                    {formatMetricValue(Math.abs(metric.delta))}
+                  </span>
+                )}
+              </span>
             </span>
           )}
-          {cardCustomProperties.map((property) => (
-            <span
-              key={property.id}
-              className="inline-flex max-w-[160px] items-center gap-1 rounded-full bg-muted/60 px-1.5 py-0.5 text-micro text-muted-foreground"
-            >
-              <PropertyIcon property={property} className="size-3 text-micro" />
-              <CustomPropertyValueDisplay property={property} value={issue.properties?.[property.id]} />
-            </span>
-          ))}
         </div>
       )}
 
-      {/* Meta row: assignee (left), start date, due date, child progress (right) */}
-      {showMetaRow && (
+      {/* Meta row: job progress */}
+      {showChildProgress && (
         <div className="mt-2 flex items-center justify-between gap-2">
-          {showAssigneeSection && (
-            <div className="min-w-0 flex-1">
-              {assigneeNode}
-            </div>
-          )}
-          {showRightMeta && (
+          <div className="inline-flex shrink-0 items-center gap-1">
+            <ProgressRing done={childProgress!.done} total={childProgress!.total} size={14} />
+            <span className="text-micro text-muted-foreground tabular-nums font-medium">
+              {childProgress!.done}/{childProgress!.total}
+            </span>
+          </div>
+          {((childProgress!.running ?? 0) > 0 || (childProgress!.failed ?? 0) > 0) && (
             <div className="ml-auto flex shrink-0 items-center gap-2">
-              {showStartDate && (
-                canEdit ? (
-                  <PickerWrapper className="flex shrink-0">
-                    <StartDatePicker
-                      startDate={issue.start_date}
-                      onUpdate={handleUpdate}
-                      trigger={
-                        <span className="flex items-center gap-1 text-caption text-muted-foreground">
-                          <CalendarClock className="size-3" />
-                          {formatDate(issue.start_date!, locale)}
-                        </span>
-                      }
-                    />
-                  </PickerWrapper>
-                ) : (
-                  <span className="flex shrink-0 items-center gap-1 text-caption text-muted-foreground">
-                    <CalendarClock className="size-3" />
-                    {formatDate(issue.start_date!, locale)}
-                  </span>
-                )
+              {(childProgress!.running ?? 0) > 0 && (
+                <span className="inline-flex items-center gap-0.5 text-micro font-medium text-warning">
+                  <Activity className="size-3" />
+                  {childProgress!.running} 运行
+                </span>
               )}
-              {showDueDate && (
-                canEdit ? (
-                  <PickerWrapper className="flex shrink-0">
-                    <DueDatePicker
-                      dueDate={issue.due_date}
-                      onUpdate={handleUpdate}
-                      trigger={
-                        <span
-                          className={`flex items-center gap-1 text-caption ${
-                            isPastDateOnly(issue.due_date)
-                              ? "text-destructive"
-                              : "text-muted-foreground"
-                          }`}
-                        >
-                          <CalendarDays className="size-3" />
-                          {formatDate(issue.due_date!, locale)}
-                        </span>
-                      }
-                    />
-                  </PickerWrapper>
-                ) : (
-                  <span
-                    className={`flex shrink-0 items-center gap-1 text-caption ${
-                      isPastDateOnly(issue.due_date)
-                        ? "text-destructive"
-                        : "text-muted-foreground"
-                    }`}
-                  >
-                    <CalendarDays className="size-3" />
-                    {formatDate(issue.due_date!, locale)}
-                  </span>
-                )
-              )}
-              {showChildProgress && (
-                <div className="inline-flex shrink-0 items-center gap-1">
-                  <ProgressRing done={childProgress!.done} total={childProgress!.total} size={14} />
-                  <span className="text-micro text-muted-foreground tabular-nums font-medium">
-                    {childProgress!.done}/{childProgress!.total}
-                  </span>
-                </div>
-              )}
-              {showUpdatedHint && (
-                <span className="shrink-0 text-caption text-muted-foreground">
-                  {t(($) => $.card.updated_ago, { time: timeAgo(issue.updated_at) })}
+              {(childProgress!.failed ?? 0) > 0 && (
+                <span className="inline-flex items-center gap-0.5 text-micro font-medium text-destructive">
+                  <Flame className="size-3" />
+                  {childProgress!.failed} 失败
                 </span>
               )}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Stage action: confirm(实验完成)→ done(归档)。方案评审在 /review 页。 */}
+      {onAdvance && issue.status === "confirm" && (
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onAdvance(issue.id, "done");
+            }}
+            className="inline-flex w-full items-center justify-center gap-1 rounded-md border-[0.5px] border-surface-border bg-surface px-2 py-1 text-caption font-medium text-foreground/80 transition-colors hover:border-foreground/15 hover:bg-surface-hover"
+          >
+            记录结论
+            <ArrowRight className="size-3" />
+          </button>
         </div>
       )}
     </div>
@@ -388,18 +151,39 @@ const animateLayoutChanges: AnimateLayoutChanges = (args) => {
   return defaultAnimateLayoutChanges(args);
 };
 
+/** 看板卡片按所在研究阶段跳到对应栏目页(而不是原始 Plan 详情页)。
+ * Issue.id 即 projectId(board.ts 投影)。
+ * 待计划→项目页(登记/补全/提Baseline;有草案时项目页有"待批准计划"入口);
+ * Baseline→Baseline 页;方案评审→评审页;Iteration/Confirm/Done→迭代页。 */
+function cardTarget(issue: Issue): string {
+  // 展开卡 id 为 "projectId:stage"(同一项目在各阶段列各有一张卡),
+  // 导航取真实 projectId(剥掉阶段后缀)
+  const project = encodeURIComponent(issue.id.split(":")[0]);
+  switch (issue.status) {
+    case "baseline":
+      return `/baseline?project=${project}`;
+    case "review":
+      return `/review?project=${project}`;
+    case "iterate":
+    case "confirm":
+    case "done":
+      return `/iteration?project=${project}`;
+    default: // prepare:准备工作台在项目页
+      return `/projects`;
+  }
+}
+
 export const DraggableBoardCard = memo(function DraggableBoardCard({
   issue,
   childProgress,
-  project,
   disableSorting,
+  onAdvance,
 }: {
   issue: Issue;
   childProgress?: ChildProgress;
-  project?: Project;
   disableSorting?: boolean;
+  onAdvance?: StageAdvanceHandler;
 }) {
-  const p = useWorkspacePaths();
   const {
     attributes,
     listeners,
@@ -420,28 +204,20 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({
   };
 
   return (
-    <IssueActionsContextMenu issue={issue}>
-      <div
-        ref={setNodeRef}
-        style={style}
-        data-board-card=""
-        {...attributes}
-        {...listeners}
-        className={`group/card ${isDragging ? "opacity-30" : ""}`}
+    <div
+      ref={setNodeRef}
+      style={style}
+      data-board-card=""
+      {...attributes}
+      {...listeners}
+      className={`group/card ${isDragging ? "opacity-30" : ""}`}
+    >
+      <Link
+        href={cardTarget(issue)}
+        className={`group block transition-colors ${isDragging ? "pointer-events-none" : ""}`}
       >
-        <AppLink
-          href={autolabStageWorkspaceHref(p, issue)}
-          newTabTitle={issue.identifier}
-          className={`group block transition-colors ${isDragging ? "pointer-events-none" : ""}`}
-        >
-          <BoardCardContent
-            issue={issue}
-            editable
-            childProgress={childProgress}
-            project={project}
-          />
-        </AppLink>
-      </div>
-    </IssueActionsContextMenu>
+        <BoardCardContent issue={issue} childProgress={childProgress} onAdvance={onAdvance} />
+      </Link>
+    </div>
   );
 });

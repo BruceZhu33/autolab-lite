@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoLab Lite · 架构全景(LangGraph 工作流 × 产品阶段)</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#11161d; --panel2:#161d26; --border:#232c38;
+    --text:#dbe4ee; --dim:#8b98a9; --brand:#4f8ef7; --brand2:#7aa7ff;
+    --green:#3ecf8e; --yellow:#e8b93e; --red:#f06a6a; --purple:#b48ef7;
+    --mono:'SF Mono','JetBrains Mono',ui-monospace,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font:15px/1.7 -apple-system,'PingFang SC','Microsoft YaHei',sans-serif;padding:0 0 80px}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 28px}
+  header{padding:44px 0 8px}
+  header h1{font-size:26px;font-weight:700;letter-spacing:.5px}
+  header p{color:var(--dim);margin-top:6px;font-size:14px}
+  .pill{display:inline-block;font:600 11px/1 var(--mono);padding:5px 10px;border-radius:999px;margin-right:8px;vertical-align:2px}
+  .pill.b{background:rgba(79,142,247,.14);color:var(--brand2)}
+  .pill.g{background:rgba(62,207,142,.12);color:var(--green)}
+  .pill.y{background:rgba(232,185,62,.12);color:var(--yellow)}
+  .pill.p{background:rgba(180,142,247,.12);color:var(--purple)}
+  h2.sec{font-size:19px;font-weight:700;margin:52px 0 6px;display:flex;align-items:center;gap:10px}
+  h2.sec .no{font:700 12px var(--mono);color:var(--brand);border:1px solid var(--border);border-radius:8px;padding:3px 9px;background:var(--panel)}
+  .sub{color:var(--dim);font-size:13.5px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:20px 22px}
+  .grid{display:grid;gap:14px}
+  .g4{grid-template-columns:repeat(4,1fr)} .g3{grid-template-columns:repeat(3,1fr)} .g2{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:960px){.g4,.g3,.g2{grid-template-columns:1fr}}
+
+  /* ---- SVG 图 ---- */
+  .graph-card{position:relative;overflow:hidden}
+  svg text{font-family:-apple-system,'PingFang SC',sans-serif}
+  .node{fill:var(--panel2);stroke:var(--border);stroke-width:1.4;rx:14}
+  .node-label{fill:var(--text);font-size:14px;font-weight:600}
+  .node-sub{fill:var(--dim);font-size:10.5px}
+  .edge{stroke:#3a4757;stroke-width:1.8;fill:none}
+  .edge.brand{stroke:var(--brand)} .edge.green{stroke:var(--green)} .edge.yellow{stroke:var(--yellow);stroke-dasharray:6 5}
+  .arrow{fill:#3a4757} .arrow.brand{fill:var(--brand)} .arrow.green{fill:var(--green)} .arrow.yellow{fill:var(--yellow)}
+  .edge-label{fill:var(--dim);font-size:11px}
+  .flow-dot{fill:var(--brand2);filter:drop-shadow(0 0 6px rgba(122,167,255,.9))}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--dim)}
+  .legend i{display:inline-block;width:22px;height:0;border-top:2.5px solid;vertical-align:middle;margin-right:6px;border-radius:2px}
+  button.play{background:rgba(79,142,247,.15);border:1px solid rgba(79,142,247,.5);color:var(--brand2);border-radius:10px;padding:8px 18px;font-size:13.5px;font-weight:600;cursor:pointer;transition:.2s}
+  button.play:hover{background:rgba(79,142,247,.28)}
+  button.play:disabled{opacity:.45;cursor:default}
+  .msg-feed{margin-top:14px;background:#0d1319;border:1px solid var(--border);border-radius:12px;padding:12px 16px;font:12.5px/1.9 var(--mono);min-height:120px;white-space:pre-wrap;color:var(--dim)}
+  .msg-feed .m{padding:1px 0}
+  .msg-feed .k{color:var(--purple)} .msg-feed .a{color:var(--brand2)} .msg-feed .t{color:var(--green)} .msg-feed .f{color:var(--yellow)}
+
+  /* ---- 角色卡 ---- */
+  .role{border-left:3px solid var(--brand)}
+  .role h3{font-size:15px;font-weight:700;margin-bottom:2px}
+  .role .where{font:11px var(--mono);color:var(--dim);margin-bottom:10px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+  .chip{font:500 11px/1 var(--mono);background:#0d1319;border:1px solid var(--border);color:var(--dim);padding:5px 9px;border-radius:999px}
+  .chip.on{color:var(--green);border-color:rgba(62,207,142,.4)}
+  .kv{font-size:12.5px;color:var(--dim)} .kv b{color:var(--text);font-weight:600}
+
+  /* ---- 阶段管线 ---- */
+  .pipe{display:flex;gap:0;align-items:stretch;margin:6px 0 22px;overflow-x:auto;padding-bottom:6px}
+  .stage{flex:1;min-width:150px;position:relative;padding:14px 14px 14px 22px;background:var(--panel);border:1px solid var(--border);border-radius:12px;margin-right:26px;cursor:pointer;transition:.18s}
+  .stage:last-child{margin-right:0}
+  .stage:hover{border-color:rgba(79,142,247,.55);transform:translateY(-2px)}
+  .stage::after{content:'›';position:absolute;right:-21px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:20px}
+  .stage:last-child::after{display:none}
+  .stage .idx{font:700 10.5px var(--mono);color:var(--brand);letter-spacing:1px}
+  .stage .nm{font-weight:700;font-size:15px;margin:2px 0}
+  .stage .tech{font-size:11.5px;color:var(--dim);line-height:1.55}
+  .detail{display:none;margin-top:14px}
+  .detail.open{display:block}
+  .detail .card{border-left:3px solid var(--brand)}
+  .detail h3{font-size:16px;margin-bottom:10px}
+  .detail ul{margin:8px 0 4px 18px}
+  .detail li{margin:7px 0;font-size:14px;color:#c3cddb}
+  .detail li b{color:var(--text)}
+  .detail code{font:12px var(--mono);background:#0d1319;border:1px solid var(--border);padding:1.5px 6px;border-radius:6px;color:var(--brand2)}
+
+  .foot{margin-top:60px;color:var(--dim);font-size:12.5px;text-align:center}
+  .ok{color:var(--green)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>AutoLab Lite · 架构全景</h1>
+  <p>LangGraph 会话工作流 × 产品六阶段实现 · 与生产代码一一对应(agent_session.py / iteration_loop.py / baseline_queue.py …)· 2026-09-22</p>
+</header>
+
+
+<!-- ============ 00、一条主线 ============ -->
+<h2 class="sec"><span class="no">00</span>一个项目的一生:BASELINE 就在第二站</h2>
+<p class="sub">黑色主线 = 产品阶段(你的项目走过的路,谁在什么时候审批)。🟡 黄框 = agent 层的工人,受雇于某个阶段干脑力活——阶段不"属于"agent,agent 只是被阶段雇用</p>
+
+<div class="card graph-card">
+<svg viewBox="0 0 1080 560" style="width:100%;height:auto">
+
+  <!-- ===== 主线(地铁) ===== -->
+  <line x1="60" y1="150" x2="1020" y2="150" stroke="var(--brand)" stroke-width="5" stroke-linecap="round"/>
+
+  <!-- 站 1 注册 -->
+  <g>
+    <circle cx="80" cy="150" r="16" fill="var(--panel2)" stroke="var(--brand)" stroke-width="3"/>
+    <text x="80" y="105" text-anchor="middle" class="node-label" style="font-size:14px">① 注册</text>
+    <text x="80" y="122" text-anchor="middle" class="node-sub">GitHub/本地 → 服务器</text>
+    <text x="80" y="190" text-anchor="middle" class="node-sub" fill="var(--dim)">代码同步·论文上传</text>
+  </g>
+
+  <!-- 站 2 BASELINE(高亮) -->
+  <g>
+    <circle cx="255" cy="150" r="20" fill="rgba(79,142,247,.25)" stroke="var(--brand2)" stroke-width="4"/>
+    <circle cx="255" cy="150" r="8" fill="var(--brand2)"/>
+    <text x="255" y="98" text-anchor="middle" class="node-label" style="font-size:16px">② BASELINE</text>
+    <text x="255" y="118" text-anchor="middle" class="node-sub">建基准(你项目现在走完的这站)</text>
+    <text x="255" y="190" text-anchor="middle" class="node-sub">环境体检 · 多数据集训练 ·</text>
+    <text x="255" y="208" text-anchor="middle" class="node-sub"><tspan style="fill:var(--purple);font-weight:700">人工确认门</tspan> → 基线指标入池</text>
+  </g>
+
+  <!-- 站 3 评审 -->
+  <g>
+    <circle cx="450" cy="150" r="16" fill="var(--panel2)" stroke="var(--brand)" stroke-width="3"/>
+    <text x="450" y="105" text-anchor="middle" class="node-label" style="font-size:14px">③ 方案评审</text>
+    <text x="450" y="122" text-anchor="middle" class="node-sub">analyzer 陪聊 → 勾评分 Agent → 打分</text>
+    <text x="450" y="190" text-anchor="middle" class="node-sub"><tspan style="fill:var(--purple);font-weight:700">你采纳</tspan>一个方案 → 报告</text>
+  </g>
+
+  <!-- 站 4 ITERATION -->
+  <g>
+    <circle cx="660" cy="150" r="20" fill="rgba(62,207,142,.18)" stroke="var(--green)" stroke-width="4"/>
+    <text x="660" y="98" text-anchor="middle" class="node-label" style="font-size:16px">④ ITERATION</text>
+    <text x="660" y="118" text-anchor="middle" class="node-sub">自动循环(改码→跑→分析 ×N)</text>
+    <text x="660" y="190" text-anchor="middle" class="node-sub">三粒度 · 超基线即停</text>
+    <text x="660" y="208" text-anchor="middle" class="node-sub">终局分析"为什么"</text>
+  </g>
+
+  <!-- 站 5/6 -->
+  <g>
+    <circle cx="850" cy="150" r="14" fill="var(--panel2)" stroke="var(--brand)" stroke-width="3"/>
+    <text x="850" y="105" text-anchor="middle" class="node-label" style="font-size:13.5px">⑤ Confirm</text>
+    <text x="850" y="122" text-anchor="middle" class="node-sub">结论归档</text>
+  </g>
+  <g>
+    <circle cx="1000" cy="150" r="14" fill="var(--panel2)" stroke="var(--dim)" stroke-width="3"/>
+    <text x="1000" y="105" text-anchor="middle" class="node-label" style="font-size:13.5px">⑥ Done</text>
+    <text x="1000" y="122" text-anchor="middle" class="node-sub">留痕全在</text>
+  </g>
+  <path class="edge" d="M872,150 L976,150" marker-end="url(#m)" style="stroke-width:1.5"/>
+
+  <!-- 回环:Done/Confirm 可回评审换方向 -->
+  <path class="edge" d="M1000,170 C 1000,240 560,250 470,205" marker-end="url(#m)" style="stroke-dasharray:4 4;stroke:#43536a"/>
+  <text class="node-sub" x="740" y="243" text-anchor="middle" fill="var(--dim)">换方向再验证:回 ③ 提新方案</text>
+
+  <!-- ===== AGENT 层(工人带) ===== -->
+  <rect x="40" y="290" width="1000" height="240" rx="18" fill="rgba(232,185,62,.05)" stroke="var(--yellow)" stroke-dasharray="8 6" stroke-width="1.6"/>
+  <text x="70" y="325" style="fill:var(--yellow);font-size:15px;font-weight:700">🟡 AGENT 层(LangGraph 会话工人)——受雇于上面的阶段,干"读代码/改代码/验证"的脑力活</text>
+
+  <!-- 工人与雇主的连线(analyzer 打两份工:② 和 ③) -->
+  <path class="edge yellow" d="M150,395 L248,290" style="stroke-width:1.4"/>
+  <path class="edge yellow" d="M300,395 L262,290" style="stroke-width:1.4"/>
+  <path class="edge yellow" d="M400,395 L438,290" style="stroke-width:1.4"/>
+  <path class="edge yellow" d="M520,395 L458,290" style="stroke-width:1.4"/>
+  <path class="edge yellow" d="M740,395 L662,290" style="stroke-width:1.4"/>
+
+  <!-- debugger -->
+  <g>
+    <rect class="node" x="70" y="395" width="160" height="110" rx="12"/>
+    <text class="node-label" x="150" y="422" text-anchor="middle" style="font-size:13.5px">🔧 debugger</text>
+    <text class="node-sub" x="150" y="445" text-anchor="middle">受雇于 ② Baseline 崩溃时</text>
+    <text class="node-sub" x="150" y="465" text-anchor="middle">读日志→补丁→自验</text>
+    <text class="node-sub" x="150" y="483" text-anchor="middle">→自动重跑</text>
+  </g>
+
+  <!-- analyzer(两份工:② 开工前 + ③ 评审对话) -->
+  <g>
+    <rect class="node" x="250" y="395" width="200" height="110" rx="12"/>
+    <text class="node-label" x="350" y="422" text-anchor="middle" style="font-size:13.5px">🔍 analyzer ×2 处上岗</text>
+    <text class="node-sub" x="350" y="445" text-anchor="middle">② 开工前:扫代码定命令/数据集</text>
+    <text class="node-sub" x="350" y="465" text-anchor="middle">③ 评审对话:陪聊方向、</text>
+    <text class="node-sub" x="350" y="483" text-anchor="middle">流式生成【方案A/B】选项卡</text>
+  </g>
+
+  <!-- reviewer -->
+  <g>
+    <rect class="node" x="470" y="395" width="160" height="110" rx="12"/>
+    <text class="node-label" x="550" y="422" text-anchor="middle" style="font-size:13.5px">⚖️ reviewer ×N</text>
+    <text class="node-sub" x="550" y="445" text-anchor="middle">受雇于 ③ · 评分环节</text>
+    <text class="node-sub" x="550" y="465" text-anchor="middle">每个勾选的评分 Agent</text>
+    <text class="node-sub" x="550" y="483" text-anchor="middle">独立会话·理由带文件:行号</text>
+  </g>
+
+  <!-- implementer -->
+  <g>
+    <rect class="node" x="650" y="395" width="200" height="110" rx="12" style="stroke:var(--green)"/>
+    <text class="node-label" x="750" y="422" text-anchor="middle" style="font-size:13.5px">🛠 implementer</text>
+    <text class="node-sub" x="750" y="445" text-anchor="middle">受雇于 ④ 每轮循环第一步</text>
+    <text class="node-sub" x="750" y="465" text-anchor="middle">grep 定位→改码→冒烟自验</text>
+    <text class="node-sub" x="750" y="483" text-anchor="middle">(43 秒修设备 bug 的那位)</text>
+  </g>
+
+  <!-- 剩余 L0 说明 -->
+  <g>
+    <rect class="node" x="870" y="395" width="150" height="110" rx="12" style="stroke-dasharray:5 4"/>
+    <text class="node-label" x="945" y="422" text-anchor="middle" style="font-size:13px">其余步骤</text>
+    <text class="node-sub" x="945" y="445" text-anchor="middle">队列/调度/对比/</text>
+    <text class="node-sub" x="945" y="463" text-anchor="middle">审批门 = 确定性代码</text>
+    <text class="node-sub" x="945" y="483" text-anchor="middle">(不需要"思考"的活)</text>
+  </g>
+</svg>
+
+<div class="legend">
+  <span style="color:var(--dim)">一句话:<b style="color:var(--text)">BASELINE 是第二站(产品阶段),它雇了 analyzer 和 debugger 两个工人</b>;评审站也雇两个——analyzer 陪聊出方案卡、reviewer×N 每个勾选的评分 Agent 独立打分;循环雇 implementer。工人全带"失败回退"保险,罢工不影响发车。</span>
+</div>
+</div>
+
+<!-- ============ 一、LangGraph 工作流 ============ -->
+<h2 class="sec"><span class="no">01</span>LangGraph 会话工作流(真实图结构)</h2>
+<p class="sub">默认视图 = <b>graph.get_graph() 官方导出</b>(与代码单一出处同步)· 切「标注版」看工具白名单/预算落点/消息流回放</p>
+
+<div class="card graph-card">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="play" id="tabOfficial" onclick="switchGraph('official')" style="opacity:1">官方导出(graph.get_graph() 生成)</button>
+      <button class="play" id="tabAnnotated" onclick="switchGraph('annotated')" style="opacity:.55">标注版(工具白名单 + 预算落点)</button>
+    </div>
+    <button class="play" id="playBtn" onclick="simulate()">▶ 模拟一轮会话(设备 bug 修复)</button>
+  </div>
+
+  <!-- 官方导出:由 scripts/gen_session_graph_png.py 从生产代码生成 -->
+  <div id="viewOfficial" style="margin-top:8px">
+    <img id="officialGraphImg" src="data:image/png;base64,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" alt="LangGraph 会话图(官方导出)" style="max-width:520px;width:100%;display:block;margin:6px auto 2px;border-radius:10px"/>
+    <div class="kv" style="text-align:center;margin-bottom:6px">由 <code style="font-family:var(--mono);color:var(--brand2)">graph.get_graph().draw_mermaid_png()</code> 直接导出 —— 节点拓扑与 agent_session.py 单一出处(<code style="font-family:var(--mono);color:var(--brand2)">_build_session_graph</code>),改图这里跟着变,不是手画的</div>
+    <details style="margin:4px 0">
+      <summary style="cursor:pointer;color:var(--dim);font-size:12.5px">展开:draw_mermaid() 原始输出(mermaid 源码)</summary>
+      <pre style="font:11.5px/1.7 var(--mono);color:#9fb3cc;background:#0d1319;border:1px solid var(--border);border-radius:10px;padding:12px;overflow-x:auto;margin-top:8px">graph TD;
+  __start__([__start__]):::first
+  agent(agent)
+  tools(tools)
+  __end__([__end__]):::last
+  __start__ --实体边--> agent;
+  agent -.条件边 route().-> __end__;
+  agent -.条件边 route():有 tool_calls.-> tools;
+  tools --实体边--> agent;
+  classDef default fill:#f2f0ff,line-height:1.2</pre>
+    </details>
+  </div>
+
+  <!-- 标注版:同一张图 + 人工注释 -->
+  <div id="viewAnnotated" style="display:none">
+  <div class="legend" style="margin:8px 0 0">
+      <span><i style="border-color:var(--brand)"></i>模型决策</span>
+      <span><i style="border-color:var(--green)"></i>工具回灌</span>
+      <span><i style="border-color:#3a4757"></i>流转</span>
+      <span><i style="border-color:var(--yellow);border-top-style:dashed"></i>预算强制收尾</span>
+  </div>
+  <svg viewBox="0 0 1080 470" style="width:100%;height:auto;margin-top:8px" id="graphSvg">
+    <defs>
+      <marker id="m" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" class="arrow"/></marker>
+      <marker id="mb" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" class="arrow brand"/></marker>
+      <marker id="mg" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" class="arrow green"/></marker>
+      <marker id="my" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" class="arrow yellow"/></marker>
+    </defs>
+
+    <!-- 输入 -->
+    <g>
+      <rect class="node" x="30" y="30" width="240" height="86" rx="12"/>
+      <text class="node-label" x="150" y="60" text-anchor="middle">SystemMessage + HumanMessage</text>
+      <text class="node-sub" x="150" y="84" text-anchor="middle">角色纪律 + 任务上下文(报告/反馈/记忆)</text>
+    </g>
+    <path class="edge" d="M270,73 L340,73" marker-end="url(#m)"/>
+
+    <!-- START -->
+    <circle cx="368" cy="73" r="15" fill="#0d1319" stroke="var(--brand)" stroke-width="2"/>
+    <text class="node-sub" x="368" y="46" text-anchor="middle" fill="var(--brand2)">START</text>
+    <path class="edge" d="M383,73 L450,73" marker-end="url(#m)"/>
+
+    <!-- agent 节点 -->
+    <g id="nAgent">
+      <rect class="node" x="452" y="18" width="300" height="110" rx="14" style="stroke:var(--brand)"/>
+      <text class="node-label" x="602" y="52" text-anchor="middle">🤖 agent 节点</text>
+      <text class="node-sub" x="602" y="76" text-anchor="middle">ChatAnthropic(glm-5.3)→ GLM Anthropic 端点</text>
+      <text class="node-sub" x="602" y="96" text-anchor="middle">.bind_tools(白名单) · thinking 已禁用</text>
+      <text class="node-sub" x="602" y="116" text-anchor="middle">整段消息历史(含 ToolMessage)回传 = 多轮上下文</text>
+    </g>
+
+    <!-- route -->
+    <path class="edge brand" d="M752,73 L830,73" marker-end="url(#mb)"/>
+    <g>
+      <polygon points="870,73 905,52 940,73 905,94" fill="var(--panel2)" stroke="var(--border)" stroke-width="1.4"/>
+      <text class="node-sub" x="905" y="77" text-anchor="middle">route()</text>
+    </g>
+    <text class="edge-label" x="792" y="60">Anthropic tool_use</text>
+
+    <!-- tools 节点(下方) -->
+    <path class="edge green" d="M905,94 C 905,205 830,205 760,205" marker-end="url(#mg)" transform="translate(0,10)"/>
+    <text class="edge-label" x="1000" y="165" fill="var(--green)">有 tool_calls → 执行</text>
+    <g id="nTools">
+      <rect class="node" x="440" y="185" width="320" height="150" rx="14" style="stroke:var(--green)"/>
+      <text class="node-label" x="600" y="216" text-anchor="middle">🧰 tools 节点</text>
+      <text class="node-sub" x="600" y="240" text-anchor="middle">read_file · list_files · grep · write_file(穿补丁系统)</text>
+      <text class="node-sub" x="600" y="260" text-anchor="middle">run_python · smoke_run(GPU 预检) · run_probe</text>
+      <text class="node-sub" x="600" y="280" text-anchor="middle">read_training_log · read_metrics</text>
+      <text class="node-sub" x="600" y="304" text-anchor="middle" fill="var(--yellow)">预算违规/工具失败 → ToolMessage 提示,不炸图</text>
+    </g>
+    <!-- 回灌 -->
+    <path class="edge green" d="M600,185 C 600,150 602,150 602,128" marker-end="url(#mg)"/>
+    <text class="edge-label" x="470" y="160" fill="var(--green)">ToolMessage(观察)回灌 agent</text>
+
+    <!-- END -->
+    <path class="edge" d="M940,73 L1010,73" marker-end="url(#m)"/>
+    <circle cx="1030" cy="73" r="15" fill="#0d1319" stroke="var(--dim)" stroke-width="2.5"/>
+    <circle cx="1030" cy="73" r="7" fill="var(--dim)"/>
+    <text class="node-sub" x="1030" y="46" text-anchor="middle">END</text>
+    <text class="edge-label" x="975" y="58">直接输出文本</text>
+
+    <!-- 墙钟强制收尾 -->
+    <path class="edge yellow" d="M905,94 C 905,94 940,110 990,88" marker-end="url(#my)" style="display:none"/>
+    <path class="edge yellow" d="M922,90 C 960,140 1000,120 1015,88" marker-end="url(#my)"/>
+    <text class="edge-label" x="960" y="148" fill="var(--yellow)" text-anchor="middle">墙钟 ≤20s 强制 END</text>
+
+    <!-- 预算带 -->
+    <g>
+      <rect class="node" x="30" y="185" width="360" height="150" rx="14" style="stroke:var(--yellow);stroke-dasharray:5 4"/>
+      <text class="node-label" x="210" y="215" text-anchor="middle" style="font-size:13.5px">⏱ 四维预算(三处落点)</text>
+      <text class="node-sub" x="210" y="242" text-anchor="middle">轮次 recursion_limit = max_turns×2+4</text>
+      <text class="node-sub" x="210" y="264" text-anchor="middle">墙钟 15min → route() 检查强制收尾</text>
+      <text class="node-sub" x="210" y="286" text-anchor="middle">写 8 次 · 冒烟 2 次(GPU 余量预检)</text>
+      <text class="node-sub" x="210" y="312" text-anchor="middle">超限 ≠ 失败:提示 agent 收尾,status=exhausted</text>
+    </g>
+
+    <!-- 收尾产物 -->
+    <g>
+      <rect class="node" x="440" y="375" width="610" height="80" rx="14" style="stroke:var(--purple)"/>
+      <text class="node-label" x="745" y="405" text-anchor="middle" style="font-size:13.5px">📦 收尾:倒序取最后一条 AI 消息(拼接 text 块,忽略 thinking)</text>
+      <text class="node-sub" x="745" y="428" text-anchor="middle">```json``` → 角色 manifest · transcript.jsonl · 补丁 manifest(兼容旧格式)· tokens 计量</text>
+    </g>
+    <path class="edge" d="M600,335 L600,375" marker-end="url(#m)"/>
+
+    <!-- 动画点 -->
+    <circle class="flow-dot" id="dot" r="7" cx="-20" cy="-20" style="opacity:0"/>
+  </svg>
+  <div class="msg-feed" id="feed"><span style="color:var(--dim)">// 点上方「模拟一轮会话」:以真实验收实验(43 秒修设备 bug)为例回放消息流</span></div>
+  </div><!-- /viewAnnotated -->
+</div>
+
+<!-- 四角色 -->
+<h2 class="sec"><span class="no">02</span>四个角色 = 同一张图,不同配置</h2>
+<p class="sub">全部"会话优先、单发回退"——LangGraph 层任何异常自动落回旧路径,产品不挂死(实战触发过 3 次)</p>
+<div class="grid g4">
+  <div class="card role">
+    <h3>implementer</h3><div class="where">循环 implement 相位</div>
+    <div class="kv">预算 <b>24轮/15min/写8/冒烟2</b></div>
+    <div class="chips">
+      <span class="chip on">read</span><span class="chip on">grep</span><span class="chip on">list</span>
+      <span class="chip on">write</span><span class="chip on">run_python</span><span class="chip on">smoke</span>
+      <span class="chip on">probe</span><span class="chip on">log</span><span class="chip on">metrics</span>
+    </div>
+    <div class="kv">验收:注入设备 bug,<b class="ok">43 秒</b>修复+自验(旧路径 3 轮 GPU)</div>
+  </div>
+  <div class="card role" style="border-left-color:var(--green)">
+    <h3>debugger</h3><div class="where">Baseline「Agent 修复并重跑」</div>
+    <div class="kv">预算 <b>14轮/12min/写4/冒烟1</b></div>
+    <div class="kv">读崩溃日志→定位→最小补丁(已知问题模式:HF 离线/timm shim/设备错位/.*残留)→run_python 自验→自动重跑队列</div>
+  </div>
+  <div class="card role" style="border-left-color:var(--purple)">
+    <h3>analyzer</h3><div class="where">/analyze(② 工作区分析) + /review/chat(③ 评审对话)</div>
+    <div class="kv">预算 <b>12轮/7min/写0</b>(纯只读)</div>
+    <div class="kv">验收:读出 16 个嵌套 yacs config,提议 Kvasir+10%/25% 变体清单,与人工配置一致</div>
+  </div>
+  <div class="card role" style="border-left-color:var(--yellow)">
+    <h3>reviewer</h3><div class="where">方案评分(每个评分 Agent)</div>
+    <div class="kv">预算 <b>10轮/6min/写0</b>(纯只读)</div>
+    <div class="kv">纪律:结论第一行 verdict + <b>必须带 文件:行号 实证引用</b>(dataloader.py:154 / train.py:82)</div>
+  </div>
+</div>
+
+<!-- ============ 三、产品阶段 ============ -->
+<h2 class="sec"><span class="no">03</span>产品六阶段:点击任一阶段看技术栈与实现</h2>
+<p class="sub">全部已在真项目(MedCLIPSeg / A6000 / zwm 环境)上端到端验证</p>
+
+<div class="pipe" id="pipe"></div>
+<div id="details"></div>
+
+<!-- 横切 -->
+<h2 class="sec"><span class="no">04</span>横切系统(贯穿所有阶段)</h2>
+<div class="grid g2">
+  <div class="card"><h3 style="font-size:15px;margin-bottom:8px">🔒 审批门</h3><div class="kv">Plan 批准必须粘 <b>spec_hash</b>(内容哈希);Agent/MCP 面上无 approve——"Agent 不能自己批准"有测试断言兜底。循环内的自动批准单独标记 <code style="font-family:var(--mono);color:var(--brand2)">approved_by=iteration-loop</code> 可审计。</div></div>
+  <div class="card"><h3 style="font-size:15px;margin-bottom:8px">🩹 补丁系统(唯一写通道)</h3><div class="kv">每次写文件:<b>备份 orig → 写 → py_compile → 失败回滚</b>。会话、单发、debugger 全穿它;restore-code 可整体回滚到基线代码(创建过的文件删除)。</div></div>
+  <div class="card"><h3 style="font-size:15px;margin-bottom:8px">🧵 调度与队列</h3><div class="kv">Scheduler <b>0.2s tick</b> + SQLite 事务 GPU 租约;基线队列线程 5 秒 tick,<b>单写者</b>(HTTP 轮询只读)防重复起跑;runner 是服务器上的 nohup 独立进程——<b>Mac 断网训练照跑</b>,恢复后事件补传。</div></div>
+  <div class="card"><h3 style="font-size:15px;margin-bottom:8px">🗂 留痕即资产</h3><div class="kv">EXP 实验文件 · failures.md(带 OOM 死因日志尾部)· 补丁目录(orig 可回滚)· 会话转录 transcript.jsonl · tokens 计量循环累计——失败也全留,不删。</div></div>
+  <div class="card"><h3 style="font-size:15px;margin-bottom:8px">🔌 MCP(23 工具)</h3><div class="kv">stdio server,agent 视角的读写面(无 approve)。P4 补齐:probe_server / preview_plan / cancel_job / retry_job / get_run_results——与 Repo/会话工具同源。</div></div>
+  <div class="card"><h3 style="font-size:15px;margin-bottom:8px">🧪 质量底座</h3><div class="kv"><b>149 个测试</b>全绿:seed 对齐、确认门、队列推进、会话回退、MCP 语义全有覆盖;DB 已到 <b>v15</b>(schema 迁移内置)。</div></div>
+</div>
+
+<div class="foot">AutoLab Lite · 本页与生产代码同步生成 · 数据来源:agent_session.py / iteration_loop.py / baseline_queue.py / http_api.py</div>
+</div>
+
+<script>
+/* ---------- 阶段数据 ---------- */
+const STAGES=[
+ {idx:'STAGE 1',nm:'项目注册',tech:'Next.js·FastAPI·SQLite·paramiko TOFU',
+  html:`<h3>① 项目注册(/projects)</h3>
+  <span class="pill b">Next.js 14 App Router</span><span class="pill b">React Query 轮询</span><span class="pill g">FastAPI + SQLite(WAL)</span><span class="pill p">paramiko + TOFU 主机密钉扎</span>
+  <ul>
+   <li><b>来源两种</b>:GitHub → 服务器端 <code>git clone / --ff-only 更新</code>;本地工作区 → <b>tar 流同步</b>(<code>sync_code_from_local</code>:COPYFILE_DISABLE 防 AppleDouble、数据集刻意排除、800MB 上限)</li>
+   <li><b>SSH 安全</b>:首次连接把 hostkey 存凭据库,之后每次校验(防中间人);密码不落日志</li>
+   <li>论文 PDF 走 SFTP 上传到 <code>.autolab/papers/</code>,供评审读</li>
+  </ul>`},
+ {idx:'STAGE 2',nm:'Baseline',tech:'多数据集队列·会话 analyzer·确认门',
+  html:`<h3>② Baseline(/baseline)</h3>
+  <span class="pill b">BaselineQueueManager 5s tick</span><span class="pill g">analyzer 会话(LangGraph)</span><span class="pill y">人工确认门</span>
+  <ul>
+   <li><b>数据集清单</b>是真相源:<code>datasets=[{name,command,dataset_path}]</code>,每数据集独立 run 目录 <code>.autolab/baseline/&lt;名&gt;/</code>(pid/exit/log/output/metrics)</li>
+   <li><b>顺序队列单写者</b>:后台线程唯一落库,HTTP 轮询只读——防双写重复起跑(实战教训);失败即停保留队列,修复后续跑</li>
+   <li><b>确认门</b>:全部数据集 跑通+有指标 才 confirmable;确认时快照各数据集指标进 <code>baseline_confirmed_json</code> = <b>迭代可选池</b>;新数据集跑通可"追加确认"并入池</li>
+   <li><b>逐数据集体检</b>:绝对路径+文件数+大小,缺失直接告诉你放哪</li>
+   <li><b>analyzer 会话</b>(P3):只读探索读嵌套 yacs config,提议含百分比变体清单;人工保存的清单永远优先</li>
+   <li><b>debugger 会话</b>(P1):崩溃→读日志→最小补丁→run_python 自验→自动重跑</li>
+  </ul>`},
+ {idx:'STAGE 3',nm:'方案评审',tech:'流式对话·多Agent评分·报告',
+  html:`<h3>③ 方案评审(/review)</h3>
+  <span class="pill b">NDJSON 流式</span><span class="pill g">analyzer 陪聊(出方案卡)</span><span class="pill g">reviewer×N 评分(引用可查证)</span><span class="pill p">LLM 报告落工作区</span>
+  <ul>
+   <li><b>流式对话</b>(analyzer):<code>/review/chat/stream</code> 逐段 yield delta;结束事件才解析【方案A】块建卡;<b>空回复/异常回滚用户消息</b>;前端"正在思考 Ns"+打字机</li>
+   <li><b>评分</b>:每个勾选 Agent 独立 reviewer 会话——只读工具在代码里核实方案,理由<b>必须带 文件:行号</b>;失败回退单发(预拼材料)</li>
+   <li><b>报告</b>写服务器 <code>.autolab/reviews/</code>;采纳=更新 accepted_proposal_id(confirm/done 阶段可回来换方案)</li>
+  </ul>`},
+ {idx:'STAGE 4',nm:'Iteration',tech:'状态机·LangGraph·三粒度',
+  html:`<h3>④ Iteration(/iteration)</h3>
+  <span class="pill b">LoopManager 状态机(2s tick)</span><span class="pill g">implementer 会话</span><span class="pill y">seed 对齐三层校验</span><span class="pill p">三粒度循环</span>
+  <ul>
+   <li><b>状态机</b>:implement→plan→await_jobs→conclude,状态存 DB——<b>进程重启无损续跑</b></li>
+   <li><b>plan 硬校验</b>:矩阵 seed ⊆ 基线跑过的 seed;联合命令不得跨数据集相同(防 9 个 job 跑同一训练的退化);数据集 ⊆ 确认池</li>
+   <li><b>await</b>:runner 是服务器 nohup 独立进程(断网照跑);失败 job 的<b>日志尾部(OOM/traceback)自动注入下轮</b></li>
+   <li><b>三粒度</b>:协作 2 轮 / 中级 5 轮 / 重型不限+Δ≥0.01 才停(小幅提升记录后继续);终局 LLM 分析"为什么提升/没提升"</li>
+   <li><b>成本可见</b>(P2):会话 tokens 累计进循环行;ImplementationCard 徽标:工具 N·冒烟 N·tokens N</li>
+  </ul>`},
+ {idx:'STAGE 5',nm:'Confirm → Done',tech:'结论归档·留痕不删',
+  html:`<h3>⑤ Confirm → Done</h3>
+  <ul>
+   <li>improved 且全终态 → 一键归档(confirm→done)</li>
+   <li>结论写回 EXP 实验文件;失败经验(带死因)进 <code>failures.md</code></li>
+   <li><b>回滚到基线代码</b>:restore-code 遍历全部补丁,最早 orig 恢复、创建过的文件删除、语法门校验</li>
+  </ul>`},
+ {idx:'CROSS',nm:'看板导航',tech:'六列研究流·卡片直达',
+  html:`<h3>看板(/)</h3>
+  <ul>
+   <li>prepare/baseline/review/iterate/confirm/done 六列 = 阶段派生(不手填)</li>
+   <li>卡片摘要实时反映状态(运行中钉在当前列、跑完待确认、方案已采纳…);点击直达对应模块页</li>
+  </ul>`},
+];
+
+const pipe=document.getElementById('pipe'),details=document.getElementById('details');
+STAGES.forEach((s,i)=>{
+  const d=document.createElement('div');d.className='stage';d.onclick=()=>toggle(i);
+  d.innerHTML=`<div class="idx">${s.idx}</div><div class="nm">${s.nm}</div><div class="tech">${s.tech}</div>`;
+  pipe.appendChild(d);
+  const det=document.createElement('div');det.className='detail';det.id='det'+i;
+  det.innerHTML=`<div class="card">${s.html}</div>`;details.appendChild(det);
+});
+function toggle(i){
+  const el=document.getElementById('det'+i);
+  const open=el.classList.contains('open');
+  document.querySelectorAll('.detail').forEach(d=>d.classList.remove('open'));
+  if(!open)el.classList.add('open');
+}
+toggle(3); // 默认展开 Iteration
+
+/* ---------- 会话模拟 ---------- */
+const FEED=[
+ {c:'k',t:'SystemMessage  「你是实现 Agent(会话模式)…工具/预算/冒烟纪律…」'},
+ {c:'k',t:'HumanMessage    「依据评审报告落实 TG-Fusion 修复…上轮反馈:设备错位崩溃」'},
+ {c:'a',t:'AI → tool_call  read_file(gate_fusion.py)'},
+ {c:'t',t:'Tool            1  """验收实验用的独立模块…」  2  import torch …  10  return model(feats) * gate'},
+ {c:'a',t:'AI → tool_call  write_file(gate_fusion.py, gate 加 device=feats.device, reason=修复设备错位)'},
+ {c:'t',t:'Tool            已写入 gate_fusion.py(剩余写预算 2)← 备份+py_compile 已过'},
+ {c:'a',t:'AI → tool_call  run_python(gate_fusion.py)'},
+ {c:'t',t:'Tool            exit=0  forward ok: torch.Size([2, 4]) cuda:0   ✅'},
+ {c:'f',t:'AI(最终)       ```json {"summary":"gate 改为 feats.device 创建","root_cause":"CPU 张量与 CUDA 相乘"} ```'},
+ {c:'f',t:'📦 收尾:manifest ✓ transcript.jsonl ✓ tokens(in 5.7k/out 1.2k) ✓ 补丁备份 ✓   — 43 秒,3 次工具调用'},
+];
+const NODES=[ // 动画路径关键点(cx,cy)
+ [150,73],[368,73],[602,73],[905,73],[602,240],[602,73],[905,73],[1030,73],[745,415]];
+function simulate(){
+  const btn=document.getElementById('playBtn'),dot=document.getElementById('dot'),feed=document.getElementById('feed');
+  btn.disabled=true;feed.innerHTML='';dot.style.opacity=1;
+  let i=0;
+  const step=()=>{
+    if(i<FEED.length){
+      const m=document.createElement('div');m.className='m';
+      m.innerHTML=`<span class="${FEED[i].c}">${FEED[i].t}</span>`;feed.appendChild(m);
+      const [x,y]=NODES[Math.min(i,NODES.length-1)];
+      dot.style.transition='all .55s cubic-bezier(.4,0,.2,1)';dot.setAttribute('cx',x);dot.setAttribute('cy',y);
+      i++;setTimeout(step,700);
+    }else{dot.style.opacity=0;btn.disabled=false;}
+  };
+  step();
+}
+function switchGraph(which){
+  const official=which==='official';
+  document.getElementById('viewOfficial').style.display=official?'':'none';
+  document.getElementById('viewAnnotated').style.display=official?'none':'';
+  document.getElementById('tabOfficial').style.opacity=official?1:.55;
+  document.getElementById('tabAnnotated').style.opacity=official?.55:1;
+  const play=document.getElementById('playBtn');
+  if(play) play.style.display=official?'none':'';
+}
+</script>
+</body>
+</html>

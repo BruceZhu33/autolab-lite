@@ -13,11 +13,19 @@
  */
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, RefreshCw, Server } from "lucide-react";
+import { Activity, MoreVertical, RefreshCw, Server } from "lucide-react";
 import { toast } from "sonner";
 
+import { EmptyState } from "@/components/empty-state";
 import { Badge } from "~/vendor/ui/components/ui/badge";
 import { Button } from "~/vendor/ui/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "~/vendor/ui/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -69,8 +77,9 @@ const EMPTY_FORM = {
   auth_kind: "key" as "key" | "password",
   secret: "",
   transport_mode: "ssh" as "ssh" | "local",
-  agent_port: "7800",
+  agent_port: "7810",
   agent_token: "",
+  manifest_hmac_key: "",
 };
 
 function transportLabel(s: ServerDetail): string {
@@ -124,23 +133,45 @@ function ServerCard({
           {s.name}
         </Badge>
         <span className="font-mono text-xs text-muted-foreground">{transportLabel(s)}</span>
-        <span className="ml-auto flex flex-wrap gap-2">
+        <span className="ml-auto flex flex-wrap items-center gap-2">
           <Button size="sm" variant="outline" disabled={isFetching}
                   onClick={() => void refetch().then(() => qc.invalidateQueries({ queryKey: ["autolab", "telemetry", s.id] }))}>
             <Activity className="size-3.5" />
             {isFetching ? "遥测中…" : "刷新遥测"}
           </Button>
-          <Button size="sm" variant="outline" disabled={busy === `${s.id}:connectivity-test`}
-                  onClick={() => void act(s, "connectivity-test")}>连通性测试</Button>
-          <Button size="sm" variant="outline" disabled={!s.agent_port || busy === `${s.id}:agent/probe`}
-                  onClick={() => void act(s, "agent/probe")}>agent 探活</Button>
-          <Button size="sm" variant="outline" disabled={busy === `${s.id}:agent/install`}
-                  onClick={() => void act(s, "agent/install")}>部署 / 修复 Agent</Button>
-          <Button size="sm" variant="ghost" disabled={busy === `${s.id}:agent/upgrade`}
-                  onClick={() => setUpgradeTarget(s)}>升级</Button>
-          <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive"
-                  disabled={busy === `${s.id}:delete`}
-                  onClick={() => setDeleteTarget(s)}>删除</Button>
+          {/* 次要操作收进菜单:一行 6 个等权按钮读不出主次,破坏性的「删除」隔开防误触 */}
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button size="sm" variant="ghost" aria-label="更多操作" disabled={busy !== null}>
+                  <MoreVertical className="size-3.5" />
+                </Button>
+              }
+            />
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem disabled={busy === `${s.id}:connectivity-test`}
+                                onClick={() => void act(s, "connectivity-test")}>
+                连通性测试
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={!s.agent_port || busy === `${s.id}:agent/probe`}
+                                onClick={() => void act(s, "agent/probe")}>
+                agent 探活
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={busy === `${s.id}:agent/install`}
+                                onClick={() => void act(s, "agent/install")}>
+                部署 / 修复 Agent
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={busy === `${s.id}:agent/upgrade`}
+                                onClick={() => setUpgradeTarget(s)}>
+                升级
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem className="text-destructive" disabled={busy === `${s.id}:delete`}
+                                onClick={() => setDeleteTarget(s)}>
+                删除服务器
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </span>
       </div>
 
@@ -200,7 +231,7 @@ function ServerCard({
             <div key={d.device} className="flex items-center gap-2 font-mono text-caption text-muted-foreground">
               <span className="w-24 truncate" title={d.device}>{d.mount}</span>
               <span className="tabular-nums">{fmtMem(d.used_mb)} / {fmtMem(d.total_mb)}</span>
-              <span className={`w-9 text-right tabular-nums ${d.use_pct >= 95 ? "text-destructive" : d.use_pct >= 85 ? "text-amber-600" : ""}`}>
+              <span className={`w-9 text-right tabular-nums ${d.use_pct >= 95 ? "text-destructive" : d.use_pct >= 85 ? "text-warning" : ""}`}>
                 {d.use_pct}%
               </span>
               <Progress className="h-1 w-28" value={d.use_pct} />
@@ -215,7 +246,7 @@ function ServerCard({
         </p>
       )}
       {isError && (
-        <p className="text-caption text-amber-600">
+        <p className="text-caption text-warning">
           遥测不可用（{error instanceof SidecarApiError ? error.message : String(error)}）——
           SSH 不通时登记数据仍可用，可点「连通性测试」排查。
         </p>
@@ -228,6 +259,8 @@ export default function GpuPage() {
   const qc = useQueryClient();
   const [busy, setBusy] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
   const [form, setForm] = useState(EMPTY_FORM);
   const [upgradeTarget, setUpgradeTarget] = useState<ServerDetail | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerDetail | null>(null);
@@ -255,9 +288,11 @@ export default function GpuPage() {
       });
       await qc.invalidateQueries({ queryKey: ["autolab", "servers"] });
     } catch (e) {
-      const msg =
-        e instanceof SidecarApiError ? `${e.code}: ${e.message}` : String(e);
-      toast.error(`${s.name} · ${OP_LABEL[op]}失败`, { description: msg.slice(0, 300) });
+      const msg = e instanceof SidecarApiError ? e.message : String(e);
+      toast.error(`${s.name} · ${OP_LABEL[op]}失败`, {
+        description: msg.slice(0, 300),
+        duration: 8000,
+      });
     } finally {
       setBusy(null);
     }
@@ -275,10 +310,11 @@ export default function GpuPage() {
       if (e instanceof SidecarApiError && e.code === "HAS_REFERENCES") {
         toast.error(`${s.name} 有训练/环境历史，不可删除`, {
           description: `${e.message}（审计链约束：有投产记录的服务器保留）`,
+          duration: 8000,
         });
       } else {
-        const msg = e instanceof SidecarApiError ? `${e.code}: ${e.message}` : String(e);
-        toast.error(`删除 ${s.name} 失败`, { description: msg.slice(0, 300) });
+        const msg = e instanceof SidecarApiError ? e.message : String(e);
+        toast.error(`删除 ${s.name} 失败`, { description: msg.slice(0, 300), duration: 8000 });
       }
     } finally {
       setBusy(null);
@@ -287,26 +323,31 @@ export default function GpuPage() {
   };
 
   const submit = async () => {
+    setSubmitting(true);
+    setFormError(null);
     try {
       await registerServer({
         name: form.name,
         host: form.host,
-        port: Number(form.port) || 22,
+        port: form.port,
         username: form.username,
         auth_kind: form.auth_kind,
-        secret: form.secret || null,
+        secret: form.secret,
         transport_mode: form.transport_mode,
-        agent_port: form.agent_port ? Number(form.agent_port) : null,
-        agent_token: form.agent_token || null,
+        agent_port: form.agent_port,
+        agent_token: form.agent_token,
+        manifest_hmac_key: form.manifest_hmac_key,
       });
       toast.success(`已注册 ${form.name}`);
       setOpen(false);
       setForm(EMPTY_FORM);
       await qc.invalidateQueries({ queryKey: ["autolab", "servers"] });
     } catch (e) {
-      const msg =
-        e instanceof SidecarApiError ? `${e.code}: ${e.message}` : String(e);
-      toast.error("注册失败", { description: msg.slice(0, 300) });
+      const msg = e instanceof SidecarApiError ? e.message : String(e);
+      setFormError(msg.slice(0, 300));
+      toast.error("注册失败", { description: msg.slice(0, 300), duration: 8000 });
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -320,7 +361,7 @@ export default function GpuPage() {
             <Server className="size-4 text-muted-foreground" />
           )}
         </span>
-        <h1 className="text-body font-medium">GPU 服务器</h1>
+        <h1 className="text-title-sm font-semibold tracking-tight">GPU 服务器</h1>
         {servers && servers.length > 0 ? (
           <span className="font-mono text-caption tabular-nums text-muted-foreground">
             {servers.length}
@@ -330,13 +371,14 @@ export default function GpuPage() {
           注册 GPU 服务器 · 连通性测试 · 实时遥测 · gpu-agent 部署与升级
         </p>
         <div className="ml-auto">
-          <Dialog open={open} onOpenChange={setOpen}>
+          <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) setFormError(null); }}>
             <DialogTrigger render={<Button size="sm">＋ 注册服务器</Button>} />
             <DialogContent className="sm:max-w-lg">
               <DialogHeader>
                 <DialogTitle>注册服务器</DialogTitle>
                 <DialogDescription>
-                  生产：SSH + 服务器上先启动 gpu-agent（--token）。开发：local 模式直连本机 agent。
+                  SSH:注册时 TOFU 固定主机密钥并验证认证,遥测走远端 nvidia-smi;Runner 可稍后部署。
+                  local:需要与已启动 Runner 一致的端口/token/HMAC。
                 </DialogDescription>
               </DialogHeader>
               <div className="grid gap-3">
@@ -379,45 +421,56 @@ export default function GpuPage() {
                       value={form.auth_kind}
                       onChange={(e) => setForm({ ...form, auth_kind: e.target.value as "key" | "password" })}
                     >
-                      <option value="key">密钥（私钥路径）</option>
+                      <option value="key">密钥(路径或内容)</option>
                       <option value="password">密码</option>
                     </select>
                   </div>
                   <div className="grid gap-1.5">
-                    <Label>凭据（密钥路径 / 密码）</Label>
+                    <Label>凭据(密钥路径/内容或密码)</Label>
                     <Input value={form.secret} onChange={(e) => setForm({ ...form, secret: e.target.value })} placeholder="~/.ssh/id_ed25519" />
                   </div>
                 </div>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-3 gap-3">
                   <div className="grid gap-1.5">
-                    <Label>agent 端口</Label>
-                    <Input value={form.agent_port} onChange={(e) => setForm({ ...form, agent_port: e.target.value })} />
+                    <Label>Runner 端口</Label>
+                    <Input value={form.agent_port} onChange={(e) => setForm({ ...form, agent_port: e.target.value })} placeholder="7810" />
                   </div>
                   <div className="grid gap-1.5">
-                    <Label>agent token</Label>
+                    <Label>Runner token</Label>
                     <Input value={form.agent_token} onChange={(e) => setForm({ ...form, agent_token: e.target.value })} />
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label>HMAC key{form.transport_mode === "local" ? "(local 必填)" : ""}</Label>
+                    <Input value={form.manifest_hmac_key} onChange={(e) => setForm({ ...form, manifest_hmac_key: e.target.value })} />
                   </div>
                 </div>
               </div>
+              {formError && (
+                <p className="text-caption text-destructive" data-testid="register-error">
+                  {formError}
+                </p>
+              )}
               <DialogFooter>
-                <Button onClick={submit}>注册</Button>
+                <Button onClick={submit} disabled={submitting}>
+                  {submitting ? "注册中…（ssh 模式含 TOFU/认证/GPU 探测，可达数十秒）" : "注册"}
+                </Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
         </div>
       </PageHeader>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4 md:px-6">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4">
           {isPending && <p className="text-sm text-muted-foreground">加载服务器列表…</p>}
 
           {isError && (
             <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm">
-              <p className="font-medium">无法连接 AutoLab sidecar</p>
+              <p className="font-medium">无法连接 Control API</p>
               <p className="mt-1 text-muted-foreground">
                 {error instanceof Error ? error.message : String(error)}
               </p>
               <p className="mt-1 text-muted-foreground">
-                请确认 sidecar 在运行（默认 http://127.0.0.1:39876，可用 scripts/dev_local.sh 启动）。
+                请确认 autolab-control 在运行（默认 http://127.0.0.1:8710），且 Settings 中已保存有效 token。
               </p>
               <Button size="sm" variant="outline" className="mt-2" onClick={() => void refetch()}>
                 重试
@@ -426,9 +479,13 @@ export default function GpuPage() {
           )}
 
           {servers?.length === 0 && (
-            <p className="text-sm text-muted-foreground">
-              尚无服务器。注册一台并完成连通性测试后即可立项。
-            </p>
+            <div className="flex min-h-[50vh] flex-col">
+              <EmptyState
+                icon={Server}
+                title="还没有注册服务器"
+                description="注册一台 GPU 服务器(SSH 或本地 Runner),完成连通性测试后即可立项跑实验。"
+              />
+            </div>
           )}
 
           {servers?.map((s) => (
@@ -477,6 +534,7 @@ export default function GpuPage() {
             <AlertDialogCancel>取消</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-white hover:bg-destructive/90"
+              disabled={busy === `${deleteTarget?.id}:delete`}
               onClick={() => void confirmDelete()}
             >
               删除
