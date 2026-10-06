@@ -118,8 +118,12 @@ class RunnerDeployer:
             raise DeployError(f"pidfile {paths.pidfile} contains dangerous PID {pid}")
         kill = self.transport.exec_argv(["kill", str(pid)], timeout=15.0)
         self.transport.exec_argv(["rm", "-f", paths.pidfile], timeout=15.0)
-        if kill.exit_code != 0 and "No such process" not in kill.stderr:
-            raise DeployError(f"kill {pid} failed: {kill.stderr[:200]}")
+        if kill.exit_code != 0:
+            # 进程可能已自行退出(kill 的报错文案随 locale 变化,不能靠字符串
+            # 匹配);用 kill -0 复核,仍存活才算真失败。
+            alive = self.transport.exec_argv(["kill", "-0", str(pid)], timeout=15.0)
+            if alive.exit_code == 0:
+                raise DeployError(f"kill {pid} failed: {kill.stderr[:200]}")
         return pid
 
     def _read_pidfile(self, paths: DeployPaths) -> int:

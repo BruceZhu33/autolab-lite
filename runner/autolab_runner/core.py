@@ -219,14 +219,17 @@ class RunnerCore:
             self.storage.commit_job_event(
                 job_id=manifest.job_id,
                 event_type="job.timed_out",
-                payload={"log_cursor": self._log_size(log_path), "stop_result": result},
+                payload={"log_cursor": self._log_size(log_path), "stop_result": result,
+                         "log_tail": self._log_tail(log_path)},
                 status="TIMED_OUT", finished=True, failure_class="resource",
                 failure_summary=f"timeout after {manifest.execution.timeout_seconds}s",
             )
+            self._archive_log(manifest, output_root, log_path)
             self._cleanup(manifest.job_id)
             return
         if manifest.job_id in self._stopping:
             # the stop handler owns the terminal commit for this process
+            self._archive_log(manifest, output_root, log_path)
             self._cleanup(manifest.job_id)
             return
         exit_code: int | None = proc.returncode
@@ -245,13 +248,46 @@ class RunnerCore:
                     "exit_code": exit_code, "failure_class": "user_code",
                     "failure_summary": f"process exited with code {exit_code}",
                     "log_cursor": self._log_size(log_path),
+                    "log_tail": self._log_tail(log_path),
                 },
                 status="FAILED", exit_code=exit_code, finished=True,
                 failure_class="user_code",
                 failure_summary=f"process exited with code {exit_code}",
             )
+        self._archive_log(manifest, output_root, log_path)
         self._discover_artifacts(manifest, output_root)
         self._cleanup(manifest.job_id)
+
+    def _log_tail(self, log_path: Path, limit: int = 2048) -> str:
+        """终态事件携带日志尾:真正的死因(traceback/OOM)随事件直达
+        Control,策略层不用 SSH 也能看到(不再只有 exit code)。"""
+        try:
+            if not log_path.exists():
+                return ""
+            with open(log_path, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - limit))
+                return fh.read().decode("utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+
+    def _archive_log(self, manifest: ManifestV1, output_root: Path,
+                     log_path: Path) -> None:
+        """日志归档到 Job 输出目录:与产物同址({output_root}/{job_id}/
+        runner.log),与 baseline 约定的 train_stdout.log 并存互补。"""
+        try:
+            if not log_path.exists():
+                return
+            dest_dir = output_root / manifest.job_id
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / "runner.log"
+            if not dest.exists():  # 重放/adopt 场景不覆盖
+                import shutil
+
+                shutil.copy2(log_path, dest)
+        except OSError:
+            pass  # 归档失败不影响终态提交
 
     def _discover_artifacts(self, manifest: ManifestV1, output_root: Path) -> None:
         metric_paths = {source.path for source in manifest.outputs.metrics}
@@ -402,7 +438,8 @@ class RunnerCore:
                     job_id=job["job_id"], event_type="job.failed",
                     payload={"exit_code": None, "failure_class": "runner",
                              "failure_summary": "runner restarted; process already gone, exit code not captured",
-                             "log_cursor": self._log_size(Path(job["log_path"]))},
+                             "log_cursor": self._log_size(Path(job["log_path"])),
+                             "log_tail": self._log_tail(Path(job["log_path"]))},
                     status="FAILED", finished=True, failure_class="runner",
                     failure_summary="runner restarted; process already gone, exit code not captured",
                 )
@@ -424,7 +461,8 @@ class RunnerCore:
             job_id=job_id, event_type="job.failed",
             payload={"exit_code": None, "failure_class": "runner",
                      "failure_summary": "process finished while runner was down; exit code not captured",
-                     "log_cursor": self._log_size(log_path)},
+                     "log_cursor": self._log_size(log_path),
+                     "log_tail": self._log_tail(log_path)},
             status="FAILED", finished=True, failure_class="runner",
             failure_summary="process finished while runner was down; exit code not captured",
         )

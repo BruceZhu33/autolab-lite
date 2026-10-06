@@ -22,6 +22,7 @@ from typing import Any
 
 from autolab_protocol import RunnerEventV1
 
+from .metric_sanity import metric_domain_issue
 from .credentials import CredentialStore
 from .manifest_builder import build_manifest
 from .repo import AcquiredJob, PlanSpecV1, Repo
@@ -29,6 +30,7 @@ from .transport import RunnerTransport, RunnerUnreachable
 
 _MAX_UNCERTAIN_ATTEMPTS = 30
 _UNCERTAIN_BACKOFF_TICKS = 1
+_MAX_METRIC_ATTEMPTS = 3
 
 
 class Scheduler:
@@ -47,6 +49,7 @@ class Scheduler:
             drop_first_dispatch = os.environ.get("AUTOLAB_TEST_DROP_FIRST_DISPATCH") == "1"
         self.drop_first_dispatch = drop_first_dispatch
         self._transports: dict[str, RunnerTransport] = {}
+        self._ssh_transports: dict[str, Any] = {}
         self._reachable: dict[str, bool] = {}
         self._uncertain_attempts: dict[str, int] = {}
         self._uncertain_wait: dict[str, int] = {}
@@ -234,6 +237,9 @@ class Scheduler:
             for artifact in self.repo.job_artifacts(job["id"]):
                 if artifact["kind"] != "metrics" or artifact["metadata"].get("metric_values"):
                     continue
+                attempts = int(artifact["metadata"].get("metric_attempts") or 0)
+                if attempts >= _MAX_METRIC_ATTEMPTS:
+                    continue  # repeated read failures stop here (no per-tick storm)
                 source = next(
                     (s for s in spec.outputs.metrics
                      if artifact["metadata"].get("relative_path") == s.path),
@@ -241,8 +247,10 @@ class Scheduler:
                 )
                 if source is None:
                     continue
+                self.repo.attach_artifact_metadata(
+                    artifact["id"], {"metric_attempts": attempts + 1})
                 try:
-                    content = open(artifact["remote_path"], encoding="utf-8", errors="replace").read()
+                    content = self._read_metrics_text(job, artifact["remote_path"])
                     value = parse_metric(content, source.kind, source.selector or "")
                 except (OSError, ValueError) as exc:
                     self.repo.attach_artifact_metadata(
@@ -250,9 +258,47 @@ class Scheduler:
                     )
                     continue
                 if value is not None:
+                    # 指标合理性门(D-023):超域值不作为有效指标(Job 保持
+                    # 无指标 → 比较无 Δ → 结论 inconclusive,保守正确)
+                    issue = metric_domain_issue(source.selector or source.path, value)
+                    if issue:
+                        self.repo.attach_artifact_metadata(
+                            artifact["id"],
+                            {"metric_error": f"指标域校验未过:{issue}"[:200]})
+                        continue
                     self.repo.attach_artifact_metadata(
                         artifact["id"], {"metric_values": {source.selector or source.path: value}}
                     )
+
+    def _read_metrics_text(self, job: dict[str, Any], remote_path: str) -> str:
+        """SSH 服务器的产物在远端:SFTP 读回再解析;本地直接 open。"""
+        try:
+            return open(remote_path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            server = self.repo.get_server(job["server_id"])
+            if server is None or server["transport_mode"] != "ssh":
+                raise
+            transport = self._ssh_transport_for(server)
+            if transport is None:
+                raise
+            return transport.sftp_read(remote_path).decode("utf-8", "replace")
+
+    def _ssh_transport_for(self, server: dict[str, Any]):
+        cached = self._ssh_transports.get(server["id"])
+        if cached is not None:
+            return cached
+        from . import server_admin
+
+        try:
+            transport = server_admin.connect_ssh(
+                server, self.credentials,
+                server_admin.hostkeys_path_for(self.credentials))
+        except Exception as exc:
+            print(f"autolab-control: metrics ssh connect failed for "
+                  f"{server['id']}: {exc}", flush=True)
+            return None
+        self._ssh_transports[server["id"]] = transport
+        return transport
 
     # --------------------------------------------------------------- helpers
 

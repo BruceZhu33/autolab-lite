@@ -169,6 +169,141 @@ def record_conclusion(project_id: str, experiment_id: str, conclusion: str,
         reconsideration=reconsideration, expected_hash=expected_hash)
 
 
+
+@server.tool()
+def probe_server(server_id: str, deep: bool = False) -> dict:
+    """Probe a GPU server's conda environments (deep=True adds torch/CUDA)."""
+    return _tool(tools.probe_server)(server_id=server_id, deep=deep)
+
+
+@server.tool()
+def preview_plan(plan_id: str) -> dict:
+    """Preview a plan's expanded jobs (params/argv/output dirs) before approval."""
+    return _tool(tools.preview_plan)(plan_id=plan_id)
+
+
+@server.tool()
+def cancel_job(job_id: str) -> dict:
+    """Request cancellation of a job (queued cancels immediately, running stops gracefully)."""
+    return _tool(tools.cancel_job)(job_id=job_id)
+
+
+@server.tool()
+def retry_job(job_id: str) -> dict:
+    """Retry a failed job: creates a new QUEUED job with the same params."""
+    return _tool(tools.retry_job)(job_id=job_id)
+
+
+@server.tool()
+def get_run_results(project_id: str) -> dict:
+    """Get a project's current baseline run results (status/metrics/per-dataset progress)."""
+    return _tool(tools.get_run_results)(project_id=project_id)
+
+
+@server.tool()
+def list_agent_sessions(project_id: str, limit: int = 6) -> dict:
+    """List a project's recent L1 agent sessions (implement/fix/analyzer/
+    reviewer/strategy) with status and tool/token metering."""
+    return _tool(tools.list_agent_sessions)(project_id=project_id, limit=limit)
+
+
+@server.tool()
+def get_agent_session_events(session_id: str, tail: int = 40) -> dict:
+    """Read one agent session's event timeline (AI text, tool calls and
+    observations, owner injections, status transitions)."""
+    return _tool(tools.get_agent_session_events)(session_id=session_id,
+                                                 tail=tail)
+
+
+@server.tool()
+def inject_agent_session(session_id: str, message: str) -> dict:
+    """Inject a guidance message into a RUNNING agent session: it enters the
+    agent's context at the next step. Use for live course-correction."""
+    return _tool(tools.inject_agent_session)(session_id=session_id,
+                                             message=message)
+
+
+@server.tool()
+def stop_agent_session(session_id: str) -> dict:
+    """Request to stop a running agent session: it wraps up after the current
+    tool step (written changes are kept)."""
+    return _tool(tools.stop_agent_session)(session_id=session_id)
+
+
+@server.tool()
+def get_iteration_loop(project_id: str) -> dict:
+    """Read a project's latest iteration loop: round/phase/direction/envelope/
+    awaiting state, recent strategy directives and the experiment backlog."""
+    return _tool(tools.get_iteration_loop)(project_id=project_id)
+
+
+@server.tool()
+def start_iteration_loop(project_id: str, mode: str = "collab",
+                         direction: str = "", matrix_cap: int = 0,
+                         gpu_hours: float = 0.0, tokens_budget: int = 0,
+                         code_ready: bool = False,
+                         confirm: bool = False) -> dict:
+    """Start an auto-iteration loop (OWNER delegation action). mode must be
+    exactly one of: "collab" (2 rounds) | "intermediate" (5 rounds) |
+    "heavy" (unlimited, stops on significant gain). matrix_cap /
+    gpu_hours / tokens_budget (>0 enables the strategy envelope; breach
+    pauses awaiting the owner; GPU estimate uses measured history).
+    code_ready=true freezes changes:
+    experiment-only loop that skips the implement phase entirely. Requires
+    the owner's explicit request: with confirm=false it only echoes the
+    params for review."""
+    return _tool(tools.start_iteration_loop)(
+        project_id=project_id, mode=mode, direction=direction,
+        matrix_cap=matrix_cap, gpu_hours=gpu_hours,
+        tokens_budget=tokens_budget, code_ready=code_ready,
+        confirm=confirm)
+
+
+@server.tool()
+def stop_iteration_loop(project_id: str) -> dict:
+    """Manually stop the auto-iteration loop (the running round finishes and
+    records its conclusion first)."""
+    return _tool(tools.stop_iteration_loop)(project_id=project_id)
+
+
+@server.tool()
+def resolve_iteration_loop(project_id: str, action: str,
+                           direction: str = "", confirm: bool = False) -> dict:
+    """Resolve a loop paused awaiting the owner (envelope/direction exit):
+    resume (one-shot), redirect (new direction required) or stop. Requires
+    the owner's explicit choice: confirm=false only echoes the reason."""
+    return _tool(tools.resolve_iteration_loop)(
+        project_id=project_id, action=action, direction=direction,
+        confirm=confirm)
+
+
+@server.tool()
+def get_project_direction(project_id: str) -> dict:
+    """Read a project's research direction (the iteration basis, D-028):
+    confirmed direction text, or a preview of the legacy accepted proposal's
+    report. Empty confirmedAt = still a draft, not an execution basis."""
+    return _tool(tools.get_project_direction)(project_id=project_id)
+
+
+@server.tool()
+def draft_project_direction(project_id: str) -> dict:
+    """LLM drafts a research direction from the paper PDFs + codebase
+    overview + confirmed baseline metrics. Stores it as a DRAFT only
+    (confirmation belongs to the owner): read the draft back to the user,
+    then call set_project_direction with confirm=true once they agree."""
+    return _tool(tools.draft_project_direction)(project_id=project_id)
+
+
+@server.tool()
+def set_project_direction(project_id: str, text: str = "",
+                          confirm: bool = False) -> dict:
+    """Save the project direction (OWNER delegation action). Requires the
+    owner's explicit request: confirm=false only echoes the text for review.
+    Empty text + confirm=true revokes the direction (back to undecided)."""
+    return _tool(tools.set_project_direction)(
+        project_id=project_id, text=text, confirm=confirm)
+
+
 def main() -> int:
     if not os.environ.get("AUTOLAB_DB"):
         print("autolab-mcp: AUTOLAB_DB is required", flush=True)

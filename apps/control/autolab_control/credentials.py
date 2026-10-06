@@ -53,6 +53,12 @@ class CredentialStore:
             raise CredentialError(f"no credentials stored under ref {ref!r}")
         return entry
 
+    def delete_entry(self, ref: str) -> None:
+        data = self._load()
+        if ref in data:
+            del data[ref]
+            self._save(data)
+
     def put(self, ref: str, runner_token: str, manifest_hmac_key: str) -> None:
         self.put_entry(ref, {"runner_token": runner_token,
                              "manifest_hmac_key": manifest_hmac_key})

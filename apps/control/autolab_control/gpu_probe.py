@@ -30,6 +30,25 @@ def probe_gpu_slots(fallback: int = 1) -> tuple[int, str]:
     return len(indices), "nvidia-smi"
 
 
+def parse_nvidia_smi_csv(stdout: str) -> list[dict]:
+    """nvidia-smi CSV(noheader,nounits)五列 → 遥测行;坏行跳过(五列必须
+    全为数字,防止非 nvidia-smi 输出被误解析)。本机探测与 SSH 远程探测共用。"""
+    out = []
+    for line in stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 5 or not all(p.isdigit() for p in parts):
+            continue
+        index, used, total, util, temp = (int(p) for p in parts)
+        out.append({
+            "gpu_index": index,
+            "memory_used_mb": used,
+            "memory_total_mb": total,
+            "utilization_percent": util,
+            "temperature_c": temp,
+        })
+    return out
+
+
 def probe_gpu_telemetry() -> list[dict]:
     """Per-GPU snapshot (index, memory, utilization, temperature) for the
     GPU Servers page; empty when nvidia-smi is absent (local transport)."""
@@ -48,23 +67,7 @@ def probe_gpu_telemetry() -> list[dict]:
         return []
     if proc.returncode != 0:
         return []
-    out = []
-    for line in proc.stdout.splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 5:
-            continue
-        try:
-            index, used, total, util, temp = (int(p) if p.isdigit() else 0 for p in parts)
-        except ValueError:
-            continue
-        out.append({
-            "gpu_index": index,
-            "memory_used_mb": used,
-            "memory_total_mb": total,
-            "utilization_percent": util,
-            "temperature_c": temp,
-        })
-    return out
+    return parse_nvidia_smi_csv(proc.stdout)
 
 
 def telemetry_json(slots: int) -> str:

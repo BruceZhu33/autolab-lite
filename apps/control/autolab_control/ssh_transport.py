@@ -82,7 +82,10 @@ class SshTransport:
             return
         client = self._client_with_pinned_host_key()
         kwargs: dict = {"hostname": self.host, "port": self.port, "username": self.username,
-                        "allow_agent": False, "look_for_keys": False}
+                        "allow_agent": False, "look_for_keys": False,
+                        # 连接超时:网络不通时快速失败(端点卡几分钟的教训),
+                        # 不影响正常连接
+                        "timeout": 12, "banner_timeout": 15, "auth_timeout": 15}
         if pkey:
             kwargs["pkey"] = self._load_pkey(pkey)
         elif password:
