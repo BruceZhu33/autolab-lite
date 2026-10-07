@@ -2260,6 +2260,65 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                             baseline_checks_json=_json.dumps(checks, ensure_ascii=False))
         return {"checks": checks}
 
+    @app.post("/api/owner/projects/{project_id}/baseline/onboard")
+    def baseline_onboard(project_id: str, _: str = Depends(require("owner"))) -> dict:
+        """D-029 接入型一键 Baseline:接入 Agent 识别工程 → 生成/复用适配器
+        → 口径清单(数据集×档位)→ 选环境 → 冒烟自验 → 落库并刷新体检。
+        接入只做准备不跑正式基线——跑与确认仍是 owner 的动作。"""
+        from . import agent_session, baseline_queue
+
+        project, server = _baseline_ctx(project_id)
+        if not (project.get("remote_workdir") or "").strip():
+            raise HTTPException(status_code=409, detail="项目还没有工作区,先在项目页补全")
+        run = baseline_queue.normalize_run(project)
+        if run.get("status") == "running":
+            raise HTTPException(status_code=409, detail="Baseline 正在运行,等它结束再接入")
+        try:
+            onboarded = agent_session.run_onboarding_session(
+                repo, credentials, hostkeys_path, project_id)
+        except agent_session.AgentSessionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        import json as _json
+
+        config = server_admin.baseline_config_defaults(project)
+        config.update({
+            "command": onboarded["datasets"][0]["command"],
+            "dataset_path": onboarded["datasets"][0].get("dataset_path") or "",
+            "conda_env": onboarded.get("conda_env") or config.get("conda_env") or "",
+            "metric_file": "metrics.json",
+            "datasets": onboarded["datasets"],
+            "onboarded": True,
+            "adapter": onboarded.get("adapter") or "",
+        })
+        repo.update_project(project_id,
+                            baseline_config_json=_json.dumps(config, ensure_ascii=False))
+        # 接入即体检:清单状态立即可见
+        transport = _open_transport(server)
+        try:
+            checks = server_admin.run_baseline_checks(
+                project["remote_workdir"], config, ssh_transport=transport)
+            repo.update_project(project_id,
+                                baseline_checks_json=_json.dumps(checks, ensure_ascii=False))
+        except Exception:
+            checks = []
+        finally:
+            if transport is not None:
+                transport.close()
+        repo.add_review_message(
+            project_id=project_id, role="system", kind="text",
+            content=f"工程接入完成:{onboarded.get('notes') or '口径清单已生成'}"
+                    f"(适配器 {'复用' if onboarded.get('adapter_reused') else onboarded.get('adapter') or '无需'};"
+                    f"清单 {len(onboarded['datasets'])} 条;环境 {onboarded.get('conda_env') or '未定'};"
+                    f"冒烟 {'通过' if onboarded.get('smoke_ok') else '未通过,首跑可能需修复'})")
+        return {"onboarded": True, "adapter": onboarded.get("adapter"),
+                "adapterReused": onboarded.get("adapter_reused"),
+                "condaEnv": onboarded.get("conda_env"),
+                "smokeOk": onboarded.get("smoke_ok"),
+                "notes": onboarded.get("notes"),
+                "datasets": onboarded["datasets"],
+                "checks": checks,
+                "changes": onboarded.get("changes") or []}
+
     @app.post("/api/owner/projects/{project_id}/baseline/fix")
     def baseline_fix(project_id: str, payload: dict,
                      _: str = Depends(require("owner"))) -> dict:
@@ -2369,7 +2428,7 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
             content=("已重新申请 Baseline:通过事实已重置,项目回到 Baseline 列,"
                      "到 Baseline 页重跑(历史运行数据保留)"
                      if reset else
-                     "已申请 Baseline:项目进入 Baseline 列,到 Baseline 页继续"))
+                     "已申请 Baseline:项目进入 Baseline 列,到 Baseline 页点「Agent 一键 Baseline」接入工作区"))
         return {"project": {"id": updated["id"],
                             "baseline_requested_at": updated["baseline_requested_at"],
                             "baseline_agent_id": updated["baseline_agent_id"]},

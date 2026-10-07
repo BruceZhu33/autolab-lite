@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import {
   analyzeWorkspace, buildEnvironment, checkCodePresence, confirmBaselinePass,
+  onboardBaseline,
   fetchBaselineState, fixBaselineRun, fetchProjects,
   fetchServerEnvironments,
   pollBaselineRun, pollEnvBuild, provideAsset, runBaselineCheck,
@@ -656,23 +657,50 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
       }
       setStepState((s) => ({ ...s, code: "done" }));
 
-      // ② Agent 分析(内部配置:命令/数据集/环境/指标文件,自动推断)
+      // ② 工程接入(D-029):未接入 → 接入 Agent(识别/适配器/口径清单/环境/冒烟);
+      //    已接入 → 沿用只读分析补缺(环境计划等)。会话时间线在下方 LiveSessionCard 可见。
       setStepState((s) => ({ ...s, analyze: "active" }));
-      const analysis = await analyzeWorkspace(project.id);
-      setEnvPlan((await Promise.resolve(analysis)).envPlan);
-      if (!analysis.applied.command) {
-        setStepState((s) => ({ ...s, analyze: "failed" }));
-        setGap({ kind: "command", hint: "Agent 读了代码/README 也没认出训练入口,告诉你它怎么跑:" });
-        toast.error("无法确定训练命令");
-        return;
+      let analysis: Awaited<ReturnType<typeof analyzeWorkspace>> | null = null;
+      let onboardDone = !!state?.config.onboarded;
+      if (!onboardDone) {
+        try {
+          toast.info("接入 Agent 正在识别工程:适配口径、生成清单、冒烟自验…", {
+            description: "全过程见下方会话时间线;真基线仍由你确认后才跑",
+          });
+          const done = await onboardBaseline(project.id);
+          onboardDone = true;
+          toast.success(`工程接入完成:${done.notes || "口径清单已生成"}`, {
+            description: `适配器 ${done.adapterReused ? "复用既有" : (done.adapter || "无需")}`
+              + ` · 清单 ${done.datasets.length} 条 · 环境 ${done.condaEnv || "未定"}`
+              + ` · 冒烟 ${done.smokeOk ? "通过" : "未通过(首跑可能需修复)"}`,
+            duration: 10000,
+          });
+          await refetch();
+        } catch (e) {
+          setStepState((s) => ({ ...s, analyze: "failed" }));
+          fail("analyze", `工程接入失败:${(e as Error).message}`);
+          return;
+        }
+      }
+      if (!onboardDone) {
+        // 接入端点未落库(异常回落)时保底:只读分析
+        analysis = await analyzeWorkspace(project.id);
+        setEnvPlan(analysis.envPlan);
+        if (!analysis.applied.command) {
+          setStepState((s) => ({ ...s, analyze: "failed" }));
+          setGap({ kind: "command", hint: "Agent 读了代码/README 也没认出训练入口,告诉你它怎么跑:" });
+          toast.error("无法确定训练命令");
+          return;
+        }
       }
       setStepState((s) => ({ ...s, analyze: "done" }));
-      setEnvPlan(analysis.envPlan);
 
-      // ③ 环境构建(有依赖文件才构建;失败亮日志)
-      if (analysis.envPlan.command) {
+      // ③ 环境构建(有依赖文件才构建;失败亮日志)——接入路径的 conda_env
+      //    由接入 Agent 选定,环境构建仅兜底(接入通常直接选了现有环境)
+      const envPlan = analysis?.envPlan;
+      if (envPlan?.command) {
         setStepState((s) => ({ ...s, env: "active" }));
-        toast.info(`环境构建中:${analysis.envPlan.detail}`);
+        toast.info(`环境构建中:${envPlan.detail}`);
         const built = await doEnvBuildAndWait();
         if (!built) {
           fail("env", "环境构建失败:看下方日志,按提示在服务器上处理(缺系统库/网络/权限)后重试");
@@ -971,6 +999,12 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
               </Button>
               {state?.config.command ? (
                 <div className="pt-1">
+                  {state.config.onboarded ? (
+                    <span className="mb-1.5 inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-micro font-medium text-success">
+                      <CheckCircle2 className="size-3" />
+                      已由接入 Agent 适配{state.config.adapter ? ` · 适配器 ${state.config.adapter}` : ""}
+                    </span>
+                  ) : null}
                   <DatasetsEditor project={project} config={state.config}
                                   disabled={busy !== null || running}
                                   onSaved={() => void doCheck()} />

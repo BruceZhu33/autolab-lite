@@ -68,8 +68,10 @@ def main(argv: list[str] | None = None) -> int:
                 # 同一循环(实测事故:双进程各跑一轮、旧代码覆盖新代码的结果)。
                 import socket as _socket
 
+                # SO_REUSEADDR 与 uvicorn 实际绑定一致:TIME_WAIT(浏览器轮询
+                # 会不断产生)不挡,只有真 LISTEN(另一个实例)才拒绝启动
                 probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 0)
+                probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
                 try:
                     probe.bind(("127.0.0.1", args.http_port))
                 except OSError as exc:

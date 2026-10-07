@@ -1038,7 +1038,7 @@ def baseline_datasets(config: dict) -> list[dict]:
 
 def baseline_config_defaults(project: dict) -> dict:
     config = {"command": "", "dataset_path": "", "conda_env": "", "metric_file": "",
-              "datasets": []}
+              "datasets": [], "onboarded": False, "adapter": ""}
     try:
         import json as _json
         stored = _json.loads(project.get("baseline_config_json") or "{}")
