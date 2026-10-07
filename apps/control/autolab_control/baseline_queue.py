@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from pathlib import Path
 
 from . import server_admin
@@ -335,6 +336,13 @@ def sync_run(repo: Repo, credentials: CredentialStore, hostkeys_path: Path,
             transport = server_admin.connect_ssh(server, credentials, hostkeys_path)
         state = server_admin.baseline_run_state(
             workdir, run_dir=by_name[active]["run_dir"], ssh_transport=transport)
+        if state["status"] == "finished" and state["exit_code"] is None:
+            # 竞态窗口:训练进程已退出、nohup 的 `echo $? > run.exit` 还没落盘
+            # (毫秒级),此刻 sync 会误判「异常终止」并把 finished+无指标持久
+            # 化,之后真正的 exit 0 再也没人看(实测事故)。等 2 秒复核一次。
+            time.sleep(2)
+            state = server_admin.baseline_run_state(
+                workdir, run_dir=by_name[active]["run_dir"], ssh_transport=transport)
         run.update({"status": state["status"], "pid": state["pid"],
                     "exit_code": state["exit_code"],
                     "log_tail": state["log_tail"],
