@@ -38,7 +38,13 @@ function projectTint(projectId: string): { bg: string; edge: string } {
 
 /** 每个项目的卡按已达阶段展开:一项目多卡,分居各列;当前阶段卡带徽章。 */
 function expandByStage(cards: BoardCardView[]): BoardCardView[] {
-  return cards.flatMap((card) => {
+  // 列内行号 = issues 顺序的投影,而后端按 updated_at 排项目——每次轮询
+  // 顺序一变,同项目的卡在各列的行号就互相错开(横向 trace 断裂)。展开前
+  // 按项目 id 稳定排序:行号恒定,同项目的卡始终横向对齐成"一行"。
+  const stable = [...cards].sort(
+    (a, b) => a.projectId.localeCompare(b.projectId)
+      || a.planId.localeCompare(b.planId));
+  return stable.flatMap((card) => {
     const stages = card.stages ?? {};
     const tint = projectTint(card.projectId);
     const reached = STAGE_KEYS.filter(
