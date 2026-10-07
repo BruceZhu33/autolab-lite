@@ -42,6 +42,32 @@ class ServerAdminError(RuntimeError):
     """Registration/connectivity failure with an owner-actionable message."""
 
 
+def browse_remote_dir(transport, path: str = "") -> dict:
+    """列远端一级子目录(SFTP),给项目页的服务器工作区选择器用。
+
+    path 为空 → 远端家目录;只返回目录;隐藏目录排后面;单项读失败跳过。
+    """
+    import stat as _stat
+
+    sftp = transport._client.open_sftp()
+    try:
+        target = sftp.normalize(path if path else ".")
+        entries: list[dict] = []
+        for attr in sftp.listdir_attr(target):
+            try:
+                if not _stat.S_ISDIR(attr.st_mode or 0):
+                    continue
+                entries.append({"name": attr.filename, "path": f"{target}/{attr.filename}"})
+            except OSError:
+                continue
+        entries.sort(key=lambda e: (e["name"].startswith("."), e["name"].lower()))
+        parent = target.rsplit("/", 1)[0] if "/" in target[1:] else "/"
+        return {"path": target, "parent": parent if parent != target else None,
+                "entries": entries}
+    finally:
+        sftp.close()
+
+
 def hostkeys_path_for(credentials: CredentialStore) -> Path:
     return credentials.path.with_name(credentials.path.stem + ".hostkeys.json")
 

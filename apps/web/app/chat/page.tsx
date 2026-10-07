@@ -28,6 +28,7 @@ import { Label } from "~/vendor/ui/components/ui/label";
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "~/vendor/ui/components/ui/dialog";
+import { FolderBrowserDialog } from "@/components/folder-browser";
 
 /** 空状态提示词:覆盖「问状态」与「让它干活」两类第一句话。 */
 const CHAT_STARTERS = [
@@ -205,130 +206,6 @@ function MessageRow({ msg }: { msg: ChatMessage }) {
 // ------------------------------------------------------------- folder picker
 
 /** 本机文件夹浏览器:面包屑 + 子目录列表 + 快捷入口,点「选择此目录」回填。 */
-function FolderBrowserDialog({ open, onOpenChange, initialPath, onPick }: {
-  open: boolean;
-  onOpenChange: (v: boolean) => void;
-  initialPath?: string;
-  onPick: (path: string) => void;
-}) {
-  const [current, setCurrent] = useState(initialPath || "");
-  const [manual, setManual] = useState("");
-  const browse = useQuery({
-    queryKey: ["chat-fs", current, open],
-    queryFn: () => browseFs(current),
-    enabled: open,
-    retry: false,
-  });
-  useEffect(() => {
-    if (open) {
-      setCurrent(initialPath || "");
-      setManual("");
-    }
-  }, [open, initialPath]);
-  const projects = useQuery({
-    queryKey: ["projects"],
-    queryFn: fetchProjects,
-    select: (all) => all.filter((p) => p.server.transport_mode === "local" && p.workdir),
-  });
-
-  const crumbs = (browse.data?.path ?? current).split("/").filter(Boolean);
-  const go = (path: string) => {
-    setManual("");
-    setCurrent(path);
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>选择工作区</DialogTitle>
-          <DialogDescription>浏览本机目录,选定 claude 的工作文件夹。</DialogDescription>
-        </DialogHeader>
-
-        {/* 快捷入口:家目录 + local 项目工作区 */}
-        <div className="flex flex-wrap gap-1.5">
-          <button type="button" onClick={() => go("")}
-                  className="inline-flex items-center gap-1 rounded-full bg-muted/60 px-2 py-1
-                             text-micro text-muted-foreground hover:bg-muted">
-            <Home className="size-3" /> 家目录
-          </button>
-          {(projects.data ?? []).slice(0, 4).map((p) => (
-            <button key={p.id} type="button" onClick={() => go(p.workdir)}
-                    title={p.workdir}
-                    className="inline-flex max-w-48 items-center gap-1 rounded-full bg-brand/10
-                               px-2 py-1 text-micro text-brand hover:bg-brand/20">
-              <FolderOpen className="size-3 shrink-0" />
-              <span className="truncate">{p.name}</span>
-            </button>
-          ))}
-        </div>
-
-        {/* 面包屑 */}
-        <div className="flex flex-wrap items-center gap-0.5 rounded-lg border border-surface-border
-                        bg-muted/30 px-2 py-1.5 text-caption">
-          <button type="button" onClick={() => go("/")} className="px-1 hover:text-brand">/</button>
-          {crumbs.map((part, i) => (
-            <span key={i} className="flex items-center">
-              <button type="button"
-                      onClick={() => go("/" + crumbs.slice(0, i + 1).join("/"))}
-                      className="max-w-32 truncate px-1 hover:text-brand">
-                {part}
-              </button>
-              {i < crumbs.length - 1 ? <span className="text-muted-foreground/50">/</span> : null}
-            </span>
-          ))}
-        </div>
-
-        {/* 目录列表 */}
-        <div className="h-64 overflow-y-auto rounded-lg border border-surface-border">
-          {browse.isLoading ? (
-            <div className="flex h-full items-center justify-center">
-              <Loader2 className="size-4 animate-spin text-muted-foreground" />
-            </div>
-          ) : browse.isError ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 p-4
-                            text-center text-caption text-muted-foreground">
-              {browse.error instanceof Error ? browse.error.message : "读取目录失败"}
-              <Button size="sm" variant="secondary" onClick={() => browse.refetch()}>
-                重试
-              </Button>
-            </div>
-          ) : (browse.data?.entries ?? []).length === 0 ? (
-            <p className="flex h-full items-center justify-center text-caption text-muted-foreground">
-              此目录下没有子目录
-            </p>
-          ) : (
-            (browse.data?.entries ?? []).map((e) => (
-              <button key={e.path} type="button" onClick={() => go(e.path)}
-                      className="flex w-full items-center gap-2 border-b border-surface-border/40
-                                 px-3 py-2 text-left text-body last:border-0 hover:bg-muted/50">
-                <Folder className="size-4 shrink-0 text-muted-foreground" />
-                <span className="truncate">{e.name}</span>
-              </button>
-            ))
-          )}
-        </div>
-
-        {/* 手动路径 + 确认 */}
-        <div className="flex items-center gap-2">
-          <Input value={manual} placeholder={browse.data?.path ?? "或直接粘贴绝对路径"}
-                 onChange={(e) => setManual(e.target.value)}
-                 onKeyDown={(e) => { if (e.key === "Enter" && manual.trim()) go(manual.trim()); }} />
-          <Button variant="secondary" size="icon" title="上一级"
-                  disabled={!browse.data?.parent}
-                  onClick={() => browse.data?.parent && go(browse.data.parent)}>
-            <ArrowUp className="size-4" />
-          </Button>
-          <Button onClick={() => onPick(manual.trim() || browse.data?.path || "")}
-                  disabled={browse.isError && !manual.trim()}>
-            选择此目录
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 // ----------------------------------------------------------- new session
 
 function NewSessionDialog({ open, onOpenChange, onCreated }: {
@@ -340,6 +217,7 @@ function NewSessionDialog({ open, onOpenChange, onCreated }: {
   const [agentId, setAgentId] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
   const agents = useQuery({ queryKey: ["agents"], queryFn: fetchAgents });
+  const projects = useQuery({ queryKey: ["projects"], queryFn: fetchProjects });
   // 内置 chatagent(供应商/Key 在 Agents 页编辑)排最前并作为默认选择
   const sortedAgents = (agents.data ?? []).slice().sort((a, b) =>
     (b.id === "agent-builtin-chat" ? 1 : 0) - (a.id === "agent-builtin-chat" ? 1 : 0));
@@ -418,6 +296,11 @@ function NewSessionDialog({ open, onOpenChange, onCreated }: {
         open={pickerOpen}
         onOpenChange={setPickerOpen}
         initialPath={cwd || undefined}
+        source={{ kind: "local" }}
+        quickPicks={(projects.data ?? [])
+          .filter((p) => p.server.transport_mode === "local" && p.workdir)
+          .slice(0, 4)
+          .map((p) => ({ label: p.name, path: p.workdir }))}
         onPick={(path) => {
           setCwd(path);
           setPickerOpen(false);

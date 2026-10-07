@@ -5,8 +5,8 @@ import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
-  Bot, CheckCircle2, FileArchive, FileText, FlaskConical, FolderKanban, FolderPlus,
-  Link2, Loader2, MoreHorizontal, Pencil, Server as ServerIcon, Trash2,
+  Bot, CheckCircle2, FileArchive, FileText, FlaskConical, FolderKanban, FolderOpen,
+  FolderPlus, Link2, Loader2, MoreHorizontal, Pencil, Server as ServerIcon, Trash2,
 } from "lucide-react";
 import {
   deleteProject, fetchAgents, fetchProjectPapers, fetchProjects, fetchServers,
@@ -29,6 +29,7 @@ import {
 } from "~/vendor/ui/components/ui/dropdown-menu";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "@/vendor/views/layout/page-header";
 import { EmptyState } from "@/components/empty-state";
+import { FolderBrowserDialog } from "@/components/folder-browser";
 import { ApiError } from "@/components/api-error";
 import { statusLabelOf } from "@/vendor/views/issues/status";
 import { timeAgo } from "@/vendor/views/issues/time";
@@ -153,6 +154,7 @@ function EditProjectDialog({
   const [localWorkspace, setLocalWorkspace] = useState("");
   const [paper, setPaper] = useState<File | null>(null);
   const [saving, setSaving] = useState(false);
+  const [picker, setPicker] = useState<null | "workdir" | "local">(null);
 
   const { data: papers = [] } = useQuery({
     queryKey: ["project-papers", project?.id],
@@ -213,6 +215,7 @@ function EditProjectDialog({
   };
 
   return (
+    <>
     <Dialog open={open} onOpenChange={(next) => (next ? null : onClose())}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
@@ -242,23 +245,35 @@ function EditProjectDialog({
           ) : (
             <div className="grid gap-1.5">
               <Label>服务器工作区({project?.server.transport_mode === "ssh" ? "服务器上的绝对路径" : "本机绝对路径"})</Label>
-              <Input
-                value={workdir}
-                onChange={(e) => setWorkdir(e.target.value)}
-                placeholder={project?.server.transport_mode === "ssh"
-                  ? "/home/serveruser/projects/medseg" : "/Users/juan/projects/medseg"}
-                spellCheck={false}
-              />
+              <div className="flex gap-2">
+                <Input
+                  value={workdir}
+                  onChange={(e) => setWorkdir(e.target.value)}
+                  placeholder={project?.server.transport_mode === "ssh"
+                    ? "/home/serveruser/projects/medseg" : "/Users/juan/projects/medseg"}
+                  spellCheck={false}
+                />
+                <Button variant="secondary" size="icon" title="浏览目录"
+                        onClick={() => setPicker("workdir")}>
+                  <FolderOpen className="size-4" />
+                </Button>
+              </div>
             </div>
           )}
           <div className="grid gap-1.5">
             <Label>本地开发工作区(可选,你 Mac 上的绝对路径;Baseline 同步代码的来源)</Label>
-            <Input
-              defaultValue={project?.localWorkspace ?? ""}
-              onChange={(e) => setLocalWorkspace(e.target.value)}
-              placeholder="/Users/juan/projects/medseg"
-              spellCheck={false}
-            />
+            <div className="flex gap-2">
+              <Input
+                defaultValue={project?.localWorkspace ?? ""}
+                onChange={(e) => setLocalWorkspace(e.target.value)}
+                placeholder="/Users/juan/projects/medseg"
+                spellCheck={false}
+              />
+              <Button variant="secondary" size="icon" title="浏览本机目录"
+                      onClick={() => setPicker("local")}>
+                <FolderOpen className="size-4" />
+              </Button>
+            </div>
           </div>
           <div className="grid gap-1.5">
             <Label>论文 PDF(可选{papers.length > 0 ? `,已有 ${papers.length} 篇` : ""})</Label>
@@ -281,6 +296,25 @@ function EditProjectDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+    <FolderBrowserDialog
+      open={picker !== null}
+      onOpenChange={(v) => (v ? null : setPicker(null))}
+      initialPath={picker === "local" ? (localWorkspace || project?.localWorkspace || undefined)
+                                      : (workdir || undefined)}
+      source={picker === "local"
+        ? { kind: "local" }
+        : { kind: "server", serverId: project?.server.id ?? "" }}
+      title={picker === "local" ? "选择本地开发工作区" : "选择服务器工作区"}
+      description={picker === "local"
+        ? "浏览你 Mac 上的目录,选定 Baseline 同步代码的来源。"
+        : `浏览 ${project?.server.name ?? "服务器"} 上的目录,选定项目工作区。`}
+      onPick={(path) => {
+        if (picker === "local") setLocalWorkspace(path);
+        else setWorkdir(path);
+        setPicker(null);
+      }}
+    />
+    </>
   );
 }
 
@@ -295,6 +329,7 @@ function NewProjectDialog({ open, onClose }: { open: boolean; onClose: () => voi
   const [paper, setPaper] = useState<File | null>(null);
   const [initResearch, setInitResearch] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [dirPicker, setDirPicker] = useState(false);
 
   const { data: servers = [] } = useQuery({
     queryKey: ["servers-for-project"],
@@ -356,6 +391,7 @@ function NewProjectDialog({ open, onClose }: { open: boolean; onClose: () => voi
   };
 
   return (
+    <>
     <Dialog open={open} onOpenChange={(next) => (next ? null : onClose())}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
@@ -407,13 +443,20 @@ function NewProjectDialog({ open, onClose }: { open: boolean; onClose: () => voi
           {sourceKind === "local" ? (
             <div className="grid gap-1.5">
               <Label>项目工作目录({selected?.transport_mode === "ssh" ? "服务器上的绝对路径" : "本机绝对路径"})</Label>
-              <Input
-                value={workdir}
-                onChange={(e) => setWorkdir(e.target.value)}
-                placeholder={selected?.transport_mode === "ssh"
-                  ? "/home/serveruser/projects/medseg" : "/Users/juan/projects/medseg"}
-                spellCheck={false}
-              />
+              <div className="flex gap-2">
+                <Input
+                  value={workdir}
+                  onChange={(e) => setWorkdir(e.target.value)}
+                  placeholder={selected?.transport_mode === "ssh"
+                    ? "/home/serveruser/projects/medseg" : "/Users/juan/projects/medseg"}
+                  spellCheck={false}
+                />
+                <Button variant="secondary" size="icon"
+                        title={serverId ? "浏览目录" : "先选择服务器"}
+                        disabled={!serverId} onClick={() => setDirPicker(true)}>
+                  <FolderOpen className="size-4" />
+                </Button>
+              </div>
             </div>
           ) : sourceKind === "github" ? (
             <div className="grid gap-1.5">
@@ -469,8 +512,24 @@ function NewProjectDialog({ open, onClose }: { open: boolean; onClose: () => voi
         </DialogFooter>
       </DialogContent>
     </Dialog>
+    <FolderBrowserDialog
+        open={dirPicker}
+        onOpenChange={setDirPicker}
+        initialPath={workdir || undefined}
+        source={serverId ? { kind: "server", serverId } : { kind: "local" }}
+        title="选择项目工作目录"
+        description={selected?.transport_mode === "ssh"
+          ? `浏览 ${selected.name} 上的目录,选定项目工作区。`
+          : "浏览目录,选定项目工作区。"}
+        onPick={(path) => {
+          setWorkdir(path);
+          setDirPicker(false);
+        }}
+      />
+    </>
   );
 }
+
 
 export default function ProjectsPage() {
   const [open, setOpen] = useState(false);

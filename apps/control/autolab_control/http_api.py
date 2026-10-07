@@ -426,6 +426,47 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
         except RepoError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.get("/api/owner/servers/{server_id}/fs/browse")
+    def server_fs_browse(server_id: str, path: str = "",
+                         _: str = Depends(require("owner"))) -> dict:
+        """列服务器上的一级子目录:项目页选工作区不用手抄路径。
+
+        local 服务器列本机目录;SSH 服务器走 SFTP(家目录起点)。
+        只返回目录名+绝对路径,不读文件内容。
+        """
+        server = repo.get_server(server_id)
+        if server is None:
+            raise HTTPException(status_code=404, detail="server not found")
+        if server["transport_mode"] == "ssh":
+            try:
+                with server_admin.connect_ssh(server, credentials, hostkeys_path) as transport:
+                    return server_admin.browse_remote_dir(transport, path)
+            except server_admin.ServerAdminError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        from pathlib import Path as _Path
+
+        target = _Path(path).expanduser() if path else _Path.home()
+        target = target.resolve()
+        if not str(target).startswith("/"):
+            raise HTTPException(status_code=409, detail="需要绝对路径")
+        if not target.is_dir():
+            raise HTTPException(status_code=409, detail=f"目录不存在:{target}")
+        entries: list[dict] = []
+        try:
+            for child in target.iterdir():
+                try:
+                    if child.is_dir():
+                        entries.append({"name": child.name, "path": str(child)})
+                except OSError:
+                    continue
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=f"无权读取该目录:{target}") from exc
+        entries.sort(key=lambda e: (e["name"].startswith("."), e["name"].lower()))
+        parent = target.parent
+        return {"path": str(target),
+                "parent": str(parent) if parent != target else None,
+                "entries": entries}
+
     @app.post("/api/owner/projects/{project_id}/stage")
     def advance_stage(project_id: str, payload: dict,
                       _: str = Depends(require("owner"))) -> dict:

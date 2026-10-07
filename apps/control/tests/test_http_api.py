@@ -399,3 +399,34 @@ def test_baseline_re_request_resets_passed(api, tmp_path):
                        headers={"Authorization": f"Bearer {AGENT}"}).json()
     card = next(c for c in cards if c["projectId"] == pid)
     assert card["column"] == "baseline"
+
+
+def test_server_fs_browse_local(api, tmp_path):
+    """项目页工作区选择器:local 服务器列本机目录(绝对路径、只目录、可上一级)。"""
+    client = api["client"]
+    owner = {"Authorization": f"Bearer {OWNER}"}
+    servers = client.get("/api/servers",
+                         headers={"Authorization": f"Bearer {AGENT}"}).json()
+    local = next(s for s in servers if s["transport_mode"] == "local")
+    (tmp_path / "browse-a").mkdir()
+    (tmp_path / "browse-b.txt").write_text("not a dir")
+    (tmp_path / ".browse-hidden").mkdir()
+    result = client.get(f"/api/owner/servers/{local['id']}/fs/browse",
+                        params={"path": str(tmp_path)}, headers=owner)
+    assert result.status_code == 200
+    data = result.json()
+    assert data["path"] == str(tmp_path)
+    names = [e["name"] for e in data["entries"]]
+    assert "browse-a" in names and "browse-b.txt" not in names
+    assert names.index(".browse-hidden") > names.index("browse-a")  # 隐藏排后
+    assert data["parent"]  # 可上一级
+    # 非绝对路径 / 不存在目录 → 409
+    assert client.get(f"/api/owner/servers/{local['id']}/fs/browse",
+                      params={"path": "relative"}, headers=owner).status_code == 409
+    assert client.get(f"/api/owner/servers/{local['id']}/fs/browse",
+                      params={"path": str(tmp_path / "nope")}, headers=owner).status_code == 409
+    # agent token 不能浏览(owner-only:列的是真实文件系统)
+    denied = client.get(f"/api/owner/servers/{local['id']}/fs/browse",
+                        params={"path": str(tmp_path)},
+                        headers={"Authorization": f"Bearer {AGENT}"})
+    assert denied.status_code == 403

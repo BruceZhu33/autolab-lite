@@ -1403,6 +1403,12 @@ export const browseFs = (path: string) =>
   get<{ path: string; parent: string | null; entries: FsBrowseEntry[] }>(
     `/api/owner/chat/fs/browse?path=${encodeURIComponent(path)}`);
 
+/** 服务器工作区浏览(项目页选择器;owner scope)。local 服务器列本机,
+ * SSH 走 SFTP(path 为空 = 远端家目录)。 */
+export const browseServerFs = (serverId: string, path: string) =>
+  get<{ path: string; parent: string | null; entries: FsBrowseEntry[] }>(
+    `/api/owner/servers/${serverId}/fs/browse?path=${encodeURIComponent(path)}`);
+
 // ------------------------------------------------- builtin chat agent config
 
 /** 内置 chatagent(不可删除):供应商 / API Key / 模型配置。 */
