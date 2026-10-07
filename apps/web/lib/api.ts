@@ -444,6 +444,9 @@ export type BaselineConfig = {
   metric_file: string;
   /** 联合基线数据集清单(真相源);空 = 旧单命令字段。 */
   datasets?: Array<{ name: string; command: string; dataset_path: string }>;
+  /** D-029 工程接入状态:接入 Agent 已适配口径(适配器/清单/环境/冒烟)。 */
+  onboarded?: boolean;
+  adapter?: string;
 };
 
 export type BaselineDatasetProgress = {
@@ -682,6 +685,31 @@ export type WorkspaceAnalysis = {
   dependencies: Array<{ file: string; kind: string }>;
   entry: string;
 };
+
+/** D-029 接入型一键 Baseline:接入 Agent 识别工程 → 生成/复用适配器 →
+ * 口径清单(数据集×档位)→ 选环境 → 冒烟自验;落库并刷新体检。 */
+export async function onboardBaseline(projectId: string) {
+  const response = await fetch(
+    `${API_URL}/api/owner/projects/${projectId}/baseline/onboard`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiToken()}`, "Content-Type": "application/json" },
+      body: "{}",
+    });
+  if (response.status === 401 || response.status === 403) {
+    throw new Error("工程接入需要 owner 权限的 token");
+  }
+  if (!response.ok) {
+    let detail = `${response.status}`;
+    try { detail = (await response.json()).detail ?? detail; } catch { /* keep */ }
+    throw new Error(detail);
+  }
+  return response.json() as Promise<{
+    onboarded: boolean; adapter: string | null; adapterReused: boolean;
+    condaEnv: string; smokeOk: boolean; notes: string;
+    datasets: Array<{ name: string; command: string; dataset_path: string }>;
+    changes: string[];
+  }>;
+}
 
 export async function analyzeWorkspace(projectId: string) {
   const response = await fetch(`${API_URL}/api/owner/projects/${projectId}/analyze`, {

@@ -447,3 +447,25 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   给系统打工;方向 + 每轮思路反馈 + 包络护栏覆盖了同样的安全语义。
 - 测试:test_direction.py 增 4 例(草稿→确认流、仅方向可启动循环、未确认被拒、
   看板方向格三态);test_review 看板断言换新文案。全量 203 passed。
+
+## D-029 · 接入型一键 Baseline:工程接入 Agent(onboard 角色,2026-10-07)
+
+- 背景:owner 真实测试暴露缺口——新建项目选好工作区后点「提 Baseline」,只得到
+  「进入 Baseline 列」,没有任何 Agent 接手;而工作区里遗留的 autolab_baseline.py
+  适配器(口径参数化/指标出口/--hflip 顺序坑)正是一键该自动产出的东西。原
+  Baseline Agent 是「修复型」(失败后给补丁),缺「接入型」。
+- 决定:agent_session 新增 onboard 角色(写能力会话:read/list/grep/probe/
+  write/smoke/submit,预算 16 轮/900s/6 写/2 冒烟):识别工程形态 → 口径核查
+  (数据档位参数 + $AUTOLAB_OUTPUT_DIR/metrics.json 指标出口)→ 生成或**复用**
+  适配器(优先不动工程源码)→ 口径清单(数据集 × 档位,≤24 条,--epochs 3 冒烟
+  口径)→ 选 conda 环境 → smoke_run 自验 → submit_result。
+- 编排:POST /api/owner/projects/{id}/baseline/onboard(owner)——拒绝 running/
+  无工作区;落库 merge baseline_config_json(datasets/command/conda_env/
+  onboarded/adapter)→ 自动刷新体检 → review_messages 留痕摘要。**接入只做
+  准备不跑正式基线**——跑与确认仍是 owner 动作(确认语义不破坏)。
+- UI:Baseline 页「Agent 一键 Baseline」的第②步由只读 analyzer 升级为 onboard
+  (未接入时);已接入显示「已由接入 Agent 适配 · 适配器 …」徽标;会话时间线走
+  LiveSessionCard(onboard: 接入 Agent)。失败回落原 analyzer 只读分析。
+- 分工定型:analyzer(只读推断)→ onboard(写能力接入)→ fix(失败修复);
+  baseline-request 提示改为指向一键接入。
+- 测试:test_onboard.py(mock 会话:适配器生成/复用、清单校验、running 拒绝)。

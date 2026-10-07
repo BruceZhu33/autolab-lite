@@ -18,6 +18,7 @@ import { Button } from "~/vendor/ui/components/ui/button";
 const SESSION_ROLE_LABEL: Record<string, string> = {
   session: "实现 Agent", fix: "修复 Agent",
   analyzer: "分析 Agent", reviewer: "评分 Agent",
+  onboard: "接入 Agent",
 };
 
 function SessionStatusPill({ status }: { status: string }) {
