@@ -494,3 +494,20 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
 - 资料槽 = 体检派生(dataset:N / weights / data_layout + supply 归位路径),
   供给两通道不变:服务器目录符号链接(provideAsset)/ zip 上传(uploadAsset),
   路径输入升级为 FolderBrowserDialog 服务器目录树选择。
+
+## D-031 · 每步 Set 门:owner 显式确认才进下一步,可回退补料(2026-10-08)
+
+- 背景:D-030 的六步状态纯派生(体检/配置/运行事实),缺"owner 确认过这步"的
+  语义——用户定义:每步都做 **set** 再进下一步;数据集步可**取消 set** 补充
+  更多数据集后重新 set,跑阶段把清单里的数据集都跑一遍。
+- 决定:`baseline_config_json.workflow = {code/assets/env/intake: set 时间戳}`;
+  `POST /baseline/workflow {action: set|unset, step}`:
+  - set 前置 = 前序步全 set + 本步事实校验(code=代码在位 / assets=**重跑体检
+    且无失败项**(缺资料即未就位)/ env=已选环境 / intake=口径清单已确认),
+    校验失败 409 带原因;
+  - unset = 该步及之后全部回退(顺序不变式),Baseline 运行中禁变更。
+- 前端:四内容步各带 SetBar(已 set 绿条 + 取消按钮,未 set 显式
+  「Set·确认这一步」);前序未 set 的后续步降透明度锁交互(路线图可见);
+  「一键走流程」= 顺序自动 Set(服务端逐项校验,不满足即停)。
+  run/confirm 是动作门不参与 set;「补充数据集」= unset assets → 补 → 重 set,
+  起跑按清单全跑(未就绪自动跳过、补齐后追加的既有语义保留)。

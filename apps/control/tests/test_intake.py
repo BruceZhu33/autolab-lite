@@ -174,3 +174,87 @@ def test_analyzer_prompt_carries_smoke_caliber_convention():
     assert "24" in asc.ANALYZER_SYSTEM          # 清单上限
     assert "禁止编造聚合名" in asc.ANALYZER_SYSTEM
     assert not hasattr(asc, "run_onboarding_session")  # 角色已退役
+
+
+# ------------------------------------------------------------- D-031 set 门
+
+def _wf_of(api, project_id) -> dict:
+    return json.loads(api["repo"].get_project(project_id)[
+        "baseline_config_json"]).get("workflow") or {}
+
+
+def test_workflow_set_requires_order_and_facts(api, workspace):
+    """set 门:跳步 409;代码就位才可 set code;unset 清该步及之后。"""
+    client = api["client"]
+    owner = {"Authorization": f"Bearer {OWNER}"}
+    pid = workspace["projectId"]
+
+    # 跳步:先 set assets(前面 code 未 set)→ 409
+    r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                    json={"action": "set", "step": "assets"}, headers=owner)
+    assert r.status_code == 409
+    assert "代码就位" in r.json()["detail"]
+
+    # code set:工作区有 train.py → 通过
+    r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                    json={"action": "set", "step": "code"}, headers=owner)
+    assert r.status_code == 200, r.text
+    assert _wf_of(api, pid)["code"]
+    assert not _wf_of(api, pid)["assets"]
+
+    # assets set:清单未配 → 体检有失败项 → 409(缺资料即未就位)
+    r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                    json={"action": "set", "step": "assets"}, headers=owner)
+    assert r.status_code == 409
+    assert "体检" in r.json()["detail"]
+
+
+def test_workflow_set_assets_green_then_unset_clears_later(
+        api, workspace):
+    """资料全绿才 set 得过;unset 中间步会把后序 set 一并清掉(回退补料)。"""
+    client = api["client"]
+    owner = {"Authorization": f"Bearer {OWNER}"}
+    pid = workspace["projectId"]
+
+    # 铺一条全绿的清单:数据目录真实存在 + 命令入口存在
+    saved = client.post(f"/api/owner/projects/{pid}/baseline/config", json={
+        "command": "python3 train.py --config-file configs/Kvasir.yaml",
+        "conda_env": "", "metric_file": "metrics.json",
+        "datasets": [{"name": "Kvasir-10",
+                      "command": "python3 train.py --config-file configs/Kvasir.yaml",
+                      "dataset_path": "data/Kvasir"}],
+    }, headers=owner)
+    assert saved.status_code == 200, saved.text
+
+    for step in ("code", "assets", "env", "intake"):
+        if step == "env":
+            # env set 的门 = 已选环境(非空);环境是否真实存在属体检层
+            cfg = client.post(f"/api/owner/projects/{pid}/baseline/config",
+                              json={"conda_env": "base"}, headers=owner)
+            assert cfg.status_code == 200, cfg.text
+        r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                        json={"action": "set", "step": step}, headers=owner)
+        assert r.status_code == 200, f"{step}: {r.text}"
+
+    wf = _wf_of(api, pid)
+    assert all(wf[s] for s in ("code", "assets", "env", "intake"))
+    # 回退:unset assets → intake 等(若有)一并清
+    r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                    json={"action": "unset", "step": "assets"}, headers=owner)
+    assert r.status_code == 200
+    wf = _wf_of(api, pid)
+    assert wf["code"] and not wf["assets"] and not wf["intake"]
+
+
+def test_workflow_blocked_while_baseline_running(api, workspace):
+    client = api["client"]
+    owner = {"Authorization": f"Bearer {OWNER}"}
+    api["repo"].update_project(
+        workspace["projectId"],
+        baseline_run_json=json.dumps({"dataset": "x", "queue": [],
+                                      "status": "running", "pid": 1}))
+    r = client.post(
+        f"/api/owner/projects/{workspace['projectId']}/baseline/workflow",
+        json={"action": "set", "step": "code"}, headers=owner)
+    assert r.status_code == 409
+    assert "运行中" in r.json()["detail"]
