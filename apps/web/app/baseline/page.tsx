@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -61,12 +61,14 @@ function StepHeader({ index, title, state }: {
   );
 }
 
-/** 串行步骤节:Baseline 是严格串行流程(代码→环境→体检→跑通),一次只
- * 展开当前步骤;已完成折叠为一行摘要,可点标题回看,未到的折叠为待办。 */
-function StepSection({ index, title, state, summary, open, onToggle, children }: {
+/** 串行步骤节:Baseline 是严格串行流程(代码→接入→环境→体检→跑通),一次只
+ * 展开当前步骤;已完成折叠为一行摘要,可点标题回看,未到的折叠为待办。
+ * locked:Agent 一键执行中——标题/箭头冻结(配置中不可切步,反馈看会话时间线)。 */
+function StepSection({ index, title, state, summary, open, onToggle, locked, children }: {
   index: number; title: string;
   state: "done" | "active" | "pending" | "failed";
   summary?: string; open: boolean; onToggle: () => void;
+  locked?: boolean;
   children: React.ReactNode;
 }) {
   return (
@@ -74,8 +76,10 @@ function StepSection({ index, title, state, summary, open, onToggle, children }:
       state === "active" ? "border-brand/40 bg-brand/[0.03]"
       : state === "failed" ? "border-warning/40 bg-warning/[0.03]"
       : "border-surface-border bg-surface"}`}>
-      <button type="button" onClick={onToggle}
-              className="flex w-full items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-left transition-colors hover:bg-surface-hover/60">
+      <button type="button" onClick={onToggle} disabled={locked}
+              title={locked ? "Agent 执行中,步骤暂时锁定" : undefined}
+              className={`flex w-full items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-left transition-colors ${
+                locked ? "cursor-not-allowed" : "hover:bg-surface-hover/60"}`}>
         <StepHeader index={index} title={title} state={state} />
         {!open && summary ? (
           <span className="min-w-0 flex-1 truncate text-caption text-muted-foreground" title={summary}>
@@ -84,7 +88,7 @@ function StepSection({ index, title, state, summary, open, onToggle, children }:
         ) : (
           <span className="flex-1" />
         )}
-        <ChevronDown className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`} />
+        <ChevronDown className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""} ${locked ? "opacity-40" : ""}`} />
       </button>
       {open ? (
         <div className="space-y-2 border-t border-surface-border/60 px-3.5 py-3">{children}</div>
@@ -523,9 +527,14 @@ function DatasetsEditor({ project, config, disabled, onSaved }: {
   );
 }
 
-function BaselinePanel({ project }: { project: ProjectListItem }) {
+function BaselinePanel({ project, onLockChange }: {
+  project: ProjectListItem;
+  /** 一键执行期间向上通报锁定(页级项目切换tabs同步禁用) */
+  onLockChange?: (locked: boolean) => void;
+}) {
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState<string | null>(null);
+  const [autoSeconds, setAutoSeconds] = useState(0);
   const [stepState, setStepState] = useState<Partial<Record<Step, "done" | "active" | "pending" | "failed">>>({});
   const [presence, setPresence] = useState<{ present: boolean; reason: string; files: string[] } | null>(null);
   const [sources, setSources] = useState<{ githubUrl: string | null; localWorkspace: string | null }>({ githubUrl: null, localWorkspace: null });
@@ -535,6 +544,17 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
   const [gap, setGap] = useState<{ kind: "dataset" | "command"; hint: string } | null>(null);
   const [gapValue, setGapValue] = useState("");
   const autoDetected = useRef(false);
+
+  // 一键执行中:计时(配置中的"活着"信号)+ 通知页级锁定
+  const autoBusy = busy === "auto";
+  useEffect(() => {
+    onLockChange?.(autoBusy);
+  }, [autoBusy, onLockChange]);
+  useEffect(() => {
+    if (!autoBusy) { setAutoSeconds(0); return; }
+    const timer = setInterval(() => setAutoSeconds((s) => s + 1), 1000);
+    return () => clearInterval(timer);
+  }, [autoBusy]);
 
   const { data: state, refetch } = useQuery({
     queryKey: ["baseline", project.id],
@@ -829,6 +849,7 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
     stepState[step]
     ?? (step === "code" && codeReady === true ? "done"
       : step === "code" && codeReady === false ? "failed"
+      : step === "analyze" && state?.config.onboarded ? "done"
       : step === "env" && envDone ? "done"
       : step === "run" && passed ? "done"
       : step === "run" && running ? "active"
@@ -878,7 +899,7 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
                 {busy === "auto"
                   ? <Loader2 className="size-3.5 animate-spin" />
                   : <Sparkles className="size-3.5" />}
-                {busy === "auto" ? "Agent 执行中…" : "Agent 一键 Baseline"}
+                {busy === "auto" ? `配置中… ${autoSeconds}s` : "Agent 一键 Baseline"}
               </Button>
             )}
           </span>
@@ -886,7 +907,7 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
 
         <div className="max-w-3xl space-y-2.5 p-4">
             {/* ① 代码就位 */}
-            <StepSection index={1} title="代码就位" state={stepStatus("code")}
+            <StepSection index={1} title="代码就位" state={stepStatus("code")} locked={autoBusy}
                          summary={presence?.present ? "已就位" : (presence?.reason || "检查服务器上有没有代码")}
                          open={stepOpen("code")} onToggle={() => toggleStep("code")}>
               {presence ? (
@@ -918,8 +939,34 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
               {syncDetail ? <p className="text-micro text-muted-foreground">上次同步:{syncDetail}</p> : null}
             </StepSection>
 
-            {/* ② 环境构建 */}
-            <StepSection index={2} title="构建 / 选择环境" state={stepStatus("env")}
+            {/* ② 工程接入(D-029):Agent 识别工程/适配器/口径清单/环境/冒烟。
+                会话时间线就嵌在这步里——配置中能实时看到 Agent 在干什么,
+                而不是只有一句 toast(用户反馈:一键接入反馈不实时)。 */}
+            <StepSection index={2} title="工程接入(Agent)" locked={autoBusy}
+                         state={stepStatus("analyze")}
+                         summary={stepState.analyze === "active"
+                           ? `配置中 · ${autoSeconds}s(会话时间线见本步内)`
+                           : state?.config.onboarded
+                             ? `已接入${state.config.adapter ? ` · 适配器 ${String(state.config.adapter).split("/").pop()}` : ""}`
+                             : "识别工程形态 → 生成适配器与口径清单 → 冒烟自验"}
+                         open={stepOpen("analyze")} onToggle={() => toggleStep("analyze")}>
+              {stepState.analyze === "active" ? (
+                <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-brand/30 bg-brand/5 px-2.5 py-2">
+                  <Loader2 className="size-3.5 shrink-0 animate-spin text-brand" />
+                  <span className="text-caption font-semibold text-brand">
+                    配置中 · {autoSeconds}s
+                  </span>
+                  <span className="text-micro text-muted-foreground">
+                    接入 Agent 正在读工作区(入口/configs/数据目录),生成适配器与口径清单;
+                    期间界面锁定,可看下方时间线,也可注入引导
+                  </span>
+                </div>
+              ) : null}
+              <LiveSessionCard projectId={project.id} />
+            </StepSection>
+
+            {/* ③ 环境构建 */}
+            <StepSection index={3} title="构建 / 选择环境" state={stepStatus("env")} locked={autoBusy}
                          summary={envDone ? "环境就绪" : (envPlan?.detail || "Agent 分析依赖后自动构建")}
                          open={stepOpen("env")} onToggle={() => toggleStep("env")}>
               {envPlan ? (
@@ -948,8 +995,8 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
               <EnvPicker project={project} currentEnv={state?.config.conda_env ?? ""} />
             </StepSection>
 
-            {/* ③ 数据集与环境检查 */}
-            <StepSection index={3} title="数据集与环境检查" state={stepStatus("check")}
+            {/* ④ 数据集与环境检查 */}
+            <StepSection index={4} title="数据集与环境检查" state={stepStatus("check")} locked={autoBusy}
                          summary={checks.length > 0
                            ? (() => {
                                const okN = checks.filter((c) => c.status === "ok").length;
@@ -1013,7 +1060,7 @@ function BaselinePanel({ project }: { project: ProjectListItem }) {
             </StepSection>
 
             {/* ④ 跑通基线 */}
-            <StepSection index={4} title="跑通基线(Agent)"
+            <StepSection index={5} title="跑通基线(Agent)" locked={autoBusy}
                          summary={passed ? "已通过" : running ? "训练进行中"
                            : (state?.datasets?.length ?? 0) > 0
                              ? `${state!.datasets.filter((d) => d.ok).length}/${state!.datasets.length} 跑通`
@@ -1287,6 +1334,9 @@ export default function BaselinePage() {
   });
   const requested = projects.filter((p) => p.baselineRequestedAt);
   const [selectedId, setSelectedId] = useState<string>("");
+  /** 面板一键执行中:项目 tabs 禁用(防切走后界面与流程脱节) */
+  const [panelLocked, setPanelLocked] = useState(false);
+  const onLockChange = useCallback((locked: boolean) => setPanelLocked(locked), []);
   // 看板卡片跳转带 ?project= 预选(client-only 读取,不参与 SSR)
   useEffect(() => {
     const from = new URLSearchParams(window.location.search).get("project");
@@ -1335,8 +1385,11 @@ export default function BaselinePage() {
                     <button
                       key={p.id}
                       type="button"
+                      disabled={panelLocked && p.id !== selected?.id}
+                      title={panelLocked && p.id !== selected?.id
+                        ? "Agent 一键执行中,暂时不能切项目" : undefined}
                       onClick={() => setSelectedId(p.id)}
-                      className={`rounded-full px-3 py-1 text-caption font-medium transition-colors ${
+                      className={`rounded-full px-3 py-1 text-caption font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                         p.id === selected?.id
                           ? "bg-accent text-accent-foreground"
                           : "bg-muted/50 text-muted-foreground hover:bg-muted"
@@ -1347,7 +1400,9 @@ export default function BaselinePage() {
                   ))}
                 </div>
               ) : null}
-              {selected ? <BaselinePanel key={selected.id} project={selected} /> : null}
+              {selected ? (
+                <BaselinePanel key={selected.id} project={selected} onLockChange={onLockChange} />
+              ) : null}
             </>
           )}
         </div>
