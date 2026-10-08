@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import {
   askBaselineAdvisor, buildEnvironment, checkCodePresence, confirmBaselinePass,
-  proposeBaselineIntake,
+  proposeBaselineIntake, setBaselineStep,
   fetchBaselineState, fixBaselineRun, fetchProjects,
   fetchServerEnvironments,
   pollBaselineRun, pollEnvBuild, provideAsset, runBaselineCheck,
@@ -72,23 +72,77 @@ function StepHeader({ index, title, state }: {
   );
 }
 
-/** 串行步骤节:Baseline 是严格串行流程(代码→接入→环境→体检→跑通),一次只
- * 展开当前步骤;已完成折叠为一行摘要,可点标题回看,未到的折叠为待办。
- * locked:Agent 一键执行中——标题/箭头冻结(配置中不可切步,反馈看会话时间线)。 */
-function StepSection({ index, title, state, summary, open, onToggle, locked, children }: {
+/** D-031 每步 set 门的状态条:set = owner 显式确认这一步、解锁下一步;
+ * unset = 回退(补数据集/改环境后重新 set)。事实校验不通过时 Set 不可点,
+ * 原因直接写在按钮旁边——不满足就回步骤内容里补。 */
+function WorkflowSetBar({ step, isSet, orderOk, valid, invalidReason, busy,
+                          onSet, onUnset }: {
+  step: "code" | "assets" | "env" | "intake";
+  isSet: boolean; orderOk: boolean; valid: boolean; invalidReason?: string;
+  busy: boolean; onSet: () => void; onUnset: () => void;
+}) {
+  if (isSet) {
+    return (
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-success/30 bg-success/5 px-2.5 py-1.5">
+        <CheckCircle2 className="size-3.5 shrink-0 text-success" />
+        <span className="text-caption font-medium text-success">
+          已 set(这一步锁定)
+        </span>
+        <span className="min-w-0 flex-1 text-micro text-muted-foreground">
+          {step === "assets"
+            ? "要补充数据集:取消 set → 上传/链接 → 重新 set,跑阶段会把清单里的都跑一遍"
+            : step === "intake"
+              ? "要改口径:取消 set(会连带动后续),编辑清单后重新 set"
+              : "要回退修改:取消 set 后再改"}
+        </span>
+        <Button variant="outline" size="sm"
+                className="h-6 px-2 text-micro text-muted-foreground"
+                disabled={busy} onClick={onUnset}>
+          取消 set
+        </Button>
+      </div>
+    );
+  }
+  if (!orderOk) {
+    return (
+      <p className="text-micro text-muted-foreground/70">
+        按顺序走:先 set 上一步,这一步才解锁
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button size="sm" className="h-7 gap-1 px-2.5 text-caption"
+              disabled={busy || !valid} onClick={onSet}>
+        <CheckCircle2 className="size-3.5" />
+        Set · 确认这一步,进入下一步
+      </Button>
+      {!valid ? (
+        <span className="text-micro text-warning">
+          {invalidReason || "本步条件还没满足"}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+/** 串行步骤节:Baseline 是严格串行流程,一次只展开当前步骤;已完成折叠为
+ * 一行摘要,可点标题回看,未到的折叠为待办。locked:一键执行/前序未 set——
+ * 标题箭头冻结;dim:前序未 set 的内容步整体降透明度(路线图可见但不可动)。 */
+function StepSection({ index, title, state, summary, open, onToggle, locked, dim, children }: {
   index: number; title: string;
   state: "done" | "active" | "pending" | "failed";
   summary?: string; open: boolean; onToggle: () => void;
-  locked?: boolean;
+  locked?: boolean; dim?: boolean;
   children: React.ReactNode;
 }) {
   return (
     <section className={`rounded-xl border-[0.5px] transition-colors ${
       state === "active" ? "border-brand/40 bg-brand/[0.03]"
       : state === "failed" ? "border-warning/40 bg-warning/[0.03]"
-      : "border-surface-border bg-surface"}`}>
+      : "border-surface-border bg-surface"} ${dim ? "opacity-55" : ""}`}>
       <button type="button" onClick={onToggle} disabled={locked}
-              title={locked ? "Agent 执行中,步骤暂时锁定" : undefined}
+              title={locked ? "一键执行中或前序步骤未 set,暂时锁定" : undefined}
               className={`flex w-full items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-left transition-colors ${
                 locked ? "cursor-not-allowed" : "hover:bg-surface-hover/60"}`}>
         <StepHeader index={index} title={title} state={state} />
@@ -845,8 +899,9 @@ function BaselinePanel({ project, onLockChange }: {
   };
   useEffect(() => { setAdvice(null); }, [state?.checks, state?.config]);
 
-  /** 一键走流程(D-030):按六步固定流程顺序推进确定性步骤,遇缺口/待确认
-   * 就停在对应步骤——不再有自主探索会话;提议结果永远等 owner 编辑确认。 */
+  /** 一键走流程(D-030/031):按六步固定流程顺序推进——确定性步骤自动
+   * Set(服务端逐项校验,不满足即停),遇缺口/待确认就停在对应步骤;
+   * 提议结果永远等 owner 编辑确认。 */
   const runAuto = async () => {
     setBusy("auto");
     setGap(null);
@@ -857,57 +912,74 @@ function BaselinePanel({ project, onLockChange }: {
       toast.info(`停在「${STEP_TITLES[step]}」:${why}`, { duration: 6000 });
     };
     try {
-      // ① 代码就位(确定性)
+      // ① 代码就位 → set(服务端校验代码在位)
       setStepState((s) => ({ ...s, code: "active" }));
-      const code = await doCodeCheck();
-      let present = code.present;
-      if (!present && (code.sources.githubUrl || code.sources.localWorkspace)) {
-        toast.info("服务器上没有代码,自动同步…");
-        present = await doCodeSync();
-      }
-      if (!present) {
-        fail("code", "代码未就位:请在项目编辑里补 GitHub 链接或本地工作区路径");
-        return;
+      if (!wf.code) {
+        const code = await doCodeCheck();
+        let present = code.present;
+        if (!present && (code.sources.githubUrl || code.sources.localWorkspace)) {
+          toast.info("服务器上没有代码,自动同步…");
+          present = await doCodeSync();
+        }
+        if (!present || !(await autoSet("code"))) {
+          fail("code", "代码未就位:请在项目编辑里补 GitHub 链接或本地工作区路径");
+          return;
+        }
       }
       setStepState((s) => ({ ...s, code: "done" }));
 
-      // ② 体检 → 资料缺口(确定性):缺数据集/权重就停在这步补
+      // ② 资料就位 → set(服务端重跑体检,缺资料即未就位)
       setStepState((s) => ({ ...s, assets: "active" }));
-      const fresh = await runBaselineCheck(project.id);
-      void refetch();
-      const gaps = fresh.checks.filter((c) =>
-        c.status === "fail" && (c.supply?.length ?? 0) > 0);
-      const hardFails = fresh.checks.filter((c) =>
-        c.status === "fail" && !(c.supply?.length ?? 0));
-      if (gaps.length > 0 || hardFails.length > 0) {
-        setStepState((s) => ({ ...s, assets: gaps.length > 0 ? "active" : "failed" }));
-        stopAt("assets", gaps.length > 0
-          ? `缺资料 ${gaps.length} 项(在下方链接或上传补齐,补完自动复核)`
-          : `体检有 ${hardFails.length} 项阻塞`);
-        return;
+      if (!wf.assets) {
+        const fresh = await runBaselineCheck(project.id);
+        void refetch();
+        const fails = fresh.checks.filter((c) => c.status === "fail");
+        if (fails.length > 0) {
+          setStepState((s) => ({ ...s, assets: "failed" }));
+          stopAt("assets", `体检 ${fails.length} 项未过(缺资料就在这步链接/上传补齐)`);
+          return;
+        }
+        if (!(await autoSet("assets"))) {
+          stopAt("assets", "体检未全绿,补齐资料后重试");
+          return;
+        }
       }
       setStepState((s) => ({ ...s, assets: "done" }));
 
-      // ③/④ 环境与口径:口径未确认 → 先提议(提案里带环境建议),停④等编辑;
-      //    口径已确认但环境没选 → 停③
-      const confirmed = !!state?.config.onboarded
-        && (state?.config.datasets?.length ?? 0) > 0;
-      if (!confirmed) {
-        setStepState((s) => ({ ...s, intake: "active" }));
-        const ok = await propose();
-        stopAt("intake", ok
-          ? "Agent 已提议入口与口径清单——检查/编辑后点「采用并保存」(环境建议也在提案里)"
-          : "提议会话不可用——手工填清单,或补齐资料后重试");
-        return;
-      }
-      setStepState((s) => ({ ...s, intake: "done" }));
-      if (!state?.config.conda_env) {
-        stopAt("env", "还没选 conda 环境(点选已有环境;提案未采用时可先在④采用)");
-        return;
+      // ③ 环境就位 → set(已选环境);没选且口径未确认 → 先提议(提案带环境建议)
+      setStepState((s) => ({ ...s, env: "active" }));
+      if (!wf.env) {
+        if (!state?.config.conda_env && !intakeConfirmed) {
+          setStepState((s) => ({ ...s, intake: "active" }));
+          const ok = await propose();
+          stopAt("intake", ok
+            ? "Agent 已提议入口与口径清单——编辑后「采用并保存」(环境建议一并保存),再回来一键走流程"
+            : "提议会话不可用——手工填清单后保存,或补齐资料后重试");
+          return;
+        }
+        if (!state?.config.conda_env) {
+          stopAt("env", "还没选 conda 环境(点选已有环境,或先在④采用提案)");
+          return;
+        }
+        if (!(await autoSet("env"))) return;
       }
       setStepState((s) => ({ ...s, env: "done" }));
 
-      // ⑤ 冒烟起跑(确定性:清单首档;未就绪的自动跳过)
+      // ④ 入口与口径 → set(清单已确认)
+      setStepState((s) => ({ ...s, intake: "active" }));
+      if (!wf.intake) {
+        if (!intakeConfirmed) {
+          const ok = await propose();
+          stopAt("intake", ok
+            ? "提案已出——检查/编辑后「采用并保存」,再一键走流程继续"
+            : "提议会话不可用——手工填清单后保存");
+          return;
+        }
+        if (!(await autoSet("intake"))) return;
+      }
+      setStepState((s) => ({ ...s, intake: "done" }));
+
+      // ⑤ 起跑:清单里的数据集按顺序都跑一遍(未就绪自动跳过,补齐后追加)
       setStepState((s) => ({ ...s, run: "active" }));
       const run = await startBaselineRun(project.id);
       const skippedNote = (run as { skipped?: string[] }).skipped?.length
@@ -916,7 +988,7 @@ function BaselinePanel({ project, onLockChange }: {
       toast.success(
         `已在 ${project.server.name} 上起跑 ${run.dataset}(PID ${run.pid})`, {
           description: run.queue.length > 0
-            ? `联合基线队列:${[run.dataset, ...run.queue].join(" → ")}${skippedNote}`
+            ? `按清单全跑:${[run.dataset, ...run.queue].join(" → ")}${skippedNote}`
             : `结果和日志在下方实时刷新;跑通且有指标即可确认通过${skippedNote}`,
         });
       void refetch();
@@ -1015,9 +1087,68 @@ function BaselinePanel({ project, onLockChange }: {
   const intakeConfirmed = !!state?.config.onboarded
     && (state?.config.datasets?.length ?? 0) > 0;
   const anyOk = (state?.datasets ?? []).some((d) => d.ok);
-  const stepStatus = (step: Step): "done" | "active" | "pending" | "failed" =>
-    stepState[step]
-    ?? (step === "code" && codeReady === true ? "done"
+
+  // ---------------------------------------------------------- D-031 set 门
+  const CONTENT_STEPS = ["code", "assets", "env", "intake"] as const;
+  type ContentStep = (typeof CONTENT_STEPS)[number];
+  const wf = state?.config.workflow
+    ?? { code: null, assets: null, env: null, intake: null };
+  const firstUnsetIdx = CONTENT_STEPS.findIndex((s) => !wf[s]);
+  const allSet = firstUnsetIdx === -1;
+  /** 内容步的顺序锁:前序未 set 时本步不可交互(仍可见,路线图不藏)。 */
+  const orderLocked = (s: ContentStep): boolean =>
+    CONTENT_STEPS.indexOf(s) > (allSet ? CONTENT_STEPS.length : firstUnsetIdx);
+  const stepValidity = (s: ContentStep): { valid: boolean; invalidReason?: string } => {
+    if (s === "code") return codeReady === true
+      ? { valid: true } : { valid: false, invalidReason: "代码未就位" };
+    if (s === "assets") return checks.length === 0
+      ? { valid: false, invalidReason: "先跑一次体检" }
+      : hardFailCount + supplyGapCount > 0
+        ? { valid: false, invalidReason: `体检有 ${hardFailCount + supplyGapCount} 项未过(缺资料即未就位)` }
+        : { valid: true };
+    if (s === "env") return state?.config.conda_env
+      ? { valid: true } : { valid: false, invalidReason: "还没选 conda 环境" };
+    return intakeConfirmed ? { valid: true }
+      : { valid: false, invalidReason: "口径清单未确认(提议/手填后保存)" };
+  };
+  const doSetStep = async (action: "set" | "unset", step: ContentStep) => {
+    setBusy(`wf-${step}`);
+    try {
+      await setBaselineStep(project.id, action, step);
+      toast.success(action === "set"
+        ? `「${STEP_TITLES[step]}」已 set`
+        : "已取消 set:补充/修改后重新 set 再前进");
+      void refetch();
+      if (action === "unset") {
+        setOpenSteps((m) => ({ ...m, [step]: true }));
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+  /** runAuto 内部用:静默 set 一步(失败返回 false 并 toast)。 */
+  const autoSet = async (step: ContentStep): Promise<boolean> => {
+    try {
+      await setBaselineStep(project.id, "set", step);
+      return true;
+    } catch (e) {
+      toast.info(`「${STEP_TITLES[step]}」set 未通过:${(e as Error).message}`, {
+        duration: 8000,
+      });
+      return false;
+    }
+  };
+  const stepStatus = (step: Step): "done" | "active" | "pending" | "failed" => {
+    if (stepState[step]) return stepState[step];
+    // set 门的四步:已 set 即 done(owner 确认优先于派生)
+    if ((CONTENT_STEPS as readonly string[]).includes(step)
+        && wf[step as ContentStep]) {
+      return "done";
+    }
+    return (
+      step === "code" && codeReady === true ? "done"
       : step === "code" && codeReady === false ? "failed"
       : step === "assets"
         ? (checks.length === 0 ? "pending"
@@ -1033,6 +1164,7 @@ function BaselinePanel({ project, onLockChange }: {
       : step === "confirm" && passed ? "done"
       : step === "confirm" && (passed || anyOk) ? "active"
       : "pending");
+  };
 
   // 串行展开:默认只展开第一个未完成步骤(失败强制展开);点击标题可覆盖
   const stepOpen = (s: Step): boolean => {
@@ -1127,7 +1259,8 @@ function BaselinePanel({ project, onLockChange }: {
 
         <div className="max-w-3xl space-y-2.5 p-4">
             {/* ① 代码就位 */}
-            <StepSection index={1} title="代码就位" state={stepStatus("code")} locked={autoBusy}
+            <StepSection index={1} title="代码就位" state={stepStatus("code")}
+                         locked={autoBusy} dim={orderLocked("code")}
                          summary={presence?.present ? "已就位" : (presence?.reason || "检查服务器上有没有代码")}
                          open={stepOpen("code")} onToggle={() => toggleStep("code")}>
               {presence ? (
@@ -1139,7 +1272,7 @@ function BaselinePanel({ project, onLockChange }: {
                   <div className="rounded-lg border border-warning/30 bg-warning/5 p-2.5 text-caption">
                     <p className="font-medium text-warning">未就位:{presence.reason}</p>
                     <p className="mt-0.5 text-muted-foreground">
-                      一键 Baseline 会自动同步(GitHub 或本地工作区);
+                      一键走流程会自动同步(GitHub 或本地工作区);
                       都没配就去项目编辑补一个来源。
                     </p>
                     {!isLocal ? (
@@ -1157,11 +1290,16 @@ function BaselinePanel({ project, onLockChange }: {
                 </p>
               )}
               {syncDetail ? <p className="text-micro text-muted-foreground">上次同步:{syncDetail}</p> : null}
+              <WorkflowSetBar step="code" isSet={!!wf.code} orderOk={!orderLocked("code")}
+                              {...stepValidity("code")} busy={busy !== null}
+                              onSet={() => void doSetStep("set", "code")}
+                              onUnset={() => void doSetStep("unset", "code")} />
             </StepSection>
 
             {/* ② 资料就位(D-030 资料槽):体检派生的确定性缺口——数据集/权重/
                 声明路径;每槽 = 链接服务器目录 或 上传 zip,补完自动复核。 */}
-            <StepSection index={2} title="资料就位" state={stepStatus("assets")} locked={autoBusy}
+            <StepSection index={2} title="资料就位" state={stepStatus("assets")}
+                         locked={autoBusy} dim={orderLocked("assets")}
                          summary={checks.length === 0
                            ? "跑一次体检看缺什么(代码/数据/权重/环境)"
                            : (() => {
@@ -1217,10 +1355,15 @@ function BaselinePanel({ project, onLockChange }: {
                 <SearchCode className="size-3" />
                 重新体检
               </Button>
+              <WorkflowSetBar step="assets" isSet={!!wf.assets} orderOk={!orderLocked("assets")}
+                              {...stepValidity("assets")} busy={busy !== null}
+                              onSet={() => void doSetStep("set", "assets")}
+                              onUnset={() => void doSetStep("unset", "assets")} />
             </StepSection>
 
             {/* ③ 环境就位:点选服务器已有环境(确定性);没有合适的在服务器上建好再探测 */}
-            <StepSection index={3} title="环境就位" state={stepStatus("env")} locked={autoBusy}
+            <StepSection index={3} title="环境就位" state={stepStatus("env")}
+                         locked={autoBusy} dim={orderLocked("env")}
                          summary={state?.config.conda_env
                            ? `已选 ${state.config.conda_env}`
                            : "点选服务器已有 conda 环境(含 torch/CUDA 探测)"}
@@ -1252,12 +1395,17 @@ function BaselinePanel({ project, onLockChange }: {
                 </p>
               ) : null}
               <EnvPicker project={project} currentEnv={state?.config.conda_env ?? ""} />
+              <WorkflowSetBar step="env" isSet={!!wf.env} orderOk={!orderLocked("env")}
+                              {...stepValidity("env")} busy={busy !== null}
+                              onSet={() => void doSetStep("set", "env")}
+                              onUnset={() => void doSetStep("unset", "env")} />
             </StepSection>
 
             {/* ④ 入口与口径(D-030 提议制):分析 Agent(只读)读代码 → 提案
                 (入口命令/口径清单 3ep 冒烟档/环境建议/证据)→ owner 编辑 →
                 采用保存。agent 只提议,永远不直接落库。 */}
-            <StepSection index={4} title="入口与口径(提议制)" state={stepStatus("intake")} locked={autoBusy || proposing}
+            <StepSection index={4} title="入口与口径(提议制)" state={stepStatus("intake")}
+                         locked={autoBusy || proposing} dim={orderLocked("intake")}
                          summary={proposing
                            ? `Agent 读代码提议中 · ${autoSeconds}s(时间线见本步内)`
                            : proposal
@@ -1323,10 +1471,15 @@ function BaselinePanel({ project, onLockChange }: {
                   ) : null}
                 </div>
               ) : null}
+              <WorkflowSetBar step="intake" isSet={!!wf.intake} orderOk={!orderLocked("intake")}
+                              {...stepValidity("intake")} busy={busy !== null}
+                              onSet={() => void doSetStep("set", "intake")}
+                              onUnset={() => void doSetStep("unset", "intake")} />
             </StepSection>
 
-            {/* ④ 跑通基线 */}
-            <StepSection index={5} title="跑通基线" locked={autoBusy}
+            {/* ⑤ 跑通基线:四步全 set 后解锁;清单里的数据集按顺序都跑一遍 */}
+            <StepSection index={5} title="跑通基线" locked={autoBusy || !allSet}
+                         dim={!allSet}
                          summary={passed ? "已通过" : running ? "训练进行中"
                            : (state?.datasets?.length ?? 0) > 0
                              ? `${state!.datasets.filter((d) => d.ok).length}/${state!.datasets.length} 跑通`

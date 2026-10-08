@@ -1038,12 +1038,20 @@ def baseline_datasets(config: dict) -> list[dict]:
 
 def baseline_config_defaults(project: dict) -> dict:
     config = {"command": "", "dataset_path": "", "conda_env": "", "metric_file": "",
-              "datasets": [], "onboarded": False, "adapter": ""}
+              "datasets": [], "onboarded": False, "adapter": "",
+              # D-031 每步 set 门:owner 显式确认才进下一步;unset 回退。
+              # 值 = set 时间戳(None = 未 set);顺序不变式由端点维护。
+              "workflow": {"code": None, "assets": None, "env": None,
+                           "intake": None}}
     try:
         import json as _json
         stored = _json.loads(project.get("baseline_config_json") or "{}")
         if isinstance(stored, dict):
             config.update({k: v for k, v in stored.items() if k in config})
+        if isinstance(config.get("workflow"), dict):
+            merged = {k: config["workflow"].get(k) for k in
+                      ("code", "assets", "env", "intake")}
+            config["workflow"] = merged
     except Exception:
         pass
     if not config["command"] and project.get("default_command"):

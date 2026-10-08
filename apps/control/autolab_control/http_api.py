@@ -2261,6 +2261,105 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                             baseline_config_json=_json.dumps(config, ensure_ascii=False))
         return {"config": config}
 
+    _WF_STEPS = ("code", "assets", "env", "intake")
+    _WF_LABELS = {"code": "代码就位", "assets": "资料就位", "env": "环境就位",
+                  "intake": "入口与口径"}
+
+    @app.post("/api/owner/projects/{project_id}/baseline/workflow")
+    def baseline_workflow(project_id: str, payload: dict,
+                          _: str = Depends(require("owner"))) -> dict:
+        """D-031 每步 set 门:owner 显式 set 一步才解锁下一步;unset 该步
+        及之后全部(回退补料再前进——如取消资料 set,补充数据集后重 set,
+        跑阶段把清单里的数据集都跑一遍)。run/confirm 是动作门,不参与 set。
+
+        set 前置:前序步全 set + 本步事实校验(code=代码在位 /
+        assets=重跑体检且无失败项,缺资料即未就位 / env=已选环境 /
+        intake=口径清单已确认)。校验失败 409 带原因,事实说话。"""
+        from .baseline_queue import normalize_run as _norm_run
+        from .db import utc_now as _utc
+
+        project, server = _baseline_ctx(project_id)
+        action = str(payload.get("action") or "")
+        step = str(payload.get("step") or "")
+        if action not in ("set", "unset"):
+            raise HTTPException(status_code=400, detail="action 需为 set 或 unset")
+        if step not in _WF_STEPS:
+            raise HTTPException(status_code=400,
+                                detail=f"step 需为 {'/'.join(_WF_STEPS)} 之一")
+        if _norm_run(project).get("status") == "running":
+            raise HTTPException(status_code=409,
+                                detail="Baseline 运行中不能变更 set 状态,等它结束")
+        import json as _json
+
+        config = server_admin.baseline_config_defaults(project)
+        wf = {k: (config.get("workflow") or {}).get(k) for k in _WF_STEPS}
+        idx = _WF_STEPS.index(step)
+        checks_payload = None
+
+        if action == "set":
+            for prev in _WF_STEPS[:idx]:
+                if not wf.get(prev):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"按顺序 set:先确认「{_WF_LABELS[prev]}」再来这一步")
+            reason = None
+            if step == "code":
+                transport = _open_transport(server)
+                try:
+                    presence = server_admin.code_presence(
+                        project["remote_workdir"], ssh_transport=transport)
+                finally:
+                    if transport is not None:
+                        transport.close()
+                if not presence.get("present"):
+                    reason = f"代码未就位:{presence.get('reason') or '工作区没有代码'}"
+            elif step == "assets":
+                transport = _open_transport(server)
+                try:
+                    checks = server_admin.run_baseline_checks(
+                        project["remote_workdir"], config, ssh_transport=transport)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=409, detail=f"体检执行失败:{exc}") from exc
+                finally:
+                    if transport is not None:
+                        transport.close()
+                repo.update_project(project_id, baseline_checks_json=_json.dumps(
+                    checks, ensure_ascii=False))
+                checks_payload = checks
+                fails = [c for c in checks if c.get("status") == "fail"]
+                if fails:
+                    reason = ("体检未全绿(缺资料/阻塞即未就位):" + ";".join(
+                        f"{c.get('label')}:{c.get('detail')}" for c in fails[:3]))
+            elif step == "env":
+                if not (config.get("conda_env") or "").strip():
+                    reason = "还没选 conda 环境(环境就位点选或提案采用)"
+            elif step == "intake":
+                if not config.get("onboarded") or not (config.get("datasets") or []):
+                    reason = "口径清单未确认:提议/手填后保存≥1 条清单"
+            if reason:
+                raise HTTPException(status_code=409, detail=reason)
+            wf[step] = _utc()
+            repo.add_review_message(
+                project_id=project_id, role="system", kind="text",
+                content=f"Baseline 流程:「{_WF_LABELS[step]}」已 set"
+                        + (f",解锁「{_WF_LABELS[_WF_STEPS[idx + 1]]}」"
+                           if idx + 1 < len(_WF_STEPS) else ",四步就绪,可起跑"))
+        else:  # unset:该步及之后全部回退
+            cleared = [_WF_LABELS[s] for s in _WF_STEPS[idx:] if wf.get(s)]
+            for later in _WF_STEPS[idx:]:
+                wf[later] = None
+            if cleared:
+                repo.add_review_message(
+                    project_id=project_id, role="system", kind="text",
+                    content="Baseline 流程:取消 set「" + "、".join(cleared)
+                            + "」——补料/修改后重新 set 再前进")
+        config["workflow"] = wf
+        repo.update_project(project_id,
+                            baseline_config_json=_json.dumps(
+                                config, ensure_ascii=False))
+        return {"workflow": wf, "checks": checks_payload}
+
     @app.post("/api/owner/projects/{project_id}/baseline/check")
     def baseline_check(project_id: str, _: str = Depends(require("owner"))) -> dict:
         """环境检查:扫服务器工作区、查数据集、验证命令脚本与运行环境。"""

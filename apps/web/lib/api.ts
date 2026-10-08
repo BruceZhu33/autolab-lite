@@ -447,7 +447,34 @@ export type BaselineConfig = {
   /** D-029 工程接入状态:接入 Agent 已适配口径(适配器/清单/环境/冒烟)。 */
   onboarded?: boolean;
   adapter?: string;
+  /** D-031 每步 set 门:值 = set 时间戳(null = 未 set);unset 回退补料再前进。 */
+  workflow?: { code: string | null; assets: string | null; env: string | null;
+               intake: string | null };
 };
+
+/** D-031 每步 set/unset:set 前置 = 前序步全 set + 本步事实校验
+ * (code=代码在位/assets=体检无失败项/env=已选环境/intake=口径已确认);
+ * unset 该步及之后全部回退(补数据集后重 set 再跑)。 */
+export async function setBaselineStep(projectId: string,
+                                      action: "set" | "unset",
+                                      step: "code" | "assets" | "env" | "intake") {
+  const response = await fetch(
+    `${API_URL}/api/owner/projects/${projectId}/baseline/workflow`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiToken()}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ action, step }),
+    });
+  if (!response.ok) {
+    let detail = `${response.status}`;
+    try { detail = (await response.json()).detail ?? detail; } catch { /* keep */ }
+    throw new Error(detail);
+  }
+  return response.json() as Promise<{
+    workflow: { code: string | null; assets: string | null; env: string | null;
+                intake: string | null };
+    checks: BaselineCheck[] | null;
+  }>;
+}
 
 export type BaselineDatasetProgress = {
   name: string;
