@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
-  Archive, Bot, CheckCircle2, Compass, FileCode, FileText, FlaskConical,
+  Archive, Bot, CheckCircle2, Circle, Compass, FileCode, FileText, FlaskConical,
   GitBranch, Lightbulb, Loader2, PauseCircle, PlayCircle, Repeat,
   ShieldCheck, XCircle,
 } from "lucide-react";
@@ -1233,9 +1233,12 @@ function FlowPanel({ projectId, state }: { projectId: string; state: IterationSt
                             setDatasets(next.length ? next : all);
                           }}
                           title={d.metrics ? Object.entries(d.metrics).map(([k, v]) => `${k}=${String(v)}`).join(" ") : undefined}
-                          className={`rounded-full px-2.5 py-1 font-mono text-micro font-medium transition-colors ${
-                            selected ? "bg-accent text-accent-foreground"
-                              : "bg-muted/50 text-muted-foreground hover:bg-muted"}`}>
+                          className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1
+                                      font-mono text-micro font-medium transition-colors ${
+                            selected
+                              ? "border-brand/60 bg-brand/15 text-brand"
+                              : "border-transparent bg-muted/40 text-muted-foreground hover:bg-muted"}`}>
+                    {selected ? <CheckCircle2 className="size-3 shrink-0" /> : <Circle className="size-3 shrink-0 opacity-40" />}
                     {d.name}
                   </button>
                 );
