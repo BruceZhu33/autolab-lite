@@ -1128,6 +1128,8 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
         project = _review_ctx(project_id)
         import json as _json
 
+        from .baseline_queue import baseline_metrics_display
+
         try:
             run = _json.loads(project.get("baseline_run_json") or "{}")
         except Exception:
@@ -1154,7 +1156,9 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                              "created_at": m["created_at"]})
         return {
             "projectId": project_id,
-            "baselineMetrics": run.get("metrics"),
+            # 展示口径:确认快照优先(run.metrics 会被补跑/失败冲掉)
+            "baselineMetrics": baseline_metrics_display(project)
+            or run.get("metrics"),
             "papers": papers,
             "refs": _review_refs(project),
             "proposals": [_proposal_public(p) for p in repo.list_proposals(project_id)],
@@ -1845,7 +1849,13 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                 project.get("baseline_run_json") or "{}").get("metrics")
         except Exception:
             baseline_metrics = None
+        from .baseline_queue import baseline_metrics_display as _bmd
         from .baseline_queue import confirmed_datasets as _confirmed
+
+        # 展示口径:确认快照优先——run.metrics 会被确认后的补跑/失败
+        # 冲成 null,已确认的基线不能跟着消失(真机事故:迭代页基线
+        # 显示 null,看起来像"从没跑过基线")
+        baseline_metrics = _bmd(project) or baseline_metrics
 
         dataset_pool = _confirmed(project)
 
@@ -2066,6 +2076,13 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
         confirm = bool(payload.get("confirm"))
         if confirm and not text:
             raise HTTPException(status_code=409, detail="确认前方向文本不能为空")
+        # 方向要立在基线指标上(与 /direction/draft 同门):没有基线的
+        # "大方向"是无根之木,确认了就能开迭代——门必须在这里,不能只挡 LLM 草稿
+        if confirm and not project.get("baseline_passed_at"):
+            raise HTTPException(
+                status_code=409,
+                detail="还没跑通 Baseline:方向要立在基线指标上,"
+                       "先在 Baseline 页跑通并确认")
         from .db import utc_now as _utc_now
 
         updated = repo.set_project_direction(
@@ -2158,7 +2175,9 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
         if project is None:
             raise HTTPException(status_code=404, detail="project not found")
         try:
-            return baseline_queue.confirm_pass(repo, project)
+            return baseline_queue.confirm_pass(repo, project,
+                                               credentials=credentials,
+                                               hostkeys_path=hostkeys_path)
         except baseline_queue.BaselineQueueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -2412,6 +2431,12 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
         # 此前重提对已通过项目在看板上完全无反映(点了等于没点)。
         reset = bool(project.get("baseline_passed_at"))
         if reset:
+            # 基线作废 = 迭代失去地基:还在跑的循环必须停下
+            # (执行中的轮跑完并记录结论后停,stop_loop 语义)
+            try:
+                iteration_loop.stop_loop(repo, project_id)
+            except iteration_loop.LoopError:
+                pass  # 没有活动循环:常态
             # update_project 跳过 None 值,显式置空两列
             conn = repo.db.connect()
             try:

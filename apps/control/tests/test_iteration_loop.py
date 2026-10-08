@@ -150,6 +150,9 @@ def test_loop_requires_accepted_proposal(api, tmp_path):
     project = client.post("/api/owner/projects", json={
         "name": "loop-bare", "server_id": local["id"], "workdir": str(bare),
     }, headers={"Authorization": f"Bearer {OWNER}"}).json()["project"]
+    # 基线已过但无执行依据 → 挡在方向/方案门(基线门另测)
+    api["repo"].update_project(
+        project["id"], baseline_passed_at="2026-09-19T00:00:00Z")
     denied = client.post(
         f"/api/owner/projects/{project['id']}/iteration/loop/start", json={},
         headers={"Authorization": f"Bearer {OWNER}"})
@@ -757,3 +760,25 @@ def test_analyzer_session_parses_nested_config_and_falls_back(tmp_path, monkeypa
     finally:
         asc.run_session = orig
         ctx.close()
+
+
+def test_loop_requires_baseline_even_with_direction(api, tmp_path):
+    """基线是迭代地基:方向已确认但 Baseline 未通过 → 开循环被拒。"""
+    client = api["client"]
+    owner = {"Authorization": f"Bearer {OWNER}"}
+    servers = client.get("/api/servers",
+                         headers={"Authorization": f"Bearer {AGENT}"}).json()
+    local = next(s for s in servers if s["transport_mode"] == "local")
+    workdir = tmp_path / "nobl-loop"
+    workdir.mkdir()
+    project = client.post("/api/owner/projects", json={
+        "name": "loop-nobl", "server_id": local["id"], "workdir": str(workdir),
+    }, headers=owner).json()["project"]
+    api["repo"].set_project_direction(
+        project["id"], "沿 semi-supervised 路线迭代", "2026-10-08T00:00:00Z")
+
+    denied = client.post(
+        f"/api/owner/projects/{project['id']}/iteration/loop/start",
+        json={}, headers=owner)
+    assert denied.status_code == 409
+    assert "Baseline" in denied.json()["detail"]

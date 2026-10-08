@@ -84,6 +84,9 @@ def test_iteration_state_requires_accepted_proposal(api, tmp_path):
     project = client.post("/api/owner/projects", json={
         "name": "bare", "server_id": local["id"], "workdir": str(bare),
     }, headers={"Authorization": f"Bearer {OWNER}"}).json()["project"]
+    # 基线已过但无执行依据 → 挡在方向/方案门(基线门另测)
+    api["repo"].update_project(
+        project["id"], baseline_passed_at="2026-09-19T00:00:00Z")
     state = client.get(f"/api/projects/{project['id']}/iteration",
                        headers={"Authorization": f"Bearer {AGENT}"})
     assert state.status_code == 200

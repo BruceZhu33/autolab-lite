@@ -293,3 +293,21 @@ def test_observation_state_derived(repo):
     instance.ingest_event(make_event(job, "job.succeeded", 2))
     finished = instance.get_job(job["id"])
     assert instance.observation_state(finished, runner_reachable=False) == "CONFIRMED"
+
+
+def test_derive_stage_caps_without_baseline():
+    """基线是迭代的地基:未通过基线的项目最多走到 Baseline 列——
+    重置基线后遗留的迭代 Plan 不该把项目钉在 iterate/confirm
+    (真机事故:迭代页基线 null,项目却显示在 Iteration 列)。"""
+    import json as _json
+
+    from autolab_control.repo import derive_project_stage
+
+    project = {"baseline_passed_at": None,
+               "baseline_requested_at": "2026-10-08T00:00:00Z"}
+    stale_iter_plan = {
+        "id": "p1", "status": "APPROVED", "created_at": "2026-10-07T00:00:00Z",
+        "experiment_ref": ".autolab/experiments/EXP-0002.md",
+        "spec_json": _json.dumps({"baseline": "EXP-0001"})}
+    assert derive_project_stage(project, stale_iter_plan, []) == "baseline"
+    assert derive_project_stage({"baseline_passed_at": None}, None, []) == "prepare"
