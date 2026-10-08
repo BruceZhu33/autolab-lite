@@ -7,7 +7,6 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { advanceProjectStage, fetchBoard, type BoardCardView } from "@/lib/api";
 import { adaptBoardCards } from "@/lib/board";
-import { ApiError } from "@/components/api-error";
 import { BoardView } from "~/vendor/views/issues/board-view";
 import { statusLabelOf, BOARD_STATUSES } from "~/vendor/views/issues/status";
 import type { DragMoveUpdates } from "~/vendor/views/issues/utils/drag-utils";
@@ -36,38 +35,79 @@ function projectTint(projectId: string): { bg: string; edge: string } {
   };
 }
 
-/** 每个项目的卡按已达阶段展开:一项目多卡,分居各列;当前阶段卡带徽章。 */
+/** 行对齐占位卡:项目已穿过该列但当前无卡 → 渲染为空槽保持同项目横向同行。 */
+function gapCard(pid: string, stageKey: string): BoardCardView {
+  return {
+    projectId: `${pid}:gap:${stageKey}`,
+    planId: "",
+    specHash: "",
+    title: "",
+    summary: "",
+    column: stageKey as BoardCardView["column"],
+    badges: [],
+    jobs: { done: 0, total: 0, running: 0, failed: 0 },
+    gpuLabels: [],
+    latestMetric: null,
+    updatedAt: "",
+  };
+}
+
+/**
+ * 按项目行 × 阶段列展开:同项目的所有卡横向对齐(同行)。
+ *
+ * 方法:先按 projectId 稳定排序建立全局项目行序,再按「项目 → 阶段」
+ * 二重循环输出:每列内,项目的卡(或 gap)按行序排列 → buildColumns
+ * 按数组序分列 → 各列中同项目的卡处于相同的行号。
+ */
 function expandByStage(cards: BoardCardView[]): BoardCardView[] {
-  // 列内行号 = issues 顺序的投影,而后端按 updated_at 排项目——每次轮询
-  // 顺序一变,同项目的卡在各列的行号就互相错开(横向 trace 断裂)。展开前
-  // 按项目 id 稳定排序:行号恒定,同项目的卡始终横向对齐成"一行"。
-  const stable = [...cards].sort(
-    (a, b) => a.projectId.localeCompare(b.projectId)
-      || a.planId.localeCompare(b.planId));
-  return stable.flatMap((card) => {
+  const stable = [...cards].sort((a, b) => a.projectId.localeCompare(b.projectId));
+
+  // 每项目:各阶段的展开卡 + 最高列号
+  const rows = new Map<string, {
+    maxCol: number;
+    byStage: Map<string, BoardCardView>;
+  }>();
+  for (const card of stable) {
     const stages = card.stages ?? {};
     const tint = projectTint(card.projectId);
-    const reached = STAGE_KEYS.filter(
-      (k) => stages[k] && stages[k].state !== "pending");
-    if (reached.length === 0) {
-      return [{ ...card, tint }];
+    if (!rows.has(card.projectId)) {
+      rows.set(card.projectId, { maxCol: -1, byStage: new Map() });
     }
-    return reached.map((k) => ({
-      ...card,
-      projectId: `${card.projectId}:${k}`,
-      tint,
-      column: k,
-      // attention 格子(如循环终态失败)在对应阶段卡上亮出「需处理」,
-      // 主视图无感 = 用户看到的「停了不动了」
-      badges: k === card.column
-        ? card.badges
-        : stages[k].state === "attention"
-          ? [{ label: "需处理", tone: "danger" as const }]
-          : [],
-      summary: stages[k].summary || card.summary,
-      latestMetric: k === card.column ? card.latestMetric : null,
-    }));
-  });
+    const row = rows.get(card.projectId)!;
+    const reached = STAGE_KEYS.filter((k) => stages[k] && stages[k].state !== "pending");
+    if (reached.length === 0) {
+      row.byStage.set("prepare", { ...card, tint });
+      row.maxCol = 0;
+      continue;
+    }
+    for (const k of reached) {
+      const col = STAGE_KEYS.indexOf(k);
+      row.maxCol = Math.max(row.maxCol, col);
+      row.byStage.set(k, {
+        ...card,
+        projectId: `${card.projectId}:${k}`,
+        tint,
+        column: k,
+        badges: k === card.column
+          ? card.badges
+          : stages[k].state === "attention"
+            ? [{ label: "需处理", tone: "danger" as const }]
+            : [],
+        summary: stages[k].summary || card.summary,
+        latestMetric: k === card.column ? card.latestMetric : null,
+      });
+    }
+  }
+
+  // 行 × 列输出:每列内,同项目同行(gap 补空位)
+  const result: BoardCardView[] = [];
+  for (const [pid, row] of rows) {
+    for (let col = 0; col <= row.maxCol; col++) {
+      const stageKey = STAGE_KEYS[col];
+      result.push(row.byStage.get(stageKey) ?? gapCard(pid, stageKey));
+    }
+  }
+  return result;
 }
 
 export function BoardClient() {
@@ -129,33 +169,13 @@ export function BoardClient() {
           </>
         ) : (
           <span className="ml-2 text-caption text-muted-foreground">
-            {error
-              ? "连接异常,内容可能滞后"
-              : isLoading && cards.length === 0
-                ? "加载中…"
-                : `${issues.length} 张卡 · ${cards.length} 个项目`}
+            {isLoading ? "加载中…" : `${issues.filter((i) => i.title).length} 张卡 · ${cards.length} 个项目`}
           </span>
         )}
       </PageHeader>
-      {error && issues.length === 0 ? (
-        <ApiError
-          error={error}
-          onRetry={() => void queryClient.invalidateQueries({ queryKey: ["board"] })}
-        />
-      ) : isLoading && cards.length === 0 ? (
-        <div className="flex flex-1 gap-4 overflow-x-auto p-2" aria-hidden>
-          {STAGE_KEYS.map((k) => (
-            <div
-              key={k}
-              className="h-full w-[280px] shrink-0 rounded-xl border border-surface-border bg-muted/30"
-            >
-              <div className="space-y-2 p-2">
-                <div className="h-5 w-24 animate-pulse rounded-md bg-muted" />
-                <div className="h-20 animate-pulse rounded-lg bg-surface" />
-                <div className="h-20 animate-pulse rounded-lg bg-surface" />
-              </div>
-            </div>
-          ))}
+      {error && issues.filter((i) => i.title).length === 0 ? (
+        <div className="px-4">
+          <p className="text-body text-destructive">{error.message}</p>
         </div>
       ) : (
         <BoardView

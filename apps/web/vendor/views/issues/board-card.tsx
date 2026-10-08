@@ -34,11 +34,17 @@ export const BoardCardContent = memo(function BoardCardContent({
   childProgress?: ChildProgress;
   onAdvance?: StageAdvanceHandler;
 }) {
+  // 行对齐占位:空标题 = gap 卡(项目已穿过此列但无内容)→ 渲染为同高透明槽
+  const isGap = !issue.title && !issue.description;
   const showDescription = useViewStore((s) => s.cardProperties.description) && issue.description;
   const showLabels = useViewStore((s) => s.cardProperties.labels) && issue.labels.length > 0;
   const showChildProgress = useViewStore((s) => s.cardProperties.childProgress) && childProgress;
   const labels = issue.labels ?? [];
   const metric = issue.latestMetric ?? null;
+
+  if (isGap) {
+    return <div className="min-h-[8.5rem]" aria-hidden="true" />;
+  }
 
   return (
     <div
