@@ -686,29 +686,51 @@ export type WorkspaceAnalysis = {
   entry: string;
 };
 
-/** D-029 接入型一键 Baseline:接入 Agent 识别工程 → 生成/复用适配器 →
- * 口径清单(数据集×档位)→ 选环境 → 冒烟自验;落库并刷新体检。 */
-export async function onboardBaseline(projectId: string) {
+/** D-030 提议制接入:分析 Agent(只读会话)读代码 → 提议入口/口径清单
+ * (数据集×档位,带 3ep 冒烟档)/环境/指标文件。只返回提案不落库——
+ * owner 编辑后经 saveBaselineConfig 采用保存。 */
+export type BaselineIntakeProposal = {
+  proposal: {
+    command: string; dataset_path: string; conda_env: string;
+    metric_file: string;
+    datasets: Array<{ name: string; command: string; dataset_path: string }>;
+  };
+  evidence: Record<string, string>;
+  dependencies: Array<{ file: string; kind: string }>;
+  session: { toolCalls: number; tokensIn: number; tokensOut: number } | null;
+  fallback: string | null;
+};
+
+export async function proposeBaselineIntake(projectId: string) {
   const response = await fetch(
-    `${API_URL}/api/owner/projects/${projectId}/baseline/onboard`, {
+    `${API_URL}/api/owner/projects/${projectId}/baseline/intake/propose`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiToken()}`, "Content-Type": "application/json" },
-      body: "{}",
+      headers: { Authorization: `Bearer ${apiToken()}` },
     });
   if (response.status === 401 || response.status === 403) {
-    throw new Error("工程接入需要 owner 权限的 token");
+    throw new Error("提议会话需要 owner 权限的 token");
   }
   if (!response.ok) {
     let detail = `${response.status}`;
     try { detail = (await response.json()).detail ?? detail; } catch { /* keep */ }
     throw new Error(detail);
   }
-  return response.json() as Promise<{
-    onboarded: boolean; adapter: string | null; adapterReused: boolean;
-    condaEnv: string; smokeOk: boolean; notes: string;
-    datasets: Array<{ name: string; command: string; dataset_path: string }>;
-    changes: string[];
-  }>;
+  return response.json() as Promise<BaselineIntakeProposal>;
+}
+
+/** D-030 流程助手:单发 LLM 读体检+配置 → 「缺什么/放哪/下一步」短建议。 */
+export async function askBaselineAdvisor(projectId: string) {
+  const response = await fetch(
+    `${API_URL}/api/owner/projects/${projectId}/baseline/advisor`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiToken()}` },
+    });
+  if (!response.ok) {
+    let detail = `${response.status}`;
+    try { detail = (await response.json()).detail ?? detail; } catch { /* keep */ }
+    throw new Error(detail);
+  }
+  return response.json() as Promise<{ advice: string }>;
 }
 
 export async function analyzeWorkspace(projectId: string) {

@@ -1320,20 +1320,25 @@ def run_fix_session(repo: Repo, credentials: CredentialStore,
 
 # ------------------------------------------------------------------ 角色:analyzer(工作区分析)
 
-ANALYZER_SYSTEM = """你是 AutoLab 的工作区分析 Agent(会话模式)。任务:自主探索代码库,推断 Baseline 运行配置。只有只读工具(读/列/搜/环境探针),不要尝试写文件。
+ANALYZER_SYSTEM = """你是 AutoLab 的工作区分析 Agent(会话模式)。任务:自主探索代码库,**提议** Baseline 运行配置——你的输出是给 owner 过目/编辑/确认的提案,不是最终决定。只有只读工具(读/列/搜/环境探针),不要尝试写文件。
 
 分析方法:
 1. 先看 README/文档里的用法行,再看 configs/*.yaml(注意:可能是嵌套结构,如 yacs 风格
    DATA: ROOT: path 需要看缩进层级),再看入口脚本(train.py/适配脚本)的 argparse 与默认值。
-2. 数据集清单以工作区**真实存在**的数据目录为准;同名 config 决定该行命令;
-   入口脚本若支持 --data_percentage/--data-percentage 之类的规模参数,且项目语境像数据效率研究,
-   可为每个数据集追加 10%/25% 变体行(名称如 Kvasir10)。
-3. conda 环境从 environment.yml 的 name 或 README 提示;指标文件找 metrics 输出约定
+2. 口径清单(数据集 × 档位):以工作区**真实存在**的数据目录与 config 文件为准——
+   先 list_files 拿真实名字清单,再生成条目:名字 = 真实数据集名 + 档位后缀(入口支持
+   --data_percentage/--data-percentage 之类规模参数时,追加 -10/-25/-50/-100% 变体行);
+   --config-file 必须指向真实存在的 config;数据目录为空的数据集不列入;上限 24 条;
+   **禁止编造聚合名**(把多个数据集合并起名)。
+3. **冒烟口径约定**:每条命令带 3-epoch 冒烟档(入口参数是什么风格就用什么,
+   如 --epochs 3 / TRAIN.NUM_EPOCHS 3;epoch 语义不在参数里时留原命令并在 evidence
+   说明)——正式基线档位由 owner 确认后在界面放开,清单先用小档保证能快速跑通。
+4. conda 环境从 environment.yml 的 name 或 README 提示;指标文件找 metrics 输出约定
    (没有证据就填 metrics.json)。
-4. 证据不足的字段留空,不要编造;每项结论都要有出处(文件:行为)。
+5. 证据不足的字段留空,不要编造;每项结论都要有出处(文件:行为)。
 
 完成后调用 submit_result 提交结构化结果(唯一结果通道,不要再在消息里写 ```json``` 块):
-{"command": "训练命令", "dataset_path": "主数据集路径", "conda_env": "环境名或空",
+{"command": "训练命令(默认档)", "dataset_path": "主数据集路径", "conda_env": "环境名或空",
  "metric_file": "指标文件名",
  "datasets": [{"name": "...", "command": "...", "dataset_path": "..."}],
  "evidence": {"command": "出处", "dataset_path": "出处", "datasets": "出处", "conda_env": "出处"}
@@ -1403,97 +1408,6 @@ def run_analyzer_session(repo: Repo, credentials: CredentialStore,
                             "tokensIn": result.tokens_in,
                             "tokensOut": result.tokens_out,
                             "sessionDir": ctx.sessions_dir}}
-    finally:
-        ctx.close()
-
-
-# ------------------------------------------------------------ 角色:onboard(工程接入,D-029)
-
-ONBOARDING_SYSTEM = """你是 AutoLab 的工程接入 Agent。任务:把一个新登记的研究工程接入 AutoLab 的 Baseline 口径,产出"选好工作区 → 真基线只差确认"的状态。你有读/列/搜/探针/写文件/冒烟工具。
-
-接入四步:
-1. **识别工程形态**:读 README/入口脚本(train.py/main.py 等)的 argparse、configs/ 目录、数据目录(data/ 等,注意可能是软链)、依赖文件。
-2. **口径核查与适配**:AutoLab 的硬口径是——命令可参数化数据规模档位,且训练/评估后把指标 JSON 写到 $AUTOLAB_OUTPUT_DIR/metrics.json(该环境变量由系统注入)。
-   - 入口已满足(或有遗留适配脚本 autolab_baseline.py)→ 直接复用,不重写;
-   - 不满足 → 写一个适配脚本 autolab_baseline.py 包装真实入口:--config-file/--data-percentage/--epochs/--seed 参数化、驱动入口、从日志/结果提取最终验证指标写成 metrics.json、流式透传训练日志;尽量不改工程源码。
-3. **口径清单**:先 `list_files configs/` 与数据目录拿到**真实名字清单**,再生成条目——
-   每条的名字 = 真实数据集名(config 文件名/数据目录名,如 Kvasir、BUSI)+ 档位后缀
-   (工程支持档位时 -10/-25/-50/-100%),command 的 --config-file 必须指向**真实存在
-   的 config 文件**,dataset_path 指向该数据集真实目录。**禁止编造聚合名**(如把多个
-   数据集合并叫 medseg-10)或引用不存在的 config;清单上限 24 条,数据目录为空的数据
-   集不列入。命令带 --epochs 3 的冒烟口径(正式基线由 owner 在界面放开)。
-   conda 环境从探针结果里选,并在 notes 里说明选择依据(如带 torch/名称与工程匹配)。
-4. **冒烟自验**:用 smoke_run 验证适配器/入口能启动(小规模),失败则修复后再验;
-   预算耗尽未能复验时如实报 smoke_ok=false。
-
-完成后调用 submit_result 提交(唯一结果通道):
-{"adapter": "autolab_baseline.py 或 null(入口原生满足)",
- "adapter_reused": true/false,
- "command_template": "适配器命令模板(含 {dataset_config} {percentage} 占位)",
- "datasets": [{"name": "Kvasir-10", "command": "...", "dataset_path": "..."}],
- "conda_env": "环境名", "smoke_ok": true/false,
- "notes": "一句话接入结论(复用/新生成/口径要点)"}
-清单不要超过 24 条;证据不足的字段留空,不要编造。
-"""
-
-
-def run_onboarding_session(repo: Repo, credentials: CredentialStore,
-                           hostkeys_path: Path, project_id: str) -> dict:
-    """D-029 接入型一键 Baseline:识别工程 → 生成/复用适配器 → 口径清单
-    → 选环境 → 冒烟自验。返回接入结果(落库由调用方编排)。"""
-    project = repo.get_project(project_id)
-    if project is None:
-        raise AgentSessionError("项目不存在")
-    if not (project.get("remote_workdir") or "").strip():
-        raise AgentSessionError("项目还没有工作区,先在项目页补全")
-    ctx = WorkspaceContext(repo, credentials, project, "onboard",
-                           budget=SessionBudget(max_turns=16,
-                                                wall_clock_seconds=900,
-                                                max_file_writes=6, smoke_runs=2))
-    try:
-        run = server_admin.baseline_config_defaults(project)
-        task = (
-            f"## 项目:{project['name']}(工作区 {project['remote_workdir']})\n"
-            f"## 现有配置(可能为空壳,以你实读为准)\n"
-            + json.dumps({k: run.get(k) for k in
-                          ("command", "dataset_path", "conda_env", "metric_file",
-                           "datasets")}, ensure_ascii=False)[:1200]
-            + "\n\n请完成工程接入:识别 → 适配(复用或生成 autolab_baseline.py)"
-              " → 口径清单 → 选环境 → 冒烟自验,最后 submit_result。")
-        result = run_session(
-            ctx, system_prompt=ONBOARDING_SYSTEM, task=task,
-            whitelist=["read_file", "list_files", "grep", "run_probe",
-                       "write_file", "smoke_run", "submit_result"])
-        if result.status == "stopped":
-            raise SessionStoppedByUser("接入会话被人工停止")
-        manifest = result.manifest if isinstance(result.manifest, dict) else None
-        datasets = []
-        for row in (manifest or {}).get("datasets") or []:
-            if not isinstance(row, dict):
-                continue
-            name = str(row.get("name") or "").strip()
-            command = str(row.get("command") or "").strip()
-            if name and command:
-                datasets.append({
-                    "name": name, "command": command,
-                    "dataset_path": str(row.get("dataset_path") or "").strip()})
-        if not datasets:
-            raise AgentSessionError(
-                f"接入会话未给出有效口径清单({result.status}):"
-                f"{result.final_text[:200]}")
-        return {
-            "adapter": str((manifest or {}).get("adapter") or "") or None,
-            "adapter_reused": bool((manifest or {}).get("adapter_reused")),
-            "conda_env": str((manifest or {}).get("conda_env") or "").strip(),
-            "smoke_ok": bool((manifest or {}).get("smoke_ok")),
-            "notes": str((manifest or {}).get("notes") or "").strip()[:300],
-            "datasets": datasets[:24],
-            "changes": ctx.written,
-            "session": {"toolCalls": result.tool_calls,
-                        "tokensIn": result.tokens_in,
-                        "tokensOut": result.tokens_out,
-                        "sessionDir": ctx.sessions_dir},
-        }
     finally:
         ctx.close()
 
