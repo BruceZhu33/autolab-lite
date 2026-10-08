@@ -226,28 +226,48 @@ def test_loop_stops_at_max_rounds(api, accepted, manager, monkeypatch):
 
 
 def test_loop_stops_on_consecutive_full_failures(api, accepted, manager, monkeypatch):
+    """连续失败终止 + 无人值守自愈:首次全挂打回实现修(不计失败链),
+    修完重跑仍全挂才计数;两连计满 → 终止。"""
     loop_id, plan1, _ = _drive_to_await(
-        api, manager, accepted, monkeypatch, rounds=2)
+        api, manager, accepted, monkeypatch, rounds=3)
     mgr = manager["manager"]
     repo = api["repo"]
-    seq = 950
-    for job in repo.list_jobs(plan_id=plan1):  # 全部失败
-        seq += 1
-        repo.ingest_event(make_event(job, "job.failed", seq))
-    mgr.advance(loop_id); mgr.advance(loop_id)
+
+    def fail_all(plan_id, seq_start):
+        seq = seq_start
+        for job in repo.list_jobs(plan_id=plan_id):
+            seq += 1
+            repo.ingest_event(make_event(job, "job.failed", seq))
+        return seq
+
+    # R1 全挂:自愈打回 implement(不计失败链),fix_retries→1
+    fail_all(plan1, 950)
+    mgr.advance(loop_id); mgr.advance(loop_id)  # await→conclude, conclude→implement(自愈)
     loop = iteration_loop._get_loop_row(api["repo"], loop_id)
-    assert loop["consecutive_failures"] == 1 and loop["phase"] == "implement"
-    mgr.advance(loop_id); mgr.advance(loop_id)
+    assert loop["consecutive_failures"] == 0, "首次全挂走自愈,不计失败链"
+    assert loop["phase"] == "implement"
+    payload = json.loads(loop.get("await_payload_json") or "{}")
+    assert payload.get("fix_retries") == 1
+
+    # R2(修完重跑)仍全挂:fix_retries=1 已用过 → 计入失败链 consecutive=1
+    mgr.advance(loop_id)  # implement
+    mgr.advance(loop_id)  # plan → await
     plan2 = iteration_loop._get_loop_row(api["repo"], loop_id)["current_plan_id"]
-    seq = 980
-    for job in repo.list_jobs(plan_id=plan2):
-        seq += 1
-        repo.ingest_event(make_event(job, "job.failed", seq))
+    fail_all(plan2, 980)
+    mgr.advance(loop_id); mgr.advance(loop_id)  # await→conclude, conclude→implement
+    loop = iteration_loop._get_loop_row(api["repo"], loop_id)
+    assert loop["consecutive_failures"] == 1, "重跑仍全挂,计入失败链"
+
+    # R3 全挂:consecutive=2 ≥ max=2 → 终止
+    mgr.advance(loop_id)  # implement
+    mgr.advance(loop_id)  # plan → await
+    plan3 = iteration_loop._get_loop_row(api["repo"], loop_id)["current_plan_id"]
+    fail_all(plan3, 1010)
     mgr.advance(loop_id); mgr.advance(loop_id)
     loop = iteration_loop._get_loop_row(api["repo"], loop_id)
     assert loop["status"] == "failed"
     assert "连续" in loop["stop_reason"]
-    # 失败经验入档(两轮 rejected)
+    # 失败经验入档(多轮 rejected)
     failures = (accepted["workdir"] / ".autolab" / "knowledge" / "failures.md").read_text(
         encoding="utf-8")
     assert failures.count("## EXP-000") >= 2
