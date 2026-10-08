@@ -171,7 +171,41 @@ function StepStrip({ step }: { step: number }) {
   );
 }
 
-/* ---------------------------------------- 左:已采纳方案 */
+/* ---------------------------------------- 左:执行依据(方向/已采纳方案) */
+
+/** 方向的紧凑展示:迭代页的主角是执行,方向只是一条可展开的背景带。 */
+function DirectionBand({ state }: { state: IterationState }) {
+  const direction = state.direction ?? null;
+  if (!direction?.text) return null;
+  return (
+    <details className="group rounded-xl border-[0.5px] border-surface-border bg-surface">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2">
+        <Compass className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="text-caption font-semibold">方向</span>
+        {direction.confirmedAt ? (
+          <span className="rounded-full bg-success/10 px-1.5 py-0.5 text-micro font-medium text-success">已确认</span>
+        ) : (
+          <span className="rounded-full bg-warning/10 px-1.5 py-0.5 text-micro font-medium text-warning">草稿</span>
+        )}
+        <span className="min-w-0 flex-1 truncate text-caption text-muted-foreground">
+          {direction.text.replace(/[#*\n]/g, " ").slice(0, 80)}…
+        </span>
+        {state.baselineMetrics
+          ? Object.entries(state.baselineMetrics).slice(0, 3).map(([name, value]) => (
+              <span key={name} className="hidden shrink-0 rounded-full bg-info/10 px-2 py-0.5 font-mono text-micro text-info sm:inline">
+                {name} {String(value)}
+              </span>
+            ))
+          : null}
+        <span className="shrink-0 text-micro text-muted-foreground group-open:hidden">展开</span>
+        <span className="hidden shrink-0 text-micro text-muted-foreground group-open:inline">收起</span>
+      </summary>
+      <div className="max-h-72 overflow-y-auto border-t border-surface-border/60 p-3">
+        <MiniMarkdown text={direction.text} />
+      </div>
+    </details>
+  );
+}
 
 function ProposalPanel({ state }: { state: IterationState }) {
   const proposal = state.proposal;
@@ -179,33 +213,7 @@ function ProposalPanel({ state }: { state: IterationState }) {
   if (!proposal && !direction?.text) return null;
   // D-028:老项目显示已采纳方案,新项目显示已确认的方向陈述
   if (!proposal) {
-    return (
-      <section className="flex min-h-0 min-w-0 flex-col rounded-xl border-[0.5px] border-surface-border bg-surface">
-        <div className="flex items-center gap-2 border-b border-surface-border px-3 py-2">
-          <Compass className="size-4 text-muted-foreground" />
-          <h2 className="text-body font-semibold">方向</h2>
-          {direction?.confirmedAt ? (
-            <span className="rounded-full bg-success/10 px-1.5 py-0.5 text-micro font-medium text-success">已确认</span>
-          ) : (
-            <span className="rounded-full bg-warning/10 px-1.5 py-0.5 text-micro font-medium text-warning">草稿</span>
-          )}
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
-          {state.baselineMetrics
-            ? (
-              <div className="mb-2 flex flex-wrap gap-1.5">
-                {Object.entries(state.baselineMetrics).map(([name, value]) => (
-                  <span key={name} className="rounded-full bg-info/10 px-2 py-0.5 font-mono text-micro text-info">
-                    基线 {name}: {String(value)}
-                  </span>
-                ))}
-              </div>
-            )
-            : null}
-          <MiniMarkdown text={direction?.text || ""} />
-        </div>
-      </section>
-    );
+    return <DirectionBand state={state} />;
   }
   return (
     <section className="flex min-h-0 min-w-0 flex-col rounded-xl border-[0.5px] border-surface-border bg-surface">
@@ -817,32 +825,34 @@ function ImplementPanel({ state, impl, loop, busy, onImplement, onGenerate,
               </label>
             </div>
           </div>
-          {impl ? <ImplementationCard impl={impl} onRedo={onImplement} busy={busy !== null} /> : (
-            <div className="flex flex-col items-center justify-center py-6 text-center">
-              <p className="max-w-md text-caption leading-relaxed text-muted-foreground">
-                或者手动单步:实现 Agent 读评审报告和工作区真实代码,直接修改/新建文件把方案落地
-                (原文件备份到 .autolab/patches/,写入后做语法检查,失败自动回滚)。
+          {/* 手动单步收进折叠:循环是主路径,单步实现/制定计划是调试手段,
+              平铺与启动卡抢注意力(用户反馈"迭代执行有些冗余") */}
+          <details className="rounded-lg border-[0.5px] border-surface-border bg-surface/60">
+            <summary className="cursor-pointer list-none px-3 py-2 text-caption font-medium text-muted-foreground">
+              手动单步(高级:只实现改动 / 只制定计划)
+              {busy === "implement" ? ` · Agent 实现改动中 ${seconds}s…` : ""}
+              {busy === "plan" ? " · Agent 制定中…" : ""}
+            </summary>
+            <div className="space-y-2 border-t border-surface-border/60 px-3 py-2.5">
+              <p className="text-micro leading-relaxed text-muted-foreground">
+                实现Agent读方向与工作区真实代码,直接修改/新建文件落地(原文件备份到
+                .autolab/patches/,写入后语法检查,失败自动回滚);也可基于已改好的代码单发制定计划。
               </p>
-              <Button className="mt-3 gap-1.5" variant="outline"
-                      disabled={busy !== null} onClick={onImplement}>
-                {busy === "implement"
-                  ? <Loader2 className="size-4 animate-spin" />
-                  : <FileCode className="size-4" />}
-                {busy === "implement" ? `Agent 实现改动中 ${seconds}s…` : "Agent 实现方案改动(单步)"}
-              </Button>
+              {impl ? <ImplementationCard impl={impl} onRedo={onImplement} busy={busy !== null} /> : null}
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" className="gap-1.5"
+                        disabled={busy !== null} onClick={onImplement}>
+                  {busy === "implement" ? <Loader2 className="size-3.5 animate-spin" /> : <FileCode className="size-3.5" />}
+                  Agent 实现改动
+                </Button>
+                <Button size="sm" variant="outline" className="gap-1.5"
+                        disabled={busy !== null} onClick={onGenerate}>
+                  {busy === "plan" ? <Loader2 className="size-3.5 animate-spin" /> : <Bot className="size-3.5" />}
+                  Agent 制定迭代计划
+                </Button>
+              </div>
             </div>
-          )}
-          {impl ? (
-            <div className="flex flex-col items-center py-2 text-center">
-              <p className="mb-2 max-w-md text-caption text-muted-foreground">
-                手动路径:代码已按方案改好 → 让 Agent 基于新代码制定实验计划(草案不会自动执行)。
-              </p>
-              <Button className="gap-1.5" variant="outline" disabled={busy !== null} onClick={onGenerate}>
-                {busy === "plan" ? <Loader2 className="size-4 animate-spin" /> : <Bot className="size-4" />}
-                {busy === "plan" ? "Agent 制定中…" : "Agent 制定迭代计划(单步)"}
-              </Button>
-            </div>
-          ) : null}
+          </details>
         </>
       )}
     </div>
@@ -1023,6 +1033,7 @@ function FlowPanel({ projectId, state }: { projectId: string; state: IterationSt
   /** 联合迭代的数据集选择(null = 确认池全部)。 */
   const [datasets, setDatasets] = useState<string[] | null>(null);
   const latest = state.plans.find((p) => p.id === state.latestPlanId) ?? null;
+  const loopActive = state.loop?.status === "running" || state.loop?.status === "stopping";
   const step = currentStep(state);
   const comparison = state.comparison;
   // 新计划出现(新一轮草案生成)即退出"开新一轮"模式
@@ -1200,6 +1211,52 @@ function FlowPanel({ projectId, state }: { projectId: string; state: IterationSt
         <div className="mb-3">
           <RoundThinkingCard state={state} />
         </div>
+        {/* 迭代启动区:无活动循环时始终显示(方向或方案任一即过门)——
+            修复"三粒度不见了":原实现被 proposal.reportMd(老评审流程字段)
+            门住,方向流程项目整段不渲染;且仅在无计划/开新一轮时出现,
+            终态后入口深藏。现在终态即"换思路继续"的一等入口。 */}
+        {!loopActive && (state.direction?.text || state.proposal) ? (
+          <div className="mb-3 space-y-2.5">
+            {/* 数据集选择:基线确认池,跑过什么才能迭代什么(owner 核心关切) */}
+            <div className="flex flex-wrap items-center gap-1.5 rounded-lg border-[0.5px] border-surface-border bg-surface px-2.5 py-2">
+              <span className="shrink-0 text-micro font-medium text-muted-foreground">
+                迭代数据集(基线跑通的才能选)
+              </span>
+              {state.datasetPool.map((d) => {
+                const selected = (datasets ?? state.datasetPool.map((x) => x.name)).includes(d.name);
+                return (
+                  <button key={d.name} type="button"
+                          disabled={busy !== null || loopActive}
+                          onClick={() => {
+                            const all = datasets ?? state.datasetPool.map((x) => x.name);
+                            const next = selected ? all.filter((n) => n !== d.name) : [...all, d.name];
+                            setDatasets(next.length ? next : all);
+                          }}
+                          title={d.metrics ? Object.entries(d.metrics).map(([k, v]) => `${k}=${String(v)}`).join(" ") : undefined}
+                          className={`rounded-full px-2.5 py-1 font-mono text-micro font-medium transition-colors ${
+                            selected ? "bg-accent text-accent-foreground"
+                              : "bg-muted/50 text-muted-foreground hover:bg-muted"}`}>
+                    {d.name}
+                  </button>
+                );
+              })}
+              <span className="ml-auto text-micro text-muted-foreground">
+                {datasets ? `${datasets.length}/${state.datasetPool.length} 选中` : "全部"}
+              </span>
+            </div>
+            {state.loop ? (
+              <p className="text-micro font-medium text-muted-foreground">
+                第 {state.plans.length + 1} 轮 · 上轮终止:{state.loop.stopReason?.slice(0, 40) ?? "已完成"}
+                ——方向是大框架,换思路继续(实现 Agent 会带上轮结论与失败经验)
+              </p>
+            ) : null}
+            <ImplementPanel state={state} impl={state.implementation} loop={state.loop}
+                            busy={busy} onImplement={() => void implement()}
+                            onGenerate={() => void generate()}
+                            onStartLoop={(m, d, env, cr) => void startLoop(m, d, env, cr)}
+                            onStopLoop={() => void stopLoop()} />
+          </div>
+        ) : null}
         {/* Agent 会话实时面板:看着 Agent 干活(工具时间线),可注入引导/停止 */}
         <div className="mb-3">
           <LiveSessionCard projectId={projectId} />
@@ -1208,57 +1265,12 @@ function FlowPanel({ projectId, state }: { projectId: string; state: IterationSt
         <div className="mb-3">
           <BacklogCard projectId={projectId} backlog={state.backlog ?? []} />
         </div>
-        {/* ① 实现改动 + ② 生成计划(首轮;或上一轮结论后点"开新一轮") */}
-        {(!latest || newRound) ? (
-          state.proposal?.reportMd ? (
-            <div className="space-y-3">
-              {state.datasetPool.length > 1 ? (
-                <div className="flex flex-wrap items-center gap-1.5 rounded-lg border-[0.5px] border-surface-border px-2.5 py-2">
-                  <span className="text-micro font-medium text-muted-foreground">
-                    迭代数据集(基线跑过的才能选)
-                  </span>
-                  {state.datasetPool.map((d) => {
-                    const selected = (datasets ?? state.datasetPool.map((x) => x.name)).includes(d.name);
-                    return (
-                      <button key={d.name} type="button"
-                              disabled={busy !== null || (state.loop?.status === "running")}
-                              onClick={() => {
-                                const all = datasets ?? state.datasetPool.map((x) => x.name);
-                                const next = selected ? all.filter((n) => n !== d.name) : [...all, d.name];
-                                setDatasets(next.length ? next : all);
-                              }}
-                              title={d.metrics ? Object.entries(d.metrics).map(([k, v]) => `${k}=${String(v)}`).join(" ") : undefined}
-                              className={`rounded-full px-2.5 py-1 font-mono text-micro font-medium transition-colors ${
-                                selected ? "bg-accent text-accent-foreground"
-                                  : "bg-muted/50 text-muted-foreground hover:bg-muted"}`}>
-                        {d.name}
-                      </button>
-                    );
-                  })}
-                  <span className="ml-auto text-micro text-muted-foreground">
-                    {datasets ? `${datasets.length}/${state.datasetPool.length} 选中` : "全部"}
-                  </span>
-                </div>
-              ) : null}
-              {latest ? (
-                <p className="text-micro font-medium text-muted-foreground">
-                  第 {state.plans.length + 1} 轮迭代(上一轮结论已记录)
-                </p>
-              ) : null}
-              <ImplementPanel state={state} impl={state.implementation} loop={state.loop}
-                              busy={busy} onImplement={() => void implement()}
-                              onGenerate={() => void generate()}
-                              onStartLoop={(m, d, env, cr) => void startLoop(m, d, env, cr)}
-                              onStopLoop={() => void stopLoop()} />
-              {latest ? <div className="border-t border-surface-border pt-1" /> : null}
-            </div>
-          ) : (
-            <div className="flex flex-col items-center justify-center py-10 text-center">
-              <p className="max-w-sm text-caption text-muted-foreground">
-                项目还没有执行依据:先回方向页提炼/手写方向并确认,实现 Agent 依它改代码。
-              </p>
-            </div>
-          )
+        {(!latest || newRound) && !(state.direction?.text || state.proposal) ? (
+          <div className="mb-3 flex flex-col items-center justify-center py-10 text-center">
+            <p className="max-w-sm text-caption text-muted-foreground">
+              项目还没有执行依据:先回方向页提炼/手写方向并确认,实现 Agent 依它改代码。
+            </p>
+          </div>
         ) : null}
 
         {latest ? (
@@ -1491,7 +1503,8 @@ export default function IterationPage() {
               />
             </div>
           ) : state ? (
-            <div className="grid min-h-0 flex-1 gap-3 py-3 lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+            /* 聚焦迭代执行:方向/方案收成一条可展开的背景带,不再占左栏 */
+            <div className="flex min-h-0 flex-1 flex-col gap-3 py-3">
               <ProposalPanel state={state} />
               <FlowPanel projectId={selected.id} state={state} />
             </div>

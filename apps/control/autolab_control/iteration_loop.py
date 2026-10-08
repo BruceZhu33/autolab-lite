@@ -715,6 +715,42 @@ class LoopManager:
                                      kind="text", content=repo_msg)
         _update_loop(self.repo, loop["id"], phase="plan", phase_started_at=utc_now())
 
+    def _prior_loop_experience(self, loop: dict) -> str:
+        """新循环第 1 轮:上一轮循环(若有)的终止原因 + 各轮结论摘要。"""
+        try:
+            conn = self.repo.db.connect()
+            try:
+                prior = conn.execute(
+                    "SELECT stop_reason, summary, round_no FROM iteration_loops"
+                    " WHERE project_id = ? AND id != ? AND started_at <"
+                    " (SELECT started_at FROM iteration_loops WHERE id = ?)"
+                    " ORDER BY started_at DESC LIMIT 1",
+                    (loop["project_id"], loop["id"], loop["id"])).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            return ""
+        if prior is None:
+            return ""
+        lines = ["## 上一轮循环的经验(同一方向内的历史,换思路继续)"]
+        reason = (prior["stop_reason"] or "").strip()
+        if reason:
+            lines.append(f"- 终止:{reason[:120]}")
+        summary = (prior["summary"] or "").strip()
+        if summary:
+            lines.append(f"- 终局分析:{summary[:300]}")
+        # 最近一轮计划的结论(实验文件里已留痕,这里给 Agent 一个指针)
+        plans = self.repo.list_plans(loop["project_id"])
+        if plans:
+            last = max(plans, key=lambda p: p["revision_no"])
+            lines.append(
+                f"- 最近实验:{last.get('experiment_ref') or last['id']}"
+                "(结论与失败经验见工作区实验文件与 knowledge/failures.md,先读再动手)")
+        lines.append(
+            "- 指令:这是同一方向内的新一轮循环。先读上述经验,换思路,"
+            "不要原样重复已证明无效的改动。")
+        return "\n".join(lines)
+
     def _phase_plan(self, loop: dict) -> None:
         if loop["status"] == "stopping":
             _update_loop(self.repo, loop["id"], status="stopped",
@@ -1181,9 +1217,14 @@ class LoopManager:
     # ------------------------------------------------------------ helpers
 
     def _round_feedback(self, loop: dict) -> str:
-        """第 2 轮起:把上一轮的对比结果与失败摘要反馈给实现/计划 Agent。"""
+        """第 2 轮起:把上一轮的对比结果与失败摘要反馈给实现/计划 Agent。
+
+        新循环的第 1 轮也带经验:方向只是大框架(owner 口径),在一个方向上
+        多次循环是常态——上一轮循环的终止原因/结论/失败经验跨循环注入,
+        Agent 才能换思路而不是从零开始(用户反馈"失败了就得改方向内策略")。
+        """
         if loop["round_no"] < 2:
-            return ""
+            return self._prior_loop_experience(loop)
         plans = self.repo.list_plans(loop["project_id"])
         if not plans:
             return ""
