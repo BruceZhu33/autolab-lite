@@ -99,12 +99,17 @@ function expandByStage(cards: BoardCardView[]): BoardCardView[] {
     }
   }
 
-  // 行 × 列输出:每列内,同项目同行(gap 补空位)
+  // 列 × 行输出:每列包含所有项目(有卡→卡,无卡→gap),同项目恒在同一行。
+  // 关键:即使项目还没走到该列,只要任何其他项目到了,也要为它占位——
+  // 否则列内行号会因"缺席项目"而错位(用户反馈的核心问题)。
   const result: BoardCardView[] = [];
-  for (const [pid, row] of rows) {
-    for (let col = 0; col <= row.maxCol; col++) {
-      const stageKey = STAGE_KEYS[col];
-      result.push(row.byStage.get(stageKey) ?? gapCard(pid, stageKey));
+  const projectIds = [...rows.keys()];
+  for (let col = 0; col < STAGE_KEYS.length; col++) {
+    const stageKey = STAGE_KEYS[col];
+    const anyCard = projectIds.some((pid) => rows.get(pid)!.byStage.has(stageKey));
+    if (!anyCard) continue; // 该列没有任何项目的卡 → 整列不渲染
+    for (const pid of projectIds) {
+      result.push(rows.get(pid)!.byStage.get(stageKey) ?? gapCard(pid, stageKey));
     }
   }
   return result;
