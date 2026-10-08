@@ -661,6 +661,17 @@ class LoopManager:
         # session_key 使 Control 重启后从 checkpoint 断点续跑同一会话;
         # 会话层异常 → 回落旧的单发路径,循环永不因新层挂死
         extra = self._round_feedback(loop)
+        # 自愈环:上一趟计划被契约核验打回(编造参数/入口不匹配)——
+        # 把核验错误交给实现 Agent,修好入口再起草
+        failure_payload = _parse_json_dict(loop.get("await_payload_json")) or {}
+        plan_failure = (failure_payload.get("plan_failure") or "").strip()
+        if plan_failure:
+            extra = (f"## 上一趟实验计划未过契约核验(必须先修)\n{plan_failure}\n"
+                     "→ 检查实验命令的入口脚本与参数:命令里每个 --flag 必须在入口"
+                     "脚本的 argparse 里真实存在;入口用适配器 autolab_baseline.py"
+                     "(--config-file/--data-percentage/--seed)或 train.py 原生参数,"
+                     "不要对不存在的脚本编造参数。修正后再提交。\n\n" + extra)
+            _update_loop(self.repo, loop["id"], await_payload_json=None)
 
         # D-7:已超越基线的最好改动文件 → 会话 write_file 硬拒回滚
         try:
@@ -765,11 +776,32 @@ class LoopManager:
             if candidate is not None and candidate["status"] == "DRAFT":
                 existing = candidate
         if existing is None:
-            result = iteration.draft_iteration_plan(
-                self.repo, self.credentials, self.hostkeys_path,
-                loop["project_id"],
-                extra_context=self._round_feedback(loop),
-                datasets=_loop_datasets(loop))
+            try:
+                result = iteration.draft_iteration_plan(
+                    self.repo, self.credentials, self.hostkeys_path,
+                    loop["project_id"],
+                    extra_context=self._round_feedback(loop),
+                    datasets=_loop_datasets(loop))
+            except iteration.IterationError as exc:
+                # 计划未过契约核验(编造参数/矩阵↔模板不符…)→ 不直接躺平:
+                # 带错误打回实现相位,让 Agent 修入口/参数后再起草(自愈环)。
+                # 改动冻结模式没有实现相位可修 → 维持原终止语义;两连修仍败
+                # → 真终止(防乒乓)。
+                if loop.get("code_ready"):
+                    raise
+                retries = int(payload.get("plan_retries") or 0) + 1
+                if retries >= 2:
+                    raise
+                _update_loop(self.repo, loop["id"], phase="implement",
+                             await_payload_json=json.dumps({
+                                 "plan_retries": retries,
+                                 "plan_failure": str(exc)[:400]}),
+                             phase_started_at=utc_now())
+                self.repo.add_review_message(
+                    project_id=loop["project_id"], role="system", kind="text",
+                    content=f"计划未过契约核验({str(exc)[:120]}…)——打回实现相位"
+                            f"让 Agent 修正入口与参数后重试(第 {retries} 次)")
+                return
             plan = self.repo.get_plan(result["plan"]["id"])
         else:
             plan = existing
