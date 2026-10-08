@@ -665,13 +665,26 @@ class LoopManager:
         # 把核验错误交给实现 Agent,修好入口再起草
         failure_payload = _parse_json_dict(loop.get("await_payload_json")) or {}
         plan_failure = (failure_payload.get("plan_failure") or "").strip()
+        job_failure = (failure_payload.get("job_failure") or "").strip()
         if plan_failure:
             extra = (f"## 上一趟实验计划未过契约核验(必须先修)\n{plan_failure}\n"
                      "→ 检查实验命令的入口脚本与参数:命令里每个 --flag 必须在入口"
                      "脚本的 argparse 里真实存在;入口用适配器 autolab_baseline.py"
                      "(--config-file/--data-percentage/--seed)或 train.py 原生参数,"
                      "不要对不存在的脚本编造参数。修正后再提交。\n\n" + extra)
-            _update_loop(self.repo, loop["id"], await_payload_json=None)
+            _update_loop(self.repo, loop["id"],
+                         await_payload_json=json.dumps({
+                             "fix_retries": int(failure_payload.get("fix_retries") or 0)}))
+        elif job_failure:
+            # 无人值守自愈:整轮 Job 全挂 → 日志尾部交给实现 Agent 修
+            # (适配器/入口/config 键名/环境——修好重跑,不浪费过夜训练)
+            extra = (f"## 上一轮实验全部 Job 失败(必须先修再跑)\n{job_failure}\n"
+                     "→ 先读日志定位根因(编造 config 键名/适配器参数不容/入口"
+                     "崩溃/环境缺包),修复后再制定计划重跑。config 的合法键名以"
+                     " configs/*.yaml 实际字段为准,不要编短名。\n\n" + extra)
+            _update_loop(self.repo, loop["id"],
+                         await_payload_json=json.dumps({
+                             "fix_retries": int(failure_payload.get("fix_retries") or 0)}))
 
         # D-7:已超越基线的最好改动文件 → 会话 write_file 硬拒回滚
         try:
@@ -827,7 +840,12 @@ class LoopManager:
                     f"{plan.get('experiment_ref') or plan_id} "
                     f"({job_count} Job)已按循环授权自动批准并派发")
         _update_loop(self.repo, loop["id"], phase="await_jobs", current_plan_id=plan_id,
-                     phase_started_at=utc_now(), await_payload_json=None)
+                     phase_started_at=utc_now(),
+                     # fix_retries 是循环级计数(无人值守自愈只修一次),穿透
+                     # 相位流转不被清零;resume_plan_id/concluded_plan 等一次性
+                     # 键才需要清
+                     await_payload_json=json.dumps({"fix_retries": int(payload.get("fix_retries") or 0)})
+                     if payload.get("fix_retries") else None)
 
     def _phase_await_jobs(self, loop: dict) -> None:
         plan_id = loop["current_plan_id"]
@@ -892,6 +910,29 @@ class LoopManager:
             finish("stopped", "人工停止(当前轮结论已记录)")
             return
         round_all_failed = bool(comparison) and comparison.get("succeeded", 0) == 0
+        # 无人值守自愈(owner 反馈:重型过夜迭代,job 挂了没人点修复=浪费训练):
+        # 整轮全挂且本循环未修过 → 不计失败链,打回实现相位让修复 Agent 干活;
+        # 修完重跑仍全挂才计数(防无限乒乓)。
+        if round_all_failed and int(payload.get("fix_retries") or 0) < 1:
+            failed_jobs = [j for j in self.repo.list_jobs(plan_id=plan_id)
+                           if j["status"] in ("FAILED", "TIMED_OUT")]
+            tails = []
+            for job in failed_jobs[:2]:
+                tail = iteration.failure_log_tail(
+                    self.repo, self.credentials, project, job)
+                if tail:
+                    tails.append(f"Job {job['id']}:\n```\n{tail}\n```")
+            _update_loop(self.repo, loop["id"], phase="implement",
+                         await_payload_json=json.dumps({
+                             "fix_retries": 1,
+                             "job_failure": "\n".join(tails)[:1500] or "全部 Job 失败(无日志尾部)"}),
+                         phase_started_at=utc_now())
+            self.repo.add_review_message(
+                project_id=loop["project_id"], role="system", kind="text",
+                content=f"第 {loop['round_no']} 轮全部 Job 失败({len(failed_jobs)} 个)"
+                        "——自动打回实现相位修复(入口/适配器/config),修好重跑;"
+                        "重跑仍失败才计入失败链(无人值守不废训练)")
+            return
         consecutive = loop["consecutive_failures"] \
             + (1 if round_all_failed else 0)
         if round_all_failed is False and comparison and comparison.get("anyImproved"):
@@ -951,7 +992,8 @@ class LoopManager:
                 return
         _update_loop(self.repo, loop["id"], phase="implement",
                      consecutive_failures=consecutive, phase_started_at=utc_now(),
-                     await_payload_json=None)
+                     await_payload_json=json.dumps({"fix_retries": int(payload.get("fix_retries") or 0)})
+                     if payload.get("fix_retries") else None)
 
     def _run_strategy(self, loop: dict, project: dict,
                       comparison: dict | None) -> str | None:
