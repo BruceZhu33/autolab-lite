@@ -1255,6 +1255,9 @@ def draft_iteration_plan(
     project = repo.get_project(project_id)
     if project is None:
         raise IterationError("项目不存在")
+    if not project.get("baseline_passed_at"):
+        raise IterationError("还没跑通 Baseline:迭代计划要立在基线指标上,"
+                             "先在 Baseline 页跑通并确认")
     proposal = direction_basis(repo, project)
     if proposal is None:
         raise IterationError(

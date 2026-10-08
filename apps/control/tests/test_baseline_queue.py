@@ -489,3 +489,50 @@ def test_diagnose_config_broken():
     assert d["kind"] == "config_broken" and "patches" in "".join(d["steps"])
     d2 = diagnose_run_failure("yaml.scanner.ScannerError: bad line")
     assert d2["kind"] == "config_broken"
+
+
+def test_confirm_pass_stops_running_queue(api, ds_project):
+    """确认即定口径:还在跑的基线队列停掉(当前档退出、剩余队列清空),
+    防确认后无主见地磨完所有档位(真机事故:确认后 BTMRI-100 满配
+    磨了一天被手动杀掉,迭代页基线指标还被冲成 null)。"""
+    repo = api["repo"]
+    project = repo.get_project(ds_project["projectId"])
+    # Kvasir 已跑通入账,Busi 正在跑(渐进式确认的典型现场)
+    repo.update_project(project["id"], baseline_run_json=json.dumps({
+        "dataset": "Busi", "queue": [], "status": "running", "pid": None,
+        "runs": {"Kvasir": {"status": "finished", "exit_code": 0,
+                            "metrics": {"val_dice": 0.90},
+                            "metrics_source": "file", "seed": 1}}}))
+
+    result = baseline_queue.confirm_pass(repo, repo.get_project(project["id"]))
+
+    assert result["passed"] is True and result["replayed"] is False
+    assert result["queueStopped"]  # 停止说明回给 UI
+    assert "Kvasir" in result["datasets"]  # 已跑通的进快照
+    after = baseline_queue.normalize_run(repo.get_project(project["id"]))
+    assert after["status"] == "stopped" and after["queue"] == []
+    # 队列冻结后 sync 不再推进(只剩读状态)
+    frozen = baseline_queue.sync_run(
+        repo, CredentialStore("/tmp/nonexistent-creds.json"),
+        "/tmp/nonexistent-hostkeys.json",
+        repo.get_project(project["id"]), advance_enabled=True)
+    assert frozen["status"] == "stopped"
+
+
+def test_baseline_metrics_display_prefers_confirmed_snapshot():
+    """展示口径:确认快照优先(带数据集前缀、只收 float 指标),
+    run.metrics 被后续补跑/失败冲成 null 也不能抹掉已确认的基线。"""
+    confirmed = {
+        "baseline_confirmed_json": json.dumps({"passed_at": "t", "datasets": {
+            "BTMRI-10": {"metrics": {"val_dice": 0.2652, "train_loss": 0.8442,
+                                      "seed": 1, "config_file": "c.yaml",
+                                      "returncode": 0}}}}),
+        # 真机事故现场:确认后队列跑到下一个档位被杀 → metrics null
+        "baseline_run_json": json.dumps({"status": "finished", "metrics": None}),
+    }
+    assert baseline_queue.baseline_metrics_display(confirmed) == {
+        "BTMRI-10·val_dice": 0.2652, "BTMRI-10·train_loss": 0.8442}
+    # 未确认:回落最后一次 run 的指标(旧单数据集行为不变)
+    legacy = {"baseline_run_json": json.dumps({"metrics": {"val_dice": 0.8}})}
+    assert baseline_queue.baseline_metrics_display(legacy) == {"val_dice": 0.8}
+    assert baseline_queue.baseline_metrics_display({}) is None

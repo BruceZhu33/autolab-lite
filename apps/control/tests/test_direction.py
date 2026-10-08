@@ -121,3 +121,30 @@ def test_board_review_cell_reflects_direction(api, based):
                 json={"text": "方向:稳定性", "confirm": True}, headers=owner)
     assert cell()["state"] == "done"
     assert "方向已确立" in cell()["summary"]
+
+
+def test_direction_confirm_requires_baseline(api, tmp_path):
+    """方向确认与 LLM 草稿同门:没有基线指标,确认被拒(无根之木);
+    未确认的草稿保存不受影响。"""
+    client = api["client"]
+    owner = {"Authorization": f"Bearer {OWNER}"}
+    servers = client.get("/api/servers",
+                         headers={"Authorization": f"Bearer {AGENT}"}).json()
+    local = next(s for s in servers if s["transport_mode"] == "local")
+    workdir = tmp_path / "nobl-ws"
+    workdir.mkdir()
+    project = client.post("/api/owner/projects", json={
+        "name": "dir-nobl", "server_id": local["id"], "workdir": str(workdir),
+    }, headers=owner).json()["project"]
+
+    denied = client.post(
+        f"/api/owner/projects/{project['id']}/direction",
+        json={"text": "沿半监督路线迭代", "confirm": True}, headers=owner)
+    assert denied.status_code == 409
+    assert "Baseline" in denied.json()["detail"]
+
+    draft = client.post(
+        f"/api/owner/projects/{project['id']}/direction",
+        json={"text": "先存草稿不确认", "confirm": False}, headers=owner)
+    assert draft.status_code == 200
+    assert draft.json()["confirmedAt"] is None

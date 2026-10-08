@@ -79,6 +79,13 @@ def derive_project_stage(
             if requested:
                 return "baseline"
         return "prepare"
+    # 基线是迭代的地基:未通过基线的项目最多走到 Baseline 列。入口
+    # (循环/计划/方向确认)都有硬门,这里是派生层兜底——重置基线后,
+    # 遗留的迭代 Plan 不该把项目钉在 iterate/confirm,让"没有基线
+    # 却在迭代"的错觉复活(真机事故)。基线轮 Plan 在跑仍是 baseline。
+    # 放在 DRAFT 分支之后:更新的草案仍回待计划列(批准才是最要紧的事)。
+    if not project.get("baseline_passed_at"):
+        return "baseline"
     if (
         project.get("post_review_stage") in ("confirm", "done")
         and project.get("post_review_plan_id") == latest_plan["id"]

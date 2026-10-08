@@ -279,6 +279,11 @@ def start_loop(repo: Repo, project_id: str, *, max_rounds: int = 0,
     project = repo.get_project(project_id)
     if project is None:
         raise LoopError("项目不存在")
+    # 基线是迭代的地基(产品铁律:迭代只立在 Baseline 确认过的指标上,
+    # 且只能选跑过的数据集)——没有基线就没有"超越基线"可比
+    if not project.get("baseline_passed_at"):
+        raise LoopError("还没跑通 Baseline:迭代必须立在基线指标上,"
+                        "先在 Baseline 页跑通并确认")
     # D-028 双门:已确认方向(新流程)或已采纳方案(旧流程),任一即可
     has_direction = bool((project.get("direction_text") or "").strip()
                          and project.get("direction_confirmed_at"))

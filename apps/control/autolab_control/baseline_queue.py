@@ -219,6 +219,32 @@ def confirmed_datasets(project: dict) -> dict[str, dict]:
             for p in progress}
 
 
+def baseline_metrics_display(project: dict) -> dict | None:
+    """迭代/方向页的基线指标展示口径:确认快照优先(确认过 = 权威),
+    未确认回落最后一次 run 的指标。
+
+    联合基线没有单一基线 → 快照键带数据集前缀(Kvasir·val_dice),
+    展示胶囊不撒谎;只收 float——适配器 metrics.json 混着 config_file/
+    seed/returncode 等回显字段,整数与字符串不是指标。run.metrics
+    会被后续队列动作冲掉(确认后补跑档位失败 → null),已确认的基线
+    不能跟着消失(真机事故:迭代页基线显示 null,像"从没跑过基线")。"""
+    out: dict[str, float] = {}
+    for name, info in confirmed_datasets(project).items():
+        metrics = info.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        for key, value in metrics.items():
+            if isinstance(value, float) and value == value:  # 排 NaN
+                out.setdefault(f"{name}·{key}", value)
+    if out:
+        return out
+    try:
+        metrics = json.loads(project.get("baseline_run_json") or "{}").get("metrics")
+    except Exception:
+        return None
+    return metrics if isinstance(metrics, dict) and metrics else None
+
+
 # ------------------------------------------------------------------ 起跑/推进
 
 def _persist(repo: Repo, project_id: str, run: dict) -> None:
@@ -410,7 +436,43 @@ def sync_run(repo: Repo, credentials: CredentialStore, hostkeys_path: Path,
 
 # ------------------------------------------------------------------ 确认门
 
-def confirm_pass(repo: Repo, project: dict) -> dict:
+def _stop_active_run(repo: Repo, project: dict, *, credentials=None,
+                     hostkeys_path=None) -> str | None:
+    """确认即定口径:停掉仍在跑的基线队列。渐进式确认的语义是
+    「这份快照就是基线」——确认后队列继续磨剩余档位(每个都可能
+    是满 epoch 配置)是无主见的 GPU 浪费(真机事故:确认后
+    BTMRI-100 磨了一天被手动杀掉)。想扩池:回来再起跑补跑,
+    然后追加确认。返回停止说明(未在跑 → None)。"""
+    run = normalize_run(project)
+    if run.get("status") != "running":
+        return None
+    remaining = len(run.get("queue") or [])
+    pid = run.get("pid")
+    if pid:
+        try:
+            server = repo.get_server(project["server_id"])
+            if server is not None and server["transport_mode"] == "ssh" \
+                    and credentials is not None:
+                with server_admin.connect_ssh(server, credentials, hostkeys_path) as t:
+                    t.exec_command(f"kill {int(pid)} 2>/dev/null")
+            elif server is not None and server["transport_mode"] != "ssh":
+                import os
+                import signal
+
+                os.kill(int(pid), signal.SIGTERM)
+        except Exception:
+            pass  # 杀不掉也会被 sync 的存活检测收敛;队列冻结才是硬保证
+    run.update({"status": "stopped", "queue": [], "exit_code": None})
+    _persist(repo, project["id"], run)
+    note = (f"基线已确认:停止基线队列(当前档 {run.get('dataset')},"
+            f"剩余 {remaining} 个档位未跑;想扩池再起跑补跑,然后追加确认)")
+    repo.add_review_message(project_id=project["id"], role="system", kind="text",
+                            content=f"⏹ {note}")
+    return note
+
+
+def confirm_pass(repo: Repo, project: dict, *, credentials=None,
+                 hostkeys_path=None) -> dict:
     """人工确认通过(渐进式基线):至少 1 个数据集 跑通+有指标 即可确认,
     快照只收录已跑通的数据集(自动迭代的数据集可选池)。
 
@@ -439,20 +501,28 @@ def confirm_pass(repo: Repo, project: dict) -> dict:
                             baseline_confirmed_json=json.dumps(
                                 {"passed_at": now, "datasets": snapshot},
                                 ensure_ascii=False))
-        return {"projectId": project["id"], "passed": True, "replayed": False,
-                "datasets": snapshot}
-    if not newly_ok:
-        return {"projectId": project["id"], "passed": True, "replayed": True,
-                "datasets": snapshot}
-    # 追加确认:合并新跑通的数据集(未跑通的不拦——它们本来就不在池里)
-    for name, p in newly_ok.items():
-        snapshot[name] = {"metrics": p["metrics"], "command": p["command"],
-                          "dataset_path": p["datasetPath"]}
-    repo.update_project(project["id"], baseline_confirmed_json=json.dumps(
-        {"passed_at": project.get("baseline_passed_at"), "datasets": snapshot},
-        ensure_ascii=False))
-    return {"projectId": project["id"], "passed": True, "replayed": False,
-            "added": list(newly_ok.keys()), "datasets": snapshot}
+        result = {"projectId": project["id"], "passed": True, "replayed": False,
+                  "datasets": snapshot}
+    elif not newly_ok:
+        result = {"projectId": project["id"], "passed": True, "replayed": True,
+                  "datasets": snapshot}
+    else:
+        # 追加确认:合并新跑通的数据集(未跑通的不拦——它们本来就不在池里)
+        for name, p in newly_ok.items():
+            snapshot[name] = {"metrics": p["metrics"], "command": p["command"],
+                              "dataset_path": p["datasetPath"]}
+        repo.update_project(project["id"], baseline_confirmed_json=json.dumps(
+            {"passed_at": project.get("baseline_passed_at"), "datasets": snapshot},
+            ensure_ascii=False))
+        result = {"projectId": project["id"], "passed": True, "replayed": False,
+                  "added": list(newly_ok.keys()), "datasets": snapshot}
+    # 确认即定口径:停掉仍在跑的队列(防无主见的 GPU 消耗)
+    stopped = _stop_active_run(repo, repo.get_project(project["id"]),
+                               credentials=credentials,
+                               hostkeys_path=hostkeys_path)
+    if stopped:
+        result["queueStopped"] = stopped
+    return result
 
 
 # ------------------------------------------------------------------ 后台推进

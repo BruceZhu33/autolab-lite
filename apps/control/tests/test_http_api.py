@@ -297,6 +297,8 @@ def test_stage_advance_confirm_done(api):
         seq += 1
         repo.ingest_event(make_event(acquired.job, "job.succeeded", seq))
     project_id = result["plan"]["project_id"]
+    # 能走到 confirm/done 的项目,基线必然已通过(迭代建立在基线之上)
+    repo.update_project(project_id, baseline_passed_at="2026-09-19T00:00:00Z")
 
     def board_column():
         return api["client"].get("/api/board", headers=headers_agent).json()[0]["column"]

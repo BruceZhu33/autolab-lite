@@ -586,6 +586,13 @@ def set_project_direction(project_id: str, text: str = "",
                 "project_id": project_id,
                 "text": text or "(空 = 撤销方向)"}
     try:
+        # 与 POST /direction 同门:方向要立在基线指标上(空文本=撤销,放行)
+        project = _repo().get_project(project_id)
+        if project is None:
+            raise ToolError("项目不存在")
+        if text.strip() and not project.get("baseline_passed_at"):
+            raise ToolError("还没跑通 Baseline:方向要立在基线指标上,"
+                            "先在 Baseline 页跑通并确认")
         updated = _repo().set_project_direction(
             project_id, text.strip(), utc_now() if text.strip() else None)
     except RepoError as exc:
