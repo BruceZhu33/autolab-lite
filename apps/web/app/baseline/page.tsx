@@ -1,26 +1,27 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   Activity, AlertTriangle, CheckCircle2, ChevronDown, CircleDashed, CircleDot,
   CloudUpload, FileUp, FlaskConical, FolderKanban, HardDrive, Loader2, Package,
-  Play, RefreshCw, SearchCode, Sparkles, Terminal,
+  Play, RefreshCw, SearchCode, Sparkles, Terminal, Wand2,
 } from "lucide-react";
 import {
-  analyzeWorkspace, buildEnvironment, checkCodePresence, confirmBaselinePass,
-  onboardBaseline,
+  askBaselineAdvisor, buildEnvironment, checkCodePresence, confirmBaselinePass,
+  proposeBaselineIntake,
   fetchBaselineState, fixBaselineRun, fetchProjects,
   fetchServerEnvironments,
   pollBaselineRun, pollEnvBuild, provideAsset, runBaselineCheck,
   saveBaselineConfig, startBaselineRun, syncCode, uploadAsset,
-  type BaselineCheck, type BaselineConfig, type ProjectListItem,
-  type ServerEnvironment,
+  type BaselineCheck, type BaselineConfig, type BaselineIntakeProposal,
+  type ProjectListItem, type ServerEnvironment,
 } from "@/lib/api";
 import { LiveSessionCard } from "@/components/live-session-card";
 import { EmptyState } from "@/components/empty-state";
+import { FolderBrowserDialog } from "@/components/folder-browser";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { Progress } from "~/vendor/ui/components/ui/progress";
 import { Input } from "~/vendor/ui/components/ui/input";
@@ -38,9 +39,19 @@ const CHECK_COLOR: Record<BaselineCheck["status"], string> = {
   fail: "text-destructive",
 };
 
-type Step = "code" | "analyze" | "env" | "check" | "run" | "done";
+/** D-030 六步固定接入流程:确定性校验 + 提议确认,agent 只提议不自主执行。 */
+type Step = "code" | "assets" | "env" | "intake" | "run" | "confirm";
 
-const STEP_ORDER: Step[] = ["code", "analyze", "env", "check", "run"];
+const STEP_ORDER: Step[] = ["code", "assets", "env", "intake", "run", "confirm"];
+
+const STEP_SHORT: Record<Step, string> = {
+  code: "代码", assets: "资料", env: "环境", intake: "口径", run: "跑通", confirm: "确认",
+};
+
+const STEP_TITLES: Record<Step, string> = {
+  code: "代码就位", assets: "资料就位", env: "环境就位",
+  intake: "入口与口径", run: "跑通基线", confirm: "基线确认",
+};
 
 function StepHeader({ index, title, state }: {
   index: number; title: string; state: "done" | "active" | "pending" | "failed";
@@ -269,6 +280,7 @@ function AssetSupplyDialog({ project, initialTarget, onClose }: {
   const [serverPath, setServerPath] = useState("");
   const [zipFile, setZipFile] = useState<File | null>(null);
   const [busy, setBusy] = useState<"link" | "upload" | null>(null);
+  const [browsing, setBrowsing] = useState(false);
 
   const run = async (mode: "link" | "upload") => {
     if (!target.trim()) {
@@ -326,6 +338,13 @@ function AssetSupplyDialog({ project, initialTarget, onClose }: {
                    value={serverPath} placeholder="/data/datasets/Kvasir"
                    spellCheck={false}
                    onChange={(e) => setServerPath(e.target.value)} />
+            <Button variant="outline" size="sm" className="h-7 gap-1 px-2 text-micro"
+                    disabled={busy !== null}
+                    title="在服务器目录树里选(不用手抄路径)"
+                    onClick={() => setBrowsing(true)}>
+              <FolderKanban className="size-3" />
+              浏览
+            </Button>
             <Button size="sm" className="h-7 gap-1 px-2 text-micro"
                     disabled={busy !== null || !serverPath.trim()}
                     onClick={() => void run("link")}>
@@ -333,6 +352,11 @@ function AssetSupplyDialog({ project, initialTarget, onClose }: {
               链接
             </Button>
           </div>
+          <FolderBrowserDialog
+            open={browsing} onOpenChange={setBrowsing}
+            source={{ kind: "server", serverId: project.server.id }}
+            title="选服务器上的数据/权重目录"
+            onPick={(p) => { setServerPath(p); setBrowsing(false); }} />
         </div>
         <div className="rounded-md border-[0.5px] border-surface-border p-2">
           <p className="text-micro font-medium text-muted-foreground">
@@ -362,6 +386,7 @@ function DatasetSupplyInline({ project, target, label, onSupplied }: {
   const [serverPath, setServerPath] = useState("");
   const [zipFile, setZipFile] = useState<File | null>(null);
   const [busy, setBusy] = useState<"link" | "upload" | null>(null);
+  const [browsing, setBrowsing] = useState(false);
 
   const run = async (mode: "link" | "upload") => {
     setBusy(mode);
@@ -396,6 +421,13 @@ function DatasetSupplyInline({ project, target, label, onSupplied }: {
                value={serverPath} placeholder="服务器已有目录的绝对路径(推荐,秒链)"
                spellCheck={false}
                onChange={(e) => setServerPath(e.target.value)} />
+        <Button variant="outline" size="sm" className="h-7 gap-1 px-2 text-micro"
+                disabled={busy !== null}
+                title="在服务器目录树里选(不用手抄路径)"
+                onClick={() => setBrowsing(true)}>
+          <FolderKanban className="size-3" />
+          浏览
+        </Button>
         <Button size="sm" className="h-7 gap-1 px-2 text-micro"
                 disabled={busy !== null || !serverPath.trim()}
                 onClick={() => void run("link")}>
@@ -403,6 +435,11 @@ function DatasetSupplyInline({ project, target, label, onSupplied }: {
           链接
         </Button>
       </div>
+      <FolderBrowserDialog
+        open={browsing} onOpenChange={setBrowsing}
+        source={{ kind: "server", serverId: project.server.id }}
+        title={`选 ${label} 的服务器目录`}
+        onPick={(p) => { setServerPath(p); setBrowsing(false); }} />
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
         <Input type="file" accept=".zip" className="h-7 min-w-0 flex-1 text-micro"
                onChange={(e) => setZipFile(e.target.files?.[0] ?? null)} />
@@ -527,6 +564,133 @@ function DatasetsEditor({ project, config, disabled, onSaved }: {
   );
 }
 
+/** D-030 入口与口径提案表单:分析 Agent 的只读提案在此变成 owner 的
+ * 编辑稿——命令/环境/指标文件/口径清单逐项可改,「采用并保存」才落库。 */
+function IntakeProposalForm({ project, proposal, disabled, onAdopted, onDiscard }: {
+  project: ProjectListItem;
+  proposal: BaselineIntakeProposal;
+  disabled?: boolean;
+  onAdopted: () => void;
+  onDiscard: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const p = proposal.proposal;
+  const [command, setCommand] = useState(p.command);
+  const [condaEnv, setCondaEnv] = useState(p.conda_env);
+  const [metricFile, setMetricFile] = useState(p.metric_file);
+  const [rows, setRows] = useState(p.datasets.map((d) => ({ ...d })));
+  const [busy, setBusy] = useState(false);
+  const rowsValid = rows.length > 0
+    && rows.every((r) => r.name.trim() && r.command.trim());
+
+  const adopt = async () => {
+    setBusy(true);
+    try {
+      await saveBaselineConfig(project.id, {
+        datasets: rows, command, conda_env: condaEnv, metric_file: metricFile,
+      });
+      toast.success(`已采用并保存:${rows.length} 条口径(入口与口径已确认)`, {
+        description: "清单即 Baseline 真相源;缺的数据集到「资料就位」补,补齐后起跑",
+        duration: 8000,
+      });
+      void queryClient.invalidateQueries({ queryKey: ["baseline", project.id] });
+      onAdopted();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-2 rounded-lg border-[0.5px] border-brand/30 bg-brand/[0.03] p-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <Wand2 className="size-3.5 text-brand" />
+        <span className="text-caption font-semibold text-brand">
+          Agent 提案(未落库——检查每行后采用)
+        </span>
+        {proposal.fallback ? (
+          <span className="rounded-full bg-warning/10 px-2 py-0.5 text-micro font-medium text-warning">
+            规则法提案(分析会话不可用)
+          </span>
+        ) : null}
+        <span className="ml-auto flex gap-1.5">
+          <Button variant="outline" size="sm" className="h-7 px-2 text-micro"
+                  disabled={busy || disabled} onClick={onDiscard}>
+            放弃
+          </Button>
+          <Button size="sm" className="h-7 gap-1 px-2.5 text-micro"
+                  disabled={busy || disabled || !rowsValid || !command.trim()}
+                  onClick={() => void adopt()}>
+            {busy ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+            采用并保存
+          </Button>
+        </span>
+      </div>
+      <div className="mt-2 grid gap-1.5 sm:grid-cols-3">
+        <label className="grid gap-1">
+          <span className="text-micro text-muted-foreground">默认命令(清单首行会镜像)</span>
+          <Input className="h-7 font-mono text-micro" value={command} spellCheck={false}
+                 onChange={(e) => setCommand(e.target.value)} />
+        </label>
+        <label className="grid gap-1">
+          <span className="text-micro text-muted-foreground">conda 环境(建议,可改选)</span>
+          <Input className="h-7 font-mono text-micro" value={condaEnv} spellCheck={false}
+                 placeholder="未定"
+                 onChange={(e) => setCondaEnv(e.target.value)} />
+        </label>
+        <label className="grid gap-1">
+          <span className="text-micro text-muted-foreground">指标文件</span>
+          <Input className="h-7 font-mono text-micro" value={metricFile} spellCheck={false}
+                 onChange={(e) => setMetricFile(e.target.value)} />
+        </label>
+      </div>
+      <div className="mt-2 space-y-1.5">
+        {rows.map((row, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <Input className="h-7 w-28 shrink-0 font-mono text-micro"
+                   value={row.name} placeholder="名称(Kvasir-10)" spellCheck={false}
+                   onChange={(e) => setRows(rows.map((r, j) =>
+                     j === i ? { ...r, name: e.target.value } : r))} />
+            <Input className="h-7 min-w-0 flex-1 font-mono text-micro"
+                   value={row.command} placeholder="训练命令(3ep 冒烟档)" spellCheck={false}
+                   onChange={(e) => setRows(rows.map((r, j) =>
+                     j === i ? { ...r, command: e.target.value } : r))} />
+            <Input className="h-7 w-36 shrink-0 font-mono text-micro"
+                   value={row.dataset_path} placeholder="data/Kvasir" spellCheck={false}
+                   onChange={(e) => setRows(rows.map((r, j) =>
+                     j === i ? { ...r, dataset_path: e.target.value } : r))} />
+            <Button variant="ghost" size="sm" className="size-7 shrink-0 p-0 text-muted-foreground"
+                    disabled={busy || disabled || rows.length <= 1}
+                    title="移除该行" onClick={() => setRows(rows.filter((r, j) => j !== i))}>
+              ×
+            </Button>
+          </div>
+        ))}
+        <Button variant="outline" size="sm" className="h-7 px-2 text-micro"
+                disabled={busy || disabled}
+                onClick={() => setRows([...rows, { name: "", command: "", dataset_path: "" }])}>
+          加一行
+        </Button>
+      </div>
+      {Object.keys(proposal.evidence).length > 0 ? (
+        <details className="mt-1.5">
+          <summary className="cursor-pointer text-micro text-muted-foreground">
+            提案出处(evidence)
+          </summary>
+          <ul className="mt-1 space-y-0.5">
+            {Object.entries(proposal.evidence).map(([k, v]) => (
+              <li key={k} className="text-micro text-muted-foreground">
+                <span className="font-medium">{k}</span>:{String(v).slice(0, 160)}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
 function BaselinePanel({ project, onLockChange }: {
   project: ProjectListItem;
   /** 一键执行期间向上通报锁定(页级项目切换tabs同步禁用) */
@@ -543,7 +707,8 @@ function BaselinePanel({ project, onLockChange }: {
   const [envPid, setEnvPid] = useState<number | null>(null);
   const [gap, setGap] = useState<{ kind: "dataset" | "command"; hint: string } | null>(null);
   const [gapValue, setGapValue] = useState("");
-  const autoDetected = useRef(false);
+  // 步骤折叠覆盖(声明在此:一键走流程的 stopAt 要用;stepOpen/toggleStep 在下方)
+  const [openSteps, setOpenSteps] = useState<Partial<Record<Step, boolean>>>({});
 
   // 一键执行中:计时(配置中的"活着"信号)+ 通知页级锁定
   const autoBusy = busy === "auto";
@@ -568,26 +733,6 @@ function BaselinePanel({ project, onLockChange }: {
     refetchInterval: (query) => (envPid ?? 0) > 0 ? 2000 : false,
     enabled: !!envPid,
   });
-
-  // Agent 自动监测:数据集清单为空时,扫工作区真实数据目录自动填入(每挂载一次)
-  useEffect(() => {
-    if (autoDetected.current || !state) return;
-    if ((state.config.datasets?.length ?? 0) > 0) return;
-    autoDetected.current = true;
-    void (async () => {
-      try {
-        const analysis = await analyzeWorkspace(project.id);
-        const found = analysis.applied.datasets ?? [];
-        if (found.length > 0) {
-          toast.success(`Agent 检测到 ${found.length} 个数据集,已自动填入清单`, {
-            description: found.map((d) => d.name).join("、") +
-              "(可在此增删改,百分比变体加一行即可)",
-          });
-          void refetch();
-        }
-      } catch { /* 检测失败静默:不打扰,清单仍可手填 */ }
-    })();
-  }, [state]);
 
   const refreshAll = () => {
     void refetch();
@@ -657,13 +802,62 @@ function BaselinePanel({ project, onLockChange }: {
     return { ok: !hardFail, datasetMissing: datasetFail };
   };
 
-  /** Agent 一键 Baseline:就位 → 分析(内部配置) → 构建环境 → 数据集检查 → 跑。 */
+  /** D-030 提议:分析 Agent(只读)读代码 → 入口/口径清单(3ep 冒烟档)提案。
+   * 只返回提案不落库;owner 在「入口与口径」步骤编辑后采用保存。 */
+  const [proposal, setProposal] = useState<BaselineIntakeProposal | null>(null);
+  const [proposing, setProposing] = useState(false);
+  const propose = async (): Promise<boolean> => {
+    setProposing(true);
+    setProposal(null);
+    try {
+      const p = await proposeBaselineIntake(project.id);
+      setProposal(p);
+      toast.success(`提议完成:${p.proposal.datasets.length} 条口径(带 3ep 冒烟档)`, {
+        description: (p.fallback ? "规则法提案(分析会话不可用):" : "检查每条命令与路径后点「采用并保存」;")
+          + Object.entries(p.evidence).filter(([k]) => k !== "analyzer_session")
+            .slice(0, 2).map(([k, v]) => `${k}: ${String(v).slice(0, 60)}`).join(";"),
+        duration: 10000,
+      });
+      return true;
+    } catch (e) {
+      toast.error(`提议失败:${(e as Error).message}`, {
+        description: "可在「入口与口径」步骤手工填清单,或补齐资料后再试",
+      });
+      return false;
+    } finally {
+      setProposing(false);
+    }
+  };
+
+  /** 流程助手(D-030):单发 LLM「缺什么/放哪/下一步」;条件变化即失效。 */
+  const [advice, setAdvice] = useState<string | null>(null);
+  const [advising, setAdvising] = useState(false);
+  const askAdvice = async () => {
+    setAdvising(true);
+    try {
+      const r = await askBaselineAdvisor(project.id);
+      setAdvice(r.advice);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setAdvising(false);
+    }
+  };
+  useEffect(() => { setAdvice(null); }, [state?.checks, state?.config]);
+
+  /** 一键走流程(D-030):按六步固定流程顺序推进确定性步骤,遇缺口/待确认
+   * 就停在对应步骤——不再有自主探索会话;提议结果永远等 owner 编辑确认。 */
   const runAuto = async () => {
     setBusy("auto");
     setGap(null);
     setStepState({});
+    const stopAt = (step: Step, why: string) => {
+      setStepState((s) => ({ ...s, [step]: "active" }));
+      setOpenSteps((m) => ({ ...m, [step]: true }));
+      toast.info(`停在「${STEP_TITLES[step]}」:${why}`, { duration: 6000 });
+    };
     try {
-      // ① 代码就位
+      // ① 代码就位(确定性)
       setStepState((s) => ({ ...s, code: "active" }));
       const code = await doCodeCheck();
       let present = code.present;
@@ -672,88 +866,55 @@ function BaselinePanel({ project, onLockChange }: {
         present = await doCodeSync();
       }
       if (!present) {
-        fail("code", "代码未就位:请在项目编辑里补 GitHub 链接或本地工作区路径,再点一键 Baseline");
+        fail("code", "代码未就位:请在项目编辑里补 GitHub 链接或本地工作区路径");
         return;
       }
       setStepState((s) => ({ ...s, code: "done" }));
 
-      // ② 工程接入(D-029):未接入 → 接入 Agent(识别/适配器/口径清单/环境/冒烟);
-      //    已接入 → 沿用只读分析补缺(环境计划等)。会话时间线在下方 LiveSessionCard 可见。
-      setStepState((s) => ({ ...s, analyze: "active" }));
-      let analysis: Awaited<ReturnType<typeof analyzeWorkspace>> | null = null;
-      let onboardDone = !!state?.config.onboarded;
-      if (!onboardDone) {
-        try {
-          toast.info("接入 Agent 正在识别工程:适配口径、生成清单、冒烟自验…", {
-            description: "全过程见下方会话时间线;真基线仍由你确认后才跑",
-          });
-          const done = await onboardBaseline(project.id);
-          onboardDone = true;
-          toast.success(`工程接入完成:${done.notes || "口径清单已生成"}`, {
-            description: `适配器 ${done.adapterReused ? "复用既有" : (done.adapter || "无需")}`
-              + ` · 清单 ${done.datasets.length} 条 · 环境 ${done.condaEnv || "未定"}`
-              + ` · 冒烟 ${done.smokeOk ? "通过" : "未通过(首跑可能需修复)"}`,
-            duration: 10000,
-          });
-          await refetch();
-        } catch (e) {
-          setStepState((s) => ({ ...s, analyze: "failed" }));
-          fail("analyze", `工程接入失败:${(e as Error).message}`);
-          return;
-        }
-      }
-      if (!onboardDone) {
-        // 接入端点未落库(异常回落)时保底:只读分析
-        analysis = await analyzeWorkspace(project.id);
-        setEnvPlan(analysis.envPlan);
-        if (!analysis.applied.command) {
-          setStepState((s) => ({ ...s, analyze: "failed" }));
-          setGap({ kind: "command", hint: "Agent 读了代码/README 也没认出训练入口,告诉你它怎么跑:" });
-          toast.error("无法确定训练命令");
-          return;
-        }
-      }
-      setStepState((s) => ({ ...s, analyze: "done" }));
-
-      // ③ 环境构建(有依赖文件才构建;失败亮日志)——接入路径的 conda_env
-      //    由接入 Agent 选定,环境构建仅兜底(接入通常直接选了现有环境)
-      const envPlan = analysis?.envPlan;
-      if (envPlan?.command) {
-        setStepState((s) => ({ ...s, env: "active" }));
-        toast.info(`环境构建中:${envPlan.detail}`);
-        const built = await doEnvBuildAndWait();
-        if (!built) {
-          fail("env", "环境构建失败:看下方日志,按提示在服务器上处理(缺系统库/网络/权限)后重试");
-          return;
-        }
-        setStepState((s) => ({ ...s, env: "done" }));
-      } else {
-        setStepState((s) => ({ ...s, env: "done" }));
-      }
-
-      // ④ 数据集与环境检查
-      setStepState((s) => ({ ...s, check: "active" }));
-      const check = await doCheck();
-      if (check.datasetMissing) {
-        setStepState((s) => ({ ...s, check: "failed" }));
-        setGap({ kind: "dataset", hint: "服务器上没找到数据集:把数据集放上去后填路径,或直接告诉我路径:" });
-        toast.error("数据集缺失");
+      // ② 体检 → 资料缺口(确定性):缺数据集/权重就停在这步补
+      setStepState((s) => ({ ...s, assets: "active" }));
+      const fresh = await runBaselineCheck(project.id);
+      void refetch();
+      const gaps = fresh.checks.filter((c) =>
+        c.status === "fail" && (c.supply?.length ?? 0) > 0);
+      const hardFails = fresh.checks.filter((c) =>
+        c.status === "fail" && !(c.supply?.length ?? 0));
+      if (gaps.length > 0 || hardFails.length > 0) {
+        setStepState((s) => ({ ...s, assets: gaps.length > 0 ? "active" : "failed" }));
+        stopAt("assets", gaps.length > 0
+          ? `缺资料 ${gaps.length} 项(在下方链接或上传补齐,补完自动复核)`
+          : `体检有 ${hardFails.length} 项阻塞`);
         return;
       }
-      if (!check.ok) {
-        fail("check", "环境检查未通过:见下方清单,红色项需要处理");
+      setStepState((s) => ({ ...s, assets: "done" }));
+
+      // ③/④ 环境与口径:口径未确认 → 先提议(提案里带环境建议),停④等编辑;
+      //    口径已确认但环境没选 → 停③
+      const confirmed = !!state?.config.onboarded
+        && (state?.config.datasets?.length ?? 0) > 0;
+      if (!confirmed) {
+        setStepState((s) => ({ ...s, intake: "active" }));
+        const ok = await propose();
+        stopAt("intake", ok
+          ? "Agent 已提议入口与口径清单——检查/编辑后点「采用并保存」(环境建议也在提案里)"
+          : "提议会话不可用——手工填清单,或补齐资料后重试");
         return;
       }
-      setStepState((s) => ({ ...s, check: "done" }));
+      setStepState((s) => ({ ...s, intake: "done" }));
+      if (!state?.config.conda_env) {
+        stopAt("env", "还没选 conda 环境(点选已有环境;提案未采用时可先在④采用)");
+        return;
+      }
+      setStepState((s) => ({ ...s, env: "done" }));
 
-      // ⑤ 跑(联合基线:只排队体检就绪的,未就绪的自动跳过)
+      // ⑤ 冒烟起跑(确定性:清单首档;未就绪的自动跳过)
       setStepState((s) => ({ ...s, run: "active" }));
       const run = await startBaselineRun(project.id);
       const skippedNote = (run as { skipped?: string[] }).skipped?.length
         ? `;跳过未就绪 ${((run as { skipped?: string[] }).skipped ?? []).length} 个(补齐后追加)`
         : "";
       toast.success(
-        `Agent 已在 ${project.server.name} 上起跑 ${run.dataset}(PID ${run.pid})`, {
+        `已在 ${project.server.name} 上起跑 ${run.dataset}(PID ${run.pid})`, {
           description: run.queue.length > 0
             ? `联合基线队列:${[run.dataset, ...run.queue].join(" → ")}${skippedNote}`
             : `结果和日志在下方实时刷新;跑通且有指标即可确认通过${skippedNote}`,
@@ -845,18 +1006,35 @@ function BaselinePanel({ project, onLockChange }: {
   const isLocal = project.server.transport_mode !== "ssh";
   const anyActive = busy === "auto" || running;
 
+  /** 六步状态全部派生(D-030:确定性校验,无持久化 workflow 状态)。
+   * 一键走流程的 stepState 覆盖优先(执行中的实时步)。 */
+  const supplyGapCount = checks.filter((c) =>
+    c.status === "fail" && (c.supply?.length ?? 0) > 0).length;
+  const hardFailCount = checks.filter((c) =>
+    c.status === "fail" && !(c.supply?.length ?? 0)).length;
+  const intakeConfirmed = !!state?.config.onboarded
+    && (state?.config.datasets?.length ?? 0) > 0;
+  const anyOk = (state?.datasets ?? []).some((d) => d.ok);
   const stepStatus = (step: Step): "done" | "active" | "pending" | "failed" =>
     stepState[step]
     ?? (step === "code" && codeReady === true ? "done"
       : step === "code" && codeReady === false ? "failed"
-      : step === "analyze" && state?.config.onboarded ? "done"
-      : step === "env" && envDone ? "done"
+      : step === "assets"
+        ? (checks.length === 0 ? "pending"
+          : hardFailCount > 0 ? "failed"
+          : supplyGapCount > 0 ? "active" : "done")
+      : step === "env" && state?.config.conda_env ? "done"
+      : step === "intake" && intakeConfirmed ? "done"
+      : step === "intake" && (proposing || proposal) ? "active"
       : step === "run" && passed ? "done"
       : step === "run" && running ? "active"
+      : step === "run" && anyOk ? "done"
+      : step === "run" && run?.status === "finished" ? "failed"
+      : step === "confirm" && passed ? "done"
+      : step === "confirm" && (passed || anyOk) ? "active"
       : "pending");
 
   // 串行展开:默认只展开第一个未完成步骤(失败强制展开);点击标题可覆盖
-  const [openSteps, setOpenSteps] = useState<Partial<Record<Step, boolean>>>({});
   const stepOpen = (s: Step): boolean => {
     if (s in openSteps) return !!openSteps[s];
     if (stepStatus(s) === "failed") return true;
@@ -899,9 +1077,51 @@ function BaselinePanel({ project, onLockChange }: {
                 {busy === "auto"
                   ? <Loader2 className="size-3.5 animate-spin" />
                   : <Sparkles className="size-3.5" />}
-                {busy === "auto" ? `配置中… ${autoSeconds}s` : "Agent 一键 Baseline"}
+                {busy === "auto" ? `走流程中… ${autoSeconds}s` : "一键走流程"}
               </Button>
             )}
+          </span>
+        </div>
+
+        {/* 流程助手条(D-030):确定性六步点列 + 缺口计数 + Agent 单发建议。
+            流程是写死的,agent 只做总揽——告诉你缺什么、放哪、下一步点什么。 */}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-surface-border px-4 py-2.5">
+          {STEP_ORDER.map((s, i) => {
+            const st = stepStatus(s);
+            return (
+              <span key={s} className="flex items-center gap-1">
+                <span className={`size-2 shrink-0 rounded-full ${
+                  st === "done" ? "bg-success"
+                  : st === "active" ? "bg-brand animate-pulse"
+                  : st === "failed" ? "bg-destructive" : "bg-muted-foreground/30"}`} />
+                <span className={`text-micro ${st === "pending" ? "text-muted-foreground/60" : "font-medium text-foreground"}`}>
+                  {i + 1}·{STEP_SHORT[s]}
+                </span>
+              </span>
+            );
+          })}
+          <span className="text-micro text-muted-foreground">
+            {supplyGapCount > 0 ? `资料缺 ${supplyGapCount}` : ""}
+            {supplyGapCount > 0 && !state?.config.conda_env ? " · " : ""}
+            {!state?.config.conda_env ? "环境未选" : ""}
+            {!state?.config.conda_env && !intakeConfirmed ? " · " : ""}
+            {!intakeConfirmed ? "口径未确认" : ""}
+            {supplyGapCount === 0 && state?.config.conda_env && intakeConfirmed
+              ? "前置就绪,可起跑" : ""}
+          </span>
+          <span className="ml-auto flex items-center gap-1.5">
+            {advising || advice ? (
+              <span className="max-w-md truncate rounded-lg border-[0.5px] border-brand/25 bg-brand/5 px-2 py-1 text-micro text-foreground"
+                    title={advice ?? ""}>
+                <Wand2 className="mr-1 inline size-3 text-brand" />
+                {advising ? "Agent 分析中…" : advice}
+              </span>
+            ) : null}
+            <Button variant="outline" size="sm" className="h-6 gap-1 px-2 text-micro"
+                    disabled={advising || busy !== null} onClick={() => void askAdvice()}>
+              {advising ? <Loader2 className="size-3 animate-spin" /> : <Wand2 className="size-3" />}
+              Agent 分析下一步
+            </Button>
           </span>
         </div>
 
@@ -939,73 +1159,24 @@ function BaselinePanel({ project, onLockChange }: {
               {syncDetail ? <p className="text-micro text-muted-foreground">上次同步:{syncDetail}</p> : null}
             </StepSection>
 
-            {/* ② 工程接入(D-029):Agent 识别工程/适配器/口径清单/环境/冒烟。
-                会话时间线就嵌在这步里——配置中能实时看到 Agent 在干什么,
-                而不是只有一句 toast(用户反馈:一键接入反馈不实时)。 */}
-            <StepSection index={2} title="工程接入(Agent)" locked={autoBusy}
-                         state={stepStatus("analyze")}
-                         summary={stepState.analyze === "active"
-                           ? `配置中 · ${autoSeconds}s(会话时间线见本步内)`
-                           : state?.config.onboarded
-                             ? `已接入${state.config.adapter ? ` · 适配器 ${String(state.config.adapter).split("/").pop()}` : ""}`
-                             : "识别工程形态 → 生成适配器与口径清单 → 冒烟自验"}
-                         open={stepOpen("analyze")} onToggle={() => toggleStep("analyze")}>
-              {stepState.analyze === "active" ? (
-                <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-brand/30 bg-brand/5 px-2.5 py-2">
-                  <Loader2 className="size-3.5 shrink-0 animate-spin text-brand" />
-                  <span className="text-caption font-semibold text-brand">
-                    配置中 · {autoSeconds}s
-                  </span>
-                  <span className="text-micro text-muted-foreground">
-                    接入 Agent 正在读工作区(入口/configs/数据目录),生成适配器与口径清单;
-                    期间界面锁定,可看下方时间线,也可注入引导
-                  </span>
-                </div>
-              ) : null}
-              <LiveSessionCard projectId={project.id} />
-            </StepSection>
-
-            {/* ③ 环境构建 */}
-            <StepSection index={3} title="构建 / 选择环境" state={stepStatus("env")} locked={autoBusy}
-                         summary={envDone ? "环境就绪" : (envPlan?.detail || "Agent 分析依赖后自动构建")}
-                         open={stepOpen("env")} onToggle={() => toggleStep("env")}>
-              {envPlan ? (
-                <div className="rounded-lg bg-muted/40 p-2.5">
-                  <p className="text-caption text-muted-foreground">{envPlan.detail}</p>
-                  {envPlan.command ? (
-                    <pre className="mt-1 overflow-x-auto font-mono text-micro text-muted-foreground">{envPlan.command}</pre>
-                  ) : (
-                    <p className="mt-1 text-caption text-warning">无依赖文件:跳过构建(需要特定环境时 Agent 会在检查环节发现)</p>
-                  )}
-                </div>
-              ) : (
-                <p className="text-caption text-muted-foreground">Agent 分析依赖后自动构建(requirements/environment.yml)</p>
-              )}
-              {envState && envState.status !== "idle" && envState.log_tail ? (
-                <pre className="max-h-28 overflow-y-auto rounded-lg bg-muted/50 p-2 font-mono text-micro leading-relaxed">
-{envState.log_tail}
-                </pre>
-              ) : null}
-              {envState?.status === "finished" && envState.exit_code !== null ? (
-                <p className={`text-caption ${envState.exit_code === 0 ? "text-success" : "text-destructive"}`}>
-                  构建退出码 {envState.exit_code}
-                  {envState.exit_code !== 0 ? " —— 按日志提示在服务器上处理(缺系统库/网络/权限)后重试" : ""}
-                </p>
-              ) : null}
-              <EnvPicker project={project} currentEnv={state?.config.conda_env ?? ""} />
-            </StepSection>
-
-            {/* ④ 数据集与环境检查 */}
-            <StepSection index={4} title="数据集与环境检查" state={stepStatus("check")} locked={autoBusy}
-                         summary={checks.length > 0
-                           ? (() => {
+            {/* ② 资料就位(D-030 资料槽):体检派生的确定性缺口——数据集/权重/
+                声明路径;每槽 = 链接服务器目录 或 上传 zip,补完自动复核。 */}
+            <StepSection index={2} title="资料就位" state={stepStatus("assets")} locked={autoBusy}
+                         summary={checks.length === 0
+                           ? "跑一次体检看缺什么(代码/数据/权重/环境)"
+                           : (() => {
+                               const gapsN = checks.filter((c) =>
+                                 c.status === "fail" && (c.supply?.length ?? 0) > 0).length;
+                               const hardN = checks.filter((c) =>
+                                 c.status === "fail" && !(c.supply?.length ?? 0)).length;
                                const okN = checks.filter((c) => c.status === "ok").length;
-                               const warnN = checks.filter((c) => c.status === "warn").length;
-                               const failN = checks.filter((c) => c.status === "fail").length;
-                               return `${okN} 通过${warnN ? ` · ${warnN} 待补` : ""}${failN ? ` · ${failN} 阻塞` : ""}`;
-                             })()
-                           : "Agent 复核数据集就位与运行环境"}
-                         open={stepOpen("check")} onToggle={() => toggleStep("check")}>
+                               return gapsN > 0
+                                 ? `缺资料 ${gapsN} 项(链接或上传即就位)`
+                                 : hardN > 0
+                                   ? `${okN} 通过 · ${hardN} 项阻塞`
+                                   : `${okN} 项通过,资料齐`;
+                             })()}
+                         open={stepOpen("assets")} onToggle={() => toggleStep("assets")}>
               {failedSupplies.length > 0 ? (
                 <div className="space-y-2">
                   <p className="text-caption text-muted-foreground">
@@ -1037,30 +1208,125 @@ function BaselinePanel({ project, onLockChange }: {
                   ))}
                 </div>
               ) : (
-                <p className="text-caption text-muted-foreground">数据集在服务器上就位即可通过;缺了 Agent 会停下来找你</p>
+                <p className="text-caption text-muted-foreground">
+                  体检扫描服务器工作区:数据集/权重在位即可通过,缺了会在这里列出归位路径
+                </p>
               )}
               <Button variant="outline" size="sm" className="h-7 gap-1 px-2 text-caption"
                       disabled={busy !== null} onClick={() => void doCheck()}>
                 <SearchCode className="size-3" />
-                重新检查
+                重新体检
               </Button>
-              {state?.config.command ? (
+            </StepSection>
+
+            {/* ③ 环境就位:点选服务器已有环境(确定性);没有合适的在服务器上建好再探测 */}
+            <StepSection index={3} title="环境就位" state={stepStatus("env")} locked={autoBusy}
+                         summary={state?.config.conda_env
+                           ? `已选 ${state.config.conda_env}`
+                           : "点选服务器已有 conda 环境(含 torch/CUDA 探测)"}
+                         open={stepOpen("env")} onToggle={() => toggleStep("env")}>
+              {envPlan ? (
+                <div className="rounded-lg bg-muted/40 p-2.5">
+                  <p className="text-caption text-muted-foreground">{envPlan.detail}</p>
+                  {envPlan.command ? (
+                    <pre className="mt-1 overflow-x-auto font-mono text-micro text-muted-foreground">{envPlan.command}</pre>
+                  ) : (
+                    <p className="mt-1 text-caption text-warning">无依赖文件:跳过构建(需要特定环境时在服务器上 conda env create 后重探测)</p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-caption text-muted-foreground">
+                  从服务器已有环境里点选(提案若给了建议会预填);没有合适的环境,在服务器上
+                  用 requirements/environment.yml 建好后重探测。
+                </p>
+              )}
+              {envState && envState.status !== "idle" && envState.log_tail ? (
+                <pre className="max-h-28 overflow-y-auto rounded-lg bg-muted/50 p-2 font-mono text-micro leading-relaxed">
+{envState.log_tail}
+                </pre>
+              ) : null}
+              {envState?.status === "finished" && envState.exit_code !== null ? (
+                <p className={`text-caption ${envState.exit_code === 0 ? "text-success" : "text-destructive"}`}>
+                  构建退出码 {envState.exit_code}
+                  {envState.exit_code !== 0 ? " —— 按日志提示在服务器上处理(缺系统库/网络/权限)后重试" : ""}
+                </p>
+              ) : null}
+              <EnvPicker project={project} currentEnv={state?.config.conda_env ?? ""} />
+            </StepSection>
+
+            {/* ④ 入口与口径(D-030 提议制):分析 Agent(只读)读代码 → 提案
+                (入口命令/口径清单 3ep 冒烟档/环境建议/证据)→ owner 编辑 →
+                采用保存。agent 只提议,永远不直接落库。 */}
+            <StepSection index={4} title="入口与口径(提议制)" state={stepStatus("intake")} locked={autoBusy || proposing}
+                         summary={proposing
+                           ? `Agent 读代码提议中 · ${autoSeconds}s(时间线见本步内)`
+                           : proposal
+                             ? "已有提案待你检查/编辑后采用"
+                             : state?.config.onboarded
+                               ? `已确认 · ${(state.config.datasets?.length ?? 0)} 条口径`
+                               : "让 Agent 读代码提议入口命令与口径清单,或手工填写"}
+                         open={stepOpen("intake")} onToggle={() => toggleStep("intake")}>
+              {proposing ? (
+                <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-brand/30 bg-brand/5 px-2.5 py-2">
+                  <Loader2 className="size-3.5 shrink-0 animate-spin text-brand" />
+                  <span className="text-caption font-semibold text-brand">
+                    提议中 · {autoSeconds}s
+                  </span>
+                  <span className="text-micro text-muted-foreground">
+                    分析 Agent 只读工作区(README/configs/入口 argparse/数据目录),
+                    产出提案后你编辑确认——期间界面锁定,可看下方时间线或注入引导
+                  </span>
+                </div>
+              ) : null}
+              {proposing || proposal ? <LiveSessionCard projectId={project.id} /> : null}
+              {proposal ? (
+                <IntakeProposalForm project={project} proposal={proposal}
+                                    disabled={busy !== null}
+                                    onAdopted={() => {
+                                      setProposal(null);
+                                      void refetch();
+                                      void doCheck();
+                                    }}
+                                    onDiscard={() => setProposal(null)} />
+              ) : !state?.config.onboarded ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" className="h-7 gap-1 px-2.5 text-caption"
+                          disabled={busy !== null || proposing}
+                          onClick={() => void propose()}>
+                    {proposing ? <Loader2 className="size-3 animate-spin" /> : <Wand2 className="size-3.5" />}
+                    让 Agent 读代码提议
+                  </Button>
+                  <span className="text-micro text-muted-foreground">
+                    提案含入口命令、数据集×档位清单(3ep 冒烟档)、环境建议与出处;
+                    也可直接手工编辑清单(下方)再保存。
+                  </span>
+                </div>
+              ) : null}
+              {state?.config.command || state?.config.onboarded ? (
                 <div className="pt-1">
-                  {state.config.onboarded ? (
+                  {state?.config.onboarded ? (
                     <span className="mb-1.5 inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-micro font-medium text-success">
                       <CheckCircle2 className="size-3" />
-                      已由接入 Agent 适配{state.config.adapter ? ` · 适配器 ${state.config.adapter}` : ""}
+                      口径已确认(保存清单即确认;改动后重新保存)
                     </span>
                   ) : null}
                   <DatasetsEditor project={project} config={state.config}
                                   disabled={busy !== null || running}
                                   onSaved={() => void doCheck()} />
+                  {state?.config.onboarded ? (
+                    <Button variant="outline" size="sm" className="mt-1.5 h-7 gap-1 px-2 text-micro"
+                            disabled={busy !== null || proposing}
+                            onClick={() => void propose()}>
+                      <Wand2 className="size-3" />
+                      重新提议(覆盖下方提案,不改已保存清单)
+                    </Button>
+                  ) : null}
                 </div>
               ) : null}
             </StepSection>
 
             {/* ④ 跑通基线 */}
-            <StepSection index={5} title="跑通基线(Agent)" locked={autoBusy}
+            <StepSection index={5} title="跑通基线" locked={autoBusy}
                          summary={passed ? "已通过" : running ? "训练进行中"
                            : (state?.datasets?.length ?? 0) > 0
                              ? `${state!.datasets.filter((d) => d.ok).length}/${state!.datasets.length} 跑通`
@@ -1126,17 +1392,9 @@ function BaselinePanel({ project, onLockChange }: {
                     ))}
                   </div>
                   {passed && pendingAdopt.length > 0 ? (
-                    <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-success/30 bg-success/5 px-2.5 py-2">
-                      <span className="text-caption text-muted-foreground">
-                        {pendingAdopt.map((d) => d.name).join("、")} 跑通且拿到指标——
-                        纳入基线后自动迭代就能选它
-                      </span>
-                      <Button size="sm" className="ml-auto h-7 gap-1 px-2.5 text-caption"
-                              disabled={busy !== null} onClick={() => void confirmPass()}>
-                        {busy === "pass" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
-                        {busy === "pass" ? "纳入中…" : `纳入基线(${pendingAdopt.length})`}
-                      </Button>
-                    </div>
+                    <p className="mt-2 text-caption text-muted-foreground">
+                      {pendingAdopt.map((d) => d.name).join("、")} 新跑通——到「基线确认」步骤追加纳入
+                    </p>
                   ) : null}
                 </div>
               ) : null}
@@ -1168,6 +1426,53 @@ function BaselinePanel({ project, onLockChange }: {
               <p className="mt-1.5 text-caption text-muted-foreground">
                 命令/数据集清单/指标文件由 Agent 从代码里定,可在此改;确认通过后迭代只能选这些数据集。
               </p>
+            </StepSection>
+
+            {/* ⑥ 基线确认(人工确认门):≥1 数据集跑通有指标即可确认;确认即
+                定口径——快照指标、停剩余队列,迭代只能选确认池里的数据集。 */}
+            <StepSection index={6} title="基线确认" state={stepStatus("confirm")} locked={autoBusy}
+                         summary={passed
+                           ? `已确认 · ${timeAgo(state?.passedAt ?? "")} 起`
+                           : confirmable
+                             ? "已可确认(跑通且有指标)"
+                             : "≥1 个数据集跑通且有指标后在此确认"}
+                         open={stepOpen("confirm")} onToggle={() => toggleStep("confirm")}>
+              {passed ? (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-success/30 bg-success/5 px-2.5 py-2">
+                  <CheckCircle2 className="size-4 shrink-0 text-success" />
+                  <span className="text-caption text-success">
+                    Baseline 已确认:基线口径已定,方向页可提炼方向、迭代页可选池内数据集
+                  </span>
+                </div>
+              ) : confirmable ? (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-success/30 bg-success/5 px-2.5 py-2">
+                  <span className="text-caption text-muted-foreground">
+                    已跑通的数据集将纳入基线池——确认后提炼方向,迭代先在池内数据集上展开;
+                    其余数据集补跑后追加纳入。确认会停掉仍在跑的队列(确认即定口径)。
+                  </span>
+                  <Button size="sm" className="ml-auto h-7 gap-1 px-2.5 text-caption"
+                          disabled={busy !== null} onClick={() => void confirmPass()}>
+                    {busy === "pass" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+                    {busy === "pass" ? "确认中…" : "确认通过 Baseline"}
+                  </Button>
+                </div>
+              ) : pendingAdopt.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-success/30 bg-success/5 px-2.5 py-2">
+                  <span className="text-caption text-muted-foreground">
+                    {pendingAdopt.map((d) => d.name).join("、")} 跑通且拿到指标——
+                    纳入基线后自动迭代就能选它
+                  </span>
+                  <Button size="sm" className="ml-auto h-7 gap-1 px-2.5 text-caption"
+                          disabled={busy !== null} onClick={() => void confirmPass()}>
+                    {busy === "pass" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+                    {busy === "pass" ? "纳入中…" : `追加纳入(${pendingAdopt.length})`}
+                  </Button>
+                </div>
+              ) : (
+                <p className="text-caption text-muted-foreground">
+                  冒烟跑通且拿到指标后,这里确认;确认 = 定基线口径(指标快照 + 停队列)。
+                </p>
+              )}
             </StepSection>
 
             {gap ? (
@@ -1235,16 +1540,9 @@ function BaselinePanel({ project, onLockChange }: {
                             Baseline 通过:{state?.datasets.length ?? 1} 个数据集全部跑通并取得基准指标
                           </p>
                         ) : confirmable ? (
-                          <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border-[0.5px] border-success/30 bg-success/5 px-2.5 py-2">
-                            <span className="text-caption text-muted-foreground">
-                              已跑通的数据集将纳入基线池——确认后提炼方向,迭代先在池内数据集上展开;其余数据集补跑后追加纳入
-                            </span>
-                            <Button size="sm" className="ml-auto h-7 gap-1 px-2.5 text-caption"
-                                    disabled={busy !== null} onClick={() => void confirmPass()}>
-                              {busy === "pass" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
-                              {busy === "pass" ? "确认中…" : "确认通过 Baseline"}
-                            </Button>
-                          </div>
+                          <p className="mt-1.5 text-caption text-muted-foreground">
+                            已可确认——到「基线确认」步骤确认通过
+                          </p>
                         ) : null}
                       </div>
                     ) : run.exit_code === 0 ? (

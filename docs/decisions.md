@@ -469,3 +469,28 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
 - 分工定型:analyzer(只读推断)→ onboard(写能力接入)→ fix(失败修复);
   baseline-request 提示改为指向一键接入。
 - 测试:test_onboard.py(mock 会话:适配器生成/复用、清单校验、running 拒绝)。
+
+## D-030 · Baseline 接入 = 固定 Workflow + 提议制:onboard 退役(2026-10-08)
+
+- 背景:D-029 的自主接入会话(onboard,16 轮探索+直写适配器+无条件落库)在
+  medclipseg-test 实测暴露产品定义错误——接入的本质是**补资料**,每个工程缺的
+  资料各不相同,自主探索等于把开放问题交给运气;且写文件无暂存、落库无确认,
+  owner 看不到它在哪一步、缺什么。用户重定义:流程写死,agent 只做总揽。
+- 决定:Baseline 接入改为**六步固定 workflow**(代码就位 → 资料就位 → 环境就位
+  → 入口与口径 → 跑通基线 → 基线确认),状态全部派生(体检+config+run),
+  无持久化 workflow 表。三个 agent 角色收敛为:
+  1. **提议**(analyzer,只读):读代码 → 入口命令/口径清单(数据集×档位,
+     3ep 冒烟档)/环境建议/证据;端点 `POST /baseline/intake/propose`
+     **只返回提案不落库**,owner 编辑后「采用并保存」= `POST /baseline/config`
+     (保存 datasets ≥1 行即置 `onboarded=true`,确认是用户动作)。
+  2. **诊断**(advisor,单发非会话):`POST /baseline/advisor` 读体检+配置+
+     工作区顶层 → ≤120 字「缺什么/放哪/下一步」;前端常驻流程助手条
+     (六步点列 + 缺口计数)按需调用。
+  3. **修复**(fix,不变):跑挂了读日志打补丁自动重跑——适配器生成回归此路。
+- 退役:`run_onboarding_session`/`ONBOARDING_SYSTEM`、`POST /baseline/onboard`、
+  web `onboardBaseline`、挂载即 merge 的自动分析;「一键 Baseline」按钮改为
+  **「一键走流程」**:顺序推进确定性步骤,遇缺口停在对应步骤(资料缺→②,
+  口径未确认→自动提议后停④等编辑采用),不再有自主执行段。
+- 资料槽 = 体检派生(dataset:N / weights / data_layout + supply 归位路径),
+  供给两通道不变:服务器目录符号链接(provideAsset)/ zip 上传(uploadAsset),
+  路径输入升级为 FolderBrowserDialog 服务器目录树选择。

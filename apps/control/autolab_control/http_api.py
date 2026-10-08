@@ -2248,6 +2248,8 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
             # 镜像到旧单命令字段(EnvPicker/体检/修复 Agent 等旧路径仍读它)
             config["command"] = cleaned[0]["command"]
             config["dataset_path"] = cleaned[0]["dataset_path"]
+            # D-030 提议制:保存口径清单 = owner 确认动作 → 接入完成
+            config["onboarded"] = True
         for key in ("command", "dataset_path", "conda_env", "metric_file"):
             if key in payload:
                 config[key] = (payload.get(key) or "").strip()
@@ -2279,64 +2281,135 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                             baseline_checks_json=_json.dumps(checks, ensure_ascii=False))
         return {"checks": checks}
 
-    @app.post("/api/owner/projects/{project_id}/baseline/onboard")
-    def baseline_onboard(project_id: str, _: str = Depends(require("owner"))) -> dict:
-        """D-029 接入型一键 Baseline:接入 Agent 识别工程 → 生成/复用适配器
-        → 口径清单(数据集×档位)→ 选环境 → 冒烟自验 → 落库并刷新体检。
-        接入只做准备不跑正式基线——跑与确认仍是 owner 的动作。"""
+    @app.post("/api/owner/projects/{project_id}/baseline/intake/propose")
+    def baseline_intake_propose(project_id: str,
+                                _: str = Depends(require("owner"))) -> dict:
+        """D-030 提议制接入:分析 Agent(只读会话)读代码 → **提议**入口命令/
+        口径清单(数据集×档位,带 3ep 冒烟档)/环境/指标文件——只返回提案,
+        **不落库**;owner 在界面编辑后经 POST /baseline/config 采用保存。
+        会话时间线 LiveSessionCard 可见(role=analyzer)。"""
         from . import agent_session, baseline_queue
 
-        project, server = _baseline_ctx(project_id)
+        project, _server = _baseline_ctx(project_id)
         if not (project.get("remote_workdir") or "").strip():
             raise HTTPException(status_code=409, detail="项目还没有工作区,先在项目页补全")
         run = baseline_queue.normalize_run(project)
         if run.get("status") == "running":
-            raise HTTPException(status_code=409, detail="Baseline 正在运行,等它结束再接入")
+            raise HTTPException(status_code=409, detail="Baseline 正在运行,等它结束再提议")
         try:
-            onboarded = agent_session.run_onboarding_session(
-                repo, credentials, hostkeys_path, project_id)
-        except agent_session.AgentSessionError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        import json as _json
-
-        config = server_admin.baseline_config_defaults(project)
-        config.update({
-            "command": onboarded["datasets"][0]["command"],
-            "dataset_path": onboarded["datasets"][0].get("dataset_path") or "",
-            "conda_env": onboarded.get("conda_env") or config.get("conda_env") or "",
-            "metric_file": "metrics.json",
-            "datasets": onboarded["datasets"],
-            "onboarded": True,
-            "adapter": onboarded.get("adapter") or "",
-        })
-        repo.update_project(project_id,
-                            baseline_config_json=_json.dumps(config, ensure_ascii=False))
-        # 接入即体检:清单状态立即可见
-        transport = _open_transport(server)
+            rule_result = server_admin.analyze_workspace(project["remote_workdir"])
+        except Exception as exc:
+            raise HTTPException(status_code=409,
+                                detail=f"工作区分析失败:{exc}") from exc
+        proposal = None
+        fallback = None
         try:
-            checks = server_admin.run_baseline_checks(
-                project["remote_workdir"], config, ssh_transport=transport)
-            repo.update_project(project_id,
-                                baseline_checks_json=_json.dumps(checks, ensure_ascii=False))
-        except Exception:
-            checks = []
-        finally:
-            if transport is not None:
-                transport.close()
+            proposal = agent_session.run_analyzer_session(
+                repo, credentials, hostkeys_path, project_id,
+                rule_result=rule_result)
+        except agent_session.SessionStoppedByUser:
+            raise HTTPException(status_code=409, detail="提议会话被人工停止")
+        except Exception as exc:  # 会话层任何失败:回落规则法提案(标注),不 409
+            fallback = str(exc)[:200]
+            rule_config = rule_result.get("config") or {}
+            datasets = rule_config.get("datasets") or []
+            if not datasets and rule_config.get("dataset_path"):
+                datasets = [{"name": "default", "command": rule_config.get("command") or "",
+                             "dataset_path": rule_config.get("dataset_path") or ""}]
+            proposal = {"config": {
+                "command": rule_config.get("command") or "",
+                "dataset_path": rule_config.get("dataset_path") or "",
+                "conda_env": rule_config.get("conda_env") or "",
+                "metric_file": rule_config.get("metric_file") or "metrics.json",
+                "datasets": datasets},
+                "evidence": {"fallback": f"分析会话不可用,规则法提案:{fallback}"},
+                "session": None}
+        config = proposal["config"]
+        if not config.get("command") or not config.get("datasets"):
+            raise HTTPException(
+                status_code=409, detail="提案无效(缺入口命令或口径清单),"
+                "请在「入口与口径」步骤手工填写,或补充工作区资料后再试")
         repo.add_review_message(
             project_id=project_id, role="system", kind="text",
-            content=f"工程接入完成:{onboarded.get('notes') or '口径清单已生成'}"
-                    f"(适配器 {'复用' if onboarded.get('adapter_reused') else onboarded.get('adapter') or '无需'};"
-                    f"清单 {len(onboarded['datasets'])} 条;环境 {onboarded.get('conda_env') or '未定'};"
-                    f"冒烟 {'通过' if onboarded.get('smoke_ok') else '未通过,首跑可能需修复'})")
-        return {"onboarded": True, "adapter": onboarded.get("adapter"),
-                "adapterReused": onboarded.get("adapter_reused"),
-                "condaEnv": onboarded.get("conda_env"),
-                "smokeOk": onboarded.get("smoke_ok"),
-                "notes": onboarded.get("notes"),
-                "datasets": onboarded["datasets"],
-                "checks": checks,
-                "changes": onboarded.get("changes") or []}
+            content=f"分析 Agent 已提议入口与口径清单({len(config['datasets'])} 条,"
+                    "带 3ep 冒烟档):待 owner 在「入口与口径」步骤编辑并采用"
+                    + (f";(回落规则法:{fallback[:80]})" if fallback else ""))
+        return {"proposal": config,
+                "evidence": proposal.get("evidence") or {},
+                "dependencies": proposal.get("dependencies") or [],
+                "session": proposal.get("session"),
+                "fallback": fallback}
+
+    @app.post("/api/owner/projects/{project_id}/baseline/advisor")
+    def baseline_advisor(project_id: str,
+                         _: str = Depends(require("owner"))) -> dict:
+        """D-030 流程助手:单发 LLM(非会话)读体检+配置+工作区摘要,给出
+        「缺什么 / 放哪 / 下一步」的短建议。确定性缺口由前端六步点列展示,
+        这里只补"怎么补"的可执行说法;不落库,响应即弃。"""
+        from . import llm as _llm
+
+        project, server = _baseline_ctx(project_id)
+        config = server_admin.baseline_config_defaults(project)
+        checks = []
+        try:
+            import json as _json
+
+            checks = _json.loads(project.get("baseline_checks_json") or "[]")
+        except Exception:
+            checks = []
+        gaps = [c for c in checks if c.get("status") == "fail"]
+        warns = [c for c in checks if c.get("status") == "warn"]
+        lines = [f"项目:{project['name']}(工作区 {project.get('remote_workdir')})",
+                 f"入口命令:{config.get('command') or '(未定)'}",
+                 f"环境:{config.get('conda_env') or '(未选)'}",
+                 f"口径清单:{len(config.get('datasets') or [])} 条"
+                 + ("(已确认)" if config.get("onboarded") else "(未确认)"),
+                 f"体检:失败 {len(gaps)} 项 / 提醒 {len(warns)} 项"]
+        for c in (gaps + warns)[:8]:
+            supply = ";".join(s.get("target") or "" for s in c.get("supply") or [])
+            lines.append(f"- [{c.get('status')}] {c.get('label')}:{c.get('detail')}"
+                         + (f"(归位到 {supply})" if supply else ""))
+        # 工作区顶层目录摘要(资料槽"放哪"的语境)
+        try:
+            import shlex as _shlex
+
+            transport = _open_transport(server)
+            try:
+                if transport is not None:
+                    r = transport.exec_argv(
+                        ["sh", "-c",
+                         "ls -A " + _shlex.quote(project["remote_workdir"])
+                         + " | head -20"], timeout=15)
+                    listing = (r.stdout or "").split()
+                else:
+                    from pathlib import Path as _Path
+
+                    listing = [c.name for c in
+                               _Path(project["remote_workdir"]).iterdir()][:20]
+                if listing:
+                    lines.append("工作区顶层:" + "、".join(listing[:20]))
+            finally:
+                if transport is not None:
+                    transport.close()
+        except Exception:
+            pass
+        system = ("你是 AutoLab Baseline 接入助手。根据体检与配置事实,用不超过 120 字"
+                  "告诉 owner:最要紧的缺口是什么、资料放到哪个路径(或选哪个环境)、"
+                  "下一步点什么。只陈述事实支持的判断,不编造路径;一次只建议一个动作。")
+        try:
+            advice = _llm.chat_multi(
+                credentials, system=system,
+                messages=[{"role": "user", "content": "\n".join(lines)}],
+                max_tokens=300).strip()
+        except Exception as exc:
+            raise HTTPException(status_code=409,
+                                detail=f"助手暂不可用:{exc}") from exc
+        if not advice:
+            raise HTTPException(status_code=409, detail="助手没有给出建议,先跑一次体检")
+        repo.add_review_message(
+            project_id=project_id, role="system", kind="text",
+            content=f"流程助手:{advice[:200]}")
+        return {"advice": advice[:600]}
 
     @app.post("/api/owner/projects/{project_id}/baseline/fix")
     def baseline_fix(project_id: str, payload: dict,
