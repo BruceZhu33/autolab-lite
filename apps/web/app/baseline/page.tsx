@@ -1194,13 +1194,6 @@ function BaselinePanel({ project, onLockChange }: {
   const toggleStep = (s: Step) =>
     setOpenSteps((m) => ({ ...m, [s]: !(s in m ? m[s] : stepOpen(s)) }));
 
-  // 体检缺口 → 行内供给行(后端检查项自带 supply:缺什么、归位到哪,补完
-  // 自动复核)。同一物理目录被多个清单条目引用时(如 Kvasir/10%/25% 变体)
-  // 按目标路径去重,一张卡补一个目录。
-  const failedSupplies = checks.flatMap((c) =>
-    (c.supply ?? []).map((s) => ({ key: `${c.key}:${s.target}`, ...s })))
-    .filter((s, i, arr) => arr.findIndex((x) => x.target === s.target) === i);
-
   return (
     <div className="space-y-3">
       <div className="rounded-xl border-[0.5px] border-surface-border bg-surface shadow-[var(--surface-shadow)]">
@@ -1443,9 +1436,9 @@ function BaselinePanel({ project, onLockChange }: {
                                : "资料齐(清单数据集全部就位)"}
                          open={stepOpen("assets")} onToggle={() => toggleStep("assets")}>
               <p className="text-caption text-muted-foreground">
-                资料槽 = 口径清单每行的数据路径(上一步已定)+ 代码检测出的预训练权重。
-                缺的每一项下面直接补:服务器已有目录点「浏览」链接(秒就位,大数据不搬家),
-                或上传 zip 解包;补完自动复核。
+                资料槽来自上一步的清单与代码检测——**数据集**按清单各行的数据路径、
+                **预训练权重**按代码检测出的归位路径,每槽都有直接入口:服务器已有目录
+                点「浏览」链接(秒就位,大数据不搬家)或「上传 zip」,补完自动复核。
               </p>
               {!intakeConfirmed ? (
                 <p className="text-caption text-warning">
@@ -1453,58 +1446,83 @@ function BaselinePanel({ project, onLockChange }: {
                   清单会告诉这步要哪些数据集。
                 </p>
               ) : null}
-              {failedSupplies.length > 0 ? (
-                <div className="space-y-2">
-                  <p className="text-caption font-medium text-warning">
-                    待补材料 {failedSupplies.length} 项(补完点「重新体检」复核后 Set):
-                  </p>
-                  {failedSupplies.map((s) => (
-                    <DatasetSupplyInline key={s.key} project={project}
-                                         target={s.target} label={s.label}
-                                         onSupplied={() => void doCheck()} />
-                  ))}
-                </div>
-              ) : null}
-              {checks.length > 0 ? (
-                <div className="divide-y divide-surface-border/50">
-                  {checks.filter((c) => isAssetCheck(c.key)).map((check) => (
-                    <div key={check.key} className="flex items-center gap-2 py-1.5">
-                      {(() => {
-                        const Icon = CHECK_ICON[check.status];
-                        return <Icon className={`size-3.5 shrink-0 ${CHECK_COLOR[check.status]}`} />;
-                      })()}
-                      <span className="w-32 shrink-0 text-caption font-medium">{check.label}</span>
-                      <span className={`min-w-0 flex-1 truncate text-caption ${
-                        check.status === "fail" ? "text-destructive" : "text-muted-foreground"
-                      }`} title={check.detail}>
-                        {check.detail}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-caption text-muted-foreground">
-                  体检按清单逐数据集扫描服务器工作区
-                </p>
-              )}
+              {/* ---- 资料槽列表:数据槽 / 权重槽 分开,目标路径已知 ---- */}
+              {(() => {
+                // 数据槽:清单行按 dataset_path 去重(同目录多档算一槽)
+                type Slot = { kind: "dataset" | "weights"; label: string;
+                              target: string; status: "ok" | "warn" | "fail" | "unknown" };
+                const byTarget = new Map<string, Slot>();
+                for (const row of state?.config.datasets ?? []) {
+                  const target = (row.dataset_path || "").trim().replace(/^\.\//, "");
+                  if (!target) continue;
+                  const check = checks.find((c) => c.key === `dataset:${row.name}`);
+                  const status = !check ? "unknown" : check.status;
+                  const slot = byTarget.get(target);
+                  if (!slot) {
+                    byTarget.set(target, {
+                      kind: "dataset", label: row.name, target, status });
+                  } else {
+                    slot.label += `、${row.name}`;
+                    if (status === "fail") slot.status = "fail";
+                    else if (status === "warn" && slot.status !== "fail") slot.status = "warn";
+                    else if (status === "ok" && slot.status === "unknown") slot.status = "ok";
+                  }
+                }
+                const weightsCheck = checks.find((c) => c.key === "weights");
+                const slots: Slot[] = [...byTarget.values()];
+                if (weightsCheck) {
+                  slots.push({
+                    kind: "weights", label: "预训练权重",
+                    target: weightsCheck.supply?.[0]?.target || "checkpoints/",
+                    status: weightsCheck.status === "ok" ? "ok" : weightsCheck.status });
+                }
+                if (slots.length === 0) {
+                  return (
+                    <p className="text-caption text-muted-foreground">
+                      {intakeConfirmed
+                        ? "清单没有声明数据路径(空)——回口径步给每行补 dataset_path,或点「重新体检」"
+                        : "采用清单后这里会列出每个数据槽与权重槽"}
+                    </p>
+                  );
+                }
+                return (
+                  <div className="space-y-1.5">
+                    {slots.map((slot) => (
+                      <div key={`${slot.kind}:${slot.target}`}>
+                        {slot.status === "ok" ? (
+                          <div className="flex items-center gap-2 rounded-lg border-[0.5px] border-success/25 bg-success/5 px-2.5 py-1.5">
+                            <CheckCircle2 className="size-3.5 shrink-0 text-success" />
+                            <span className="text-caption font-medium">
+                              {slot.kind === "weights" ? "预训练权重" : "数据集"} {slot.label}
+                            </span>
+                            <span className="min-w-0 flex-1 truncate font-mono text-micro text-muted-foreground">
+                              {slot.target}
+                            </span>
+                            <span className="shrink-0 text-micro font-medium text-success">在位</span>
+                          </div>
+                        ) : (
+                          <DatasetSupplyInline
+                            project={project} target={slot.target}
+                            label={`${slot.kind === "weights" ? "预训练权重" : "数据集"} ${slot.label}`}
+                            onSupplied={() => void doCheck()} />
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
               <div className="flex flex-wrap items-center gap-2">
                 <Button variant="outline" size="sm" className="h-7 gap-1 px-2 text-caption"
                         disabled={busy !== null} onClick={() => void doCheck()}>
                   <SearchCode className="size-3" />
                   重新体检
                 </Button>
-                <Button variant="outline" size="sm" className="h-7 gap-1 px-2 text-caption"
-                        disabled={busy !== null}
-                        title="清单外的额外资料(如预训练权重、外部数据)手动供给到任意路径"
-                        onClick={() => setManualSupply(true)}>
-                  <FileUp className="size-3" />
-                  手动供给(数据/权重)
-                </Button>
               </div>
               {checks.length > 0 ? (
                 <details className="text-micro text-muted-foreground/70">
                   <summary className="cursor-pointer">
                     其他体检项(命令脚本/运行环境/依赖;不拦本步,口径 Set 已复核命令)
+                    与清单外资料手动供给
                   </summary>
                   <div className="mt-1 divide-y divide-surface-border/50">
                     {checks.filter((c) => !isAssetCheck(c.key)).map((check) => (
@@ -1517,11 +1535,22 @@ function BaselinePanel({ project, onLockChange }: {
                       </div>
                     ))}
                   </div>
+                  <div className="mt-1.5">
+                    <Button variant="outline" size="sm" className="h-6 gap-1 px-2 text-micro"
+                            disabled={busy !== null}
+                            title="清单外的额外资料手动供给到任意路径"
+                            onClick={() => setManualSupply(true)}>
+                      <FileUp className="size-3" />
+                      清单外资料供给
+                    </Button>
+                    {manualSupply ? (
+                      <div className="mt-1.5">
+                        <AssetSupplyDialog project={project} initialTarget=""
+                                           onClose={() => setManualSupply(false)} />
+                      </div>
+                    ) : null}
+                  </div>
                 </details>
-              ) : null}
-              {manualSupply ? (
-                <AssetSupplyDialog project={project} initialTarget=""
-                                   onClose={() => setManualSupply(false)} />
               ) : null}
               <WorkflowSetBar step="assets" isSet={!!wf.assets} orderOk={!orderLocked("assets")}
                               {...stepValidity("assets")} busy={busy !== null}
