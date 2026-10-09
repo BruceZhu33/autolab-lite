@@ -1103,11 +1103,12 @@ function BaselinePanel({ project, onLockChange }: {
   /** 内容步的顺序锁:前序未 set 时本步不可交互(仍可见,路线图不藏)。 */
   const orderLocked = (s: ContentStep): boolean =>
     CONTENT_STEPS.indexOf(s) > (allSet ? CONTENT_STEPS.length : firstUnsetIdx);
-  // 检查分类:资料类把守「资料就位」;命令脚本/环境类分别等口径步与环境选定
+  // 检查分类:资料类把守「资料就位」;**非 ok 即未就位**——数据集缺失在
+  // 体检里是 warn(渐进式老语义只管起跑跳过),Set 门/绿点必须真齐
   const isAssetCheck = (key: string) =>
     key === "workspace" || key === "weights" || key.startsWith("dataset");
   const assetGaps = checks.filter((c) =>
-    c.status === "fail" && isAssetCheck(c.key));
+    c.status !== "ok" && isAssetCheck(c.key));
   const stepValidity = (s: ContentStep): { valid: boolean; invalidReason?: string } => {
     if (s === "code") return codeReady === true
       ? { valid: true } : { valid: false, invalidReason: "代码未就位" };
@@ -1124,7 +1125,7 @@ function BaselinePanel({ project, onLockChange }: {
       }
       return assetGaps.length > 0
         ? { valid: false,
-            invalidReason: `缺资料 ${assetGaps.length} 项:每个缺口点「浏览」链接服务器目录,或上传 zip` }
+            invalidReason: `资料未齐 ${assetGaps.length} 项(缺/部分缺都算):每个槽位点「浏览」链接或「上传 zip」` }
         : { valid: true };
     }
     return intakeConfirmed ? { valid: true }

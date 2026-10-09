@@ -2240,7 +2240,9 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                     continue
                 names.add(name)
                 cleaned.append({"name": name, "command": command,
-                                "dataset_path": str(item.get("dataset_path") or "").strip()})
+                                "dataset_path": _norm_rel_path(
+                                    str(item.get("dataset_path") or ""),
+                                    project["remote_workdir"])})
             if not cleaned:
                 raise HTTPException(status_code=400,
                                     detail="datasets 需要至少一条(名称与命令必填)")
@@ -2250,9 +2252,13 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
             config["dataset_path"] = cleaned[0]["dataset_path"]
             # D-030 提议制:保存口径清单 = owner 确认动作 → 接入完成
             config["onboarded"] = True
-        for key in ("command", "dataset_path", "conda_env", "metric_file"):
+        for key in ("command", "conda_env", "metric_file"):
             if key in payload:
                 config[key] = (payload.get(key) or "").strip()
+        if "dataset_path" in payload:
+            config["dataset_path"] = _norm_rel_path(
+                str(payload.get("dataset_path") or ""),
+                project["remote_workdir"])
         # 注意不强制 command 非空:环境步(②)选环境时口径还没定,单存
         # conda_env 是合法的部分保存——入口命令由口径步的 Set 门把关
         # (清单保存时镜像首行命令;Set 时复核脚本真实存在)。
@@ -2273,6 +2279,20 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
 
     def _is_asset_check(key: str) -> bool:
         return key in _ASSET_KEYS or key.startswith("dataset")
+
+    def _norm_rel_path(path: str, workdir: str) -> str:
+        """清单数据路径规整:去 './' 前缀;Agent 提案常带仓库目录名前缀
+        (如 MedCLIPSeg-test/data/X,体检解析成双重路径永远找不到),
+        以工作区 basename 剥掉。"""
+        import re as _re
+
+        p = _re.sub(r"^\.?/+", "", (path or "").strip())
+        base = (workdir or "").rstrip("/").rsplit("/", 1)[-1]
+        if base and p == base:
+            return ""
+        if base and p.startswith(base + "/"):
+            p = p[len(base) + 1:]
+        return p
 
     @app.post("/api/owner/projects/{project_id}/baseline/workflow")
     def baseline_workflow(project_id: str, payload: dict,
@@ -2350,15 +2370,18 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                     repo.update_project(project_id, baseline_checks_json=_json.dumps(
                         checks, ensure_ascii=False))
                     checks_payload = checks
-                    # 资料类 = 工作区/逐数据集/权重;逐数据集行必须有真实数据
-                    fails = [c for c in checks
-                             if c.get("status") == "fail"
-                             and _is_asset_check(c.get("key") or "")]
-                    if fails:
-                        reason = ("资料未就位:在本步每个缺口的「供给」区链接服务器"
-                                  "已有目录(点浏览选)或上传 zip,补完自动复核:"
+                    # 资料类 = 工作区/逐数据集/权重;**非 ok 即未就位**
+                    # (数据集缺失在体检里是 warn——渐进式"待补不阻塞起跑"的
+                    # 老语义只管 RUN,Set 门必须真齐;真机事故:10 个数据集
+                    # 全缺因全是 warn 被放行,权重缺 5/6 也绿)
+                    pending = [c for c in checks
+                               if c.get("status") != "ok"
+                               and _is_asset_check(c.get("key") or "")]
+                    if pending:
+                        reason = ("资料未就位(缺/warn 都算):在本步每个槽位的"
+                                  "「浏览」链接或「上传 zip」补齐,复核后重试:"
                                   + ";".join(f"{c.get('label')}:{c.get('detail')}"
-                                             for c in fails[:3]))
+                                             for c in pending[:3]))
             elif step == "intake":
                 if not config.get("onboarded") or not (config.get("datasets") or []):
                     reason = "口径清单未确认:点「让 Agent 读代码提议」后编辑采用," \
@@ -2477,6 +2500,13 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
             raise HTTPException(
                 status_code=409, detail="提案无效(缺入口命令或口径清单),"
                 "请在「入口与口径」步骤手工填写,或补充工作区资料后再试")
+        # 路径规整:剥 './' 与仓库目录名前缀(提案常带,双重路径必失)
+        workdir = project["remote_workdir"]
+        for row in config["datasets"]:
+            row["dataset_path"] = _norm_rel_path(row.get("dataset_path") or "",
+                                                 workdir)
+        config["dataset_path"] = _norm_rel_path(
+            config.get("dataset_path") or "", workdir)
         repo.add_review_message(
             project_id=project_id, role="system", kind="text",
             content=f"分析 Agent 已提议入口与口径清单({len(config['datasets'])} 条,"
