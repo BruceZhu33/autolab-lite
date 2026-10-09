@@ -2262,7 +2262,7 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                             baseline_config_json=_json.dumps(config, ensure_ascii=False))
         return {"config": config}
 
-    _WF_STEPS = ("code", "env", "assets", "intake")
+    _WF_STEPS = ("code", "env", "intake", "assets")
     _WF_LABELS = {"code": "代码就位", "assets": "资料就位", "env": "环境就位",
                   "intake": "入口与口径"}
     # 资料类检查(把守「资料就位」):工作区/数据集/权重。命令脚本与
@@ -2277,14 +2277,15 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
     @app.post("/api/owner/projects/{project_id}/baseline/workflow")
     def baseline_workflow(project_id: str, payload: dict,
                           _: str = Depends(require("owner"))) -> dict:
-        """D-031 每步 set 门(顺序:代码→环境→资料→口径):owner 显式 set
+        """D-031 每步 set 门(顺序:代码→环境→口径→资料):owner 显式 set
         一步才解锁下一步;unset 该步及之后全部(回退补料再前进)。run/confirm
         是动作门,不参与 set。
 
+        顺序的因果:口径清单(数据集×档位,每行带 dataset_path)**定义了
+        资料需求**——资料步照单逐槽补(链接/上传),没有清单就没有槽。
         set 前置 = 前序步全 set + 本步事实校验:code=代码在位 / env=已选
-        conda 环境 / assets=体检**资料类**全绿(工作区/数据集/权重;命令
-        脚本与环境类检查不在此步管——它们分别等到口径步与环境选定后才有
-        意义)/ intake=口径已确认且命令脚本真实存在。失败 409 带可操作原因。"""
+        conda 环境 / intake=口径已确认且命令脚本真实存在 / assets=**清单
+        已配**且体检资料类全绿(逐数据集在位+权重就位)。失败 409 带可操作原因。"""
         from .baseline_queue import normalize_run as _norm_run
         from .db import utc_now as _utc
 
@@ -2328,27 +2329,36 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                     reason = "还没选 conda 环境:本步「探测已有环境」点选一个," \
                              "或先在「入口与口径」采用 Agent 提案(含环境建议)"
             elif step == "assets":
-                transport = _open_transport(server)
-                try:
-                    checks = server_admin.run_baseline_checks(
-                        project["remote_workdir"], config, ssh_transport=transport)
-                except Exception as exc:
-                    raise HTTPException(
-                        status_code=409, detail=f"体检执行失败:{exc}") from exc
-                finally:
-                    if transport is not None:
-                        transport.close()
-                repo.update_project(project_id, baseline_checks_json=_json.dumps(
-                    checks, ensure_ascii=False))
-                checks_payload = checks
-                # 只看资料类(工作区/数据集/权重):命令脚本与环境类检查
-                # 依赖后面的口径步与本步已选环境,不拦资料 Set
-                fails = [c for c in checks
-                         if c.get("status") == "fail" and _is_asset_check(c.get("key") or "")]
-                if fails:
-                    reason = ("资料未就位(在本步「供给」区链接服务器目录或上传 zip,"
-                              "补完自动复核):" + ";".join(
-                                  f"{c.get('label')}:{c.get('detail')}" for c in fails[:3]))
+                # 资料槽由口径清单定义:没有清单就没有"要什么资料"的答案
+                # (真机反馈:空工作区因无红色项被放行 set——清单在前才成立)
+                if not (config.get("datasets") or []):
+                    reason = ("还没有口径清单:先在「入口与口径」让 Agent 读代码提议"
+                              "并采用(或手填保存)——清单每行的数据路径就是资料槽,"
+                              "这步照单补料")
+                else:
+                    transport = _open_transport(server)
+                    try:
+                        checks = server_admin.run_baseline_checks(
+                            project["remote_workdir"], config,
+                            ssh_transport=transport)
+                    except Exception as exc:
+                        raise HTTPException(
+                            status_code=409, detail=f"体检执行失败:{exc}") from exc
+                    finally:
+                        if transport is not None:
+                            transport.close()
+                    repo.update_project(project_id, baseline_checks_json=_json.dumps(
+                        checks, ensure_ascii=False))
+                    checks_payload = checks
+                    # 资料类 = 工作区/逐数据集/权重;逐数据集行必须有真实数据
+                    fails = [c for c in checks
+                             if c.get("status") == "fail"
+                             and _is_asset_check(c.get("key") or "")]
+                    if fails:
+                        reason = ("资料未就位:在本步每个缺口的「供给」区链接服务器"
+                                  "已有目录(点浏览选)或上传 zip,补完自动复核:"
+                                  + ";".join(f"{c.get('label')}:{c.get('detail')}"
+                                             for c in fails[:3]))
             elif step == "intake":
                 if not config.get("onboarded") or not (config.get("datasets") or []):
                     reason = "口径清单未确认:点「让 Agent 读代码提议」后编辑采用," \

@@ -40,10 +40,11 @@ const CHECK_COLOR: Record<BaselineCheck["status"], string> = {
 };
 
 /** D-030/031 六步固定接入流程:确定性校验 + 每步 set 门 + 提议确认。
- * 顺序:代码 → 环境(先选,体检的环境检查才有意义)→ 资料 → 口径。 */
-type Step = "code" | "env" | "assets" | "intake" | "run" | "confirm";
+ * 顺序:代码 → 环境 → 口径 → 资料——口径清单(数据集×档位)定义资料需求,
+ * 资料步照单逐槽补(链接/上传),清单在前资料才有"要什么"的答案。 */
+type Step = "code" | "env" | "intake" | "assets" | "run" | "confirm";
 
-const STEP_ORDER: Step[] = ["code", "env", "assets", "intake", "run", "confirm"];
+const STEP_ORDER: Step[] = ["code", "env", "intake", "assets", "run", "confirm"];
 
 const STEP_SHORT: Record<Step, string> = {
   code: "代码", assets: "资料", env: "环境", intake: "口径", run: "跑通", confirm: "确认",
@@ -762,6 +763,8 @@ function BaselinePanel({ project, onLockChange }: {
   const [envPid, setEnvPid] = useState<number | null>(null);
   const [gap, setGap] = useState<{ kind: "dataset" | "command"; hint: string } | null>(null);
   const [gapValue, setGapValue] = useState("");
+  /** 资料步的手动供给入口(清单外:权重/额外数据) */
+  const [manualSupply, setManualSupply] = useState(false);
   // 步骤折叠覆盖(声明在此:一键走流程的 stopAt 要用;stepOpen/toggleStep 在下方)
   const [openSteps, setOpenSteps] = useState<Partial<Record<Step, boolean>>>({});
 
@@ -949,7 +952,21 @@ function BaselinePanel({ project, onLockChange }: {
       }
       setStepState((s) => ({ ...s, env: "done" }));
 
-      // ③ 资料就位 → set(体检资料类全绿:工作区/数据集/权重;
+      // ③ 入口与口径 → set(提议/采用;清单定义资料槽)(清单已确认)
+      setStepState((s) => ({ ...s, intake: "active" }));
+      if (!wf.intake) {
+        if (!intakeConfirmed) {
+          const ok = await propose();
+          stopAt("intake", ok
+            ? "提案已出——检查/编辑后「采用并保存」,再一键走流程继续"
+            : "提议会话不可用——手工填清单后保存");
+          return;
+        }
+        if (!(await autoSet("intake"))) return;
+      }
+      setStepState((s) => ({ ...s, intake: "done" }));
+
+      // ④ 资料就位 → set(照清单逐槽补料)(体检资料类全绿:工作区/数据集/权重;
       //    命令脚本/环境类检查等口径步与环境选定后再管)
       setStepState((s) => ({ ...s, assets: "active" }));
       if (!wf.assets) {
@@ -966,20 +983,6 @@ function BaselinePanel({ project, onLockChange }: {
         if (!(await autoSet("assets"))) return;
       }
       setStepState((s) => ({ ...s, assets: "done" }));
-
-      // ④ 入口与口径 → set(清单已确认)
-      setStepState((s) => ({ ...s, intake: "active" }));
-      if (!wf.intake) {
-        if (!intakeConfirmed) {
-          const ok = await propose();
-          stopAt("intake", ok
-            ? "提案已出——检查/编辑后「采用并保存」,再一键走流程继续"
-            : "提议会话不可用——手工填清单后保存");
-          return;
-        }
-        if (!(await autoSet("intake"))) return;
-      }
-      setStepState((s) => ({ ...s, intake: "done" }));
 
       // ⑤ 起跑:清单里的数据集按顺序都跑一遍(未就绪自动跳过,补齐后追加)
       setStepState((s) => ({ ...s, run: "active" }));
@@ -1091,7 +1094,7 @@ function BaselinePanel({ project, onLockChange }: {
   const anyOk = (state?.datasets ?? []).some((d) => d.ok);
 
   // ---------------------------------------------------------- D-031 set 门
-  const CONTENT_STEPS = ["code", "env", "assets", "intake"] as const;
+  const CONTENT_STEPS = ["code", "env", "intake", "assets"] as const;
   type ContentStep = (typeof CONTENT_STEPS)[number];
   const wf = state?.config.workflow
     ?? { code: null, assets: null, env: null, intake: null };
@@ -1111,11 +1114,19 @@ function BaselinePanel({ project, onLockChange }: {
     if (s === "env") return state?.config.conda_env
       ? { valid: true }
       : { valid: false, invalidReason: "还没选 conda 环境(本步「探测」点选,或先在口径步采用提案)" };
-    if (s === "assets") return checks.length === 0
-      ? { valid: false, invalidReason: "先点「重新体检」扫一遍资料" }
-      : assetGaps.length > 0
-        ? { valid: false, invalidReason: `缺资料 ${assetGaps.length} 项:在本步「供给」区链接服务器目录或上传 zip` }
+    if (s === "assets") {
+      if (!intakeConfirmed) {
+        return { valid: false,
+                 invalidReason: "先在「入口与口径」采用/保存清单——清单定义要哪些数据集" };
+      }
+      if (checks.length === 0) {
+        return { valid: false, invalidReason: "先点「重新体检」扫一遍资料" };
+      }
+      return assetGaps.length > 0
+        ? { valid: false,
+            invalidReason: `缺资料 ${assetGaps.length} 项:每个缺口点「浏览」链接服务器目录,或上传 zip` }
         : { valid: true };
+    }
     return intakeConfirmed ? { valid: true }
       : { valid: false, invalidReason: "口径清单未确认:点「让 Agent 读代码提议」编辑后采用,或手填保存" };
   };
@@ -1343,70 +1354,10 @@ function BaselinePanel({ project, onLockChange }: {
                               onUnset={() => void doSetStep("unset", "env")} />
             </StepSection>
 
-            {/* ③ 资料就位(D-030 资料槽):体检派生的确定性缺口——数据集/权重/
-                声明路径;每槽 = 链接服务器目录 或 上传 zip,补完自动复核。 */}
-            <StepSection index={3} title="资料就位" state={stepStatus("assets")}
-                         locked={autoBusy} dim={orderLocked("assets")}
-                         summary={checks.length === 0
-                           ? "跑一次体检看缺什么(数据集/权重;命令与环境的检查在后面步骤)"
-                           : assetGaps.length > 0
-                             ? `缺资料 ${assetGaps.length} 项:链接服务器目录或上传 zip 即就位`
-                             : "资料齐(工作区/数据集/权重)"}
-                         open={stepOpen("assets")} onToggle={() => toggleStep("assets")}>
-              {failedSupplies.length > 0 ? (
-                <div className="space-y-2">
-                  <p className="text-caption text-muted-foreground">
-                    待补材料 {failedSupplies.length} 项(渐进式基线:不阻塞已就绪的数据集,
-                    起跑会自动跳过未就绪的)。下面直接补,系统自动归位并复核:
-                  </p>
-                  {failedSupplies.map((s) => (
-                    <DatasetSupplyInline key={s.key} project={project}
-                                         target={s.target} label={s.label}
-                                         onSupplied={() => void doCheck()} />
-                  ))}
-                </div>
-              ) : null}
-              {checks.length > 0 ? (
-                <div className="divide-y divide-surface-border/50">
-                  {checks.map((check) => (
-                    <div key={check.key} className="flex items-center gap-2 py-1.5">
-                      {(() => {
-                        const Icon = CHECK_ICON[check.status];
-                        return <Icon className={`size-3.5 shrink-0 ${CHECK_COLOR[check.status]}`} />;
-                      })()}
-                      <span className="w-32 shrink-0 text-caption font-medium">{check.label}</span>
-                      <span className={`min-w-0 flex-1 truncate text-caption ${
-                        check.status === "fail" ? "text-destructive" : "text-muted-foreground"
-                      }`} title={check.detail}>
-                        {check.detail}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-caption text-muted-foreground">
-                  体检扫描服务器工作区:数据集/权重在位即可通过,缺了会在这里列出归位路径
-                </p>
-              )}
-              <Button variant="outline" size="sm" className="h-7 gap-1 px-2 text-caption"
-                      disabled={busy !== null} onClick={() => void doCheck()}>
-                <SearchCode className="size-3" />
-                重新体检
-              </Button>
-              <p className="text-micro text-muted-foreground/70">
-                本步只看资料类(工作区/数据集/权重);「命令脚本/运行环境/依赖」等项
-                依赖后面的口径步与本步已选环境,不拦资料 Set——口径 Set 时会复核命令。
-              </p>
-              <WorkflowSetBar step="assets" isSet={!!wf.assets} orderOk={!orderLocked("assets")}
-                              {...stepValidity("assets")} busy={busy !== null}
-                              onSet={() => void doSetStep("set", "assets")}
-                              onUnset={() => void doSetStep("unset", "assets")} />
-            </StepSection>
-
-            {/* ④ 入口与口径(D-030 提议制):分析 Agent(只读)读代码 → 提案
+            {/* ③ 入口与口径(D-030 提议制):分析 Agent(只读)读代码 → 提案
                 (入口命令/口径清单 3ep 冒烟档/环境建议/证据)→ owner 编辑 →
                 采用保存。agent 只提议,永远不直接落库。 */}
-            <StepSection index={4} title="入口与口径(提议制)" state={stepStatus("intake")}
+            <StepSection index={3} title="入口与口径(提议制)" state={stepStatus("intake")}
                          locked={autoBusy || proposing} dim={orderLocked("intake")}
                          summary={proposing
                            ? `Agent 读代码提议中 · ${autoSeconds}s(时间线见本步内)`
@@ -1477,6 +1428,105 @@ function BaselinePanel({ project, onLockChange }: {
                               {...stepValidity("intake")} busy={busy !== null}
                               onSet={() => void doSetStep("set", "intake")}
                               onUnset={() => void doSetStep("unset", "intake")} />
+            </StepSection>
+
+            {/* ④ 资料就位(D-030 资料槽):体检派生的确定性缺口——数据集/权重/
+                声明路径;每槽 = 链接服务器目录 或 上传 zip,补完自动复核。 */}
+            <StepSection index={4} title="资料就位" state={stepStatus("assets")}
+                         locked={autoBusy} dim={orderLocked("assets")}
+                         summary={!intakeConfirmed
+                           ? "口径清单定下资料槽(先做上一步)"
+                           : checks.length === 0
+                             ? "跑一次体检,照清单逐槽补料"
+                             : assetGaps.length > 0
+                               ? `缺资料 ${assetGaps.length} 项:点「浏览」链接或上传 zip`
+                               : "资料齐(清单数据集全部就位)"}
+                         open={stepOpen("assets")} onToggle={() => toggleStep("assets")}>
+              <p className="text-caption text-muted-foreground">
+                资料槽 = 口径清单每行的数据路径(上一步已定)+ 代码检测出的预训练权重。
+                缺的每一项下面直接补:服务器已有目录点「浏览」链接(秒就位,大数据不搬家),
+                或上传 zip 解包;补完自动复核。
+              </p>
+              {!intakeConfirmed ? (
+                <p className="text-caption text-warning">
+                  还没有口径清单——先在上一步「入口与口径」采用 Agent 提案或手填保存,
+                  清单会告诉这步要哪些数据集。
+                </p>
+              ) : null}
+              {failedSupplies.length > 0 ? (
+                <div className="space-y-2">
+                  <p className="text-caption font-medium text-warning">
+                    待补材料 {failedSupplies.length} 项(补完点「重新体检」复核后 Set):
+                  </p>
+                  {failedSupplies.map((s) => (
+                    <DatasetSupplyInline key={s.key} project={project}
+                                         target={s.target} label={s.label}
+                                         onSupplied={() => void doCheck()} />
+                  ))}
+                </div>
+              ) : null}
+              {checks.length > 0 ? (
+                <div className="divide-y divide-surface-border/50">
+                  {checks.filter((c) => isAssetCheck(c.key)).map((check) => (
+                    <div key={check.key} className="flex items-center gap-2 py-1.5">
+                      {(() => {
+                        const Icon = CHECK_ICON[check.status];
+                        return <Icon className={`size-3.5 shrink-0 ${CHECK_COLOR[check.status]}`} />;
+                      })()}
+                      <span className="w-32 shrink-0 text-caption font-medium">{check.label}</span>
+                      <span className={`min-w-0 flex-1 truncate text-caption ${
+                        check.status === "fail" ? "text-destructive" : "text-muted-foreground"
+                      }`} title={check.detail}>
+                        {check.detail}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-caption text-muted-foreground">
+                  体检按清单逐数据集扫描服务器工作区
+                </p>
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="outline" size="sm" className="h-7 gap-1 px-2 text-caption"
+                        disabled={busy !== null} onClick={() => void doCheck()}>
+                  <SearchCode className="size-3" />
+                  重新体检
+                </Button>
+                <Button variant="outline" size="sm" className="h-7 gap-1 px-2 text-caption"
+                        disabled={busy !== null}
+                        title="清单外的额外资料(如预训练权重、外部数据)手动供给到任意路径"
+                        onClick={() => setManualSupply(true)}>
+                  <FileUp className="size-3" />
+                  手动供给(数据/权重)
+                </Button>
+              </div>
+              {checks.length > 0 ? (
+                <details className="text-micro text-muted-foreground/70">
+                  <summary className="cursor-pointer">
+                    其他体检项(命令脚本/运行环境/依赖;不拦本步,口径 Set 已复核命令)
+                  </summary>
+                  <div className="mt-1 divide-y divide-surface-border/50">
+                    {checks.filter((c) => !isAssetCheck(c.key)).map((check) => (
+                      <div key={check.key} className="flex items-center gap-2 py-1">
+                        <span className={`shrink-0 font-medium ${
+                          CHECK_COLOR[check.status]}`}>{check.label}</span>
+                        <span className="min-w-0 flex-1 truncate" title={check.detail}>
+                          {check.detail}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              ) : null}
+              {manualSupply ? (
+                <AssetSupplyDialog project={project} initialTarget=""
+                                   onClose={() => setManualSupply(false)} />
+              ) : null}
+              <WorkflowSetBar step="assets" isSet={!!wf.assets} orderOk={!orderLocked("assets")}
+                              {...stepValidity("assets")} busy={busy !== null}
+                              onSet={() => void doSetStep("set", "assets")}
+                              onUnset={() => void doSetStep("unset", "assets")} />
             </StepSection>
 
             {/* ⑤ 跑通基线:四步全 set 后解锁;清单里的数据集按顺序都跑一遍 */}
