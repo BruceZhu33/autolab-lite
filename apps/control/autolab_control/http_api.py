@@ -2253,28 +2253,38 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
         for key in ("command", "dataset_path", "conda_env", "metric_file"):
             if key in payload:
                 config[key] = (payload.get(key) or "").strip()
-        if not config["command"]:
-            raise HTTPException(status_code=400, detail="command 不能为空")
+        # 注意不强制 command 非空:环境步(②)选环境时口径还没定,单存
+        # conda_env 是合法的部分保存——入口命令由口径步的 Set 门把关
+        # (清单保存时镜像首行命令;Set 时复核脚本真实存在)。
         import json as _json
 
         repo.update_project(project_id,
                             baseline_config_json=_json.dumps(config, ensure_ascii=False))
         return {"config": config}
 
-    _WF_STEPS = ("code", "assets", "env", "intake")
+    _WF_STEPS = ("code", "env", "assets", "intake")
     _WF_LABELS = {"code": "代码就位", "assets": "资料就位", "env": "环境就位",
                   "intake": "入口与口径"}
+    # 资料类检查(把守「资料就位」):工作区/数据集/权重。命令脚本与
+    # 环境类检查(script/environment/deps/metrics_out…)分别依赖口径与
+    # 环境选择,不归这一步管——之前一锅全卡在这里形成死锁(用户实测:
+    # "运行命令未配置"把资料 Set 拦死,而命令要到口径步才定)。
+    _ASSET_KEYS = {"workspace", "weights"}
+
+    def _is_asset_check(key: str) -> bool:
+        return key in _ASSET_KEYS or key.startswith("dataset")
 
     @app.post("/api/owner/projects/{project_id}/baseline/workflow")
     def baseline_workflow(project_id: str, payload: dict,
                           _: str = Depends(require("owner"))) -> dict:
-        """D-031 每步 set 门:owner 显式 set 一步才解锁下一步;unset 该步
-        及之后全部(回退补料再前进——如取消资料 set,补充数据集后重 set,
-        跑阶段把清单里的数据集都跑一遍)。run/confirm 是动作门,不参与 set。
+        """D-031 每步 set 门(顺序:代码→环境→资料→口径):owner 显式 set
+        一步才解锁下一步;unset 该步及之后全部(回退补料再前进)。run/confirm
+        是动作门,不参与 set。
 
-        set 前置:前序步全 set + 本步事实校验(code=代码在位 /
-        assets=重跑体检且无失败项,缺资料即未就位 / env=已选环境 /
-        intake=口径清单已确认)。校验失败 409 带原因,事实说话。"""
+        set 前置 = 前序步全 set + 本步事实校验:code=代码在位 / env=已选
+        conda 环境 / assets=体检**资料类**全绿(工作区/数据集/权重;命令
+        脚本与环境类检查不在此步管——它们分别等到口径步与环境选定后才有
+        意义)/ intake=口径已确认且命令脚本真实存在。失败 409 带可操作原因。"""
         from .baseline_queue import normalize_run as _norm_run
         from .db import utc_now as _utc
 
@@ -2313,6 +2323,10 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                         transport.close()
                 if not presence.get("present"):
                     reason = f"代码未就位:{presence.get('reason') or '工作区没有代码'}"
+            elif step == "env":
+                if not (config.get("conda_env") or "").strip():
+                    reason = "还没选 conda 环境:本步「探测已有环境」点选一个," \
+                             "或先在「入口与口径」采用 Agent 提案(含环境建议)"
             elif step == "assets":
                 transport = _open_transport(server)
                 try:
@@ -2327,16 +2341,41 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                 repo.update_project(project_id, baseline_checks_json=_json.dumps(
                     checks, ensure_ascii=False))
                 checks_payload = checks
-                fails = [c for c in checks if c.get("status") == "fail"]
+                # 只看资料类(工作区/数据集/权重):命令脚本与环境类检查
+                # 依赖后面的口径步与本步已选环境,不拦资料 Set
+                fails = [c for c in checks
+                         if c.get("status") == "fail" and _is_asset_check(c.get("key") or "")]
                 if fails:
-                    reason = ("体检未全绿(缺资料/阻塞即未就位):" + ";".join(
-                        f"{c.get('label')}:{c.get('detail')}" for c in fails[:3]))
-            elif step == "env":
-                if not (config.get("conda_env") or "").strip():
-                    reason = "还没选 conda 环境(环境就位点选或提案采用)"
+                    reason = ("资料未就位(在本步「供给」区链接服务器目录或上传 zip,"
+                              "补完自动复核):" + ";".join(
+                                  f"{c.get('label')}:{c.get('detail')}" for c in fails[:3]))
             elif step == "intake":
                 if not config.get("onboarded") or not (config.get("datasets") or []):
-                    reason = "口径清单未确认:提议/手填后保存≥1 条清单"
+                    reason = "口径清单未确认:点「让 Agent 读代码提议」后编辑采用," \
+                             "或手工填清单保存"
+                else:
+                    # 清单已确认:复核入口类检查(命令脚本真实存在,不放假命令)
+                    transport = _open_transport(server)
+                    try:
+                        checks = server_admin.run_baseline_checks(
+                            project["remote_workdir"], config, ssh_transport=transport)
+                    except Exception as exc:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"复核体检失败:{exc}") from exc
+                    finally:
+                        if transport is not None:
+                            transport.close()
+                    repo.update_project(project_id,
+                                        baseline_checks_json=_json.dumps(
+                                            checks, ensure_ascii=False))
+                    checks_payload = checks
+                    script_fail = next((c for c in checks
+                                        if c.get("key") == "script"
+                                        and c.get("status") == "fail"), None)
+                    if script_fail:
+                        reason = (f"入口命令不可用:{script_fail.get('detail')}"
+                                  "(回本步改清单里第一条命令后重新保存)")
             if reason:
                 raise HTTPException(status_code=409, detail=reason)
             wf[step] = _utc()
