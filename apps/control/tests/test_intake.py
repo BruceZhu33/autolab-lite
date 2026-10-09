@@ -267,3 +267,47 @@ def test_workflow_blocked_while_baseline_running(api, workspace):
         json={"action": "set", "step": "code"}, headers=owner)
     assert r.status_code == 409
     assert "运行中" in r.json()["detail"]
+
+
+def test_workflow_assets_set_blocks_on_warn_and_normalizes_paths(api, workspace):
+    """真机事故回归:①数据集缺失在体检里是 warn(渐进式老语义),资料 Set
+    必须按"非 ok 即未就位"拦——10 个全缺不能因全是 warn 被放行;
+    ②提案/保存的 dataset_path 带仓库目录名前缀会被双重解析,必须剥掉。"""
+    client = api["client"]
+    owner = {"Authorization": f"Bearer {OWNER}"}
+    pid = workspace["projectId"]
+
+    # 前缀路径:保存时规整为工作区相对路径
+    saved = client.post(f"/api/owner/projects/{pid}/baseline/config", json={
+        "conda_env": "base",
+        "datasets": [{"name": "Kvasir-10",
+                      "command": "python3 train.py",
+                      # 故意带仓库目录名前缀 + ./ 前缀
+                      "dataset_path": "./intake-ws/data/Kvasir"}],
+    }, headers=owner)
+    assert saved.status_code == 200, saved.text
+    config = _config_of(api, pid)
+    assert config["datasets"][0]["dataset_path"] == "data/Kvasir"
+
+    for step in ("code", "env", "intake"):
+        r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                        json={"action": "set", "step": step}, headers=owner)
+        assert r.status_code == 200, f"{step}: {r.text}"
+
+    # 资料齐(data/Kvasir 有真实文件)→ assets set 通过
+    r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                    json={"action": "set", "step": "assets"}, headers=owner)
+    assert r.status_code == 200, r.text
+    # 回退以便下一场景
+    client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                json={"action": "unset", "step": "assets"}, headers=owner)
+
+    # 换成不存在的数据路径:体检= warn(缺失)→ Set 必须被拦(事故核心)
+    client.post(f"/api/owner/projects/{pid}/baseline/config", json={
+        "datasets": [{"name": "Nope-10", "command": "python3 train.py",
+                      "dataset_path": "data/Nope"}]}, headers=owner)
+    r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
+                    json={"action": "set", "step": "assets"}, headers=owner)
+    assert r.status_code == 409
+    assert "资料未就位" in r.json()["detail"]
+    assert not _wf_of(api, pid)["assets"]
