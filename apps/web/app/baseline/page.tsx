@@ -39,10 +39,11 @@ const CHECK_COLOR: Record<BaselineCheck["status"], string> = {
   fail: "text-destructive",
 };
 
-/** D-030 六步固定接入流程:确定性校验 + 提议确认,agent 只提议不自主执行。 */
-type Step = "code" | "assets" | "env" | "intake" | "run" | "confirm";
+/** D-030/031 六步固定接入流程:确定性校验 + 每步 set 门 + 提议确认。
+ * 顺序:代码 → 环境(先选,体检的环境检查才有意义)→ 资料 → 口径。 */
+type Step = "code" | "env" | "assets" | "intake" | "run" | "confirm";
 
-const STEP_ORDER: Step[] = ["code", "assets", "env", "intake", "run", "confirm"];
+const STEP_ORDER: Step[] = ["code", "env", "assets", "intake", "run", "confirm"];
 
 const STEP_SHORT: Record<Step, string> = {
   code: "代码", assets: "资料", env: "环境", intake: "口径", run: "跑通", confirm: "确认",
@@ -928,42 +929,43 @@ function BaselinePanel({ project, onLockChange }: {
       }
       setStepState((s) => ({ ...s, code: "done" }));
 
-      // ② 资料就位 → set(服务端重跑体检,缺资料即未就位)
-      setStepState((s) => ({ ...s, assets: "active" }));
-      if (!wf.assets) {
-        const fresh = await runBaselineCheck(project.id);
-        void refetch();
-        const fails = fresh.checks.filter((c) => c.status === "fail");
-        if (fails.length > 0) {
-          setStepState((s) => ({ ...s, assets: "failed" }));
-          stopAt("assets", `体检 ${fails.length} 项未过(缺资料就在这步链接/上传补齐)`);
-          return;
-        }
-        if (!(await autoSet("assets"))) {
-          stopAt("assets", "体检未全绿,补齐资料后重试");
-          return;
-        }
-      }
-      setStepState((s) => ({ ...s, assets: "done" }));
-
-      // ③ 环境就位 → set(已选环境);没选且口径未确认 → 先提议(提案带环境建议)
+      // ② 环境就位 → set(已选环境;体检的环境检查这时才有意义)
       setStepState((s) => ({ ...s, env: "active" }));
       if (!wf.env) {
         if (!state?.config.conda_env && !intakeConfirmed) {
+          // 环境没选且口径也没确认:先提议(提案带环境建议),采用后一并保存
           setStepState((s) => ({ ...s, intake: "active" }));
           const ok = await propose();
           stopAt("intake", ok
-            ? "Agent 已提议入口与口径清单——编辑后「采用并保存」(环境建议一并保存),再回来一键走流程"
-            : "提议会话不可用——手工填清单后保存,或补齐资料后重试");
+            ? "Agent 已提议入口与口径清单——检查/编辑后点「采用并保存」(环境建议一并保存),再点一键走流程继续"
+            : "提议会话不可用——去「环境就位」点探测选一个,或手工填口径清单保存");
           return;
         }
         if (!state?.config.conda_env) {
-          stopAt("env", "还没选 conda 环境(点选已有环境,或先在④采用提案)");
+          stopAt("env", "还没选 conda 环境:本步点「探测(含 torch/CUDA)」选一个;提案有建议也可先去④采用");
           return;
         }
         if (!(await autoSet("env"))) return;
       }
       setStepState((s) => ({ ...s, env: "done" }));
+
+      // ③ 资料就位 → set(体检资料类全绿:工作区/数据集/权重;
+      //    命令脚本/环境类检查等口径步与环境选定后再管)
+      setStepState((s) => ({ ...s, assets: "active" }));
+      if (!wf.assets) {
+        const fresh = await runBaselineCheck(project.id);
+        void refetch();
+        const gaps = fresh.checks.filter((c) =>
+          c.status === "fail"
+          && (c.key === "workspace" || c.key === "weights" || c.key.startsWith("dataset")));
+        if (gaps.length > 0) {
+          setStepState((s) => ({ ...s, assets: "active" }));
+          stopAt("assets", `缺资料 ${gaps.length} 项——在本步下方「供给」区:服务器已有目录点「浏览」链接,或上传 zip;补完自动复核`);
+          return;
+        }
+        if (!(await autoSet("assets"))) return;
+      }
+      setStepState((s) => ({ ...s, assets: "done" }));
 
       // ④ 入口与口径 → set(清单已确认)
       setStepState((s) => ({ ...s, intake: "active" }));
@@ -1089,7 +1091,7 @@ function BaselinePanel({ project, onLockChange }: {
   const anyOk = (state?.datasets ?? []).some((d) => d.ok);
 
   // ---------------------------------------------------------- D-031 set 门
-  const CONTENT_STEPS = ["code", "assets", "env", "intake"] as const;
+  const CONTENT_STEPS = ["code", "env", "assets", "intake"] as const;
   type ContentStep = (typeof CONTENT_STEPS)[number];
   const wf = state?.config.workflow
     ?? { code: null, assets: null, env: null, intake: null };
@@ -1098,18 +1100,24 @@ function BaselinePanel({ project, onLockChange }: {
   /** 内容步的顺序锁:前序未 set 时本步不可交互(仍可见,路线图不藏)。 */
   const orderLocked = (s: ContentStep): boolean =>
     CONTENT_STEPS.indexOf(s) > (allSet ? CONTENT_STEPS.length : firstUnsetIdx);
+  // 检查分类:资料类把守「资料就位」;命令脚本/环境类分别等口径步与环境选定
+  const isAssetCheck = (key: string) =>
+    key === "workspace" || key === "weights" || key.startsWith("dataset");
+  const assetGaps = checks.filter((c) =>
+    c.status === "fail" && isAssetCheck(c.key));
   const stepValidity = (s: ContentStep): { valid: boolean; invalidReason?: string } => {
     if (s === "code") return codeReady === true
       ? { valid: true } : { valid: false, invalidReason: "代码未就位" };
-    if (s === "assets") return checks.length === 0
-      ? { valid: false, invalidReason: "先跑一次体检" }
-      : hardFailCount + supplyGapCount > 0
-        ? { valid: false, invalidReason: `体检有 ${hardFailCount + supplyGapCount} 项未过(缺资料即未就位)` }
-        : { valid: true };
     if (s === "env") return state?.config.conda_env
-      ? { valid: true } : { valid: false, invalidReason: "还没选 conda 环境" };
+      ? { valid: true }
+      : { valid: false, invalidReason: "还没选 conda 环境(本步「探测」点选,或先在口径步采用提案)" };
+    if (s === "assets") return checks.length === 0
+      ? { valid: false, invalidReason: "先点「重新体检」扫一遍资料" }
+      : assetGaps.length > 0
+        ? { valid: false, invalidReason: `缺资料 ${assetGaps.length} 项:在本步「供给」区链接服务器目录或上传 zip` }
+        : { valid: true };
     return intakeConfirmed ? { valid: true }
-      : { valid: false, invalidReason: "口径清单未确认(提议/手填后保存)" };
+      : { valid: false, invalidReason: "口径清单未确认:点「让 Agent 读代码提议」编辑后采用,或手填保存" };
   };
   const doSetStep = async (action: "set" | "unset", step: ContentStep) => {
     setBusy(`wf-${step}`);
@@ -1152,8 +1160,7 @@ function BaselinePanel({ project, onLockChange }: {
       : step === "code" && codeReady === false ? "failed"
       : step === "assets"
         ? (checks.length === 0 ? "pending"
-          : hardFailCount > 0 ? "failed"
-          : supplyGapCount > 0 ? "active" : "done")
+          : assetGaps.length > 0 ? "active" : "done")
       : step === "env" && state?.config.conda_env ? "done"
       : step === "intake" && intakeConfirmed ? "done"
       : step === "intake" && (proposing || proposal) ? "active"
@@ -1233,13 +1240,13 @@ function BaselinePanel({ project, onLockChange }: {
             );
           })}
           <span className="text-micro text-muted-foreground">
-            {supplyGapCount > 0 ? `资料缺 ${supplyGapCount}` : ""}
-            {supplyGapCount > 0 && !state?.config.conda_env ? " · " : ""}
+            {assetGaps.length > 0 ? `资料缺 ${assetGaps.length}` : ""}
+            {assetGaps.length > 0 && !state?.config.conda_env ? " · " : ""}
             {!state?.config.conda_env ? "环境未选" : ""}
             {!state?.config.conda_env && !intakeConfirmed ? " · " : ""}
             {!intakeConfirmed ? "口径未确认" : ""}
-            {supplyGapCount === 0 && state?.config.conda_env && intakeConfirmed
-              ? "前置就绪,可起跑" : ""}
+            {assetGaps.length === 0 && state?.config.conda_env && intakeConfirmed
+              ? "四步就绪,可起跑" : ""}
           </span>
           <span className="ml-auto flex items-center gap-1.5">
             {advising || advice ? (
@@ -1296,24 +1303,55 @@ function BaselinePanel({ project, onLockChange }: {
                               onUnset={() => void doSetStep("unset", "code")} />
             </StepSection>
 
-            {/* ② 资料就位(D-030 资料槽):体检派生的确定性缺口——数据集/权重/
+            {/* ② 环境就位:点选服务器已有环境(确定性);没有合适的在服务器上建好再探测 */}
+            <StepSection index={2} title="环境就位" state={stepStatus("env")}
+                         locked={autoBusy} dim={orderLocked("env")}
+                         summary={state?.config.conda_env
+                           ? `已选 ${state.config.conda_env}`
+                           : "点选服务器已有 conda 环境(含 torch/CUDA 探测)"}
+                         open={stepOpen("env")} onToggle={() => toggleStep("env")}>
+              {envPlan ? (
+                <div className="rounded-lg bg-muted/40 p-2.5">
+                  <p className="text-caption text-muted-foreground">{envPlan.detail}</p>
+                  {envPlan.command ? (
+                    <pre className="mt-1 overflow-x-auto font-mono text-micro text-muted-foreground">{envPlan.command}</pre>
+                  ) : (
+                    <p className="mt-1 text-caption text-warning">无依赖文件:跳过构建(需要特定环境时在服务器上 conda env create 后重探测)</p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-caption text-muted-foreground">
+                  从服务器已有环境里点选(提案若给了建议会预填);没有合适的环境,在服务器上
+                  用 requirements/environment.yml 建好后重探测。
+                </p>
+              )}
+              {envState && envState.status !== "idle" && envState.log_tail ? (
+                <pre className="max-h-28 overflow-y-auto rounded-lg bg-muted/50 p-2 font-mono text-micro leading-relaxed">
+{envState.log_tail}
+                </pre>
+              ) : null}
+              {envState?.status === "finished" && envState.exit_code !== null ? (
+                <p className={`text-caption ${envState.exit_code === 0 ? "text-success" : "text-destructive"}`}>
+                  构建退出码 {envState.exit_code}
+                  {envState.exit_code !== 0 ? " —— 按日志提示在服务器上处理(缺系统库/网络/权限)后重试" : ""}
+                </p>
+              ) : null}
+              <EnvPicker project={project} currentEnv={state?.config.conda_env ?? ""} />
+              <WorkflowSetBar step="env" isSet={!!wf.env} orderOk={!orderLocked("env")}
+                              {...stepValidity("env")} busy={busy !== null}
+                              onSet={() => void doSetStep("set", "env")}
+                              onUnset={() => void doSetStep("unset", "env")} />
+            </StepSection>
+
+            {/* ③ 资料就位(D-030 资料槽):体检派生的确定性缺口——数据集/权重/
                 声明路径;每槽 = 链接服务器目录 或 上传 zip,补完自动复核。 */}
-            <StepSection index={2} title="资料就位" state={stepStatus("assets")}
+            <StepSection index={3} title="资料就位" state={stepStatus("assets")}
                          locked={autoBusy} dim={orderLocked("assets")}
                          summary={checks.length === 0
-                           ? "跑一次体检看缺什么(代码/数据/权重/环境)"
-                           : (() => {
-                               const gapsN = checks.filter((c) =>
-                                 c.status === "fail" && (c.supply?.length ?? 0) > 0).length;
-                               const hardN = checks.filter((c) =>
-                                 c.status === "fail" && !(c.supply?.length ?? 0)).length;
-                               const okN = checks.filter((c) => c.status === "ok").length;
-                               return gapsN > 0
-                                 ? `缺资料 ${gapsN} 项(链接或上传即就位)`
-                                 : hardN > 0
-                                   ? `${okN} 通过 · ${hardN} 项阻塞`
-                                   : `${okN} 项通过,资料齐`;
-                             })()}
+                           ? "跑一次体检看缺什么(数据集/权重;命令与环境的检查在后面步骤)"
+                           : assetGaps.length > 0
+                             ? `缺资料 ${assetGaps.length} 项:链接服务器目录或上传 zip 即就位`
+                             : "资料齐(工作区/数据集/权重)"}
                          open={stepOpen("assets")} onToggle={() => toggleStep("assets")}>
               {failedSupplies.length > 0 ? (
                 <div className="space-y-2">
@@ -1355,50 +1393,14 @@ function BaselinePanel({ project, onLockChange }: {
                 <SearchCode className="size-3" />
                 重新体检
               </Button>
+              <p className="text-micro text-muted-foreground/70">
+                本步只看资料类(工作区/数据集/权重);「命令脚本/运行环境/依赖」等项
+                依赖后面的口径步与本步已选环境,不拦资料 Set——口径 Set 时会复核命令。
+              </p>
               <WorkflowSetBar step="assets" isSet={!!wf.assets} orderOk={!orderLocked("assets")}
                               {...stepValidity("assets")} busy={busy !== null}
                               onSet={() => void doSetStep("set", "assets")}
                               onUnset={() => void doSetStep("unset", "assets")} />
-            </StepSection>
-
-            {/* ③ 环境就位:点选服务器已有环境(确定性);没有合适的在服务器上建好再探测 */}
-            <StepSection index={3} title="环境就位" state={stepStatus("env")}
-                         locked={autoBusy} dim={orderLocked("env")}
-                         summary={state?.config.conda_env
-                           ? `已选 ${state.config.conda_env}`
-                           : "点选服务器已有 conda 环境(含 torch/CUDA 探测)"}
-                         open={stepOpen("env")} onToggle={() => toggleStep("env")}>
-              {envPlan ? (
-                <div className="rounded-lg bg-muted/40 p-2.5">
-                  <p className="text-caption text-muted-foreground">{envPlan.detail}</p>
-                  {envPlan.command ? (
-                    <pre className="mt-1 overflow-x-auto font-mono text-micro text-muted-foreground">{envPlan.command}</pre>
-                  ) : (
-                    <p className="mt-1 text-caption text-warning">无依赖文件:跳过构建(需要特定环境时在服务器上 conda env create 后重探测)</p>
-                  )}
-                </div>
-              ) : (
-                <p className="text-caption text-muted-foreground">
-                  从服务器已有环境里点选(提案若给了建议会预填);没有合适的环境,在服务器上
-                  用 requirements/environment.yml 建好后重探测。
-                </p>
-              )}
-              {envState && envState.status !== "idle" && envState.log_tail ? (
-                <pre className="max-h-28 overflow-y-auto rounded-lg bg-muted/50 p-2 font-mono text-micro leading-relaxed">
-{envState.log_tail}
-                </pre>
-              ) : null}
-              {envState?.status === "finished" && envState.exit_code !== null ? (
-                <p className={`text-caption ${envState.exit_code === 0 ? "text-success" : "text-destructive"}`}>
-                  构建退出码 {envState.exit_code}
-                  {envState.exit_code !== 0 ? " —— 按日志提示在服务器上处理(缺系统库/网络/权限)后重试" : ""}
-                </p>
-              ) : null}
-              <EnvPicker project={project} currentEnv={state?.config.conda_env ?? ""} />
-              <WorkflowSetBar step="env" isSet={!!wf.env} orderOk={!orderLocked("env")}
-                              {...stepValidity("env")} busy={busy !== null}
-                              onSet={() => void doSetStep("set", "env")}
-                              onUnset={() => void doSetStep("unset", "env")} />
             </StepSection>
 
             {/* ④ 入口与口径(D-030 提议制):分析 Agent(只读)读代码 → 提案

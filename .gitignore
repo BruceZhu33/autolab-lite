@@ -32,3 +32,4 @@ next-env.d.ts
 .DS_Store
 .idea/
 .vscode/
+.local-state/
