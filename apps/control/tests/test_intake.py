@@ -184,12 +184,13 @@ def _wf_of(api, project_id) -> dict:
 
 
 def test_workflow_set_requires_order_and_facts(api, workspace):
-    """set 门:跳步 409;顺序 = 代码→环境→资料→口径;资料 Set 只看资料类。"""
+    """set 门:跳步 409;顺序 = 代码→环境→口径→资料;资料 Set 必须先有清单
+    (清单定义资料槽——空工作区不能因"无红色项"被放行,真机反馈的漏洞)。"""
     client = api["client"]
     owner = {"Authorization": f"Bearer {OWNER}"}
     pid = workspace["projectId"]
 
-    # 跳步:先 set assets(前面 code/env 未 set)→ 409
+    # 跳步:先 set assets(前序未 set)→ 409
     r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
                     json={"action": "set", "step": "assets"}, headers=owner)
     assert r.status_code == 409
@@ -199,13 +200,12 @@ def test_workflow_set_requires_order_and_facts(api, workspace):
     r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
                     json={"action": "set", "step": "code"}, headers=owner)
     assert r.status_code == 200, r.text
-    assert _wf_of(api, pid)["code"]
     r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
                     json={"action": "set", "step": "env"}, headers=owner)
     assert r.status_code == 409
     assert "conda" in r.json()["detail"]
 
-    # 选环境后 set env → 通过
+    # 选环境后 set env → 通过(环境步的部分保存:单存 conda_env 合法)
     cfg = client.post(f"/api/owner/projects/{pid}/baseline/config",
                       json={"conda_env": "base"}, headers=owner)
     assert cfg.status_code == 200, cfg.text
@@ -213,12 +213,12 @@ def test_workflow_set_requires_order_and_facts(api, workspace):
                     json={"action": "set", "step": "env"}, headers=owner)
     assert r.status_code == 200, r.text
 
-    # assets set:清单未配时体检的 script 类失败("运行命令未配置")
-    # 不拦资料 Set(死锁修复);资料类(数据集)缺失才拦
+    # assets set:intake 未 set → 顺序门拦下(口径清单定义资料槽,
+    # 没有清单就没有"要什么资料"的答案——顺序本身即防线的第一层)
     r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
                     json={"action": "set", "step": "assets"}, headers=owner)
-    # workspace 存在、无清单 → dataset 检查按扫描模式(warn 不拦)→ set 应通过
-    assert r.status_code == 200, r.text
+    assert r.status_code == 409
+    assert "入口与口径" in r.json()["detail"]
 
 
 def test_workflow_set_assets_green_then_unset_clears_later(
@@ -238,20 +238,21 @@ def test_workflow_set_assets_green_then_unset_clears_later(
     }, headers=owner)
     assert saved.status_code == 200, saved.text
 
-    # 顺序:code → env → assets → intake(intake Set 还会复核命令脚本真实存在)
-    for step in ("code", "env", "assets", "intake"):
+    # 顺序:code → env → intake → assets(口径清单定义资料槽;
+    # intake Set 复核命令脚本真实存在;assets Set 照清单逐数据集验证)
+    for step in ("code", "env", "intake", "assets"):
         r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
                         json={"action": "set", "step": step}, headers=owner)
         assert r.status_code == 200, f"{step}: {r.text}"
 
     wf = _wf_of(api, pid)
-    assert all(wf[s] for s in ("code", "env", "assets", "intake"))
-    # 回退:unset assets → intake 等(若有)一并清
+    assert all(wf[s] for s in ("code", "env", "intake", "assets"))
+    # 回退:unset assets 只清它自己(intake/code/env 在前,保留)
     r = client.post(f"/api/owner/projects/{pid}/baseline/workflow",
                     json={"action": "unset", "step": "assets"}, headers=owner)
     assert r.status_code == 200
     wf = _wf_of(api, pid)
-    assert wf["code"] and not wf["assets"] and not wf["intake"]
+    assert wf["code"] and wf["env"] and wf["intake"] and not wf["assets"]
 
 
 def test_workflow_blocked_while_baseline_running(api, workspace):
