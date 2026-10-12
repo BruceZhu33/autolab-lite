@@ -199,6 +199,9 @@ def test_server_fs_browse_local(api, tmp_path):
     assert client.get(url, params={"path": str(tmp_path / "nope")},
                       headers=OWNER_H).status_code == 409
     assert client.get(url, params={"path": str(tmp_path)}, headers=AGENT_H).status_code == 403
+    # Control 本机目录(选本机代码目录作同步来源)
+    mine = client.get("/api/owner/fs/browse", params={"path": str(tmp_path)}, headers=OWNER_H)
+    assert "browse-a" in [e["name"] for e in mine.json()["entries"]]
 
 
 def test_model_settings(api):

@@ -1,0 +1,77 @@
+"use client";
+
+import { get, post, request } from "./client";
+import type { StageCell, StageKey } from "./system";
+
+export type Project = {
+  id: string;
+  name: string;
+  server: { id: string; name: string; transport_mode: string };
+  workdir: string;
+  output_root: string;
+  githubUrl: string | null;
+  localWorkspace: string | null;
+  papersCount: number;
+  baselinePassedAt: string | null;
+  stage: StageKey;
+  stages: Record<StageKey, StageCell>;
+  needsYou: boolean;
+  updated_at: string;
+};
+
+export type ServerOption = {
+  id: string;
+  name: string;
+  transport_mode: string;
+  gpu_slots: number;
+};
+
+export type NewProject =
+  | { name: string; server_id: string; source: { kind: "dir"; path: string }; local_workspace?: string }
+  | { name: string; server_id: string; source: { kind: "github"; url: string }; local_workspace?: string };
+
+export const fetchProjects = () => get<Project[]>("/api/projects");
+export const fetchServerOptions = () => get<ServerOption[]>("/api/servers");
+
+export const createProject = (input: NewProject) =>
+  post<{ project: Project }>("/api/owner/projects", input);
+
+export function createProjectFromZip(name: string, serverId: string, file: File) {
+  const form = new FormData();
+  form.append("name", name);
+  form.append("server_id", serverId);
+  form.append("file", file);
+  return post<{ project: Project }>("/api/owner/projects/upload", form);
+}
+
+export const updateProject = (
+  id: string, input: { github_url?: string; workdir?: string; local_workspace?: string },
+) => request<{ project: Project }>(`/api/owner/projects/${id}`, { method: "PATCH", body: input });
+
+export const deleteProject = (id: string) =>
+  request<{ deleted: string; name: string }>(`/api/owner/projects/${id}`, { method: "DELETE" });
+
+export const syncProjectCode = (id: string, source?: "github" | "local") =>
+  post<{ source: string; detail: string }>(`/api/owner/projects/${id}/code/sync`,
+                                           source ? { source } : {});
+
+export const fetchPapers = (id: string) => get<string[]>(`/api/projects/${id}/papers`);
+
+export function uploadPaper(id: string, file: File) {
+  const form = new FormData();
+  form.append("file", file);
+  return post<{ path: string; size: number }>(`/api/owner/projects/${id}/papers`, form);
+}
+
+/** 服务器上已有的数据/权重目录 → 链接到工作区 target。 */
+export const linkAsset = (id: string, targetPath: string, serverPath: string) =>
+  post<{ target: string }>(`/api/owner/projects/${id}/assets/link`,
+                           { target_path: targetPath, server_path: serverPath });
+
+/** 上传 zip 解包到工作区 target。 */
+export function uploadAsset(id: string, targetPath: string, file: File) {
+  const form = new FormData();
+  form.append("target_path", targetPath);
+  form.append("file", file);
+  return post<{ target: string }>(`/api/owner/projects/${id}/assets/upload`, form);
+}

@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowUp, Folder, FolderOpen, Home, Loader2 } from "lucide-react";
-import { browseFs, browseServerFs } from "@/lib/api";
+import { browseLocalFs, browseServerFs } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { Input } from "~/vendor/ui/components/ui/input";
 import {
@@ -36,7 +36,7 @@ export function FolderBrowserDialog({
     queryKey: ["folder-browser", source.kind, (source as { serverId?: string }).serverId ?? "", current, open],
     queryFn: () => source.kind === "server"
       ? browseServerFs(source.serverId, current)
-      : browseFs(current),
+      : browseLocalFs(current),
     enabled,
     retry: false,
   });

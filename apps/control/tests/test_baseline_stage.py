@@ -7,9 +7,8 @@ import json
 import re
 
 from autolab_control.agent import runtime as al
-from autolab_control.agent import tools as agent_tools
-from autolab_control.stages import baseline as baseline_stage
 from autolab_control.core.db import utc_now
+from autolab_control.stages import baseline as baseline_stage
 
 from .test_http_api import AGENT, OWNER, api  # noqa: F401
 from .test_repo import repo  # noqa: F401, F811

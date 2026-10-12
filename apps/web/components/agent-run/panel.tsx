@@ -12,16 +12,13 @@ import {
   MessageSquare, Send, Square, Terminal, User,
 } from "lucide-react";
 import {
-  confirmAgentBaseline, fetchAgentRunEvents, provideAsset, sendAgentRunMessage,
-  stopAgentRun, uploadAsset,
-  type AgentRun, type AgentRunEvent, type AgentRunPending, type ProjectListItem,
+  confirmBaseline, fetchRunEvents, isActive, linkAsset, sendRunMessage, stopRun, uploadAsset,
+  type Project, type Run, type RunEvent, type RunPending,
 } from "@/lib/api";
 import { FolderBrowserDialog } from "@/components/folder-browser";
 import { MiniMarkdown } from "@/components/mini-markdown";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { Input } from "~/vendor/ui/components/ui/input";
-
-const ACTIVE = new Set(["running", "waiting_human", "waiting_jobs"]);
 
 const STATUS_LABEL: Record<string, { label: string; cls: string }> = {
   running: { label: "工作中", cls: "bg-brand/10 text-brand" },
@@ -37,7 +34,7 @@ function brief(value: unknown, max = 120): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-function EventRow({ event }: { event: AgentRunEvent }) {
+function EventRow({ event }: { event: RunEvent }) {
   const p = event.payload as Record<string, unknown>;
   switch (event.kind) {
     case "assistant":
@@ -98,7 +95,7 @@ function EventRow({ event }: { event: AgentRunEvent }) {
 
 /** 要材料:目标路径由 agent 给出,owner 只需给来源(服务器目录 或 zip)。 */
 function MaterialSupply({ project, run, pending }: {
-  project: ProjectListItem; run: AgentRun; pending: AgentRunPending;
+  project: Project; run: Run; pending: RunPending;
 }) {
   const target = pending.payload.target_path ?? "";
   const [serverPath, setServerPath] = useState("");
@@ -110,10 +107,10 @@ function MaterialSupply({ project, run, pending }: {
   const supply = async (mode: "link" | "upload") => {
     setBusy(mode);
     try {
-      if (mode === "link") await provideAsset(project.id, target, serverPath.trim());
+      if (mode === "link") await linkAsset(project.id, target, serverPath.trim());
       else if (zip) await uploadAsset(project.id, target, zip);
       const how = mode === "link" ? `链接自服务器目录 ${serverPath.trim()}` : `上传 zip ${zip?.name} 解包`;
-      await sendAgentRunMessage(run.id, `已把材料放到 ${target}(${how}),请检查后继续。`);
+      await sendRunMessage(run.id, `已把材料放到 ${target}(${how}),请检查后继续。`);
       toast.success("材料已就位,已通知 Agent");
       void queryClient.invalidateQueries({ queryKey: ["agent-run", run.id] });
     } catch (err) {
@@ -159,7 +156,7 @@ function MaterialSupply({ project, run, pending }: {
   );
 }
 
-function BaselineProposalCard({ run }: { run: AgentRun }) {
+function BaselineProposalCard({ run }: { run: Run }) {
   const proposal = run.pending?.payload.proposal;
   const [busy, setBusy] = useState(false);
   const queryClient = useQueryClient();
@@ -167,7 +164,7 @@ function BaselineProposalCard({ run }: { run: AgentRun }) {
   const confirm = async () => {
     setBusy(true);
     try {
-      await confirmAgentBaseline(run.id);
+      await confirmBaseline(run.id);
       toast.success("基线已确认,项目进入研究阶段");
       void queryClient.invalidateQueries();
     } catch (err) {
@@ -208,7 +205,7 @@ function BaselineProposalCard({ run }: { run: AgentRun }) {
   );
 }
 
-function PendingCard({ project, run }: { project: ProjectListItem; run: AgentRun }) {
+function PendingCard({ project, run }: { project: Project; run: Run }) {
   const pending = run.pending;
   if (!pending) return null;
   if (run.status === "waiting_jobs") {
@@ -242,9 +239,9 @@ function PendingCard({ project, run }: { project: ProjectListItem; run: AgentRun
   );
 }
 
-export function AgentRunPanel({ project, run }: { project: ProjectListItem; run: AgentRun }) {
+export function RunPanel({ project, run }: { project: Project; run: Run }) {
   const queryClient = useQueryClient();
-  const [events, setEvents] = useState<AgentRunEvent[]>([]);
+  const [events, setEvents] = useState<RunEvent[]>([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -252,9 +249,9 @@ export function AgentRunPanel({ project, run }: { project: ProjectListItem; run:
 
   const { data } = useQuery({
     queryKey: ["agent-run", run.id, lastSeq],
-    queryFn: () => fetchAgentRunEvents(run.id, lastSeq),
+    queryFn: () => fetchRunEvents(run.id, lastSeq),
     refetchInterval: (query) =>
-      ACTIVE.has(query.state.data?.run.status ?? run.status) ? 2500 : false,
+      isActive(query.state.data?.run ?? run) ? 2500 : false,
   });
   useEffect(() => {
     if (data?.events.length) {
@@ -268,14 +265,14 @@ export function AgentRunPanel({ project, run }: { project: ProjectListItem; run:
   useEffect(() => { bottomRef.current?.scrollIntoView({ block: "nearest" }); }, [events.length]);
 
   const current = data?.run ?? run;
-  const active = ACTIVE.has(current.status);
+  const active = isActive(current);
   const status = STATUS_LABEL[current.status] ?? STATUS_LABEL.stopped;
 
   const send = async () => {
     if (!text.trim()) return;
     setSending(true);
     try {
-      await sendAgentRunMessage(current.id, text.trim());
+      await sendRunMessage(current.id, text.trim());
       setText("");
       void queryClient.invalidateQueries({ queryKey: ["agent-run", current.id] });
     } catch (err) {
@@ -286,7 +283,7 @@ export function AgentRunPanel({ project, run }: { project: ProjectListItem; run:
   };
   const stop = async () => {
     try {
-      await stopAgentRun(current.id);
+      await stopRun(current.id);
       toast.success("已请求停止");
     } catch (err) {
       toast.error(`停止失败:${(err as Error).message}`);

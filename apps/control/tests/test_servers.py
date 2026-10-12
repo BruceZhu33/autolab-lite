@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 from autolab_control.infra.gpu import parse_nvidia_smi_csv
 
-from .test_http_api import OWNER, AGENT, api  # noqa: F401
+from .test_http_api import AGENT, OWNER, api  # noqa: F401
 from .test_repo import repo  # noqa: F401
 from .test_ssh_transport import PASSWORD, USER, FakeSshServer
 
