@@ -146,6 +146,13 @@ def start(repo: Repo, project_id: str, *, note: str = "", network: bool = False)
     if not (project.get("remote_workdir") or "").strip():
         raise AgentLoopError("项目还没有工作区,先完成立项")
     task = "请把这个工程的 Baseline 跑通。论文(如有)可用 read_paper 阅读。"
+    pool = baseline_pool(project)
+    if pool:
+        listing = "\n".join(
+            f"- {name}: 指标 {json.dumps(info.get('metrics') or {}, ensure_ascii=False)}"
+            for name, info in pool.items())
+        task += ("\n\n## 已确认的基线(不要重跑,除非 owner 明确要求)\n" + listing
+                 + "\n本次只需为**新增**的数据集补跑基线;finish 时把新增的列出来即可。")
     if note.strip():
         task += f"\n\nowner 补充说明:\n{note.strip()}"
     return runtime.start_run(repo, project_id, KIND, task, {"network": bool(network)})
@@ -164,12 +171,14 @@ def confirm(repo: Repo, run_id: str) -> dict:
         "datasets": [{"name": d["name"], "job_id": d["jobId"], "dataset_path": d["datasetPath"]}
                      for d in proposal["datasets"]]})
     now = utc_now()
+    # 追加确认:新提案覆盖同名数据集,已确认的其他数据集原样保留(池只增不减)
+    datasets = {name: info for name, info in baseline_snapshot(project).get("datasets", {}).items()}
+    datasets.update({d["name"]: {"metrics": d["metrics"], "command": d["command"],
+                                 "dataset_path": d["datasetPath"], "job_id": d["jobId"]}
+                     for d in proposal["datasets"]})
     snapshot = {
         "passed_at": now, "run_id": run_id, "conda_env": proposal["condaEnv"],
-        "notes": proposal["notes"],
-        "datasets": {d["name"]: {"metrics": d["metrics"], "command": d["command"],
-                                 "dataset_path": d["datasetPath"], "job_id": d["jobId"]}
-                     for d in proposal["datasets"]},
+        "notes": proposal["notes"], "datasets": datasets,
     }
     repo.update_project(project["id"], baseline_passed_at=now,
                         baseline_json=json.dumps(snapshot, ensure_ascii=False))
