@@ -6,8 +6,8 @@ from __future__ import annotations
 import time
 
 import pytest
-from autolab_control.db import Database
-from autolab_control.repo import Repo
+from autolab_control.core.db import Database
+from autolab_control.core.repo import Repo
 
 from .conftest import SLOW_TRAIN_SCRIPT, run_cli, spawn_control, spawn_runner
 from .test_m1_e2e import setup_world, wait_for, wait_terminal

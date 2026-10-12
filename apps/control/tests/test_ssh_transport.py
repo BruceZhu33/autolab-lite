@@ -11,8 +11,8 @@ import threading
 
 import paramiko
 import pytest
-from autolab_control.hostkeys import HostKeyError, HostKeyStore, fingerprint_for
-from autolab_control.ssh_transport import SshError, SshTransport
+from autolab_control.infra.hostkeys import HostKeyError, HostKeyStore, fingerprint_for
+from autolab_control.infra.ssh import SshError, SshTransport
 
 USER = "autolab"
 PASSWORD = "unit-test-password"

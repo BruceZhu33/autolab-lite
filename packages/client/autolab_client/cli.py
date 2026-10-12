@@ -16,10 +16,10 @@ import sys
 from pathlib import Path
 
 import typer
-from autolab_control.credentials import CredentialStore
-from autolab_control.db import Database
-from autolab_control.repo import PlanHashMismatch, Repo, RepoError
-from autolab_control.transport import RunnerTransport
+from autolab_control.core.credentials import CredentialStore
+from autolab_control.core.db import Database
+from autolab_control.core.repo import PlanHashMismatch, Repo, RepoError
+from autolab_control.infra.runner_client import RunnerTransport
 from autolab_protocol import (
     CodeAnchor,
     MetricDefinition,

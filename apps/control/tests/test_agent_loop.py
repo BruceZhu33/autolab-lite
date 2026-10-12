@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import copy
 
-from autolab_control import agent_loop as al
+from autolab_control.agent import runtime as al
+from autolab_control.agent import tools as agent_tools
 
 from .test_repo import repo  # noqa: F401, F811
 
@@ -43,10 +44,10 @@ def jobs_tool(job_ids):
 
 
 def profile(*, tools=None, on_finish=None, **kw):
-    finish = al.finish_tool("结束", {"summary": {"type": "string"}}, ["summary"])
+    finish = agent_tools.finish_tool("结束", {"summary": {"type": "string"}}, ["summary"])
     return al.LoopProfile(
         kind="test", system_prompt="sys",
-        build_tools=lambda env: (tools or []) + [al.ask_human_tool(), finish],
+        build_tools=lambda env: (tools or []) + [agent_tools.ask_human_tool(), finish],
         on_finish=on_finish or (lambda env, payload: None), **kw)
 
 

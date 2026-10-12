@@ -124,8 +124,8 @@ def stack(tmp_path, request):
     ), "runner")
     db_path = tmp_path / "control.db"
     credentials = tmp_path / "credentials.json"
-    from autolab_control.credentials import CredentialStore
-    from autolab_control.http_api import API_REF
+    from autolab_control.core.credentials import CredentialStore
+    from autolab_control.api.app import API_REF
 
     if getattr(request, "param", {}).get("http"):
         store = CredentialStore(credentials)

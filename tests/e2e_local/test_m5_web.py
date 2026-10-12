@@ -12,8 +12,8 @@ from pathlib import Path
 
 import httpx
 import pytest
-from autolab_control.db import Database
-from autolab_control.repo import Repo
+from autolab_control.core.db import Database
+from autolab_control.core.repo import Repo
 
 from .conftest import REPO_ROOT, Proc, run_cli
 from .test_m1_e2e import create_plan, setup_world, wait_terminal

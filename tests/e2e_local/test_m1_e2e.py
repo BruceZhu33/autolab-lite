@@ -17,10 +17,10 @@ from datetime import datetime
 
 import httpx
 import pytest
-from autolab_control.db import Database
-from autolab_control.manifest_builder import build_manifest
-from autolab_control.repo import AcquiredJob, Repo
-from autolab_control.transport import RunnerTransport
+from autolab_control.core.db import Database
+from autolab_control.execution.manifest import build_manifest
+from autolab_control.core.repo import AcquiredJob, Repo
+from autolab_control.infra.runner_client import RunnerTransport
 from autolab_protocol import PlanSpecV1, manifest_signature
 
 from .conftest import run_cli

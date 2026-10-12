@@ -3,11 +3,7 @@ name = "autolab-lite"
 version = "0.1.0"
 description = "AutoLab Lite: personal GPU experiment workbench (control plane, runner, protocol, CLI)"
 requires-python = ">=3.10"
-dependencies = [
-    "langchain-anthropic>=1.7.2",
-    "langgraph>=1.2.12",
-    "langgraph-checkpoint-sqlite>=3.1.1",
-]
+dependencies = []
 
 [dependency-groups]
 dev = [
@@ -39,10 +35,12 @@ extend-exclude = ["docs"]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI 的 File()/Form() 是参数默认值惯用法
+extend-immutable-calls = ["fastapi.File", "fastapi.Form", "fastapi.Depends"]
+
 [tool.ruff.lint.per-file-ignores]
 # typer's argument-default idiom trips B008
 "packages/client/autolab_client/cli.py" = ["B008"]
-# reuses the test_repo fixture; param name shadows the import on purpose
-"apps/control/tests/test_m2_repo.py" = ["F811"]
-"apps/control/tests/test_m3_ops.py" = ["F811"]
-"apps/control/tests/test_http_api.py" = ["F811"]
+# 测试复用 fixture:参数名有意与导入的 fixture 同名
+"**/tests/*.py" = ["F811"]

@@ -38,8 +38,8 @@ chmod 600 "$WORK/runner.json"
 
 uv run python - "$CREDS" "$RTOK" "$RHMAC" "$OWNER_TOKEN" "$AGENT_TOKEN" <<'PY'
 import sys
-from autolab_control.credentials import CredentialStore
-from autolab_control.http_api import API_REF
+from autolab_control.core.credentials import CredentialStore
+from autolab_control.api.app import API_REF
 creds = CredentialStore(sys.argv[1])
 creds.put("demo-local:runner", runner_token=sys.argv[2], manifest_hmac_key=sys.argv[3])
 creds.put_entry(API_REF, {"owner_token": sys.argv[4], "agent_token": sys.argv[5]})

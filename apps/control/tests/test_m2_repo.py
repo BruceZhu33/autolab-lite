@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from autolab_control.repo import RepoError
+from autolab_control.core.repo import RepoError
 
 from .test_repo import approve_simple, make_event, make_spec, repo  # noqa: F401
 
