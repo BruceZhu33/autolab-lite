@@ -44,6 +44,17 @@ def main(argv: list[str] | None = None) -> int:
             target=queue_manager.run_forever, daemon=True, name="baseline-queue")
         queue_thread.start()
         print("autolab-control: baseline queue manager started", flush=True)
+        from . import baseline_stage, research_stage
+        from .agent_loop import AgentLoopManager
+
+        research_stage.ensure_schema(repo)
+        agent_manager = AgentLoopManager(
+            repo, CredentialStore(args.credentials),
+            {baseline_stage.KIND: baseline_stage.PROFILE,
+             research_stage.KIND: research_stage.PROFILE})
+        threading.Thread(target=agent_manager.run_forever, daemon=True,
+                         name="agent-loop").start()
+        print("autolab-control: agent loop manager started", flush=True)
         stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         signal.signal(signal.SIGINT, lambda *_: stop.set())

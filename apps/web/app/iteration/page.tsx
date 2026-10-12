@@ -27,6 +27,11 @@ import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "@/vendor/views/layout/page-h
 import { MiniMarkdown } from "@/components/mini-markdown";
 import { LiveSessionCard } from "@/components/live-session-card";
 import { EmptyState } from "@/components/empty-state";
+import { AgentRunPanel } from "@/components/agent-run-panel";
+import {
+  fetchLatestAgentRun, fetchResearchRounds, startResearch,
+  type ProjectListItem, type ResearchRound, type ResearchTier,
+} from "@/lib/api";
 
 const JOB_TONE: Record<string, string> = {
   QUEUED: "bg-muted text-muted-foreground",
@@ -1404,6 +1409,156 @@ function FlowPanel({ projectId, state }: { projectId: string; state: IterationSt
 
 /* ---------------------------------------- 页面 */
 
+const RESEARCH_TIERS: Array<{ key: ResearchTier; title: string; badge: string; desc: string }> = [
+  { key: "light", title: "轻量 · 人机协作", badge: "≤3 轮",
+    desc: "每轮结束停下给你看报告,你回复后才进下一轮" },
+  { key: "medium", title: "中量", badge: "≤5 轮",
+    desc: "自动连续迭代,出现提升或轮数用完即停" },
+  { key: "heavy", title: "重量 · 过夜", badge: "不限轮",
+    desc: "达到显著阈值(Δ≥0.01)才停,GPU 小时兜底" },
+];
+
+function ResearchJournal({ rounds }: { rounds: ResearchRound[] }) {
+  if (!rounds.length) return null;
+  return (
+    <div className="space-y-1.5 rounded-xl border-[0.5px] border-surface-border bg-card p-3">
+      <p className="text-caption font-semibold">研究日志</p>
+      {rounds.map((r) => (
+        <details key={r.id} className="rounded-md border-[0.5px] border-surface-border px-2 py-1">
+          <summary className="cursor-pointer text-caption">
+            <span className="font-medium">第 {r.roundNo} 轮</span>
+            <span className={`ml-2 rounded-full px-1.5 text-micro ${r.evaluation.anyImproved
+              ? "bg-success/10 text-success" : "bg-muted/60 text-muted-foreground"}`}>
+              {r.evaluation.anyImproved ? "有提升" : "未提升"}
+              {r.evaluation.bestGain != null ? ` ${r.evaluation.bestGain >= 0 ? "+" : ""}${r.evaluation.bestGain.toFixed(4)}` : ""}
+            </span>
+            <span className="ml-2 text-muted-foreground">{r.hypothesis}</span>
+          </summary>
+          <div className="mt-1 space-y-1 text-caption">
+            <p><span className="text-muted-foreground">改动:</span>{r.changes}</p>
+            <p><span className="text-muted-foreground">分析:</span>{r.analysis}</p>
+            {r.nextIdea ? <p><span className="text-muted-foreground">下一步:</span>{r.nextIdea}</p> : null}
+            <table className="w-full text-micro">
+              <tbody>
+                {r.evaluation.rows.map((row) => (
+                  <tr key={row.jobId}>
+                    <td className="pr-2">{row.name}</td>
+                    <td className="pr-2 text-muted-foreground">{row.dataset ?? "-"}</td>
+                    <td className="pr-2">{row.status}</td>
+                    <td className="pr-2 font-mono tabular-nums">
+                      {row.metric}={row.value?.toFixed(4) ?? "-"}(基线 {row.baseline?.toFixed(4) ?? "-"})
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {r.evaluation.warnings.map((w) => (
+              <p key={w} className="text-micro text-warning">⚠ {w}</p>
+            ))}
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
+/** 研究 = 一个 Agent 会话:论文/参考库 + 你的想法 → 自由迭代;
+ * 是否提升由 Python 对照基线判定。旧的方向/方案/循环流程过渡期折叠保留。 */
+function ResearchSection({ project, legacy }: { project: ProjectListItem; legacy: React.ReactNode }) {
+  const queryClient = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["agent-run-latest", project.id, "research"],
+    queryFn: () => fetchLatestAgentRun(project.id, "research"),
+    refetchInterval: 4000,
+  });
+  const run = data?.run ?? null;
+  const active = !!run && ["running", "waiting_human", "waiting_jobs"].includes(run.status);
+  const { data: rounds } = useQuery({
+    queryKey: ["research-rounds", project.id, run?.id ?? ""],
+    queryFn: () => fetchResearchRounds(project.id, run!.id),
+    enabled: !!run,
+    refetchInterval: active ? 5000 : false,
+  });
+  const [tier, setTier] = useState<ResearchTier>("light");
+  const [idea, setIdea] = useState("");
+  const [reference, setReference] = useState("");
+  const [gpuHours, setGpuHours] = useState("");
+  const [network, setNetwork] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [showLegacy, setShowLegacy] = useState(false);
+
+  const start = async () => {
+    setStarting(true);
+    try {
+      await startResearch(project.id, {
+        tier, idea, reference, network,
+        gpu_hours: tier === "heavy" && gpuHours ? Number(gpuHours) : undefined,
+      });
+      setIdea("");
+      void queryClient.invalidateQueries({ queryKey: ["agent-run-latest", project.id] });
+    } catch (err) {
+      toast.error(`启动失败:${(err as Error).message}`);
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      {!active ? (
+        <div className="space-y-2 rounded-xl border-[0.5px] border-surface-border bg-card p-3">
+          <p className="text-caption font-semibold">
+            <Lightbulb className="mr-1 inline size-3.5 align-[-2px] text-brand" />开始研究
+          </p>
+          <textarea value={idea} onChange={(e) => setIdea(e.target.value)} rows={3}
+                    placeholder="你的想法(可选):想验证什么、往哪个方向改、哪些不要碰…"
+                    className="w-full rounded-md border-[0.5px] border-surface-border bg-background px-2 py-1.5 text-caption" />
+          <input value={reference} onChange={(e) => setReference(e.target.value)}
+                 placeholder="参考代码库(可选):GitHub URL 或本机路径;论文在项目页上传"
+                 className="h-8 w-full rounded-md border-[0.5px] border-surface-border bg-background px-2 text-caption" />
+          <div className="grid gap-2 md:grid-cols-3">
+            {RESEARCH_TIERS.map((t) => (
+              <button key={t.key} type="button" onClick={() => setTier(t.key)}
+                      className={`rounded-lg border-[0.5px] p-2 text-left ${tier === t.key
+                        ? "border-brand bg-brand/5" : "border-surface-border hover:bg-muted/40"}`}>
+                <p className="text-caption font-medium">{t.title}
+                  <span className="ml-1.5 rounded-full bg-muted/60 px-1.5 text-micro text-muted-foreground">{t.badge}</span>
+                </p>
+                <p className="mt-0.5 text-micro text-muted-foreground">{t.desc}</p>
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            {tier === "heavy" ? (
+              <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
+                GPU 小时上限
+                <input value={gpuHours} onChange={(e) => setGpuHours(e.target.value)} placeholder="24"
+                       className="h-7 w-16 rounded-md border-[0.5px] border-surface-border bg-background px-1.5 text-micro" />
+              </label>
+            ) : null}
+            <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
+              <input type="checkbox" checked={network} onChange={(e) => setNetwork(e.target.checked)} />
+              服务器可访问外网
+            </label>
+            <Button size="sm" className="ml-auto gap-1" disabled={starting} onClick={() => void start()}>
+              {starting ? <Loader2 className="size-3.5 animate-spin" /> : <PlayCircle className="size-3.5" />}
+              启动
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {run ? <AgentRunPanel key={run.id} project={project} run={run} /> : null}
+      <ResearchJournal rounds={rounds?.rounds ?? []} />
+      <button type="button" onClick={() => setShowLegacy((v) => !v)}
+              className="flex items-center gap-1 text-micro text-muted-foreground hover:text-foreground">
+        <ChevronRightMark open={showLegacy} />
+        旧版方向 / 方案 / 自动迭代流程(过渡期保留)
+      </button>
+      {showLegacy ? legacy : null}
+    </div>
+  );
+}
+
 export default function IterationPage() {
   const { data: projects = [] } = useQuery({
     queryKey: ["projects"],
@@ -1446,7 +1601,7 @@ export default function IterationPage() {
     <div className="flex h-full flex-col">
       <PageHeader>
         <Repeat className="size-4 text-muted-foreground" />
-        <h1 className="text-title-sm font-semibold tracking-tight">自动迭代</h1>
+        <h1 className="text-title-sm font-semibold tracking-tight">研究</h1>
         {candidates.length > 1 ? (
           <div className="ml-1 flex gap-1">
             {candidates.map((p) => (
@@ -1466,8 +1621,8 @@ export default function IterationPage() {
         <div className={`${PAGE_GUTTER} flex flex-1`}>
           <EmptyState
             icon={Repeat}
-            title="还没有可迭代的项目"
-            description="方向已确立(或老项目方案已采纳)的项目会出现在这里,Agent 依据方向制定迭代实验计划。"
+            title="还没有可研究的项目"
+            description="Baseline 确认后的项目会出现在这里:给论文/参考库和你的想法,Agent 自由迭代。"
             action={
               <Link href="/review">
                 <Button variant="outline" size="sm" className="gap-1.5">
@@ -1479,6 +1634,9 @@ export default function IterationPage() {
           />
         </div>
       ) : selected ? (
+        <div className={`${PAGE_GUTTER} flex-1 overflow-y-auto`}>
+          <div className={`${PAGE_RAIL} py-4`}>
+            <ResearchSection key={selected.id} project={selected} legacy={(
         <div className={`${PAGE_GUTTER} flex min-h-0 flex-1 flex-col`}>
           {!acceptedOnly ? (
             <div className={`${PAGE_RAIL} flex flex-1 flex-col`}>
@@ -1516,6 +1674,9 @@ export default function IterationPage() {
               <Loader2 className="mr-2 size-4 animate-spin" />加载迭代状态…
             </div>
           )}
+        </div>
+            )} />
+          </div>
         </div>
       ) : null}
     </div>
