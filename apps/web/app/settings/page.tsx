@@ -5,7 +5,10 @@ import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Copy, Loader2, Plug, Sun, Moon, Monitor } from "lucide-react";
 import { useTheme } from "next-themes";
-import { apiToken, apiUrl, clearApiToken, fetchOverview, setApiToken } from "@/lib/api";
+import {
+  apiToken, apiUrl, clearApiToken, fetchModelSettings, fetchOverview,
+  saveModelSettings, setApiToken,
+} from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { Input } from "~/vendor/ui/components/ui/input";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "@/vendor/views/layout/page-header";
@@ -135,6 +138,53 @@ function ConnectionSettings() {
   );
 }
 
+function ModelSettings() {
+  const [apiKey, setApiKey] = useState("");
+  const [revealed, setRevealed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const { data: settings } = useQuery({
+    queryKey: ["model-settings"], queryFn: fetchModelSettings,
+  });
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const saved = await saveModelSettings({ api_key: apiKey.trim() });
+      toast.success(saved.configured ? "模型设置已保存" : "已保存");
+      setApiKey("");
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card title="模型(Agent 用的 LLM)"
+          desc={`当前:${settings?.model ?? "…"} @ ${settings?.baseUrl ?? "…"}。key 只存 Control 本机凭据文件,Agent 会话共用。`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          type={revealed ? "text" : "password"}
+          className="max-w-md font-mono text-caption"
+          placeholder={settings?.configured ? "已配置(输入可覆盖)" : "粘贴 API Key"}
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          spellCheck={false}
+        />
+        <Button size="sm" variant="outline" onClick={() => setRevealed((v) => !v)}>
+          {revealed ? "隐藏" : "显示"}
+        </Button>
+        <Button size="sm" onClick={() => void save()} disabled={saving || !apiKey.trim()}>
+          {saving ? <Loader2 className="size-3.5 animate-spin" /> : null}保存
+        </Button>
+      </div>
+      <p className="mt-1 text-micro text-muted-foreground">
+        默认 GLM(open.bigmodel.cn 的 Anthropic 兼容端点);base_url / model 可在凭据文件 model:api-key 条目里覆盖。
+      </p>
+    </Card>
+  );
+}
+
 export default function SettingsPage() {
   return (
     <div className="flex h-full flex-col">
@@ -144,6 +194,7 @@ export default function SettingsPage() {
       <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
         <div className={`${PAGE_RAIL} max-w-2xl space-y-3 py-4`}>
           <ConnectionSettings />
+          <ModelSettings />
           <AppearanceSettings />
           <Card title="服务器登记" desc="在 GPU Servers 页注册:local 需与已启动 Runner 一致的端口/token/HMAC;SSH 注册时 TOFU 固定主机密钥并验证认证。">
             <p className="text-caption text-muted-foreground">

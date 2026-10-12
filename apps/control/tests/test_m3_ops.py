@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 from autolab_control.execution.artifacts import ArtifactPullError, pull_artifact
-from autolab_control.infra.runner_deploy import DeployPaths, RunnerDeployer, generate_runner_config
 from autolab_control.infra.gpu import probe_gpu_slots, telemetry_json
+from autolab_control.infra.runner_deploy import DeployPaths, RunnerDeployer, generate_runner_config
 from autolab_control.infra.ssh import ExecResult
 
 from .test_repo import approve_simple, make_spec, repo  # noqa: F401

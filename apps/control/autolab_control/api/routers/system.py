@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from ...agent import model
 from ...stages import board
+from ...workspace.host import LocalHost, browse_dirs
 from ..app import Ctx
 
 
@@ -39,5 +40,10 @@ def build(ctx: Ctx) -> APIRouter:
         return model.save_model_settings(
             ctx.credentials, api_key=str(payload.get("api_key") or ""),
             base_url=str(payload.get("base_url") or ""), model=str(payload.get("model") or ""))
+
+    @router.get("/api/owner/fs/browse", dependencies=[ctx.owner])
+    def browse_control_machine(path: str = "") -> dict:
+        """列 Control 所在机器(你的电脑)的目录:选本机代码目录作同步来源。"""
+        return browse_dirs(LocalHost(), path)
 
     return router

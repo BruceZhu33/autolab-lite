@@ -1,32 +1,16 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
-import {
-  Check, ChevronRight, Copy, FileText, FlaskConical, Loader2, ShieldCheck,
-  Timer, Users,
-} from "lucide-react";
-import {
-  approvePlan, fetchPlanDetail, fetchProjects, type PlanDetailView,
-} from "@/lib/api";
+import { useQuery } from "@tanstack/react-query";
+import { ChevronRight, FileText, FlaskConical, Loader2, Timer, Users } from "lucide-react";
+import { fetchPlanDetail, fetchProjects, type PlanDetail } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
-import { Input } from "~/vendor/ui/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "~/vendor/ui/components/ui/dialog";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "@/vendor/views/layout/page-header";
 
 const STATUS_VIEW: Record<string, { label: string; cls: string }> = {
-  DRAFT: { label: "待批准", cls: "bg-warning/10 text-warning" },
+  DRAFT: { label: "草稿", cls: "bg-warning/10 text-warning" },
   APPROVED: { label: "已批准", cls: "bg-info/10 text-info" },
   ABANDONED: { label: "已废弃", cls: "bg-muted text-muted-foreground" },
 };
@@ -102,92 +86,6 @@ function MetricChip({ name, direction }: { name: string; direction?: string }) {
   );
 }
 
-function ApproveDialog({ plan }: { plan: PlanDetailView }) {
-  const [open, setOpen] = useState(false);
-  const [typed, setTyped] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const queryClient = useQueryClient();
-
-  const copyHash = async () => {
-    try {
-      await navigator.clipboard.writeText(plan.spec_hash);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      toast.error("复制失败,请手动选择复制");
-    }
-  };
-
-  const confirm = async () => {
-    if (typed.trim() !== plan.spec_hash) {
-      toast.error("spec hash 不匹配:请粘贴完整 hash 以确认本轮执行契约");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const result = await approvePlan(plan.id, typed.trim());
-      toast.success(`已批准:${result.jobs.length} 个 Job 已生成`);
-      setOpen(false);
-      setTyped("");
-      void queryClient.invalidateQueries({ queryKey: ["board"] });
-      void queryClient.invalidateQueries({ queryKey: ["plan", plan.id] });
-    } catch (e) {
-      toast.error((e as Error).message);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger render={
-        <Button size="sm" className="gap-1.5">
-          <ShieldCheck className="size-3.5" />批准执行
-        </Button>
-      } />
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>批准 Plan revision {plan.revision_no}</DialogTitle>
-          <DialogDescription>
-            一次确认覆盖整批 Job。批准后执行契约冻结(spec hash 不变),改变口径需创建下一版 Plan。
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-3">
-          <div>
-            <p className="text-caption font-medium text-muted-foreground">期望 spec hash</p>
-            <div className="mt-1 flex items-start gap-2">
-              <code className="min-w-0 flex-1 break-all rounded-lg bg-muted/50 p-2 text-micro leading-relaxed">
-                {plan.spec_hash}
-              </code>
-              <Button variant="outline" size="icon-sm" onClick={() => void copyHash()} aria-label="复制 hash">
-                {copied ? <Check className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
-              </Button>
-            </div>
-          </div>
-          <div>
-            <p className="text-caption font-medium text-muted-foreground">粘贴完整 hash 以确认</p>
-            <Input
-              className="mt-1 font-mono text-caption"
-              placeholder={plan.spec_hash.slice(0, 16) + "…"}
-              value={typed}
-              onChange={(e) => setTyped(e.target.value)}
-              spellCheck={false}
-            />
-          </div>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" size="sm" onClick={() => setOpen(false)}>取消</Button>
-          <Button size="sm" disabled={submitting || !typed.trim()} onClick={() => void confirm()}>
-            {submitting ? <Loader2 className="size-3.5 animate-spin" /> : null}
-            确认批准
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 export default function PlanPage() {
   const params = useParams<{ id: string }>();
   const id = Array.isArray(params.id) ? params.id[0] : params.id;
@@ -250,8 +148,10 @@ export default function PlanPage() {
         <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-micro font-medium ${statusView.cls}`}>
           {statusView.label}
         </span>
-        {plan.status === "DRAFT" ? (
-          <span className="ml-auto"><ApproveDialog plan={plan} /></span>
+        {plan.approved_by ? (
+          <span className="ml-auto text-caption text-muted-foreground" title={plan.approved_by}>
+            批准来源 {plan.approved_by.startsWith("agent-run:") ? "Agent 会话" : plan.approved_by}
+          </span>
         ) : plan.experiment_ref ? (
           <span className="ml-auto inline-flex items-center gap-1 text-caption text-muted-foreground">
             <FileText className="size-3.5" />
@@ -350,7 +250,7 @@ export default function PlanPage() {
                 <ul className="space-y-1">
                   {criteria.map((c, i) => (
                     <li key={i} className="flex items-start gap-1.5 text-caption leading-relaxed">
-                      <Check className="mt-0.5 size-3 shrink-0 text-success" />
+                      <ChevronRight className="mt-0.5 size-3 shrink-0 text-success" />
                       {asText(c)}
                     </li>
                   ))}

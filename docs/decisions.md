@@ -511,3 +511,25 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   「一键走流程」= 顺序自动 Set(服务端逐项校验,不满足即停)。
   run/confirm 是动作门不参与 set;「补充数据集」= unset assets → 补 → 重 set,
   起跑按清单全跑(未就绪自动跳过、补齐后追加的既有语义保留)。
+
+## D-032 · 重构:三段 workflow + 阶段 agent,按职责分层重组(2026-10-12)
+
+- 背景:owner 定调「workflow 与 agent loop 并行」——外层只保留三段(立项 →
+  Baseline → 研究),段内交给一个 agent 会话自由推进,不再逐步状态机。旧实现
+  (六步 Baseline Set 门 / 四相位迭代循环 / 多角色拆分 / 单发回落 / await 旗标群)
+  复杂度失控:每起一次真机事故就长一层 Python 补丁。
+- 新形态:`agent/runtime`(等人 / 等 GPU 两种暂停,统一由外部事件唤醒;Python
+  验收 finish;跨轮翻篇 NewContext)+ `stages/baseline`(缺材料 ask_human,
+  确认即写基线快照)+ `stages/research`(end_round 收束,Python 对照基线判定
+  提升;轻量每轮停下等 owner,重量 GPU 小时兜底)。实验提交 `execution/experiments`
+  以 agent-run 名义自动批准,派发/GPU 租约/重启恢复沿用 scheduler+Runner。
+- 分层:core < infra < workspace < execution < agent < stages < api,依赖只往下;
+  test_architecture 守卫依赖方向与跨模块私有导入。`workspace.Host` 是本机/SSH
+  的唯一执行与文件抽象;API 单 app + 5 个 router,UserError→409 / NotFound→404
+  统一映射;看板改三段、由事实派生(工作区/基线快照/最近会话)。
+- 删除:iteration / iteration_loop / agent_session / baseline_queue / baseline_agent /
+  chat / llm / server_admin / 旧 http_api、MCP server 与 agent_tools、方案评审/
+  方向/Chat/Agents 页面与看板 vendor;依赖去掉 langgraph/langchain/mcp。旧库迁移:
+  review_refs_json→refs_json、确认快照→baseline_json(原地,退役表保留不读)。
+- 遗留:GLM 真机验证(长工具循环 + 跨暂停续跑)未做,先在真项目上跑通 Baseline
+  与轻量研究再合并回 main。

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronRight, GitBranch } from "lucide-react";
-import { fetchJobs, type JobView } from "@/lib/api";
+import { fetchJobs, type Job } from "@/lib/api";
 import { ApiError } from "@/components/api-error";
 import { Badge } from "~/vendor/ui/components/ui/badge";
 import { PageHeader } from "~/vendor/views/layout/page-header";
@@ -45,7 +45,7 @@ function duration(started?: string | null, finished?: string | null): string | n
 }
 
 /** 矩阵实参 → 「seed=1 lr=0.1」;解析失败或为空返回空串。 */
-function fmtParams(params: JobView["params_json"]): string {
+function fmtParams(params: Job["params_json"]): string {
   if (!params) return "";
   const obj = typeof params === "string" ? (() => {
     try { return JSON.parse(params) as Record<string, unknown>; } catch { return null; }
@@ -56,7 +56,7 @@ function fmtParams(params: JobView["params_json"]): string {
 
 export default function RunsPage() {
   const router = useRouter();
-  const [jobs, setJobs] = useState<JobView[] | null>(null);
+  const [jobs, setJobs] = useState<Job[] | null>(null);
   const [error, setError] = useState<unknown>(null);
 
   const refresh = useCallback(() => {

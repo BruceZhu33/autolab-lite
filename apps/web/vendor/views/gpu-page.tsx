@@ -154,11 +154,11 @@ function ServerCard({
                 连通性测试
               </DropdownMenuItem>
               <DropdownMenuItem disabled={!s.agent_port || busy === `${s.id}:agent/probe`}
-                                onClick={() => void act(s, "agent/probe")}>
-                agent 探活
+                                onClick={() => void act(s, "runner/probe")}>
+                Runner 探活
               </DropdownMenuItem>
               <DropdownMenuItem disabled={busy === `${s.id}:agent/install`}
-                                onClick={() => void act(s, "agent/install")}>
+                                onClick={() => void act(s, "runner/install")}>
                 部署 / 修复 Agent
               </DropdownMenuItem>
               <DropdownMenuItem disabled={busy === `${s.id}:agent/upgrade`}
@@ -275,9 +275,9 @@ export default function GpuPage() {
     setBusy(`${s.id}:${op}`);
     const OP_LABEL: Record<ServerOp, string> = {
       "connectivity-test": "连通性测试",
-      "agent/probe": "agent 探活",
-      "agent/install": "部署 Agent",
-      "agent/upgrade": "升级 Agent",
+      "runner/probe": "Runner 探活",
+      "runner/install": "部署 Runner",
+      "runner/upgrade": "升级 Runner",
     };
     try {
       const r = await serverOp(s.id, op, body);
@@ -512,7 +512,7 @@ export default function GpuPage() {
             <AlertDialogCancel>取消</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                if (upgradeTarget) void act(upgradeTarget, "agent/upgrade", { force: false });
+                if (upgradeTarget) void act(upgradeTarget, "runner/upgrade", { force: false });
                 setUpgradeTarget(null);
               }}
             >

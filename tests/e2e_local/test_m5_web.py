@@ -1,6 +1,6 @@
 """M5 full-stack smoke: real Runner + Control (HTTP API) + production web
-build. Verifies the board projection over HTTP, rendered pages, and that the
-production bundle carries no Multica domain core."""
+build. Verifies the three-stage board projection over HTTP, rendered pages,
+auth scopes, and that the production bundle carries no Multica domain core."""
 
 from __future__ import annotations
 
@@ -12,8 +12,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from autolab_control.core.db import Database
-from autolab_control.core.repo import Repo
 
 from .conftest import REPO_ROOT, Proc, run_cli
 from .test_m1_e2e import create_plan, setup_world, wait_terminal
@@ -21,6 +19,11 @@ from .test_m1_e2e import create_plan, setup_world, wait_terminal
 # 端口可被环境覆盖;默认撞常驻 demo 时 skip(红色假失败消除,D-025)
 WEB_PORT = int(os.environ.get("AUTOLAB_E2E_WEB_PORT", "3430"))
 API_PORT = int(os.environ.get("AUTOLAB_E2E_API_PORT", "8710"))
+
+OWNER_TOKEN = "e2e-owner-token"
+AGENT_TOKEN = "e2e-agent-token"
+OWNER_H = {"Authorization": f"Bearer {OWNER_TOKEN}"}
+AGENT_H = {"Authorization": f"Bearer {AGENT_TOKEN}"}
 
 
 def _port_busy(port: int) -> bool:
@@ -39,8 +42,7 @@ def _require_ports():
             f"端口 {busy} 被占用(常驻 demo?):停掉占用进程,或设 "
             "AUTOLAB_E2E_WEB_PORT / AUTOLAB_E2E_API_PORT(注意 web 的 API "
             "地址是 build 期内联,换 API 端口需重建 web)")
-OWNER_TOKEN = "e2e-owner-token"
-AGENT_TOKEN = "e2e-agent-token"
+
 
 pytestmark = pytest.mark.parametrize("stack", [{"http": True}], indirect=True)
 
@@ -71,48 +73,42 @@ def web_server(_require_ports):
 
 
 def test_m5_full_stack_smoke(stack, web_server):
+    from autolab_control.core.db import Database
+    from autolab_control.core.repo import Repo
+
     ids = setup_world(stack)
     created = create_plan(stack, ids, seeds="1")
     run_cli(["plan", "approve", created["plan"]["id"],
              "--expect-spec-hash", created["plan"]["spec_hash"]], stack)
     repo = Repo(Database(stack["db"]))
     wait_terminal(repo, created["plan"]["id"], 1)
+    job_id = repo.list_jobs(plan_id=created["plan"]["id"])[0]["id"]
 
-    owner_headers = {"Authorization": f"Bearer {OWNER_TOKEN}"}
-
-    # 1. control HTTP API: board projection reflects the finished plan
+    # 1. control HTTP API:三段看板 + 权限分离
     with httpx.Client(timeout=5.0, base_url=f"http://127.0.0.1:{API_PORT}") as api:
-        board = api.get("/api/board", headers=owner_headers).json()
-        assert board and board[0]["column"] == "confirm"
-        assert board[0]["jobs"] == {"done": 1, "total": 1, "running": 0, "failed": 0}
-        assert board[0]["latestMetric"]["name"] == "val_dice"
-        overview = api.get("/api/overview", headers=owner_headers).json()
+        board = api.get("/api/board", headers=OWNER_H).json()
+        card = next(c for c in board if c["projectId"] == ids["project_id"])
+        # 有工作区、没基线快照 → 停在 Baseline 段
+        assert card["stage"] == "baseline"
+        assert set(card["stages"]) == {"setup", "baseline", "research"}
+        assert card["stages"]["setup"]["state"] == "done"
+        assert card["stages"]["baseline"]["state"] == "pending"
+
+        overview = api.get("/api/overview", headers=OWNER_H).json()
         assert overview["projects"][0]["name"] == "demo"
-        # agent token works for reads, cannot approve or advance stages
-        agent_headers = {"Authorization": f"Bearer {AGENT_TOKEN}"}
-        assert api.get("/api/overview", headers=agent_headers).status_code == 200
-        denied = api.post("/api/owner/plans/none-0/approve",
-                          json={"expect_spec_hash": "0" * 64}, headers=agent_headers)
-        assert denied.status_code == 403
-        # stage advance: confirm → done (owner only, expect-stage guarded)
-        project_id = board[0]["projectId"]
-        denied_stage = api.post(f"/api/owner/projects/{project_id}/stage",
-                                json={"to": "done", "from": "confirm"},
-                                headers=agent_headers)
-        assert denied_stage.status_code == 403
-        finished = api.post(f"/api/owner/projects/{project_id}/stage",
-                            json={"to": "done", "from": "confirm"},
-                            headers=owner_headers)
-        assert finished.status_code == 200
-        assert api.get("/api/board", headers=owner_headers).json()[0]["column"] == "done"
-        # anonymous gets nothing
+
+        # agent token 可读、不可写(owner-only)
+        assert api.get("/api/overview", headers=AGENT_H).status_code == 200
+        assert api.post("/api/owner/settings/model", json={"api_key": "x"},
+                        headers=AGENT_H).status_code == 403
+        # 匿名什么都拿不到
         assert api.get("/api/board").status_code == 401
-        # logs proxy reaches the runner through control
-        job_id = repo.list_jobs(plan_id=created["plan"]["id"])[0]["id"]
-        logs = api.get(f"/api/jobs/{job_id}/logs", headers=owner_headers).json()
+
+        # 日志代理直达 Runner
+        logs = api.get(f"/api/jobs/{job_id}/logs", headers=OWNER_H).json()
         assert "log line 0" in logs["text"]
 
-    # 2. web console serves real HTML for every P0 page
+    # 2. web console serves real HTML for every page
     with httpx.Client(timeout=10.0, base_url=f"http://127.0.0.1:{WEB_PORT}") as web:
         board_page = web.get("/")
         assert board_page.status_code == 200 and "AutoLab" in board_page.text

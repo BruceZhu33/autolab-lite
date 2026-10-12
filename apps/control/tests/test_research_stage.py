@@ -6,7 +6,6 @@ import json
 
 import pytest
 from autolab_control.agent import runtime as al
-from autolab_control.agent import tools as agent_tools
 from autolab_control.core.errors import UserError
 from autolab_control.stages import research as research_stage
 

@@ -4,9 +4,8 @@ import { useEffect, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
-  BarChart3, Bot, ChevronDown, Circle, CircleDot, Compass, FlaskConical,
-  FolderKanban, GitBranch, Gpu, ListChecks, MessageCircle, Moon, Repeat,
-  Search, Settings, Sparkles, Sun, User,
+  BarChart3, ChevronDown, FlaskConical, FolderKanban, GitBranch, Gpu,
+  Lightbulb, ListChecks, Moon, Search, Settings, Sun, User,
 } from "lucide-react";
 
 import {
@@ -16,33 +15,23 @@ import {
 } from "~/vendor/ui/components/ui/sidebar";
 
 /**
- * 用户设计稿的侧栏(part 1/4):工作区切换器、搜索槽、New 入口、
- * 个人导航(Chat、GPU Servers,不属于工作流)、Work 分组(研究流程视图)、
- * AI Team 分组、底部 Analytics/Settings/用户。
+ * 侧栏:Work 分组(立项 → Baseline → 研究 三段工作流)、全局入口
+ * (实验运行 / GPU 服务器)、底部 Analytics/Settings/用户。
  * 未接线的项禁用并标「待接线」,不假装可用。
  */
 
-/** 个人导航:不属于 Work 研究工作流的全局入口(对应原 personalNav)。 */
+/** 全局入口:研究与工作流之外的工具页。 */
 const PERSONAL = [
-  { label: "Chat", icon: MessageCircle, href: "/chat", key: "chat" },
-  { label: "GPU Servers", icon: Gpu, href: "/gpus", key: "gpus" },
+  { label: "实验运行", icon: GitBranch, href: "/runs", key: "runs" },
+  { label: "GPU 服务器", icon: Gpu, href: "/gpus", key: "gpus" },
 ];
 
-/** Work:研究流程;Baseline/方向/项目是独立页面,其余下钻看板对应列。 */
+/** Work:研究流程三段——立项 → Baseline → 研究。 */
 const WORK = [
   { label: "实验看板", icon: ListChecks, href: "/", key: "board" },
   { label: "项目", icon: FolderKanban, href: "/projects", key: "projects" },
-  { label: "Baseline", icon: CircleDot, href: "/baseline", key: "baseline" },
-  { label: "方向", icon: Compass, href: "/review", key: "review" },
-  { label: "Iteration", icon: Repeat, href: "/iteration", key: "iteration" },
-  { label: "Confirm", icon: Circle, href: "/?stage=confirm", key: "confirm", stage: "confirm" },
-  { label: "Done", icon: FlaskConical, href: "/?stage=done", key: "done", stage: "done" },
-];
-
-/** AI Team:Agents 已可用(Claude Code + GLM + 提示词);Skills 待接线。 */
-const AI_TEAM = [
-  { label: "Agents", icon: Bot, href: "/agents", key: "agents" },
-  { label: "Skills", icon: Sparkles, key: "skills" },
+  { label: "Baseline", icon: FlaskConical, href: "/baseline", key: "baseline" },
+  { label: "研究", icon: Lightbulb, href: "/research", key: "research" },
 ];
 
 export function AppSidebar({ agentsWorking = 0 }: { agentsWorking?: number }) {
@@ -134,27 +123,6 @@ export function AppSidebar({ agentsWorking = 0 }: { agentsWorking?: number }) {
                   {agentsWorking > 0 ? <SidebarMenuBadge>{agentsWorking}</SidebarMenuBadge> : null}
                 </SidebarMenuButton>
               </SidebarMenuItem>
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        <SidebarGroup>
-          <SidebarGroupLabel>AI Team</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {AI_TEAM.map((item) => (
-                <SidebarMenuItem key={item.key}>
-                  <SidebarMenuButton
-                    isActive={active(item.href)}
-                    tooltip={item.href ? item.label : `${item.label} 待接线`}
-                    disabled={!item.href}
-                    onClick={item.href ? () => router.push(item.href!) : undefined}
-                  >
-                    <item.icon />
-                    <span>{item.label}</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

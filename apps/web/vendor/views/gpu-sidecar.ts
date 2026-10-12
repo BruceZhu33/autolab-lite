@@ -7,9 +7,9 @@
 
 export type ServerOp =
   | "connectivity-test"
-  | "agent/probe"
-  | "agent/install"
-  | "agent/upgrade";
+  | "runner/probe"
+  | "runner/install"
+  | "runner/upgrade";
 
 export interface GpuTelemetry {
   index: number;
@@ -184,9 +184,9 @@ export interface OpResultView {
 
 const OP_LABELS: Record<ServerOp, string> = {
   "connectivity-test": "连通性测试",
-  "agent/probe": "Runner 探活",
-  "agent/install": "Runner 部署",
-  "agent/upgrade": "Runner 升级",
+  "runner/probe": "Runner 探活",
+  "runner/install": "Runner 部署",
+  "runner/upgrade": "Runner 升级",
 };
 
 export function describeOpResult(op: ServerOp, result: unknown): OpResultView {
@@ -199,7 +199,7 @@ export function describeOpResult(op: ServerOp, result: unknown): OpResultView {
       detail: r?.detail,
     };
   }
-  if (op === "agent/probe") {
+  if (op === "runner/probe") {
     const r = result as { version?: string; runner_instance_id?: string };
     return {
       ok: true,
@@ -207,7 +207,7 @@ export function describeOpResult(op: ServerOp, result: unknown): OpResultView {
       detail: `版本 ${r?.version ?? "?"} · 实例 ${r?.runner_instance_id ?? "?"}`,
     };
   }
-  if (op === "agent/install" || op === "agent/upgrade") {
+  if (op === "runner/install" || op === "runner/upgrade") {
     const r = result as { pid?: number; port?: number; version?: string };
     return {
       ok: true,
@@ -219,8 +219,8 @@ export function describeOpResult(op: ServerOp, result: unknown): OpResultView {
 }
 
 export async function serverOp(id: string, op: ServerOp, _body?: unknown): Promise<unknown> {
-  const path = op === "agent/install" || op === "agent/upgrade"
-    ? "agent/install" // 升级 = 重新部署(强制重装 wheel + 轮换凭据)
+  const path = op === "runner/install" || op === "runner/upgrade"
+    ? "runner/install" // 升级 = 重新部署(强制重装 wheel + 轮换凭据)
     : op;
   return request<Record<string, unknown>>(
     `/api/owner/servers/${encodeURIComponent(id)}/${path}`,
