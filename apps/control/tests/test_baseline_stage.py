@@ -216,3 +216,53 @@ def test_start_requires_workspace_and_single_active(api, tmp_path):
     assert again.status_code == 409 and "进行中" in again.json()["detail"]
     assert client.post(f"/api/owner/projects/{pid}/baseline/start", json={},
                        headers=AGENT_H).status_code == 403
+
+
+def test_append_confirm_keeps_existing_pool(api, tmp_path):
+    """追加确认:第二次基线只跑新数据集,已确认的不丢(池只增不减)。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    state: dict = {}
+
+    def round_script(prefix, name):
+        def remember(messages):
+            match = re.search(rf"{name}: (job-\S+)", last_tool_text(messages))
+            assert match, last_tool_text(messages)
+            state["job"] = match.group(1)
+            return [use(f"{prefix}w", "wait_jobs", job_ids=[state["job"]])]
+
+        def submit_finish(messages):
+            return [use(f"{prefix}f", "finish", notes="补跑",
+                        datasets=[{"name": name, "job_id": state["job"]}])]
+
+        return [
+            [use(f"{prefix}r", "run_experiment", purpose="基线",
+                 jobs=[{"name": name, "dataset": name, "command": f"python train.py --{name}"}],
+                 metrics=["val_dice"])],
+            remember,
+            submit_finish,
+        ]
+
+    def run_baseline(dataset):
+        _r = client.post(f"/api/owner/projects/{pid}/baseline/start", json={},
+                         headers=OWNER_H)
+        assert _r.status_code == 200, _r.text
+        run_id = _r.json()["run"]["id"]
+        model = ScriptModel(round_script("a", dataset))
+        step = lambda: al.step(repo, None, run_id, baseline_stage.PROFILE, model=model)
+        assert step() == "running" and step() == "waiting_jobs"
+        finish_job(repo, state["job"], {"val_dice": 0.7})
+        assert step() == "waiting_human"
+        resp = client.post(f"/api/owner/runs/{run_id}/baseline/confirm", headers=OWNER_H)
+        assert resp.status_code == 200, resp.text
+        return resp.json()["run"]
+
+    run_baseline("kvasir")
+    pool = baseline_stage.baseline_pool(repo.get_project(pid))
+    assert list(pool) == ["kvasir"]
+
+    run_baseline("polyp")
+    pool = baseline_stage.baseline_pool(repo.get_project(pid))
+    assert set(pool) == {"kvasir", "polyp"}          # 旧的还在
+    assert pool["kvasir"]["metrics"] == {"val_dice": 0.7}
+    assert "polyp" not in pool["kvasir"]["command"]  # kvasir 命令未被覆盖
