@@ -20,6 +20,8 @@ import {
   type ProjectListItem, type ServerEnvironment,
 } from "@/lib/api";
 import { LiveSessionCard } from "@/components/live-session-card";
+import { AgentRunPanel } from "@/components/agent-run-panel";
+import { fetchLatestAgentRun, startBaselineAgent } from "@/lib/api";
 import { EmptyState } from "@/components/empty-state";
 import { FolderBrowserDialog } from "@/components/folder-browser";
 import { Button } from "~/vendor/ui/components/ui/button";
@@ -1859,6 +1861,74 @@ function BaselinePanel({ project, onLockChange }: {
   );
 }
 
+/** Baseline = 一个 Agent 会话:它自己探索/装环境/适配/跑通,缺材料问你,
+ * 跑通后交你确认。旧的六步流程过渡期折叠保留。 */
+function BaselineAgentSection({ project, onLockChange }: {
+  project: ProjectListItem; onLockChange: (locked: boolean) => void;
+}) {
+  const queryClient = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["agent-run-latest", project.id, "baseline"],
+    queryFn: () => fetchLatestAgentRun(project.id, "baseline"),
+    refetchInterval: 4000,
+  });
+  const run = data?.run ?? null;
+  const active = !!run && ["running", "waiting_human", "waiting_jobs"].includes(run.status);
+  const [note, setNote] = useState("");
+  const [network, setNetwork] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [legacy, setLegacy] = useState(false);
+
+  const start = async () => {
+    setStarting(true);
+    try {
+      await startBaselineAgent(project.id, { note, network });
+      setNote("");
+      void queryClient.invalidateQueries({ queryKey: ["agent-run-latest", project.id] });
+    } catch (err) {
+      toast.error(`启动失败:${(err as Error).message}`);
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      {!active ? (
+        <div className="space-y-2 rounded-xl border-[0.5px] border-surface-border bg-card p-3">
+          <p className="text-caption font-semibold">
+            <Sparkles className="mr-1 inline size-3.5 align-[-2px] text-brand" />
+            {run?.status === "done" ? "重新跑 Baseline" : "启动 Baseline Agent"}
+          </p>
+          <p className="text-micro text-muted-foreground">
+            Agent 会读代码、选环境、写适配器、冒烟后正式跑;缺数据集/权重/信息会停下来问你。
+          </p>
+          <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2}
+                    placeholder="补充说明(可选):要跑哪些数据集、训练口径、已知的坑…"
+                    className="w-full rounded-md border-[0.5px] border-surface-border bg-background px-2 py-1.5 text-caption" />
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
+              <input type="checkbox" checked={network} onChange={(e) => setNetwork(e.target.checked)} />
+              服务器可访问外网(允许 Agent 自行下载)
+            </label>
+            <Button size="sm" className="ml-auto gap-1" disabled={starting} onClick={() => void start()}>
+              {starting ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
+              启动
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {run ? <AgentRunPanel key={run.id} project={project} run={run} /> : null}
+      <button type="button" onClick={() => setLegacy((v) => !v)}
+              className="flex items-center gap-1 text-micro text-muted-foreground hover:text-foreground">
+        <ChevronDown className={`size-3 transition-transform ${legacy ? "" : "-rotate-90"}`} />
+        旧版六步流程(过渡期保留)
+      </button>
+      {legacy ? <BaselinePanel project={project} onLockChange={onLockChange} /> : null}
+    </div>
+  );
+}
+
 export default function BaselinePage() {
   const { data: projects = [] } = useQuery({
     queryKey: ["projects"],
@@ -1888,7 +1958,7 @@ export default function BaselinePage() {
           </span>
         ) : null}
         <p className="ml-2 hidden min-w-0 truncate text-caption text-muted-foreground md:block">
-          一键:代码就位 → 环境构建 → 数据集检查 → 跑通拿指标
+          Agent 跑通基线,缺材料问你,跑通后你确认
         </p>
       </PageHeader>
 
@@ -1934,7 +2004,7 @@ export default function BaselinePage() {
                 </div>
               ) : null}
               {selected ? (
-                <BaselinePanel key={selected.id} project={selected} onLockChange={onLockChange} />
+                <BaselineAgentSection key={selected.id} project={selected} onLockChange={onLockChange} />
               ) : null}
             </>
           )}

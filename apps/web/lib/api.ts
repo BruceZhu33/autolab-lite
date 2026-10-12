@@ -1573,3 +1573,114 @@ export async function dismissBacklogItem(projectId: string, itemId: string) {
   }
   return response.json() as Promise<{ dismissed: string }>;
 }
+
+// ------------------------------------------------ 阶段 agent 会话(agent_loop)
+
+export type AgentRunStatus =
+  | "running" | "waiting_human" | "waiting_jobs" | "done" | "failed" | "stopped";
+
+export type BaselineProposal = {
+  condaEnv: string;
+  notes: string;
+  datasets: Array<{
+    name: string; jobId: string; command: string; datasetPath: string;
+    metrics: Record<string, number>;
+  }>;
+};
+
+export type AgentRunPending = {
+  kind: "human" | "jobs";
+  tool_use_id: string | null;
+  payload: {
+    question?: string;
+    /** dataset / weights / file / info / confirm / confirm_baseline */
+    kind?: string;
+    name?: string;
+    target_path?: string;
+    why?: string;
+    job_ids?: string[];
+    proposal?: BaselineProposal;
+    /** round_review:本轮报告(markdown)与轮次 */
+    report?: string;
+    roundNo?: number;
+  };
+};
+
+export type AgentRun = {
+  id: string;
+  projectId: string;
+  kind: string;
+  status: AgentRunStatus;
+  stopReason: string | null;
+  pending: AgentRunPending | null;
+  result: Record<string, unknown> | null;
+  config: Record<string, unknown>;
+  steps: number;
+  tokensIn: number;
+  tokensOut: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AgentRunEvent = {
+  seq: number;
+  kind: string;
+  payload: Record<string, unknown>;
+  at: string;
+};
+
+export const fetchLatestAgentRun = (projectId: string, kind: string) =>
+  get<{ run: AgentRun | null }>(`/api/projects/${projectId}/agent-runs/${kind}/latest`);
+
+export const fetchAgentRunEvents = (runId: string, after = 0) =>
+  get<{ run: AgentRun; events: AgentRunEvent[] }>(
+    `/api/agent-runs/${runId}/events?after=${after}`);
+
+export const startBaselineAgent = (projectId: string, input: { note?: string; network?: boolean }) =>
+  chatPost<{ run: AgentRun }>(`/api/owner/projects/${projectId}/baseline/agent/start`, input);
+
+/** owner 发话:等人时即回答 / 对提案的修改意见;运行中即插话。 */
+export const sendAgentRunMessage = (runId: string, text: string) =>
+  chatPost<{ runId: string }>(`/api/owner/agent-runs/${runId}/message`, { text });
+
+export const stopAgentRun = (runId: string) =>
+  chatPost<{ runId: string }>(`/api/owner/agent-runs/${runId}/stop`);
+
+export const confirmAgentBaseline = (runId: string) =>
+  chatPost<{ run: AgentRun }>(`/api/owner/agent-runs/${runId}/baseline/confirm`);
+
+// ------------------------------------------------ 研究阶段
+
+export type ResearchTier = "light" | "medium" | "heavy";
+
+export type ResearchRound = {
+  id: string;
+  runId: string;
+  roundNo: number;
+  createdAt: string;
+  hypothesis: string;
+  changes: string;
+  analysis: string;
+  nextIdea: string;
+  kept: boolean;
+  evaluation: {
+    anyImproved: boolean;
+    bestGain: number | null;
+    succeeded: number;
+    warnings: string[];
+    rows: Array<{
+      jobId: string; name: string | null; dataset: string | null; status: string;
+      metric: string | null; value: number | null; baseline: number | null;
+      gain: number | null; improved: boolean;
+    }>;
+  };
+};
+
+export const fetchResearchRounds = (projectId: string, runId?: string) =>
+  get<{ rounds: ResearchRound[] }>(
+    `/api/projects/${projectId}/research/rounds${runId ? `?run_id=${runId}` : ""}`);
+
+export const startResearch = (projectId: string, input: {
+  tier: ResearchTier; idea?: string; reference?: string; network?: boolean;
+  max_rounds?: number; gpu_hours?: number;
+}) => chatPost<{ run: AgentRun }>(`/api/owner/projects/${projectId}/research/start`, input);

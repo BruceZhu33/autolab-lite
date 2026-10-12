@@ -2878,4 +2878,105 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                                        "username", "status_hint", "gpu_slots",
                                        "runner_port", "last_seen_at")}
 
+    # ------------------------------------- 阶段 agent 会话(agent_loop 运行时)
+
+    def _run_or_404(run_id: str) -> dict:
+        from . import agent_loop
+
+        try:
+            return agent_loop.get_run(repo, run_id)
+        except agent_loop.AgentLoopError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/projects/{project_id}/agent-runs/{kind}/latest")
+    def agent_run_latest(project_id: str, kind: str,
+                         _: str = Depends(require("agent"))) -> dict:
+        from . import agent_loop
+
+        return {"run": agent_loop.latest_run(repo, project_id, kind)}
+
+    @app.get("/api/agent-runs/{run_id}/events")
+    def agent_run_events(run_id: str, after: int = 0,
+                         _: str = Depends(require("agent"))) -> dict:
+        from . import agent_loop
+
+        run = _run_or_404(run_id)
+        return {"run": run, "events": agent_loop.list_events(repo, run_id, after)}
+
+    @app.post("/api/owner/agent-runs/{run_id}/message")
+    def agent_run_message(run_id: str, payload: dict,
+                          _: str = Depends(require("owner"))) -> dict:
+        """owner 发话:等人时即回答(含对基线提案的修改意见),运行中即插话。"""
+        from . import agent_loop
+
+        _run_or_404(run_id)
+        try:
+            return agent_loop.post_message(repo, run_id, str(payload.get("text") or ""))
+        except agent_loop.AgentLoopError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/owner/agent-runs/{run_id}/stop")
+    def agent_run_stop(run_id: str, _: str = Depends(require("owner"))) -> dict:
+        from . import agent_loop
+
+        _run_or_404(run_id)
+        try:
+            return agent_loop.stop_run(repo, run_id)
+        except agent_loop.AgentLoopError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/owner/projects/{project_id}/baseline/agent/start")
+    def baseline_agent_start(project_id: str, payload: dict,
+                             _: str = Depends(require("owner"))) -> dict:
+        """启动 Baseline Agent 会话:agent 自己探索/装环境/适配/跑通,缺材料问 owner。"""
+        from . import agent_loop, baseline_stage
+
+        try:
+            return {"run": baseline_stage.start(
+                repo, project_id, note=str(payload.get("note") or ""),
+                network=bool(payload.get("network")))}
+        except agent_loop.AgentLoopError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/owner/agent-runs/{run_id}/baseline/confirm")
+    def baseline_agent_confirm(run_id: str, _: str = Depends(require("owner"))) -> dict:
+        """owner 确认 agent 提交的基线:写确认快照,项目进入研究阶段。"""
+        from . import agent_loop, baseline_stage
+
+        _run_or_404(run_id)
+        try:
+            return {"run": baseline_stage.confirm(repo, run_id)}
+        except (agent_loop.AgentLoopError, agent_loop.ToolError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/owner/projects/{project_id}/research/start")
+    def research_start(project_id: str, payload: dict,
+                       _: str = Depends(require("owner"))) -> dict:
+        """启动研究会话:论文/参考库 + owner 想法 → agent 自由迭代;
+        tier=light(每轮等 owner)/ medium / heavy(过夜,显著阈值 + GPU 小时)。"""
+        from . import agent_loop, research_stage
+
+        def opt_number(key, cast):
+            value = payload.get(key)
+            return None if value in (None, "") else cast(value)
+
+        try:
+            return {"run": research_stage.start(
+                repo, project_id, tier=str(payload.get("tier") or "light"),
+                idea=str(payload.get("idea") or ""),
+                reference=str(payload.get("reference") or ""),
+                network=bool(payload.get("network")),
+                max_rounds=opt_number("max_rounds", int),
+                gpu_hours=opt_number("gpu_hours", float))}
+        except (agent_loop.AgentLoopError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/projects/{project_id}/research/rounds")
+    def research_rounds(project_id: str, run_id: str | None = None,
+                        _: str = Depends(require("agent"))) -> dict:
+        from . import research_stage
+
+        return {"rounds": research_stage.list_rounds(repo, project_id, run_id),
+                "tiers": research_stage.TIERS}
+
     return app
