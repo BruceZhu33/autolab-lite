@@ -1,24 +1,68 @@
-"""autolab-control console entry: run the scheduler process."""
+"""autolab-control serve:一个进程跑三件事——
+
+1. scheduler:Job 派发 / 事件摄取 / 取消 / 指标提取(主线程);
+2. agent 驱动:推进各项目的 Baseline / 研究会话(后台线程);
+3. HTTP API:给 web 控制台(可选,--http-port)。
+"""
 
 from __future__ import annotations
 
 import argparse
 import signal
+import socket
 import sys
 import threading
 
 from . import __version__
-from .credentials import CredentialStore
-from .db import Database
-from .repo import Repo
-from .scheduler import Scheduler
+from .agent.runtime import AgentLoopManager
+from .core.credentials import CredentialStore
+from .core.db import Database
+from .core.repo import Repo
+from .execution.scheduler import Scheduler
+from .stages import baseline, research
+
+
+def _port_free(port: int) -> bool:
+    """端口预检:另一个 Control 还在监听时必须拒绝启动,否则两个进程会
+    双写同一批会话。SO_REUSEADDR 与 uvicorn 一致:TIME_WAIT 不挡。"""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def _start_http(repo: Repo, credentials: CredentialStore, port: int) -> bool:
+    import uvicorn
+
+    from .api.app import API_REF, create_api_app
+
+    try:
+        credentials.get_entry(API_REF)
+    except Exception:
+        print(f"autolab-control: credentials lack '{API_REF}' (owner_token/agent_token);"
+              " http api disabled", file=sys.stderr, flush=True)
+        return True
+    if not _port_free(port):
+        print(f"autolab-control: http port {port} unavailable; another control instance?"
+              " refusing to start", file=sys.stderr, flush=True)
+        return False
+    threading.Thread(target=uvicorn.run, args=(create_api_app(repo, credentials),),
+                     kwargs={"host": "127.0.0.1", "port": port, "log_level": "warning"},
+                     daemon=True, name="http-api").start()
+    print(f"autolab-control: web api on 127.0.0.1:{port}", flush=True)
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="autolab-control", description="AutoLab Control scheduler")
+    parser = argparse.ArgumentParser(prog="autolab-control", description="AutoLab Control")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
-    serve = sub.add_parser("serve", help="run the scheduler loop")
+    serve = sub.add_parser("serve", help="run scheduler + agent driver (+ web api)")
     serve.add_argument("--db", required=True, help="path to control SQLite database")
     serve.add_argument("--credentials", required=True, help="path to 0600 credentials JSON")
     serve.add_argument("--poll-interval", type=float, default=0.2)
@@ -26,82 +70,21 @@ def main(argv: list[str] | None = None) -> int:
                        help="also serve the loopback web API on this port (0 = off)")
     args = parser.parse_args(argv)
 
-    if args.command == "serve":
-        repo = Repo(Database(args.db))
-        CredentialStore(args.credentials)  # validates privacy early
-        scheduler = Scheduler(repo, args.credentials, poll_interval=args.poll_interval)
-        from .iteration_loop import LoopManager
+    repo = Repo(Database(args.db))
+    credentials = CredentialStore(args.credentials)  # 尽早校验 0600 权限
+    if args.http_port and not _start_http(repo, credentials, args.http_port):
+        return 2
+    agents = AgentLoopManager(repo, credentials, {baseline.KIND: baseline.PROFILE,
+                                                  research.KIND: research.PROFILE})
+    threading.Thread(target=agents.run_forever, daemon=True, name="agent-loop").start()
 
-        loop_manager = LoopManager(repo, args.credentials)
-        loop_thread = threading.Thread(
-            target=loop_manager.run_forever, daemon=True, name="iteration-loop")
-        loop_thread.start()
-        print("autolab-control: iteration loop manager started", flush=True)
-        from .baseline_queue import BaselineQueueManager
-
-        queue_manager = BaselineQueueManager(repo, args.credentials)
-        queue_thread = threading.Thread(
-            target=queue_manager.run_forever, daemon=True, name="baseline-queue")
-        queue_thread.start()
-        print("autolab-control: baseline queue manager started", flush=True)
-        from . import baseline_stage, research_stage
-        from .agent_loop import AgentLoopManager
-
-        research_stage.ensure_schema(repo)
-        agent_manager = AgentLoopManager(
-            repo, CredentialStore(args.credentials),
-            {baseline_stage.KIND: baseline_stage.PROFILE,
-             research_stage.KIND: research_stage.PROFILE})
-        threading.Thread(target=agent_manager.run_forever, daemon=True,
-                         name="agent-loop").start()
-        print("autolab-control: agent loop manager started", flush=True)
-        stop = threading.Event()
-        signal.signal(signal.SIGTERM, lambda *_: stop.set())
-        signal.signal(signal.SIGINT, lambda *_: stop.set())
-        if args.http_port:
-            import threading as _t
-
-            import uvicorn
-
-            from .http_api import API_REF, create_api_app
-
-            credentials = CredentialStore(args.credentials)
-            try:
-                credentials.get_entry(API_REF)
-            except Exception:
-                print(f"autolab-control: credentials lack '{API_REF}' (owner_token/agent_token); http api disabled",
-                      file=sys.stderr, flush=True)
-                args.http_port = 0
-            if args.http_port:
-                # 端口预检:绑定失败(常驻 demo 还活着/端口被占)必须立刻退出
-                # 整个进程——否则 uvicorn 线程死了、LoopManager/scheduler 还在,
-                # 留下一个"无 HTTP 但每 2s 推进循环"的僵尸进程,与新进程双写
-                # 同一循环(实测事故:双进程各跑一轮、旧代码覆盖新代码的结果)。
-                import socket as _socket
-
-                # SO_REUSEADDR 与 uvicorn 实际绑定一致:TIME_WAIT(浏览器轮询
-                # 会不断产生)不挡,只有真 LISTEN(另一个实例)才拒绝启动
-                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-                try:
-                    probe.bind(("127.0.0.1", args.http_port))
-                except OSError as exc:
-                    print(f"autolab-control: http port {args.http_port} unavailable ({exc});"
-                          " another control instance? refusing to start", file=sys.stderr, flush=True)
-                    return 2
-                finally:
-                    probe.close()
-                app = create_api_app(repo, credentials)
-                api_thread = _t.Thread(
-                    target=uvicorn.run, args=(app,),
-                    kwargs={"host": "127.0.0.1", "port": args.http_port, "log_level": "warning"},
-                    daemon=True,
-                )
-                api_thread.start()
-                print(f"autolab-control: web api on 127.0.0.1:{args.http_port}", flush=True)
-        print(f"autolab-control {__version__}: scheduler started (db={args.db})", flush=True)
-        scheduler.run_forever(stop)
-        print("autolab-control: stopped", flush=True)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    print(f"autolab-control {__version__}: scheduler started + agent driver (db={args.db})",
+          flush=True)
+    Scheduler(repo, args.credentials, poll_interval=args.poll_interval).run_forever(stop)
+    print("autolab-control: stopped", flush=True)
     return 0
 
 

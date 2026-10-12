@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 
 import pytest
-from autolab_control import agent_loop as al
-from autolab_control import research_stage
+from autolab_control.agent import runtime as al
+from autolab_control.agent import tools as agent_tools
+from autolab_control.core.errors import UserError
+from autolab_control.stages import research as research_stage
 
 from .test_baseline_stage import (
     AGENT_H,
@@ -23,7 +25,7 @@ from .test_repo import repo  # noqa: F401, F811
 
 def confirm_baseline(repo, pid, dice=0.80):
     repo.update_project(pid, baseline_passed_at="2026-10-01T00:00:00Z",
-                        baseline_confirmed_json=json.dumps({"datasets": {
+                        baseline_json=json.dumps({"datasets": {
                             "kvasir": {"metrics": {"val_dice": dice},
                                        "command": "python train.py", "dataset_path": ""}}}))
 
@@ -94,7 +96,7 @@ def test_light_tier_pauses_every_round_for_owner(api, tmp_path):
     assert len(rounds) == 1 and rounds[0]["evaluation"]["anyImproved"]
     assert "第 1 轮" in (tmp_path / "ws/.autolab/research_journal.md").read_text()
 
-    client.post(f"/api/owner/agent-runs/{run_id}/message",
+    client.post(f"/api/owner/runs/{run_id}/message",
                 json={"text": "不错,下一轮试 dropout"}, headers=OWNER_H)
     assert step() == "waiting_human"
     reply = model.seen[-1][-1]["content"][0]
@@ -166,7 +168,7 @@ def test_read_reference_local_and_bounded(api, tmp_path):
     ref = tmp_path / "ref-repo"
     (ref / "models").mkdir(parents=True)
     (ref / "models/attn.py").write_text("class Attn:\n    pass\n", encoding="utf-8")
-    repo.update_project(pid, review_refs_json=json.dumps(
+    repo.update_project(pid, refs_json=json.dumps(
         [{"name": "attnlib", "source": str(ref), "path": str(ref)}]))
     project = repo.get_project(pid)
     env = al.LoopEnv(repo, None, {"id": "r", "kind": KIND_PLACEHOLDER, "config_json": "{}"}, project)
@@ -174,7 +176,7 @@ def test_read_reference_local_and_bounded(api, tmp_path):
     assert "attnlib" in tool.handler(env, {})
     assert "models/attn.py" in tool.handler(env, {"ref": "attnlib"})
     assert "1\tclass Attn:" in tool.handler(env, {"ref": "attnlib", "path": "models/attn.py"})
-    with pytest.raises(al.ToolError):
+    with pytest.raises(UserError, match="越界"):
         tool.handler(env, {"ref": "attnlib", "path": "../../etc/passwd"})
 
 

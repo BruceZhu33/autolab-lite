@@ -8,10 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from autolab_control.db import Database
-from autolab_control.repo import AcquiredJob, Repo
-from autolab_control.scheduler import Scheduler, parse_metric
-from autolab_control.transport import DispatchResult, RunnerUnreachable
+from autolab_control.core.db import Database
+from autolab_control.core.repo import AcquiredJob, Repo
+from autolab_control.execution.scheduler import Scheduler, parse_metric
+from autolab_control.infra.runner_client import DispatchResult, RunnerUnreachable
 from autolab_protocol import PlanSpecV1, RunnerEventV1
 
 CONTRACTS = Path(__file__).resolve().parents[3] / "docs" / "reboot-source" / "source-assets" / "contracts-v1"
@@ -62,7 +62,7 @@ def env(tmp_path, monkeypatch):
 
 
 def store_credentials(path):
-    from autolab_control.credentials import CredentialStore
+    from autolab_control.core.credentials import CredentialStore
 
     store = CredentialStore(path)
     store.put("srv-c", runner_token="tok", manifest_hmac_key="key")
@@ -241,7 +241,7 @@ def test_parse_metric_kinds():
 def test_manifest_rebuild_is_byte_stable(env):
     """Same dispatch_id must always rebuild an identical payload (hash-wise),
     so replays after uncertain outcomes never look like conflicts."""
-    from autolab_control.manifest_builder import build_manifest
+    from autolab_control.execution.manifest import build_manifest
     from autolab_protocol import payload_hash
 
     approve(env, make_spec(env, seeds=(1,)))

@@ -6,10 +6,10 @@ import copy
 import json
 import re
 
-from autolab_control import agent_loop as al
-from autolab_control import baseline_stage
-from autolab_control import repo as repo_mod
-from autolab_control.db import utc_now
+from autolab_control.agent import runtime as al
+from autolab_control.agent import tools as agent_tools
+from autolab_control.stages import baseline as baseline_stage
+from autolab_control.core.db import utc_now
 
 from .test_http_api import AGENT, OWNER, api  # noqa: F401
 from .test_repo import repo  # noqa: F401, F811
@@ -63,6 +63,11 @@ def finish_job(repo, job_id, metrics):
         conn.close()
 
 
+def card_of(client, pid):
+    return next(c for c in client.get("/api/board", headers=AGENT_H).json()
+                if c["projectId"] == pid)
+
+
 def make_project(api, tmp_path):
     server_id = api["fixture"]["server"]["id"]
     workdir = tmp_path / "ws"
@@ -70,7 +75,7 @@ def make_project(api, tmp_path):
     (workdir / "train.py").write_text("print('train')\n", encoding="utf-8")
     resp = api["client"].post("/api/owner/projects", json={
         "name": "bl", "server_id": server_id, "workdir": str(workdir),
-        "init_research": False}, headers=OWNER_H)
+        "source": {"kind": "dir", "path": str(workdir)}}, headers=OWNER_H)
     assert resp.status_code == 200, resp.text
     return resp.json()["project"]["id"]
 
@@ -103,28 +108,28 @@ def test_baseline_agent_end_to_end(api, tmp_path):
         submit_finish("t7"),   # 修好后再交
     ])
 
-    resp = client.post(f"/api/owner/projects/{pid}/baseline/agent/start",
+    resp = client.post(f"/api/owner/projects/{pid}/baseline/start",
                        json={"note": "只跑 Kvasir"}, headers=OWNER_H)
     assert resp.status_code == 200, resp.text
     run_id = resp.json()["run"]["id"]
-    assert repo.get_project(pid)["baseline_requested_at"]
+    assert card_of(client, pid)["stage"] == "baseline"
 
     def step():
         return al.step(repo, None, run_id, baseline_stage.PROFILE, model=model)
 
     assert step() == "running"  # shell
     assert step() == "waiting_human"
-    pending = client.get(f"/api/projects/{pid}/agent-runs/baseline/latest",
+    pending = client.get(f"/api/projects/{pid}/runs/baseline/latest",
                          headers=AGENT_H).json()["run"]["pending"]
     assert pending["payload"]["target_path"] == "data/Kvasir"
-    assert client.post(f"/api/owner/agent-runs/{run_id}/message",
+    assert client.post(f"/api/owner/runs/{run_id}/message",
                        json={"text": "已上传"}, headers=OWNER_H).status_code == 200
     assert step() == "running"   # run_experiment:真 Plan + Job
     assert step() == "waiting_jobs"
     plan = repo.get_plan(repo.get_job(state["job"])["plan_revision_id"])
     assert plan["status"] == "APPROVED"
     assert plan["approved_by"] == f"agent-run:{run_id}"
-    assert not repo_mod.is_iteration_plan(plan)  # 基线实验不把看板推到迭代列
+    assert json.loads(plan["spec_json"])["baseline"] == "baseline"
     assert (tmp_path / "ws/.autolab/experiments/EXP-0001.md").exists()
 
     finish_job(repo, state["job"], {})   # 成功但没有合法指标
@@ -140,17 +145,17 @@ def test_baseline_agent_end_to_end(api, tmp_path):
     assert proposal["datasets"][0]["command"] == "python train.py"  # 取 Job 实际命令
     assert proposal["datasets"][0]["metrics"] == {"val_dice": 0.81}
 
-    resp = client.post(f"/api/owner/agent-runs/{run_id}/baseline/confirm", headers=OWNER_H)
+    resp = client.post(f"/api/owner/runs/{run_id}/baseline/confirm", headers=OWNER_H)
     assert resp.status_code == 200, resp.text
     assert resp.json()["run"]["status"] == "done"
     project = repo.get_project(pid)
     assert project["baseline_passed_at"]
-    from autolab_control.baseline_queue import confirmed_datasets
-
-    pool = confirmed_datasets(project)
+    pool = baseline_stage.baseline_pool(project)
     assert pool["kvasir"]["metrics"] == {"val_dice": 0.81}
-    config = json.loads(project["baseline_config_json"])
-    assert config["datasets"][0]["command"] == "python train.py" and config["onboarded"]
+    snapshot = baseline_stage.baseline_snapshot(project)
+    assert snapshot["datasets"]["kvasir"]["command"] == "python train.py"
+    assert snapshot["run_id"] == run_id
+    assert card_of(client, pid)["stage"] == "research"
 
 
 def finish_job_metrics(repo, job_id, metrics):
@@ -166,7 +171,7 @@ def finish_job_metrics(repo, job_id, metrics):
 def test_owner_feedback_on_proposal_goes_back_to_agent(api, tmp_path):
     client, repo = api["client"], api["repo"]
     pid = make_project(api, tmp_path)
-    run_id = client.post(f"/api/owner/projects/{pid}/baseline/agent/start", json={},
+    run_id = client.post(f"/api/owner/projects/{pid}/baseline/start", json={},
                          headers=OWNER_H).json()["run"]["id"]
     # 直接造一个成功 Job,省掉提交环节
     state = {}
@@ -191,13 +196,13 @@ def test_owner_feedback_on_proposal_goes_back_to_agent(api, tmp_path):
     assert step() == "waiting_jobs"
     finish_job(repo, state["job"], {"val_dice": 0.7})
     assert step() == "waiting_human"   # 恢复 + finish 通过核验 → 等确认
-    client.post(f"/api/owner/agent-runs/{run_id}/message",
+    client.post(f"/api/owner/runs/{run_id}/message",
                 json={"text": "单 seed 不够,跑 5 个 seed 取平均"}, headers=OWNER_H)
     assert step() == "waiting_human"   # agent 回了一句话(纯文本 = 对 owner 说话)
     feedback = model.seen[-1][-1]["content"][0]
     assert feedback["tool_use_id"] == "t3" and "5 个 seed" in feedback["content"]
     # 不在确认态:确认被拒
-    resp = client.post(f"/api/owner/agent-runs/{run_id}/baseline/confirm", headers=OWNER_H)
+    resp = client.post(f"/api/owner/runs/{run_id}/baseline/confirm", headers=OWNER_H)
     assert resp.status_code == 409
     assert not repo.get_project(pid)["baseline_passed_at"]
 
@@ -205,10 +210,10 @@ def test_owner_feedback_on_proposal_goes_back_to_agent(api, tmp_path):
 def test_start_requires_workspace_and_single_active(api, tmp_path):
     client = api["client"]
     pid = make_project(api, tmp_path)
-    assert client.post(f"/api/owner/projects/{pid}/baseline/agent/start", json={},
+    assert client.post(f"/api/owner/projects/{pid}/baseline/start", json={},
                        headers=OWNER_H).status_code == 200
-    again = client.post(f"/api/owner/projects/{pid}/baseline/agent/start", json={},
+    again = client.post(f"/api/owner/projects/{pid}/baseline/start", json={},
                         headers=OWNER_H)
     assert again.status_code == 409 and "进行中" in again.json()["detail"]
-    assert client.post(f"/api/owner/projects/{pid}/baseline/agent/start", json={},
+    assert client.post(f"/api/owner/projects/{pid}/baseline/start", json={},
                        headers=AGENT_H).status_code == 403

@@ -1,0 +1,224 @@
+"""agent 可用的全部工具。各阶段按需组合(stages/baseline.py、stages/research.py)。
+
+工具只做薄包装:业务逻辑在 workspace/ 与 execution/;工具里抛出的 UserError
+会作为错误结果回给 agent,不中断会话。
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+
+from ..execution import experiments
+from ..workspace import papers, refs
+from ..workspace.host import q
+from .runtime import Finish, LoopEnv, Pause, Tool, ToolError
+
+_OBJ = "object"
+
+
+def _schema(properties: dict, required: list[str] | None = None) -> dict:
+    return {"type": _OBJ, "properties": properties, "required": required or []}
+
+
+# ------------------------------------------------------------------ 工作区
+
+def workspace_tools() -> list[Tool]:
+    return [
+        Tool("read_file", "读工作区文件(带行号,分片)",
+             _schema({"path": {"type": "string"}, "offset": {"type": "integer"},
+                      "limit": {"type": "integer"}}, ["path"]),
+             lambda env, a: env.workspace.read_file(a["path"], a.get("offset") or 1,
+                                                    a.get("limit") or 400)),
+        Tool("list_files", "列工作区目录(两层)",
+             _schema({"path": {"type": "string"}}),
+             lambda env, a: env.workspace.list_files(a.get("path") or ".")),
+        Tool("grep", "在工作区搜索(py/yaml/json/md/sh/cfg)",
+             _schema({"pattern": {"type": "string"}, "path": {"type": "string"}}, ["pattern"]),
+             lambda env, a: env.workspace.grep(a["pattern"], a.get("path") or "")),
+        Tool("write_file", "写整个文件(首次改动前备份原件;.py 语法检查不过自动回滚)",
+             _schema({"path": {"type": "string"}, "content": {"type": "string"},
+                      "reason": {"type": "string"}}, ["path", "content", "reason"]),
+             lambda env, a: env.workspace.write_file(a["path"], a["content"], a["reason"])),
+    ]
+
+
+_DENY = ("sudo ", "rm -rf /", "rm -rf ~", "mkfs", "shutdown", "reboot",
+         "git push", ":(){", "> /dev/sd", "chmod -R 777 /")
+
+
+def shell_tool(*, max_timeout: int = 900) -> Tool:
+    """工作区内执行 shell(探索 / 装环境 / 解压 / 冒烟)。只拦破坏性命令;
+    长训练用 run_experiment(排队、可恢复、有 GPU 租约)。"""
+
+    def handler(env: LoopEnv, args: dict) -> str:
+        command = (args.get("command") or "").strip()
+        if not command:
+            raise ToolError("command 不能为空")
+        hit = next((d for d in _DENY if d in command.lower()), None)
+        if hit:
+            raise ToolError(f"命令被拒绝(含 {hit.strip()})")
+        timeout = max(5, min(int(args.get("timeout") or 120), max_timeout))
+        conda_env = (args.get("conda_env") or "").strip()
+        if conda_env:
+            command = ("source $HOME/anaconda3/etc/profile.d/conda.sh 2>/dev/null || "
+                       "source $HOME/miniconda3/etc/profile.d/conda.sh 2>/dev/null; "
+                       f"conda activate {q(conda_env)} && {command}")
+        try:
+            result = env.workspace.sh(command, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - 超时/断连都是观察
+            raise ToolError(f"执行超时/中断({timeout}s):{exc}") from exc
+        out = result.text
+        if len(out) > 12000:
+            out = out[:3000] + "\n…(中间省略)…\n" + out[-8000:]
+        return f"exit={result.code}\n{out}"
+
+    return Tool(
+        "shell",
+        "在工作区目录执行 bash 命令,返回 exit code 与输出;可选 conda_env 激活环境。"
+        f"超时上限 {max_timeout}s。用于探索、装依赖、解压、短冒烟;正式训练用 run_experiment。",
+        _schema({"command": {"type": "string"},
+                 "timeout": {"type": "integer", "description": "秒,默认 120"},
+                 "conda_env": {"type": "string"}}, ["command"]),
+        handler)
+
+
+# ------------------------------------------------------------------ 与 owner 交互
+
+def ask_human_tool() -> Tool:
+    """结构化求助:kind 决定前端渲染(上传 / 选目录 / 文字回答)。"""
+
+    def handler(env: LoopEnv, args: dict) -> Pause:
+        question = (args.get("question") or "").strip()
+        if not question:
+            raise ToolError("question 不能为空")
+        payload = {"question": question, "kind": args.get("kind") or "info"}
+        for key in ("name", "target_path", "why"):
+            if args.get(key):
+                payload[key] = str(args[key])
+        return Pause("human", payload)
+
+    return Tool(
+        "ask_human",
+        "向 owner 提问或索要材料(数据集/权重/文件/信息),会话暂停直到 owner 回复。"
+        "一次把同类缺口问清楚;能自己查到的不要问。",
+        _schema({
+            "question": {"type": "string", "description": "要 owner 做什么/回答什么"},
+            "kind": {"type": "string", "enum": ["dataset", "weights", "file", "info", "confirm"],
+                     "description": "dataset/weights/file=需要上传或指定目录;info=文字回答;"
+                                    "confirm=请 owner 确认"},
+            "name": {"type": "string", "description": "材料名,如 Kvasir-SEG"},
+            "target_path": {"type": "string", "description": "材料应放到工作区的相对路径"},
+            "why": {"type": "string", "description": "依据(哪段代码/配置需要它)"},
+        }, ["question", "kind"]),
+        handler)
+
+
+def finish_tool(description: str, properties: dict, required: list[str],
+                handler: Callable[[LoopEnv, dict], object] | None = None) -> Tool:
+    return Tool("finish", description, _schema(properties, required),
+                handler or (lambda env, args: Finish(dict(args))))
+
+
+# ------------------------------------------------------------------ 实验
+
+def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
+                     allowed_datasets: Callable[[LoopEnv], set[str] | None] | None = None,
+                     before_submit: Callable[[LoopEnv], None] | None = None) -> list[Tool]:
+    """baseline_ref / allowed_datasets 按会话惰性求值;before_submit 抛 ToolError
+    可拦截提交(如 GPU 预算用完)。"""
+
+    def run_experiment(env: LoopEnv, args: dict) -> str:
+        if before_submit is not None:
+            before_submit(env)
+        request = experiments.ExperimentRequest(
+            jobs=args.get("jobs") or [], metrics=args.get("metrics") or [],
+            purpose=(args.get("purpose") or "").strip() or "实验",
+            conda_env=args.get("conda_env") or "",
+            metric_file=args.get("metric_file") or "metrics.json",
+            timeout_minutes=args.get("timeout_minutes") or 120,
+            gpus_per_job=args.get("gpus_per_job") or 1,
+            allowed_datasets=allowed_datasets(env) if allowed_datasets else None)
+        result = experiments.submit(
+            env.repo, env.workspace, env.project, request,
+            approved_by=f"agent-run:{env.run['id']}",
+            baseline_ref=baseline_ref(env) if baseline_ref else "baseline")
+        listing = "\n".join(f"- {j['name']}: {j['id']}" for j in result["jobs"])
+        return (f"已提交 {result['experimentId']}(plan {result['planId']}),Job 已排队:\n"
+                f"{listing}\n用 wait_jobs 等结果。")
+
+    def wait_jobs(env: LoopEnv, args: dict):
+        job_ids = [str(j) for j in args.get("job_ids") or []]
+        if not job_ids:
+            raise ToolError("job_ids 不能为空")
+        for job_id in job_ids:
+            experiments.project_job(env.repo, env.project, job_id)
+        if experiments.all_terminal(env.repo, job_ids):
+            return experiments.describe_jobs(env.repo, env.credentials, env.project, job_ids)
+        return Pause("jobs", {"job_ids": job_ids})
+
+    def cancel_jobs(env: LoopEnv, args: dict) -> str:
+        cancelled = []
+        for job_id in [str(j) for j in args.get("job_ids") or []]:
+            job = experiments.project_job(env.repo, env.project, job_id)
+            if not experiments.all_terminal(env.repo, [job["id"]]):
+                env.repo.request_cancel(job_id)
+                cancelled.append(job_id)
+        return f"已请求取消:{', '.join(cancelled) or '(无未结束的 Job)'}"
+
+    job_ids = {"job_ids": {"type": "array", "items": {"type": "string"}}}
+    return [
+        Tool("run_experiment",
+             "在 GPU 上正式运行一组命令(每条一个 Job,经 Runner 排队执行,可过夜,重启不丢)。"
+             "命令在工作区目录执行;程序必须把指标写成 JSON 到 $AUTOLAB_OUTPUT_DIR/<metric_file>"
+             "(默认 metrics.json),键名与 metrics 一致。提交后立即返回 Job id,用 wait_jobs 等结果。",
+             _schema({
+                 "jobs": {"type": "array", "items": _schema({
+                     "name": {"type": "string", "description": "如 kvasir 或 lr1e-4"},
+                     "command": {"type": "string"},
+                     "dataset": {"type": "string",
+                                 "description": "该 Job 跑的数据集(研究阶段必填,用于对照该数据集基线)"},
+                 }, ["name", "command"])},
+                 "metrics": {"type": "array", "items": _schema({
+                     "name": {"type": "string"},
+                     "direction": {"type": "string", "enum": ["maximize", "minimize"]}}, ["name"])},
+                 "purpose": {"type": "string", "description": "这批实验要验证什么"},
+                 "conda_env": {"type": "string"}, "metric_file": {"type": "string"},
+                 "timeout_minutes": {"type": "integer"}, "gpus_per_job": {"type": "integer"},
+             }, ["jobs", "metrics", "purpose"]),
+             run_experiment),
+        Tool("wait_jobs", "等待 Job 结束(会话暂停,不占 LLM);结束后返回状态、指标、失败日志尾部。",
+             _schema(job_ids, ["job_ids"]), wait_jobs),
+        Tool("cancel_jobs", "取消仍在排队/运行的 Job(方向错了及时止损)。",
+             _schema(job_ids, ["job_ids"]), cancel_jobs),
+    ]
+
+
+# ------------------------------------------------------------------ 资料
+
+def read_paper_tool() -> Tool:
+    def handler(env: LoopEnv, args: dict) -> str:
+        name = str(args.get("path") or "").strip()
+        if not name:
+            return "\n".join(papers.list_papers(env.workspace)) or "(没有上传论文)"
+        first = int(args.get("from_page") or 1)
+        return papers.read_pages(env.workspace, name.rsplit("/", 1)[-1], first,
+                                 int(args.get("to_page") or first + 7))[:20000]
+
+    return Tool("read_paper", "不带 path:列出论文;带 path:按页读取文本(默认 8 页一段)。",
+                _schema({"path": {"type": "string"}, "from_page": {"type": "integer"},
+                         "to_page": {"type": "integer"}}),
+                handler)
+
+
+def read_reference_tool() -> Tool:
+    def handler(env: LoopEnv, args: dict) -> str:
+        registered = json.loads(env.project.get("refs_json") or "[]")
+        return refs.read(registered, str(args.get("ref") or ""), str(args.get("path") or "."),
+                         int(args.get("offset") or 1), int(args.get("limit") or 400))
+
+    return Tool("read_reference",
+                "读参考代码库:ref=库名(不填列出全部);path 为目录则列出,为文件则带行号读取。",
+                _schema({"ref": {"type": "string"}, "path": {"type": "string"},
+                         "offset": {"type": "integer"}, "limit": {"type": "integer"}}),
+                handler)

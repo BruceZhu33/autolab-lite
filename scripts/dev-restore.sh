@@ -27,7 +27,7 @@ fi
 if [ -n "$KEY_SRC" ] && [ -f "$KEY_SRC/credentials.json" ]; then
   uv run python - "$KEY_SRC" "$WORK" <<'PY'
 import sys
-from autolab_control.credentials import CredentialStore
+from autolab_control.core.credentials import CredentialStore
 src, dst = sys.argv[1], sys.argv[2]
 try:
     key = CredentialStore(f"{src}/credentials.json").get_entry("chatagent:api-key")["api_key"]
