@@ -10,6 +10,7 @@ import { toast } from "sonner";
 import { FlaskConical, FolderKanban, Loader2, Play } from "lucide-react";
 import { fetchLatestRun, isActive, startBaseline, type Project } from "@/lib/api";
 import { RunPanel } from "@/components/agent-run/panel";
+import { DatasetBoard } from "@/components/agent-run/datasets";
 import { ProjectTabs, useProjectSelection } from "@/components/project-picker";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "~/vendor/ui/components/ui/button";
@@ -72,6 +73,7 @@ function BaselineSection({ project }: { project: Project }) {
           重新跑会在你再次确认后覆盖当前基线。
         </p>
       ) : null}
+      <DatasetBoard project={project} />
       {!isActive(run) ? <StartForm project={project} again={!!run} /> : null}
       {run ? <RunPanel key={run.id} project={project} run={run} /> : null}
     </div>

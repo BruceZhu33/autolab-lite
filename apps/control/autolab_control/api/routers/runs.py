@@ -41,17 +41,23 @@ def build(ctx: Ctx) -> APIRouter:
         """owner 确认 agent 提交的基线:写基线快照,项目进入研究阶段。"""
         return {"run": baseline.confirm(repo, run_id)}
 
+    @router.get("/api/projects/{project_id}/datasets", dependencies=[ctx.reader])
+    def project_datasets(project_id: str) -> dict:
+        """按数据集聚合状态:已确认 / 已跑 / 待补充(UI 投影,事实派生)。"""
+        return {"datasets": baseline.dataset_states(repo, project_id)}
+
     @router.post("/api/owner/projects/{project_id}/research/start", dependencies=[ctx.owner])
     def research_start(project_id: str, payload: dict) -> dict:
         def number(key, cast):
             value = payload.get(key)
             return None if value in (None, "") else cast(value)
 
+        datasets = [str(d) for d in (payload.get("datasets") or []) if str(d).strip()]
         return {"run": research.start(
             repo, project_id, tier=str(payload.get("tier") or "light"),
             idea=str(payload.get("idea") or ""), reference=str(payload.get("reference") or ""),
             network=bool(payload.get("network")), max_rounds=number("max_rounds", int),
-            gpu_hours=number("gpu_hours", float))}
+            gpu_hours=number("gpu_hours", float), datasets=datasets or None)}
 
     @router.get("/api/projects/{project_id}/research/rounds", dependencies=[ctx.reader])
     def research_rounds(project_id: str, run_id: str | None = None) -> dict:

@@ -26,6 +26,10 @@ SYSTEM_PROMPT = """你是 AutoLab 的 Baseline Agent。目标:让这个代码库
 2. 环境:先用 shell 看服务器已有的 conda 环境(`conda env list`)和已装的包,优先复用能用的环境。
 3. 缺材料就问:数据集、权重、私有文件、你无法确定的口径,用 ask_human 向 owner 要。
    - kind 选 dataset/weights/file 时必须给 target_path(工作区相对路径,依据代码里读取的位置)和 why(哪段代码/配置需要它)。
+   - **数据集供给纪律**:先查服务器上已有的数据目录(工程 data/、~/datasets 等)能不能直接用;
+     允许联网时公开直链能下则下;**Kaggle/需登录/私有源,或下载失败过一次**的,立即
+     ask_human(kind=dataset,name=数据集名,target_path,why) 让 owner 上传或指路——
+     不要反复尝试下载,也不要悄悄跳过该数据集不报。
    - 同一类缺口一次问清;能自己从代码查到的不要问。
    - 问完之后你会暂停,owner 回复后继续。
 4. 指标出口:正式运行的程序必须把评测指标写成 JSON 到 `$AUTOLAB_OUTPUT_DIR/metrics.json`(键名即指标名,值为数字)。工程本身做不到时,写一个适配器脚本(如 autolab_baseline.py)包住原入口,**尽量不改原工程源码**。
@@ -57,6 +61,49 @@ def baseline_pool(project: dict) -> dict[str, dict]:
     datasets = baseline_snapshot(project).get("datasets")
     return {str(k): v for k, v in datasets.items() if isinstance(v, dict)} \
         if isinstance(datasets, dict) else {}
+
+
+def dataset_states(repo: Repo, project_id: str) -> list[dict]:
+    """按数据集聚合状态(UI 投影,全部从事实派生,不依赖 agent 自报):
+    confirmed = owner 已确认的基线快照;ran/running/failed = Job 实况;
+    pending_supply = 当前 baseline 会话等待中的 dataset 求助(等 owner 供给)。"""
+    project = repo.get_project(project_id)
+    if project is None:
+        return []
+    out: dict[str, dict] = {}
+    for name, info in baseline_pool(project).items():
+        out[name] = {"name": name, "state": "confirmed",
+                     "metrics": info.get("metrics") or {},
+                     "command": info.get("command") or "",
+                     "jobId": info.get("job_id") or ""}
+    conn = repo.db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT j.id, j.status FROM jobs j"
+            " JOIN plan_revisions pr ON pr.id = j.plan_revision_id"
+            " WHERE pr.project_id = ? ORDER BY j.rowid", (project_id,)).fetchall()
+    finally:
+        conn.close()
+    for r in rows:
+        job = repo.get_job(r["id"])
+        name = str(json.loads(job["params_json"] or "{}").get("dataset") or "").strip()
+        if not name:
+            continue
+        if out.get(name, {}).get("state") == "confirmed":
+            continue
+        state = ("running" if r["status"] in ("QUEUED", "DISPATCHING", "RUNNING")
+                 else "ran" if r["status"] == "SUCCEEDED" else "failed")
+        out[name] = {"name": name, "state": state, "jobId": r["id"],
+                     "jobStatus": r["status"], "metrics": job_metrics(repo, r["id"])}
+    run = runtime.latest_run(repo, project_id, KIND)
+    pending = ((run or {}).get("pending") or {}).get("payload") or {}
+    if (run or {}).get("status") == "waiting_human" and pending.get("kind") == "dataset":
+        name = str(pending.get("name") or "").strip() or "(未命名)"
+        out[name] = {"name": name, "state": "pending_supply",
+                     "targetPath": pending.get("target_path") or "",
+                     "why": pending.get("why") or "",
+                     "question": pending.get("question") or "", "runId": run["id"]}
+    return sorted(out.values(), key=lambda d: d["name"])
 
 
 def _facts(env: LoopEnv) -> str:

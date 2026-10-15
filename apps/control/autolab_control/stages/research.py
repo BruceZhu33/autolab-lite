@@ -188,10 +188,15 @@ def _tier(env_or_config) -> dict:
 
 def build_task(repo: Repo, project: dict, config: dict, *, run_id: str | None) -> str:
     pool = baseline_pool(project)
+    chosen = config.get("datasets") or None
+    if chosen:
+        pool = {name: info for name, info in pool.items() if name in chosen}
     lines = ["# 研究任务", ""]
     if (config.get("idea") or "").strip():
         lines += ["## owner 的想法", config["idea"].strip(), ""]
     lines += ["## 基线(确认过的,对比对象)"]
+    if chosen:
+        lines.append(f"(owner 指定本轮只在:{', '.join(pool) or '无'};其他数据集不要碰)")
     for name, info in pool.items():
         lines.append(f"- {name}: 指标 {json.dumps(info.get('metrics') or {}, ensure_ascii=False)}"
                      f";命令 `{info.get('command') or ''}`")
@@ -330,7 +335,8 @@ PROFILE = LoopProfile(
 
 def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
           reference: str = "", network: bool = False,
-          max_rounds: int | None = None, gpu_hours: float | None = None) -> dict:
+          max_rounds: int | None = None, gpu_hours: float | None = None,
+          datasets: list[str] | None = None) -> dict:
     project = repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
@@ -350,6 +356,7 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
     if gpu_hours is not None:
         overrides["gpu_hours"] = max(0.0, float(gpu_hours))
     config = {"tier": tier, "idea": idea.strip(), "network": bool(network),
-              "overrides": overrides}
+              "overrides": overrides,
+              "datasets": [d for d in (datasets or []) if d in baseline_pool(project)] or None}
     return runtime.start_run(repo, project_id, KIND,
                                 build_task(repo, project, config, run_id=None), config)
