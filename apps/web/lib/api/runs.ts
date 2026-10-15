@@ -52,6 +52,24 @@ export type Run = {
 
 export type RunEvent = { seq: number; kind: string; payload: Record<string, unknown>; at: string };
 
+/** 按数据集聚合的状态(事实派生):confirmed=owner 已确认;ran/running/failed=Job 实况;
+ * pending_supply=baseline 会话正在等 owner 供给该数据集。 */
+export type DatasetState = {
+  name: string;
+  state: "confirmed" | "ran" | "running" | "failed" | "pending_supply";
+  metrics?: Record<string, number>;
+  command?: string;
+  jobId?: string;
+  jobStatus?: string;
+  targetPath?: string;
+  why?: string;
+  question?: string;
+  runId?: string;
+};
+
+export const fetchProjectDatasets = (projectId: string) =>
+  get<{ datasets: DatasetState[] }>(`/api/projects/${projectId}/datasets`);
+
 export type ResearchTier = "light" | "medium" | "heavy";
 
 export type ResearchRound = {
@@ -97,6 +115,7 @@ export const confirmBaseline = (runId: string) =>
 
 export const startResearch = (projectId: string, input: {
   tier: ResearchTier; idea?: string; reference?: string; network?: boolean; gpu_hours?: number;
+  datasets?: string[];
 }) => post<{ run: Run }>(`/api/owner/projects/${projectId}/research/start`, input);
 export const fetchResearchRounds = (projectId: string, runId?: string) =>
   get<{ rounds: ResearchRound[] }>(

@@ -1,10 +1,10 @@
 "use client";
 
 import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Lightbulb, Loader2, PlayCircle } from "lucide-react";
-import { startResearch, type Project, type ResearchTier } from "@/lib/api";
+import { Database, Lightbulb, Loader2, PlayCircle } from "lucide-react";
+import { fetchProjectDatasets, startResearch, type Project, type ResearchTier } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 
 const TIERS: Array<{ key: ResearchTier; title: string; badge: string; desc: string }> = [
@@ -24,7 +24,16 @@ export function ResearchStartForm({ project }: { project: Project }) {
   const [reference, setReference] = useState("");
   const [gpuHours, setGpuHours] = useState("");
   const [network, setNetwork] = useState(false);
+  const [picked, setPicked] = useState<string[]>([]);
   const [starting, setStarting] = useState(false);
+  const { data: dsData } = useQuery({
+    queryKey: ["datasets", project.id],
+    queryFn: () => fetchProjectDatasets(project.id),
+  });
+  const confirmed = (dsData?.datasets ?? []).filter((d) => d.state === "confirmed");
+
+  const toggle = (name: string) =>
+    setPicked((prev) => prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]);
 
   const start = async () => {
     setStarting(true);
@@ -32,6 +41,7 @@ export function ResearchStartForm({ project }: { project: Project }) {
       await startResearch(project.id, {
         tier, idea, reference, network,
         gpu_hours: tier === "heavy" && gpuHours ? Number(gpuHours) : undefined,
+        datasets: picked.length ? picked : undefined,
       });
       setIdea("");
       void queryClient.invalidateQueries({ queryKey: ["run-latest", project.id] });
@@ -53,6 +63,19 @@ export function ResearchStartForm({ project }: { project: Project }) {
       <input value={reference} onChange={(e) => setReference(e.target.value)}
              placeholder="参考代码库(可选):GitHub URL 或本机路径;论文在项目页上传"
              className={`${FIELD} h-8`} />
+      {confirmed.length > 1 ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span className="flex items-center gap-1 text-micro text-muted-foreground">
+            <Database className="size-3" />迭代数据集(不选=全部):
+          </span>
+          {confirmed.map((d) => (
+            <label key={d.name} className="flex items-center gap-1 text-caption">
+              <input type="checkbox" checked={picked.includes(d.name)} onChange={() => toggle(d.name)} />
+              {d.name}
+            </label>
+          ))}
+        </div>
+      ) : null}
       <div className="grid gap-2 md:grid-cols-3">
         {TIERS.map((t) => (
           <button key={t.key} type="button" onClick={() => setTier(t.key)}

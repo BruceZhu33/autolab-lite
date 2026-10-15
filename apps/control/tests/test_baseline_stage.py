@@ -268,3 +268,45 @@ def test_append_confirm_keeps_existing_pool(api, tmp_path):
     assert set(pool) == {"kvasir", "polyp"}          # 旧的还在
     assert pool["kvasir"]["metrics"] == {"val_dice": 0.7}
     assert "polyp" not in pool["kvasir"]["command"]  # kvasir 命令未被覆盖
+
+
+def test_dataset_states_confirmed_ran_pending(repo):
+    """数据集状态板三态投影(事实派生):Job 实况→ran;等待中的 dataset
+    求助→pending_supply;owner 确认快照→confirmed(优先级最高)。"""
+    r = repo["repo"]
+    project = repo["project"]
+    from .test_repo import approve_simple, make_spec
+
+    approve_simple(repo, make_spec(repo))
+    job = r.list_jobs()[0]
+    conn = r.db.connect()
+    with r.db.tx(conn):
+        conn.execute("UPDATE jobs SET status='SUCCEEDED', params_json=? WHERE id=?",
+                     (json.dumps({"name": "kvasir", "dataset": "kvasir"}), job["id"]))
+    conn.close()
+    states = {d["name"]: d for d in baseline_stage.dataset_states(r, project["id"])}
+    assert states["kvasir"]["state"] == "ran"
+    assert states["kvasir"]["jobId"] == job["id"]
+
+    run = al.start_run(r, project["id"], "baseline", "跑通基线", {})
+    conn = r.db.connect()
+    with r.db.tx(conn):
+        conn.execute(
+            "UPDATE agent_runs SET status='waiting_human', pending_json=? WHERE id=?",
+            (json.dumps({"kind": "human", "tool_use_id": None, "payload": {
+                "kind": "dataset", "name": "BUSI", "question": "请提供 BUSI",
+                "target_path": "data/BUSI", "why": "configs/BUSI.yaml 读取"}}, ensure_ascii=False),
+             run["id"]))
+    conn.close()
+    states = {d["name"]: d for d in baseline_stage.dataset_states(r, project["id"])}
+    assert states["BUSI"]["state"] == "pending_supply"
+    assert states["BUSI"]["targetPath"] == "data/BUSI"
+    assert states["BUSI"]["runId"] == run["id"]
+
+    snapshot = {"passed_at": utc_now(), "datasets": {
+        "kvasir": {"metrics": {"val_dice": 0.8}, "command": "x", "job_id": job["id"]}}}
+    r.update_project(project["id"], baseline_passed_at=utc_now(),
+                     baseline_json=json.dumps(snapshot, ensure_ascii=False))
+    states = {d["name"]: d for d in baseline_stage.dataset_states(r, project["id"])}
+    assert states["kvasir"]["state"] == "confirmed"
+    assert states["kvasir"]["metrics"] == {"val_dice": 0.8}
