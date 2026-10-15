@@ -282,11 +282,13 @@ def test_dataset_states_confirmed_ran_pending(repo):
     conn = r.db.connect()
     with r.db.tx(conn):
         conn.execute("UPDATE jobs SET status='SUCCEEDED', params_json=? WHERE id=?",
-                     (json.dumps({"name": "kvasir", "dataset": "kvasir"}), job["id"]))
+                     (json.dumps({"name": "kvasir", "dataset": "kvasir",
+                        "command": "python train.py --config-file configs/Kvasir.yaml"}), job["id"]))
     conn.close()
     states = {d["name"]: d for d in baseline_stage.dataset_states(r, project["id"])}
     assert states["kvasir"]["state"] == "ran"
     assert states["kvasir"]["jobId"] == job["id"]
+    assert "configs/Kvasir.yaml" in states["kvasir"]["command"]
 
     run = al.start_run(r, project["id"], "baseline", "跑通基线", {})
     conn = r.db.connect()

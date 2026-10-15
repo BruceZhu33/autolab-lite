@@ -145,6 +145,11 @@ export function DatasetBoard({ project }: { project: Project }) {
               {ds.jobId
                 ? <code className="ml-auto text-micro text-muted-foreground">{ds.jobId}</code> : null}
             </div>
+            {ds.command ? (
+              <p className="mt-0.5 truncate text-micro text-muted-foreground" title={ds.command}>
+                <code className="rounded bg-muted/50 px-1">{ds.command}</code>
+              </p>
+            ) : null}
             {ds.state === "pending_supply" ? (
               <>
                 {ds.why

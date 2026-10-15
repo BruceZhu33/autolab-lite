@@ -86,7 +86,8 @@ def dataset_states(repo: Repo, project_id: str) -> list[dict]:
         conn.close()
     for r in rows:
         job = repo.get_job(r["id"])
-        name = str(json.loads(job["params_json"] or "{}").get("dataset") or "").strip()
+        params = json.loads(job["params_json"] or "{}")
+        name = str(params.get("dataset") or "").strip()
         if not name:
             continue
         if out.get(name, {}).get("state") == "confirmed":
@@ -94,7 +95,8 @@ def dataset_states(repo: Repo, project_id: str) -> list[dict]:
         state = ("running" if r["status"] in ("QUEUED", "DISPATCHING", "RUNNING")
                  else "ran" if r["status"] == "SUCCEEDED" else "failed")
         out[name] = {"name": name, "state": state, "jobId": r["id"],
-                     "jobStatus": r["status"], "metrics": job_metrics(repo, r["id"])}
+                     "jobStatus": r["status"], "metrics": job_metrics(repo, r["id"]),
+                     "command": str(params.get("command") or "")}
     run = runtime.latest_run(repo, project_id, KIND)
     pending = ((run or {}).get("pending") or {}).get("payload") or {}
     if (run or {}).get("status") == "waiting_human" and pending.get("kind") == "dataset":
