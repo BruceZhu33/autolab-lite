@@ -54,11 +54,13 @@ def web_server(_require_ports):
         subprocess.run(["npm", "run", "build"], cwd=web_dir, check=True,
                        capture_output=True, text=True)
     proc = Proc(subprocess.Popen(
-        ["npm", "run", "start"], cwd=web_dir,
+        # package.json 的 start 硬编码 -p 3430;追加的 -p 覆盖它,否则
+        # AUTOLAB_E2E_WEB_PORT 只改探活端口,server 还是撞旧端口(D-025 半成品)
+        ["npm", "run", "start", "--", "-p", str(WEB_PORT)], cwd=web_dir,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     ), "web")
     deadline = time.monotonic() + 60
-    with httpx.Client(timeout=3.0) as probe:
+    with httpx.Client(timeout=3.0, trust_env=False) as probe:
         while time.monotonic() < deadline:
             try:
                 if probe.get(f"http://127.0.0.1:{WEB_PORT}/").status_code == 200:
@@ -85,7 +87,8 @@ def test_m5_full_stack_smoke(stack, web_server):
     job_id = repo.list_jobs(plan_id=created["plan"]["id"])[0]["id"]
 
     # 1. control HTTP API:三段看板 + 权限分离
-    with httpx.Client(timeout=5.0, base_url=f"http://127.0.0.1:{API_PORT}") as api:
+    with httpx.Client(timeout=5.0, trust_env=False,
+                      base_url=f"http://127.0.0.1:{API_PORT}") as api:
         board = api.get("/api/board", headers=OWNER_H).json()
         card = next(c for c in board if c["projectId"] == ids["project_id"])
         # 有工作区、没基线快照 → 停在 Baseline 段
@@ -109,7 +112,8 @@ def test_m5_full_stack_smoke(stack, web_server):
         assert "log line 0" in logs["text"]
 
     # 2. web console serves real HTML for every page
-    with httpx.Client(timeout=10.0, base_url=f"http://127.0.0.1:{WEB_PORT}") as web:
+    with httpx.Client(timeout=10.0, trust_env=False,
+                      base_url=f"http://127.0.0.1:{WEB_PORT}") as web:
         board_page = web.get("/")
         assert board_page.status_code == 200 and "AutoLab" in board_page.text
         assert "实验看板" in board_page.text

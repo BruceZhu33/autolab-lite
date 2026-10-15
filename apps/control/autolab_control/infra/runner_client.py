@@ -45,7 +45,9 @@ class RunnerTransport:
         self.timeout = timeout or DEFAULT_TIMEOUT
         self._drop_first_dispatch = drop_first_dispatch
         self._dropped_already = False
-        self._client = httpx.Client(timeout=self.timeout)
+        # Runner 都在 loopback/LAN,直连;trust_env 会吃 macOS 系统代理把
+        # 本机请求发去代理,得 502(2026-10-13 e2e 排障发现)
+        self._client = httpx.Client(timeout=self.timeout, trust_env=False)
 
     def close(self) -> None:
         self._client.close()

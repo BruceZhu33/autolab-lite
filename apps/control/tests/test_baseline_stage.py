@@ -249,7 +249,9 @@ def test_append_confirm_keeps_existing_pool(api, tmp_path):
         assert _r.status_code == 200, _r.text
         run_id = _r.json()["run"]["id"]
         model = ScriptModel(round_script("a", dataset))
-        step = lambda: al.step(repo, None, run_id, baseline_stage.PROFILE, model=model)
+
+        def step():
+            return al.step(repo, None, run_id, baseline_stage.PROFILE, model=model)
         assert step() == "running" and step() == "waiting_jobs"
         finish_job(repo, state["job"], {"val_dice": 0.7})
         assert step() == "waiting_human"

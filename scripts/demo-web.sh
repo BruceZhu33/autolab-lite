@@ -55,7 +55,7 @@ uv run autolab-runner --config "$WORK/runner.json" > "$WORK/runner.log" 2>&1 & R
 uv run autolab-control serve --db "$DB" --credentials "$CREDS" \
   --poll-interval 0.2 --http-port $API_PORT > "$WORK/control.log" 2>&1 & CTRL_PID=$!
 for _ in $(seq 1 100); do
-  python3 -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:$PORT/healthz',timeout=1)" 2>/dev/null && break
+  python3 -c "import urllib.request as u;u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:$PORT/healthz',timeout=1)" 2>/dev/null && break
   sleep 0.1
 done
 

@@ -197,7 +197,7 @@ def test_m1_replay_approve_and_dispatch_are_side_effect_free(stack):
         "Authorization": f"Bearer {stack['token']}",
         "X-Autolab-Manifest-Signature": manifest_signature(stack["hmac_key"], manifest),
     }
-    with httpx.Client(timeout=10.0) as client:
+    with httpx.Client(timeout=10.0, trust_env=False) as client:
         single = client.post(f"http://127.0.0.1:{stack['port']}/jobs",
                              json=manifest.model_dump(mode="json"), headers=headers)
         assert single.status_code == 200 and single.json()["replayed"] is True
