@@ -154,7 +154,7 @@ class RunnerDeployer:
         last = ""
         while _t.monotonic() < deadline:
             try:
-                response = httpx.get(url, timeout=2.0)
+                response = httpx.get(url, timeout=2.0, trust_env=False)
                 if response.status_code == 200:
                     return response.json()
             except httpx.HTTPError as exc:
@@ -311,7 +311,8 @@ def wait_runner_health(host: str, port: int, *, timeout: float = 30.0) -> dict:
     last = ""
     while time.monotonic() < deadline:
         try:
-            response = httpx.get(f"http://{host}:{port}/healthz", timeout=2.0)
+            response = httpx.get(
+                f"http://{host}:{port}/healthz", timeout=2.0, trust_env=False)
             if response.status_code == 200:
                 return response.json()
         except httpx.HTTPError as exc:

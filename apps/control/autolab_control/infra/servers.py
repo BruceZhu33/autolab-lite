@@ -113,7 +113,7 @@ def test_connectivity(
             return False, "未登记 Runner 端口"
         try:
             response = httpx.get(
-                f"http://127.0.0.1:{port}/healthz", timeout=3.0,
+                f"http://127.0.0.1:{port}/healthz", timeout=3.0, trust_env=False,
             )
             ok = response.status_code == 200
             return ok, ("Runner healthz OK" if ok else f"healthz -> {response.status_code}")

@@ -147,7 +147,8 @@ def stack(tmp_path, request):
     ), "control")
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(2.0)) as probe:
+        # trust_env=False:本机探活直连,不吃 macOS 系统代理(否则 502)
+        with httpx.Client(timeout=httpx.Timeout(2.0), trust_env=False) as probe:
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 try:
@@ -229,7 +230,7 @@ def spawn_runner(stack_dict) -> Proc:
         [sys.executable, "-m", "autolab_runner", "--config", str(config)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT),
     ), "runner-2")
-    with httpx.Client(timeout=httpx.Timeout(2.0)) as probe:
+    with httpx.Client(timeout=httpx.Timeout(2.0), trust_env=False) as probe:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             try:
