@@ -73,9 +73,9 @@ function BaselineSection({ project }: { project: Project }) {
           重新跑会在你再次确认后覆盖当前基线。
         </p>
       ) : null}
-      <DatasetBoard project={project} />
       {!isActive(run) ? <StartForm project={project} again={!!run} /> : null}
       {run ? <RunPanel key={run.id} project={project} run={run} /> : null}
+      <DatasetBoard project={project} />
     </div>
   );
 }
