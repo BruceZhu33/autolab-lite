@@ -66,7 +66,6 @@ export type DatasetState = {
   question?: string;
   runId?: string;
 };
-
 export const fetchProjectDatasets = (projectId: string) =>
   get<{ datasets: DatasetState[] }>(`/api/projects/${projectId}/datasets`);
 
