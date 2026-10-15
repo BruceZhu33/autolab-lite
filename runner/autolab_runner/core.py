@@ -304,6 +304,18 @@ class RunnerCore:
                     break
             if len(found) >= _MAX_ARTIFACTS:
                 break
+        # 指标源文件必须登记为产物,即使 artifacts 模式没列它:控制端的指标
+        # 提取按产物行 relative_path 对位 metric source。agent 提交的 spec
+        # 常只有 outputs.metrics 不带 artifacts 模式,不扫这里指标整个丢失
+        # (真机发现:基线 Job 成功但 finish 核验报无合法指标)。
+        for rel in sorted(metric_paths):
+            if len(found) >= _MAX_ARTIFACTS:
+                break
+            path = output_root / rel
+            if path in seen or not path.is_file():
+                continue
+            seen.add(path)
+            found.append(path)
         for number, path in enumerate(found, start=1):
             try:
                 digest, size = sha256_file(path)

@@ -235,40 +235,53 @@ class Scheduler:
             if spec is None:
                 continue
             for artifact in self.repo.job_artifacts(job["id"]):
-                if artifact["kind"] != "metrics" or artifact["metadata"].get("metric_values"):
+                if artifact["kind"] != "metrics":
+                    continue
+                # 同一产物文件可对应多个 metric source(同 path 不同 selector),
+                # 按"已提取的 selector"增量补齐,而不是提取第一个就跳过
+                done = artifact["metadata"].get("metric_values") or {}
+                sources = [
+                    s for s in spec.outputs.metrics
+                    if artifact["metadata"].get("relative_path") == s.path
+                    and (s.selector or s.path) not in done]
+                if not sources:
                     continue
                 attempts = int(artifact["metadata"].get("metric_attempts") or 0)
                 if attempts >= _MAX_METRIC_ATTEMPTS:
                     continue  # repeated read failures stop here (no per-tick storm)
-                source = next(
-                    (s for s in spec.outputs.metrics
-                     if artifact["metadata"].get("relative_path") == s.path),
-                    None,
-                )
-                if source is None:
-                    continue
                 self.repo.attach_artifact_metadata(
                     artifact["id"], {"metric_attempts": attempts + 1})
                 try:
                     content = self._read_metrics_text(job, artifact["remote_path"])
-                    value = parse_metric(content, source.kind, source.selector or "")
-                except (OSError, ValueError) as exc:
+                except OSError as exc:
                     self.repo.attach_artifact_metadata(
                         artifact["id"], {"metric_error": str(exc)[:200]}
                     )
                     continue
-                if value is not None:
+                extracted: dict[str, float] = {}
+                problems: list[str] = []
+                for source in sources:
+                    try:
+                        value = parse_metric(content, source.kind, source.selector or "")
+                    except ValueError as exc:
+                        problems.append(f"{source.selector or source.path}:{exc}")
+                        continue
+                    if value is None:
+                        continue
                     # 指标合理性门(D-023):超域值不作为有效指标(Job 保持
                     # 无指标 → 比较无 Δ → 结论 inconclusive,保守正确)
                     issue = metric_domain_issue(source.selector or source.path, value)
                     if issue:
-                        self.repo.attach_artifact_metadata(
-                            artifact["id"],
-                            {"metric_error": f"指标域校验未过:{issue}"[:200]})
+                        problems.append(f"指标域校验未过:{issue}")
                         continue
-                    self.repo.attach_artifact_metadata(
-                        artifact["id"], {"metric_values": {source.selector or source.path: value}}
-                    )
+                    extracted[source.selector or source.path] = value
+                metadata: dict[str, Any] = {}
+                if extracted:
+                    metadata["metric_values"] = {**done, **extracted}
+                if problems:
+                    metadata["metric_error"] = "; ".join(problems)[:200]
+                if metadata:
+                    self.repo.attach_artifact_metadata(artifact["id"], metadata)
 
     def _read_metrics_text(self, job: dict[str, Any], remote_path: str) -> str:
         """SSH 服务器的产物在远端:SFTP 读回再解析;本地直接 open。"""

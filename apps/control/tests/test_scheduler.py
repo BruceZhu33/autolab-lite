@@ -12,7 +12,7 @@ from autolab_control.core.db import Database
 from autolab_control.core.repo import AcquiredJob, Repo
 from autolab_control.execution.scheduler import Scheduler, parse_metric
 from autolab_control.infra.runner_client import DispatchResult, RunnerUnreachable
-from autolab_protocol import PlanSpecV1, RunnerEventV1
+from autolab_protocol import MetricSource, PlanOutputs, PlanSpecV1, RunnerEventV1
 
 CONTRACTS = Path(__file__).resolve().parents[3] / "docs" / "reboot-source" / "source-assets" / "contracts-v1"
 
@@ -228,6 +228,45 @@ def test_metric_extraction_after_success(env):
     scheduler._extract_metrics()
     refreshed = env["repo"].job_artifacts(job["id"])
     assert refreshed[0]["metadata"]["metric_values"] == {"val_dice": 0.8123}
+
+
+def test_metric_extraction_multiple_selectors_same_file(env):
+    """同一产物文件声明多个指标(同 path 不同 selector):一次提取全部,
+    而不是提完第一个就把产物标记完成。"""
+    spec = make_spec(env, seeds=(1,))
+    spec.outputs = PlanOutputs(subdir_template="{{job_id}}", metrics=[
+        MetricSource(kind="json", path="metrics.json", selector="val_dice"),
+        MetricSource(kind="json", path="metrics.json", selector="val_iou"),
+    ])
+    approve(env, spec)
+    fake = FakeTransport(script=[DispatchResult("accepted")])
+    scheduler = scheduler_with(env, fake)
+    scheduler.tick()
+    job = env["repo"].list_jobs()[0]
+    out_dir = env["tmp_path"] / "out" / job["id"]
+    out_dir.mkdir(parents=True)
+    (out_dir / "metrics.json").write_text(
+        '{"val_dice": 0.8123, "val_iou": 0.655}', encoding="utf-8")
+    now = datetime.now(timezone.utc).isoformat()
+    artifact = {
+        "schema_version": 1, "artifact_id": f"artifact-{job['id']}-001", "job_id": job["id"],
+        "kind": "metrics", "location_kind": "remote",
+        "remote_path": str(out_dir / "metrics.json"), "local_cache_path": None,
+        "sha256": "c" * 64, "size_bytes": 20,
+        "metadata": {"relative_path": "metrics.json"}, "created_at": now,
+    }
+    for raw in started_succeeded_events(job):
+        env["repo"].ingest_event(RunnerEventV1.model_validate(raw))
+    env["repo"].ingest_event(RunnerEventV1(
+        schema_version=1, runner_instance_id="runner-fake-01", event_seq=3,
+        dispatch_id=job["dispatch_id"], job_id=job["id"],
+        event_type="artifact.discovered", occurred_at=datetime.now(timezone.utc),
+        payload={"artifact": artifact},
+    ))
+    scheduler._extract_metrics()
+    refreshed = env["repo"].job_artifacts(job["id"])
+    assert refreshed[0]["metadata"]["metric_values"] == {
+        "val_dice": 0.8123, "val_iou": 0.655}
 
 
 def test_parse_metric_kinds():
