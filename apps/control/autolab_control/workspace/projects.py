@@ -6,6 +6,7 @@ GitHub 重新同步代码」。本机与 SSH 服务器共用同一套逻辑(经�
 
 from __future__ import annotations
 
+import json
 import os
 import tarfile
 import tempfile
@@ -48,6 +49,36 @@ def use_existing_dir(host: Host, workdir: str) -> str:
     if not host.run(f"test -w {q(workdir)}").ok:
         raise UserError(f"目录不可写:{workdir}")
     return workdir.rstrip("/")
+
+
+def _within(path: str, roots: list[str]) -> bool:
+    for root in roots:
+        stripped = root.rstrip("/")
+        if path == stripped or path.startswith(stripped + "/"):
+            return True
+    return False
+
+
+def ensure_within_roots(server: dict, workdir: str, output_root: str) -> None:
+    """立项早失败:工作区/输出目录必须在该服务器 Runner 的白名单根内。
+    否则要到 Job 派发那一刻才被 Runner 拒(workdir_outside_roots),owner
+    和 agent 都难定位——真机:项目立到 ~/autolab-projects,沙盒 Runner 只
+    信 /tmp,agent 拷整个工程自救也无效。roots 未登记(空)时跳过,
+    Runner 派发时仍会兜底拒绝。"""
+    work_roots = json.loads(server.get("allowed_work_roots_json") or "[]")
+    out_roots = json.loads(server.get("allowed_output_roots_json") or "[]")
+    problems: list[str] = []
+    if work_roots and workdir and not _within(workdir, work_roots):
+        problems.append(f"工作区 {workdir} 不在 Runner 允许根目录 {work_roots} 内")
+    if out_roots and output_root and not _within(output_root, out_roots):
+        problems.append(f"输出目录 {output_root} 不在 Runner 允许输出根目录 {out_roots} 内")
+    if problems:
+        raise UserError(
+            "；".join(problems)
+            + "——Job 派发时会被该服务器的 Runner 直接拒绝。两选一:"
+              "①把项目放到白名单内的路径重新立项;"
+              "②由 owner 重新部署该服务器的 Runner,把目标路径的父目录"
+              "加进 allowed_work_roots/allowed_output_roots(GPU Servers 页操作)")
 
 
 def clone_repo(host: Host, *, url: str, name: str) -> str:

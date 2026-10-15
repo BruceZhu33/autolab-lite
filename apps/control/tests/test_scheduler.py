@@ -302,3 +302,16 @@ def test_manifest_rebuild_is_byte_stable(env):
         project,
     )
     assert payload_hash(first) == payload_hash(second)
+
+
+def test_permanent_rejection_carries_owner_hint(env):
+    """workdir_outside_roots 这类 owner 才能解的拒绝,失败摘要要带行动
+    指引(让 agent ask_human 升级,而不是反复重试/拷工程自救)。"""
+    approve(env, make_spec(env, seeds=(1,)))
+    fake = FakeTransport(script=[DispatchResult("rejected", reason="workdir_outside_roots")])
+    scheduler = scheduler_with(env, fake)
+    scheduler.tick()
+    job = env["repo"].list_jobs()[0]
+    assert job["status"] == "FAILED"
+    assert "ask_human" in job["failure_summary"]
+    assert "allowed_work_roots" in job["failure_summary"]

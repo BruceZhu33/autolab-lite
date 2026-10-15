@@ -54,10 +54,13 @@ def build(ctx: Ctx) -> APIRouter:
         """workdir_for(host) 负责把代码放到服务器上并返回工作区路径。"""
         if not name or not server_id:
             raise HTTPException(400, "name、server_id 为必填")
+        server = repo.get_server(server_id)
         with open_host(repo, credentials, server_id) as host:
             workdir = workdir_for(host)
             if workdir:
                 projects.prepare_workspace(host, workdir)
+        if workdir and server:
+            projects.ensure_within_roots(server, workdir, f"{workdir}/output")
         return repo.add_project(name=name, server_id=server_id, workdir=workdir or "",
                                 output_root=f"{workdir}/output" if workdir else "",
                                 project_id=new_id("proj"))
@@ -108,6 +111,9 @@ def build(ctx: Ctx) -> APIRouter:
                 workdir = projects.use_existing_dir(host, workdir) if workdir \
                     else projects.clone_repo(host, url=github_url, name=project["name"])
                 projects.prepare_workspace(host, workdir)
+            server = repo.get_server(project["server_id"])
+            if server:
+                projects.ensure_within_roots(server, workdir, f"{workdir}/output")
             repo.update_project(project_id, workdir=workdir, output_root=f"{workdir}/output")
         repo.update_project(project_id, github_url=github_url,
                             local_workspace=(payload.get("local_workspace") or "").strip() or None)

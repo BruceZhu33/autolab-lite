@@ -215,3 +215,28 @@ def test_model_settings(api):
     assert saved == {"configured": True, "baseUrl": "https://open.bigmodel.cn/api/anthropic",
                      "model": "glm-5.3"}
     assert "new-key" not in str(saved)
+
+
+def test_create_project_rejects_workdir_outside_runner_roots(api, tmp_path):
+    """立项早失败:workdir 不在目标服务器 Runner 白名单内时当场拒绝,
+    而不是等到 Job 派发被 Runner 拒(真机 medtest2 教训)。"""
+    sandbox = api["repo"].add_local_server(
+        name="sandbox", runner_port=8422, runner_token_ref="srv-x",
+        allowed_work_roots=[str(tmp_path / "work")],
+        allowed_output_roots=[str(tmp_path)],
+    )
+    (tmp_path / "elsewhere").mkdir()
+    outside = api["client"].post("/api/owner/projects", json={
+        "name": "outside", "server_id": sandbox["id"],
+        "source": {"kind": "dir", "path": str(tmp_path / "elsewhere")},
+    }, headers=OWNER_H)
+    assert outside.status_code == 409, outside.text
+    assert "Runner 允许根目录" in outside.json()["detail"]
+    assert "allowed_work_roots" in outside.json()["detail"]
+
+    (tmp_path / "work" / "p").mkdir(parents=True)
+    inside = api["client"].post("/api/owner/projects", json={
+        "name": "inside", "server_id": sandbox["id"],
+        "source": {"kind": "dir", "path": str(tmp_path / "work" / "p")},
+    }, headers=OWNER_H)
+    assert inside.status_code == 200, inside.text

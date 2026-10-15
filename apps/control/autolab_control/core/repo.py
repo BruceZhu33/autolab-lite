@@ -21,6 +21,25 @@ TERMINAL_JOB_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OU
 ACTIVE_LEASE_STATUSES = frozenset({"HELD", "RELEASING"})
 MAX_DISPATCH_ATTEMPTS = 3
 
+# Runner 拒绝原因 → agent/owner 可行动的提示。这类拒绝不是 agent 能自救的
+# (改 Runner 白名单/重立项都是 owner 权限),要点是让 agent 立刻升级而不是
+# 反复重试或拷工程自救(真机:medtest2 派发被拒 8 次,agent 拷了 7.5G 进沙盒)。
+_REJECT_HINTS = {
+    "workdir_outside_roots":
+        "工作区不在该服务器 Runner 的允许根目录内——agent 无法自行解决,"
+        "应立即 ask_human 升级 owner:把项目移进白名单路径重新立项,"
+        "或重部署 Runner 把路径加进 allowed_work_roots",
+    "output_outside_roots":
+        "输出目录不在该服务器 Runner 的允许输出根目录内——需 owner 调整"
+        "项目 output_root 或 Runner 的 allowed_output_roots,应 ask_human 升级",
+}
+
+
+def _reject_summary(reason: str) -> str:
+    summary = f"dispatch rejected: {reason}"
+    hint = _REJECT_HINTS.get(reason)
+    return f"{summary}({hint})" if hint else summary
+
 class RepoError(UserError):
     pass
 
@@ -559,7 +578,7 @@ class Repo:
                     conn.execute(
                         "UPDATE jobs SET status = 'FAILED', failure_summary = ?,"
                         " finished_at = ?, updated_at = ? WHERE id = ?",
-                        (f"dispatch rejected: {reason}", utc_now(), utc_now(), job_id),
+                        (_reject_summary(reason), utc_now(), utc_now(), job_id),
                     )
                 else:
                     conn.execute(
