@@ -70,6 +70,14 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
     async def conflict(_: Request, exc: sqlite3.IntegrityError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": f"与已有记录冲突:{exc}"})
 
+    @app.exception_handler(sqlite3.OperationalError)
+    async def db_unavailable(_: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+        # 磁盘满/IO 故障时曾把整个进程带崩(真机:磁盘写爆,SQLite 反复
+        # disk I/O error,ASGI 未处理异常)——降级为 503 保住进程,提示可行动
+        return JSONResponse(status_code=503, content={
+            "detail": f"数据库暂时不可用({exc})——多半是磁盘满或 I/O 故障:"
+                      "在服务器上 df -h 检查运行目录所在盘,清理后自动恢复"})
+
     ctx = Ctx(repo=repo, credentials=credentials,
               owner=Depends(_auth(owner_token, agent_token, "owner")),
               reader=Depends(_auth(owner_token, agent_token, "agent")))

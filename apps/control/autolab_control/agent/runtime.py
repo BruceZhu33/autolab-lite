@@ -595,9 +595,13 @@ class AgentLoopManager:
                 if events and events[-1]["kind"] == "model_error":
                     time.sleep(30)
         except Exception as exc:  # 运行时自身 bug:终结会话并留因,不明灭
-            _update(self.repo, run_id, status="failed",
-                    stop_reason=f"运行时异常:{str(exc)[:300]}")
-            record_event(self.repo, run_id, "failed", {"error": str(exc)[:2000]})
+            try:
+                _update(self.repo, run_id, status="failed",
+                        stop_reason=f"运行时异常:{str(exc)[:300]}")
+                record_event(self.repo, run_id, "failed", {"error": str(exc)[:2000]})
+            except Exception:  # 磁盘满/IO 故障时连留痕都写不进:至少别炸线程
+                print(f"autolab-control: driver crash-logging failed (run {run_id}):"
+                      f" {exc}", flush=True)
         finally:
             with self._lock:
                 self._busy.discard(run_id)
