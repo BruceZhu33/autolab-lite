@@ -58,6 +58,37 @@ def workspace_tools() -> list[Tool]:
     ]
 
 
+# 治理(真机前科:agent 用 shell 直改控制端 DB 的 projects 表自救、给平台
+# 进程埋雷)。控制端数据库/凭据是产品边界——状态改动只能走工具/API;
+# 平台自身进程(control/runner/web)的生死是 owner 的事。
+_KILL_RE = re.compile(r"\b(?:pkill|killall|kill)\b")
+_PLATFORM_TOKENS = ("autolab_control", "autolab_runner", "autolab-runner",
+                    "next-server", "next start", "npm", "sshd", "systemctl",
+                    "docker", "systemd")
+
+
+def _governance_paths(env: LoopEnv) -> list[str]:
+    paths: list[str] = []
+    for holder in (getattr(env, "repo", None), getattr(env, "credentials", None)):
+        db = getattr(holder, "db", None) or holder
+        path = getattr(db, "path", None)
+        if path is not None:
+            paths.append(str(path))
+    return paths
+
+
+def _governance_check(env: LoopEnv, command: str) -> None:
+    for path in _governance_paths(env):
+        if path and path in command:
+            raise ToolError(
+                f"命令碰到了控制端数据/凭据({path})——这是产品边界,agent 不能直读直改:"
+                "改状态用工具(它们走产品 API);需要 owner 做的事用 ask_human。")
+    if _KILL_RE.search(command) and any(t in command.lower() for t in _PLATFORM_TOKENS):
+        raise ToolError(
+            "不允许杀平台自身进程(control/runner/web)或系统服务——那是 owner 的领地;"
+            "自己的训练/冒烟进程可以 kill(按 train.py、autolab_baseline.py 等匹配)。")
+
+
 _DENY = ("sudo ", "rm -rf /", "rm -rf ~", "mkfs", "shutdown", "reboot",
          "git push", ":(){", "> /dev/sd", "chmod -R 777 /")
 
@@ -73,6 +104,7 @@ def shell_tool(*, max_timeout: int = 900) -> Tool:
         hit = next((d for d in _DENY if d in command.lower()), None)
         if hit:
             raise ToolError(f"命令被拒绝(含 {hit.strip()})")
+        _governance_check(env, command)
         timeout = max(5, min(int(args.get("timeout") or 120), max_timeout))
         conda_env = (args.get("conda_env") or "").strip()
         if conda_env:

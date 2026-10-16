@@ -19,9 +19,12 @@ class FakeWorkspace:
         return SimpleNamespace(text=text, code=0)
 
 
-def make_env(run_id: str = "arun-test"):
+def make_env(run_id: str = "arun-test", db_path: str = "/tmp/x/control.db",
+             cred_path: str = "/tmp/x/credentials.json"):
     workspace = FakeWorkspace([])
-    env = SimpleNamespace(run={"id": run_id}, workspace=workspace)
+    env = SimpleNamespace(run={"id": run_id}, workspace=workspace,
+                          repo=SimpleNamespace(db=SimpleNamespace(path=db_path)),
+                          credentials=SimpleNamespace(path=cred_path))
     return env, workspace
 
 
@@ -58,3 +61,33 @@ def test_clean_output_never_pauses():
     for _ in range(8):
         result = call_shell(env)
         assert isinstance(result, str)
+
+
+# ------------------------------------------------------------------ 治理
+
+def test_control_db_path_is_denied():
+    """真机前科:agent 用 shell 直改控制端 DB 的 projects 表自救。"""
+    import pytest
+    from autolab_control.agent.runtime import ToolError
+
+    env, _ = make_env(db_path="/tmp/autolab-web-X/control.db",
+                      cred_path="/tmp/autolab-web-X/credentials.json")
+    with pytest.raises(ToolError, match="产品边界"):
+        call_shell(env, command='python -c "import sqlite3;'
+                                ' c=sqlite3.connect(\'/tmp/autolab-web-X/control.db\')"')
+    with pytest.raises(ToolError, match="产品边界"):
+        call_shell(env, command="cat /tmp/autolab-web-X/credentials.json")
+
+
+def test_platform_process_kill_is_denied_but_own_training_allowed():
+    import pytest
+    from autolab_control.agent.runtime import ToolError
+
+    env, ws = make_env()
+    with pytest.raises(ToolError, match="平台自身进程"):
+        call_shell(env, command='pkill -f "autolab_control serve"')
+    with pytest.raises(ToolError, match="平台自身进程"):
+        call_shell(env, command="killall next-server")
+    ws.outputs = ["killed"]
+    result = call_shell(env, command="pkill -f train.py || true")
+    assert isinstance(result, str) and "exit=0" in result

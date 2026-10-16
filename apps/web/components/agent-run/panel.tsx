@@ -235,6 +235,19 @@ function PendingCard({ project, run }: { project: Project; run: Run }) {
           <MiniMarkdown text={pending.payload.report} />
         </div>
       ) : null}
+      {kind === "round_review" ? (
+        <p className="mt-2 rounded-md bg-background/70 px-2 py-1.5 text-micro">
+          本轮已收束——在下方回话即进下一轮(说「继续」或给新思路);
+          点上方「请求停止」则结束本次研究,回到启动界面(结论已留在研究日志)。
+        </p>
+      ) : null}
+      {kind === "info" && pending.payload.question?.includes("网络不可达") ? (
+        <p className="mt-2 rounded-md bg-background/70 px-2 py-1.5 text-micro">
+          网络自动升级:通常加离线前缀
+          <code className="mx-1 rounded bg-muted/60 px-1">export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1</code>
+          即可继续;回复处置方式后 Agent 会照做。
+        </p>
+      ) : null}
     </div>
   );
 }
