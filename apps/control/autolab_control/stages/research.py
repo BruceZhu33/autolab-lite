@@ -65,6 +65,9 @@ SYSTEM_PROMPT = """你是 AutoLab 的研究 Agent。工程已经在 GPU 服务�
 
 ## 其他
 - 服务器网络情况见下方「研究状态」;没有外网就不要尝试下载。
+- **离线前缀是常量**:涉及 HuggingFace/transformers 的命令(冒烟、run_experiment)一律加前缀
+  `export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`——这些库即使文件已缓存也默认联网校验版本,
+  网络不通会挂在重试里假死(真机教训)。命令输出累计 3 次出现网络不可达错误时会被强制暂停问 owner。
 - 真正需要 owner 决策或材料时才用 ask_human。
 - 回复用中文,简洁。"""
 

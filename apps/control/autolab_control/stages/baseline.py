@@ -41,6 +41,9 @@ SYSTEM_PROMPT = """你是 AutoLab 的 Baseline Agent。目标:让这个代码库
 
 ## 约束
 - 服务器的网络情况见下方「环境事实」。没有外网时不要尝试 pip install / wget / git clone / 从 HuggingFace 下载,缺什么就问 owner。
+- **离线前缀是常量**:涉及 HuggingFace/transformers 的命令(冒烟、run_experiment)一律加前缀
+  `export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`——这些库即使文件已缓存也默认联网校验版本,
+  网络不通会挂在重试里假死(真机教训)。命令输出累计 3 次出现网络不可达错误时会被强制暂停问 owner。
 - 指标必须是真实评测结果,不要伪造或硬编码。比率类指标(dice/iou/acc 等)应在 [0,1]。
 - 回复用中文,简洁。"""
 

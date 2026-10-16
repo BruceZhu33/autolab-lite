@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 
 from ..execution import experiments
@@ -15,6 +16,20 @@ from ..workspace.host import q
 from .runtime import Finish, LoopEnv, Pause, Tool, ToolError
 
 _OBJ = "object"
+
+# 网络不可达升级(真机教训:HF 组件即使有缓存也默认联网校验,网络部分不通时
+# 训练进程挂在重试里干等,agent 跟着空转烧步数)。同会话累计撞到阈值就强制
+# 暂停问 owner,而不是让 agent 无限排障。
+_NETWORK_FAIL_RE = re.compile(
+    r"network is unreachable|connection refused|could not resolve host"
+    r"|max retries exceeded|errno 1[01][17]|failed to establish a new connection"
+    r"|connection timed out|connect\(\) timed out", re.IGNORECASE)
+_NETWORK_FAIL_LIMIT = 3
+_net_fail_counts: dict[str, int] = {}
+
+
+def reset_network_failures(run_id: str) -> None:
+    _net_fail_counts.pop(run_id, None)
 
 
 def _schema(properties: dict, required: list[str] | None = None) -> dict:
@@ -71,6 +86,23 @@ def shell_tool(*, max_timeout: int = 900) -> Tool:
         out = result.text
         if len(out) > 12000:
             out = out[:3000] + "\n…(中间省略)…\n" + out[-8000:]
+        failure = _NETWORK_FAIL_RE.search(out)
+        if failure is not None:
+            run_id = str(env.run.get("id") or "")
+            count = _net_fail_counts.get(run_id, 0) + 1
+            _net_fail_counts[run_id] = count
+            if count >= _NETWORK_FAIL_LIMIT:
+                _net_fail_counts.pop(run_id, None)
+                return Pause("human", {
+                    "kind": "info",
+                    "question": (
+                        f"本会话已累计 {count} 次命令输出出现网络不可达错误"
+                        f"(最近一处:{failure.group(0)}),自动暂停请 owner 定夺。\n"
+                        "常见处置:①离线模式——后续命令加前缀 "
+                        "export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 用本地缓存"
+                        "(HuggingFace 组件即使已缓存也默认联网校验版本);"
+                        "②换镜像源;③确实要联网下载的材料,请 owner 配代理或直接提供。"
+                        "owner 回复后继续。")})
         return f"exit={result.code}\n{out}"
 
     return Tool(
