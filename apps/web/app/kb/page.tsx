@@ -9,8 +9,9 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { BookOpen, FileUp, Loader2, LogOut, Plus, Send, Trash2 } from "lucide-react";
 import {
-  clearKbToken, kbChatStream, kbDelete, kbGet, kbLogin, kbPost, kbPut, kbRegister,
-  kbToken, kbUpload, type KbDoc, type KbSession, type KbSpace,
+  clearKbToken, kbChatStream, kbCreateSpace, kbDelete, kbGet, kbLogin, kbPost,
+  kbPut, kbRegister, kbToken, kbUpload, kbUploadJob, type KbDoc, type KbSession,
+  type KbSpace,
 } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-header";
@@ -68,18 +69,24 @@ function LoginCard({ onOk }: { onOk: (username: string) => void }) {
 
 export default function KnowledgePage() {
   const [user, setUser] = useState("");
+  const [isAdmin, setIsAdmin] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [spaceIds, setSpaceIds] = useState<string[]>([]);
+  const [creatingSpace, setCreatingSpace] = useState(false);
+  const [newSpaceName, setNewSpaceName] = useState("");
+  const [newSpacePrivate, setNewSpacePrivate] = useState(true);
+  const [uploadSpace, setUploadSpace] = useState("");
+  const [docFilter, setDocFilter] = useState("");
   const bottom = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
 
   useEffect(() => {
     if (!kbToken()) return;
-    void kbGet<{ username: string }>("/auth/me")
-      .then((me) => setUser(me.username))
+    void kbGet<{ username: string; role: string }>("/auth/me")
+      .then((me) => { setUser(me.username); setIsAdmin(me.role === "admin"); })
       .catch(() => clearKbToken());
   }, []);
   useEffect(() => { bottom.current?.scrollIntoView({ block: "nearest" }); }, [messages]);
@@ -154,13 +161,40 @@ export default function KnowledgePage() {
   };
 
   const upload = async (file: File) => {
-    toast.info(`上传解析中:${file.name}(大 PDF 会久)`);
+    const target = uploadSpace || spaceIds[0]
+      || (spaces.data ?? []).find((sp) => sp.is_default)?.id
+      || (spaces.data ?? [])[0]?.id || "";
+    if (!target) return toast.error("先建一个空间再上传");
+    toast.info(`${file.name} 已提交解析(空间 ${spaceName(target)})`);
     try {
-      await kbUpload(file);
-      toast.success(`${file.name} 已入库`);
+      const started = await kbUpload(file, target);
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const job = await kbUploadJob(started.job_id);
+        if (job.status === "failed") throw new Error(job.error || "解析失败");
+        if (job.status === "completed") break;
+      }
+      toast.success(`${file.name} 已入库(空间 ${spaceName(target)})`);
       void queryClient.invalidateQueries({ queryKey: ["kb-docs", user] });
     } catch (err) {
       toast.error(`上传失败:${(err as Error).message}`);
+    }
+  };
+
+  const spaceName = (id: string) =>
+    (spaces.data ?? []).find((sp) => sp.id === id)?.name ?? id;
+
+  const createSpace = async () => {
+    const name = newSpaceName.trim();
+    if (!name) return toast.error("填空间名");
+    try {
+      await kbCreateSpace(name, newSpacePrivate ? "private" : "shared");
+      toast.success(`空间已创建:${name}(${newSpacePrivate ? "私有,仅你与邀请的成员" : "共享,全员可读"})`);
+      setNewSpaceName("");
+      setCreatingSpace(false);
+      void queryClient.invalidateQueries({ queryKey: ["kb-spaces", user] });
+    } catch (err) {
+      toast.error(`建空间失败:${(err as Error).message}`);
     }
   };
 
@@ -223,8 +257,31 @@ export default function KnowledgePage() {
             </ul>
           </div>
           <div className="rounded-xl border-[0.5px] border-surface-border bg-card p-2.5">
-            <p className="text-caption font-semibold">检索空间</p>
-            <p className="mt-0.5 text-micro text-muted-foreground">会话绑定的检索域</p>
+            <div className="flex items-center justify-between">
+              <p className="text-caption font-semibold">检索空间</p>
+              <button className="text-muted-foreground hover:text-foreground"
+                      title="新建空间(私有=仅自己可见)" onClick={() => setCreatingSpace((v) => !v)}>
+                <Plus className="size-3.5" />
+              </button>
+            </div>
+            <p className="mt-0.5 text-micro text-muted-foreground">会话绑定的检索域(勾选才算)</p>
+            {creatingSpace ? (
+              <div className="mt-1.5 space-y-1 rounded-md bg-muted/30 p-1.5">
+                <input className={`${FIELD} h-7`} placeholder="空间名" value={newSpaceName}
+                       onChange={(e) => setNewSpaceName(e.target.value)} />
+                <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
+                  <input type="checkbox" checked={newSpacePrivate}
+                         onChange={(e) => setNewSpacePrivate(e.target.checked)} />
+                  私有(仅自己与邀请的成员可见)
+                </label>
+                <div className="flex gap-1.5">
+                  <Button size="sm" variant="outline" className="h-6 px-2 text-micro"
+                          onClick={() => void createSpace()}>创建</Button>
+                  <Button size="sm" variant="ghost" className="h-6 px-2 text-micro"
+                          onClick={() => setCreatingSpace(false)}>取消</Button>
+                </div>
+              </div>
+            ) : null}
             <div className="mt-1.5 space-y-1">
               {(spaces.data ?? []).map((sp) => (
                 <label key={sp.id} className="flex items-center gap-1.5 text-micro">
@@ -232,7 +289,7 @@ export default function KnowledgePage() {
                          onChange={(e) => void bindSpaces(
                            e.target.checked ? [...spaceIds, sp.id]
                              : spaceIds.filter((x) => x !== sp.id) || [sp.id])} />
-                  {sp.name ?? sp.id}
+                  {sp.visibility === "private" ? "🔒 " : ""}{sp.name ?? sp.id}
                   {sp.is_default ? <span className="text-muted-foreground/60">(默认)</span> : null}
                 </label>
               ))}
@@ -241,23 +298,45 @@ export default function KnowledgePage() {
           <div className="rounded-xl border-[0.5px] border-surface-border bg-card p-2.5">
             <div className="flex items-center justify-between">
               <p className="text-caption font-semibold">文档</p>
-              <label className="cursor-pointer text-muted-foreground hover:text-foreground"
-                     title="上传(pdf/docx/xlsx)">
-                <FileUp className="size-3.5" />
-                <input type="file" className="hidden" accept=".pdf,.docx,.doc,.xlsx,.xls"
-                       onChange={(e) => e.target.files?.[0] && void upload(e.target.files[0])} />
-              </label>
+              <div className="flex items-center gap-1.5">
+                <select className="max-w-24 rounded border-[0.5px] border-surface-border bg-background px-1 text-micro"
+                        value={uploadSpace} onChange={(e) => setUploadSpace(e.target.value)}
+                        title="上传目标空间(需该空间 editor 权限)">
+                  <option value="">跟随会话</option>
+                  {(spaces.data ?? []).map((sp) => (
+                    <option key={sp.id} value={sp.id}>{sp.name ?? sp.id}</option>
+                  ))}
+                </select>
+                <label className="cursor-pointer text-muted-foreground hover:text-foreground"
+                       title="上传(pdf/docx/xlsx)">
+                  <FileUp className="size-3.5" />
+                  <input type="file" className="hidden" accept=".pdf,.docx,.doc,.xlsx,.xls"
+                         onChange={(e) => e.target.files?.[0] && void upload(e.target.files[0])} />
+                </label>
+              </div>
             </div>
+            <select className="mt-1.5 w-full rounded border-[0.5px] border-surface-border bg-background px-1 text-micro"
+                    value={docFilter} onChange={(e) => setDocFilter(e.target.value)}>
+              <option value="">全部空间</option>
+              {(spaces.data ?? []).map((sp) => (
+                <option key={sp.id} value={sp.id}>{sp.name ?? sp.id}</option>
+              ))}
+            </select>
             <ul className="mt-1.5 space-y-0.5">
-              {(documents.data ?? []).slice(0, 30).map((d) => (
-                <li key={d.filename} className="flex items-center gap-1">
+              {(documents.data ?? [])
+                .filter((d) => !docFilter || d.space_id === docFilter).slice(0, 30).map((d) => (
+                <li key={`${d.space_id}/${d.filename}`} className="flex items-center gap-1">
+                  <span className="shrink-0 rounded bg-muted/50 px-1 text-micro text-muted-foreground"
+                        title={d.space_id}>{spaceName(d.space_id || "")}</span>
                   <span className="min-w-0 flex-1 truncate text-micro" title={d.filename}>
                     {d.filename}
                   </span>
-                  <button className="text-muted-foreground/60 hover:text-destructive"
-                          onClick={() => void removeDoc(d.filename)} title="删除">
-                    <Trash2 className="size-3" />
-                  </button>
+                  {isAdmin ? (
+                    <button className="text-muted-foreground/60 hover:text-destructive"
+                            onClick={() => void removeDoc(d.filename)} title="删除(需管理员)">
+                      <Trash2 className="size-3" />
+                    </button>
+                  ) : null}
                 </li>
               ))}
             </ul>

@@ -63,13 +63,25 @@ export async function kbDelete<T>(path: string): Promise<T> {
   return request<T>(`/api/kb/${path.replace(/^\//, "")}`, { method: "DELETE", headers: kbHeaders() });
 }
 
-/** 上传文档(multipart)。labnote 侧同步解析,大 PDF 会久,超时放宽。 */
-export async function kbUpload(file: File): Promise<unknown> {
+/** 建空间(visibility: shared 全员可读 / private 仅成员可见,创建者即 owner)。 */
+export async function kbCreateSpace(name: string, visibility: "shared" | "private",
+                                     description = ""): Promise<KbSpace> {
+  return kbPost<KbSpace>("/spaces", { name, visibility, description });
+}
+
+/** 上传文档到指定空间(异步:解析+向量化后台跑,返回 job_id 供轮询)。 */
+export async function kbUpload(file: File, spaceId: string): Promise<{ job_id: string }> {
   const form = new FormData();
   form.append("file", file);
-  return request(`/api/kb/documents/upload`, {
+  form.append("space_id", spaceId);
+  return request(`/api/kb/documents/upload/async`, {
     method: "POST", body: form, headers: kbHeaders(),
   });
+}
+
+/** 上传任务状态(status: pending/running/completed/failed)。 */
+export async function kbUploadJob(jobId: string): Promise<{ status: string; error?: string }> {
+  return kbGet(`/documents/upload/jobs/${jobId}`);
 }
 
 /** 流式对话:SSE(data: {...})逐块回调;返回完整答复文本。 */
