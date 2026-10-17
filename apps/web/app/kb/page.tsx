@@ -9,8 +9,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { BookOpen, FileUp, Loader2, LogOut, Plus, Send, Trash2 } from "lucide-react";
 import {
-  clearKbToken, kbChatStream, kbDelete, kbGet, kbLogin, kbPost, kbPut, kbToken,
-  kbUpload, type KbDoc, type KbSession, type KbSpace,
+  clearKbToken, kbChatStream, kbDelete, kbGet, kbLogin, kbPost, kbPut, kbRegister,
+  kbToken, kbUpload, type KbDoc, type KbSession, type KbSpace,
 } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-header";
@@ -18,6 +18,7 @@ import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-h
 const FIELD = "w-full rounded-md border-[0.5px] border-surface-border bg-background px-2 text-caption";
 
 function LoginCard({ onOk }: { onOk: (username: string) => void }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -25,20 +26,32 @@ function LoginCard({ onOk }: { onOk: (username: string) => void }) {
     if (!username.trim() || !password) return toast.error("填用户名和密码");
     setBusy(true);
     try {
-      const r = await kbLogin(username.trim(), password);
+      const r = mode === "login"
+        ? await kbLogin(username.trim(), password)
+        : await kbRegister(username.trim(), password);
       onOk(r.username);
-      toast.success(`已登录知识库:${r.username}`);
+      toast.success(mode === "login" ? `已登录知识库:${r.username}` : `已注册并登录:${r.username}`);
     } catch (err) {
-      toast.error(`登录失败:${(err as Error).message}`);
+      toast.error(`${mode === "login" ? "登录" : "注册"}失败:${(err as Error).message}`);
     } finally {
       setBusy(false);
     }
   };
   return (
     <div className="mx-auto mt-10 max-w-sm rounded-xl border-[0.5px] border-surface-border bg-card p-4">
-      <p className="text-caption font-semibold">登录 LABNOTE 知识库</p>
-      <p className="mt-0.5 text-micro text-muted-foreground">
-        用你的 labnote 账号(实验室成员账号);登录一次存在本机浏览器。
+      <div className="flex gap-2">
+        {(["login", "register"] as const).map((m) => (
+          <button key={m}
+                  className={`rounded-full px-2.5 py-0.5 text-caption ${mode === m ? "bg-accent font-medium" : "text-muted-foreground hover:text-foreground"}`}
+                  onClick={() => setMode(m)}>
+            {m === "login" ? "登录" : "注册新账号"}
+          </button>
+        ))}
+      </div>
+      <p className="mt-1.5 text-micro text-muted-foreground">
+        {mode === "login"
+          ? "用你的 labnote 账号(实验室成员账号);登录一次存在本机浏览器。"
+          : "没有账号?注册一个(普通成员,可读共享空间);注册即登录。"}
       </p>
       <input className={`${FIELD} mt-3 h-8`} placeholder="用户名" value={username}
              onChange={(e) => setUsername(e.target.value)} />
@@ -46,7 +59,8 @@ function LoginCard({ onOk }: { onOk: (username: string) => void }) {
              onChange={(e) => setPassword(e.target.value)}
              onKeyDown={(e) => e.key === "Enter" && void go()} />
       <Button size="sm" className="mt-3 w-full gap-1" disabled={busy} onClick={() => void go()}>
-        {busy ? <Loader2 className="size-3.5 animate-spin" /> : null}登录
+        {busy ? <Loader2 className="size-3.5 animate-spin" /> : null}
+        {mode === "login" ? "登录" : "注册并登录"}
       </Button>
     </div>
   );
