@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -51,13 +53,23 @@ def build(ctx: Ctx) -> APIRouter:
         is_stream = path.endswith("chat/stream")
         if is_stream:
             async def relay():
-                async with httpx.AsyncClient(verify=False, timeout=None,
-                                             trust_env=False) as stream_client:
-                    async with stream_client.stream("POST", url, content=body,
-                                                    headers={**headers,
-                                                             "Content-Type": "application/json"}) as upstream:
-                        async for chunk in upstream.aiter_bytes():
-                            yield chunk
+                # labnote 的流可能中途断(真机:LLM 流式崩溃,peer closed without
+                # complete body)——不能让转发静默死掉,补一个 SSE 错误事件收尾,
+                # 浏览器端才能把"卡住"变成明确的报错。
+                try:
+                    async with httpx.AsyncClient(verify=False, timeout=None,
+                                                 trust_env=False) as stream_client:
+                        async with stream_client.stream(
+                                "POST", url, content=body,
+                                headers={**headers,
+                                         "Content-Type": "application/json"}) as upstream:
+                            async for chunk in upstream.aiter_bytes():
+                                yield chunk
+                except Exception as exc:  # noqa: BLE001 - 断流是观察,不是代理崩溃
+                    error_event = json.dumps(
+                        {"type": "error", "content": f"知识库连接中断:{exc}"},
+                        ensure_ascii=False)
+                    yield f"data: {error_event}\n\n".encode()
 
             return StreamingResponse(relay(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache",
