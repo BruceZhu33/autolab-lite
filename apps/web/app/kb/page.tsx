@@ -4,14 +4,17 @@
  * 身份 = owner 自己的 labnote 账号(登录一次存本机);请求经 control 代理,
  * 能看到自己有权限的全部空间。autolab 服务链路(PAT)不受影响。 */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { BookOpen, FolderPlus, Loader2, LogOut, Plus, Send } from "lucide-react";
+import { BookOpen, FolderPlus, Loader2, LogOut, Plus } from "lucide-react";
 import {
   clearKbToken, kbChatStream, kbGet, kbLogin, kbPut, kbRegister, kbToken,
   type KbSession, type KbSpace,
 } from "@/lib/api";
+import { ChatComposer } from "@/components/chat/chat-composer";
+import { AssistantMessage, JumpToLatest, UserMessage } from "@/components/chat/chat-message";
+import { useScrollPinning } from "@/components/chat/use-scroll-pinning";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-header";
 
@@ -74,7 +77,8 @@ export default function KnowledgePage() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [spaceIds, setSpaceIds] = useState<string[]>([]);
-  const bottom = useRef<HTMLDivElement>(null);
+  const { containerRef, showJumpControl, handleScroll, scrollToBottom } =
+    useScrollPinning([messages, sending]);
 
   useEffect(() => {
     if (!kbToken()) return;
@@ -82,7 +86,6 @@ export default function KnowledgePage() {
       .then((me) => { setUser(me.username); setIsAdmin(me.role === "admin"); })
       .catch(() => clearKbToken());
   }, []);
-  useEffect(() => { bottom.current?.scrollIntoView({ block: "nearest" }); }, [messages]);
 
   const sessions = useQuery({
     queryKey: ["kb-sessions", user], enabled: !!user,
@@ -126,14 +129,20 @@ export default function KnowledgePage() {
   const send = async () => {
     const text = input.trim();
     if (!text || sending) return;
-    if (!sessionId) newChat();
+    // 首次发言自动开会话;sessionId 在本闭包里是旧值,必须用局部 sid,
+    // 否则流式请求会带着空 session_id 发出去。
+    const sid = sessionId || `autolab-${Date.now().toString(36)}`;
+    if (!sessionId) setSessionId(sid);
     setInput("");
-    setMessages((prev) => [...prev, { role: "user", text }]);
+    setMessages((prev) => {
+      const base = sessionId ? prev : []; // 自动开会话时丢掉旧空壳
+      return [...base, { role: "user", text }];
+    });
     setSending(true);
     let acc = "";
     setMessages((prev) => [...prev, { role: "assistant", text: "" }]);
     try {
-      await kbChatStream(text, sessionId, (chunk) => {
+      await kbChatStream(text, sid, (chunk) => {
         acc += chunk;
         setMessages((prev) => {
           const copy = [...prev];
@@ -224,16 +233,16 @@ export default function KnowledgePage() {
             </ul>
           </div>
         </aside>
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden pb-3">
-          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="flex flex-wrap items-center gap-1.5 pb-1.5">
             <span className="text-micro text-muted-foreground">检索域:</span>
             {(spaces.data ?? []).map((sp) => {
               const on = spaceIds.includes(sp.id);
               return (
                 <button key={sp.id}
-                        className={`rounded-full border-[0.5px] px-2 py-0.5 text-micro ${
-                          on ? "border-brand bg-brand/10 text-foreground"
-                             : "border-surface-border text-muted-foreground hover:bg-muted/40"}`}
+                        className={`rounded-full border-[0.5px] px-2 py-0.5 text-micro transition-colors ${
+                          on ? "border-brand bg-brand/10 text-brand"
+                             : "border-surface-border text-muted-foreground hover:bg-muted/40 hover:text-foreground"}`}
                         title={on ? "点击移出检索域" : "点击加入检索域"}
                         onClick={() => void bindSpaces(
                           on ? spaceIds.filter((x) => x !== sp.id) : [...spaceIds, sp.id])}>
@@ -242,42 +251,45 @@ export default function KnowledgePage() {
               );
             })}
             <a href="/spaces"
-               className="ml-auto inline-flex h-7 shrink-0 items-center gap-1 rounded-md border-[0.5px] border-surface-border bg-surface px-2.5 text-micro shadow-[var(--surface-shadow)] hover:bg-muted/40">
+               className="ml-auto inline-flex h-7 shrink-0 items-center gap-1 rounded-md bg-surface px-2.5 text-micro shadow-[var(--surface-shadow)] hover:bg-muted/40">
               管理空间与文档<FolderPlus className="size-3" />
             </a>
           </div>
-          <div className="flex-1 overflow-y-auto rounded-xl border-[0.5px] border-surface-border bg-card p-3">
-            {messages.length === 0 ? (
-              <div className="flex h-full flex-col items-center justify-center gap-3">
-                <BookOpen className="size-6 text-muted-foreground/50" />
-                <p className="text-caption text-muted-foreground">
-                  与知识库对话——论文、笔记、往轮实验结论
-                  {spaceIds.length ? `(检索域:${spaceIds.map((x) => spaceName(x)).join("、")})` : ""}
-                </p>
-                <div className="flex flex-wrap justify-center gap-1.5">
-                  {["EGDK 在低标注预算下的结论是什么", "往轮 25% 预算为什么失败", "这个方向有哪些可行改进"].map((q) => (
-                    <button key={q}
-                            className="rounded-full border-[0.5px] border-surface-border px-2.5 py-1 text-micro text-muted-foreground hover:bg-muted/40 hover:text-foreground"
-                            onClick={() => setInput(q)}>{q}</button>
-                  ))}
+          <div className="relative min-h-0 flex-1">
+            {showJumpControl ? <JumpToLatest onClick={() => scrollToBottom(true)} /> : null}
+            <div ref={containerRef} onScroll={handleScroll}
+                 className="cds-scroll-fade-y h-full overflow-y-auto pr-1">
+              {messages.length === 0 ? (
+                <div className="flex h-full flex-col items-center justify-center gap-2.5 text-center">
+                  <p className="font-serif text-title text-foreground">与知识库对话</p>
+                  <p className="text-caption text-muted-foreground">
+                    论文、笔记、往轮实验结论
+                    {spaceIds.length ? ` · 检索域:${spaceIds.map((x) => spaceName(x)).join("、")}` : ""}
+                  </p>
+                  <div className="flex max-w-xl flex-wrap justify-center gap-1.5 py-2">
+                    {["EGDK 在低标注预算下的结论是什么", "往轮 25% 预算为什么失败", "这个方向有哪些可行改进"].map((q) => (
+                      <button key={q}
+                              className="rounded-full border-[0.5px] border-surface-border bg-surface px-3 py-1.5 text-caption text-muted-foreground shadow-[var(--surface-shadow)] transition-colors hover:text-foreground"
+                              onClick={() => setInput(q)}>{q}</button>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ) : messages.map((m, i) => (
-              <div key={i} className={`mb-2 max-w-[85%] rounded-lg px-2.5 py-1.5 text-caption ${
-                m.role === "user" ? "ml-auto bg-accent" : "bg-muted/40"}`}>
-                <p className="whitespace-pre-wrap">{m.text ||
-                  (sending && i === messages.length - 1 ? "…" : "")}</p>
-              </div>
-            ))}
-            <div ref={bottom} />
+              ) : (
+                <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col justify-end py-4">
+                  {messages.map((m, i) => m.role === "user"
+                    ? <UserMessage key={i} text={m.text} />
+                    : <AssistantMessage key={i} text={m.text}
+                        streaming={sending && i === messages.length - 1} />)}
+                </div>
+              )}
+            </div>
           </div>
-          <div className="mt-2 flex gap-2">
-            <input className={`${FIELD} h-9`} placeholder={sessionId ? "提问…" : "点左侧 + 开个新会话"}
-                   value={input} onChange={(e) => setInput(e.target.value)}
-                   onKeyDown={(e) => e.key === "Enter" && void send()} />
-            <Button size="sm" className="gap-1" disabled={sending || !input.trim()} onClick={() => void send()}>
-              {sending ? <Loader2 className="size-3.5 animate-spin" /> : <Send className="size-3.5" />}
-            </Button>
+          <div className="mx-auto w-full max-w-3xl px-3 pb-3 pt-2">
+            <ChatComposer
+              value={input} onChange={setInput} onSend={() => void send()} sending={sending}
+              placeholder={sessionId ? "提问…" : "直接提问会自动开一个新会话"}
+              footer={<span className="hidden sm:inline">Enter 发送 · Shift + Enter 换行</span>}
+            />
           </div>
         </main>
       </div>
