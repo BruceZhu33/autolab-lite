@@ -30,13 +30,15 @@ export class ApiRequestError extends Error {
 
 type Body = Record<string, unknown> | FormData;
 
-export async function request<T>(path: string, init?: { method?: string; body?: Body }): Promise<T> {
+export async function request<T>(path: string, init?: { method?: string; body?: Body;
+  headers?: Record<string, string> }): Promise<T> {
   const isForm = init?.body instanceof FormData;
   const response = await fetch(`${apiUrl}${path}`, {
     method: init?.method ?? (init?.body ? "POST" : "GET"),
     headers: {
       Authorization: `Bearer ${apiToken()}`,
       ...(init?.body && !isForm ? { "Content-Type": "application/json" } : {}),
+      ...(init?.headers ?? {}),
     },
     body: init?.body ? (isForm ? (init.body as FormData) : JSON.stringify(init.body)) : undefined,
     cache: "no-store",

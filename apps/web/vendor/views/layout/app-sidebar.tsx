@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
-  BarChart3, ChevronDown, FlaskConical, FolderKanban, GitBranch, Gpu,
+  BarChart3, BookOpen, ChevronDown, FlaskConical, FolderKanban, GitBranch, Gpu,
   Lightbulb, ListChecks, Moon, Search, Settings, Sun, User,
 } from "lucide-react";
 
@@ -23,6 +23,7 @@ import {
 /** 全局入口:研究与工作流之外的工具页。 */
 const PERSONAL = [
   { label: "实验运行", icon: GitBranch, href: "/runs", key: "runs" },
+  { label: "知识库", icon: BookOpen, href: "/kb", key: "kb" },
   { label: "GPU 服务器", icon: Gpu, href: "/gpus", key: "gpus" },
 ];
 
