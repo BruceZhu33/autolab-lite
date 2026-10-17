@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { BookOpen, Loader2, LogOut, Plus, Send } from "lucide-react";
+import { BookOpen, FolderPlus, Loader2, LogOut, Plus, Send } from "lucide-react";
 import {
   clearKbToken, kbChatStream, kbGet, kbLogin, kbPut, kbRegister, kbToken,
   type KbSession, type KbSpace,
@@ -193,7 +193,7 @@ export default function KnowledgePage() {
         </button>
       </PageHeader>
       <div className={`flex flex-1 gap-3 overflow-hidden ${PAGE_GUTTER}`}>
-        <aside className={`${PAGE_GUTTER} ${PAGE_RAIL} flex w-60 shrink-0 flex-col gap-2 py-3`}>
+        <aside className={`${PAGE_GUTTER} ${PAGE_RAIL} flex w-44 shrink-0 flex-col gap-2 py-3`}>
           <Button size="sm" variant="outline" className="w-full gap-1" onClick={newChat}>
             <Plus className="size-3.5" />新会话
           </Button>
@@ -241,8 +241,9 @@ export default function KnowledgePage() {
                 </button>
               );
             })}
-            <a href="/spaces" className="ml-auto text-micro text-muted-foreground hover:text-foreground hover:underline">
-              管理空间与文档 →
+            <a href="/spaces"
+               className="ml-auto inline-flex h-7 shrink-0 items-center gap-1 rounded-md border-[0.5px] border-surface-border bg-surface px-2.5 text-micro shadow-[var(--surface-shadow)] hover:bg-muted/40">
+              管理空间与文档<FolderPlus className="size-3" />
             </a>
           </div>
           <div className="flex-1 overflow-y-auto rounded-xl border-[0.5px] border-surface-border bg-card p-3">
