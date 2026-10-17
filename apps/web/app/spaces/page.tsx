@@ -1,12 +1,14 @@
 "use client";
 
-/** 知识空间管理:空间的创建/成员/授权,文档的上传/删除/按空间浏览。
- * 与 /kb(纯对话)分工——那里只留会话与检索域,重管理动作都在这里。 */
+/** 知识空间管理:文件夹式导航——大厅是空间瓷砖网格(图标+名称+徽标+文档数),
+ * 点进去是该空间的详情(成员/授权/文档上传与浏览)。风格沿用控制台 tokens。 */
 
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { FileUp, FolderPlus, Loader2, Lock, Plus, Trash2, Users } from "lucide-react";
+import {
+  ArrowLeft, FileUp, Folder, FolderPlus, Loader2, Lock, Plus, Trash2, Users,
+} from "lucide-react";
 import {
   clearKbToken, kbAddMember, kbCreateSpace, kbDelete, kbGet, kbGrantAgent, kbLogin,
   kbMembers, kbToken, kbUpload, kbUploadJob, type KbDoc, type KbMember, type KbSpace,
@@ -41,7 +43,48 @@ function LoginCard({ onOk }: { onOk: () => void }) {
   );
 }
 
-function SpaceCard({ space, isAdmin }: { space: KbSpace; isAdmin: boolean }) {
+/* ------------------------------------------------------------------ 大厅 */
+
+function Lobby({ spaces, docsAll, onOpen, onNew }: {
+  spaces: KbSpace[]; docsAll: KbDoc[];
+  onOpen: (id: string) => void; onNew: () => void;
+}) {
+  const countOf = (id: string) => docsAll.filter((d) => d.space_id === id).length;
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+      <button onClick={onNew}
+              className="flex h-28 flex-col items-center justify-center gap-1.5 rounded-xl border-[0.5px] border-dashed border-surface-border text-muted-foreground transition-colors hover:border-brand hover:bg-brand/5 hover:text-foreground">
+        <FolderPlus className="size-6" />
+        <span className="text-caption">新建空间</span>
+      </button>
+      {spaces.map((sp) => (
+        <button key={sp.id} onClick={() => onOpen(sp.id)}
+                className="flex h-28 flex-col rounded-xl border-[0.5px] border-surface-border bg-card p-3 text-left shadow-[var(--surface-shadow)] transition-colors hover:border-brand/60 hover:bg-brand/5">
+          <div className="flex items-start justify-between">
+            {sp.visibility === "private"
+              ? <Lock className="size-4 text-muted-foreground" />
+              : <Folder className="size-4 text-brand/70" />}
+            <span className="rounded-full bg-muted/60 px-1.5 text-micro tabular-nums text-muted-foreground">
+              {countOf(sp.id)}
+            </span>
+          </div>
+          <p className="mt-auto truncate text-caption font-semibold" title={sp.name ?? sp.id}>
+            {sp.name ?? sp.id}
+          </p>
+          <p className="truncate text-micro text-muted-foreground">
+            {sp.is_default ? "默认 · " : ""}{sp.my_role ?? "—"}
+          </p>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ 详情 */
+
+function SpaceDetail({ space, isAdmin, onBack }: {
+  space: KbSpace; isAdmin: boolean; onBack: () => void;
+}) {
   const queryClient = useQueryClient();
   const [adding, setAdding] = useState(false);
   const [memberName, setMemberName] = useState("");
@@ -58,11 +101,6 @@ function SpaceCard({ space, isAdmin }: { space: KbSpace; isAdmin: boolean }) {
     queryFn: () => kbMembers(space.id),
   });
 
-  const refresh = () => {
-    void queryClient.invalidateQueries({ queryKey: ["kb-space-docs", space.id] });
-    void queryClient.invalidateQueries({ queryKey: ["kb-docs-all"] });
-  };
-
   const upload = async (file: File) => {
     setBusy("upload");
     toast.info(`${file.name} 已提交解析…`);
@@ -75,7 +113,8 @@ function SpaceCard({ space, isAdmin }: { space: KbSpace; isAdmin: boolean }) {
         if (job.status === "completed") break;
       }
       toast.success(`${file.name} 已入「${space.name}」`);
-      refresh();
+      void queryClient.invalidateQueries({ queryKey: ["kb-space-docs", space.id] });
+      void queryClient.invalidateQueries({ queryKey: ["kb-docs-all"] });
     } catch (err) {
       toast.error(`上传失败:${(err as Error).message}`);
     } finally {
@@ -109,34 +148,49 @@ function SpaceCard({ space, isAdmin }: { space: KbSpace; isAdmin: boolean }) {
     }
   };
 
+  const removeDoc = async (filename: string) => {
+    try {
+      await kbDelete(`/documents/${encodeURIComponent(filename)}`);
+      void queryClient.invalidateQueries({ queryKey: ["kb-space-docs", space.id] });
+      void queryClient.invalidateQueries({ queryKey: ["kb-docs-all"] });
+    } catch (err) {
+      toast.error(`删除失败:${(err as Error).message}`);
+    }
+  };
+
   return (
-    <section className="rounded-xl border-[0.5px] border-surface-border bg-card p-3">
+    <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
-        <p className="text-caption font-semibold">
+        <button onClick={onBack}
+                className="inline-flex h-7 items-center gap-1 rounded-md border-[0.5px] border-surface-border bg-surface px-2 text-micro shadow-[var(--surface-shadow)] hover:bg-muted/40">
+          <ArrowLeft className="size-3" />全部空间
+        </button>
+        <h2 className="text-caption font-semibold">
           {space.visibility === "private" ? <Lock className="mr-1 inline size-3.5 align-[-3px]" /> : null}
           {space.name ?? space.id}
-        </p>
+        </h2>
         <span className="rounded-full bg-muted/60 px-1.5 text-micro text-muted-foreground">
-          {space.visibility === "private" ? "私有" : "共享"}
-          {space.is_default ? " · 默认" : ""}
+          {space.visibility === "private" ? "私有" : "共享"}{space.is_default ? " · 默认" : ""} · 我的角色 {space.my_role ?? "—"}
         </span>
-        <span className="text-micro text-muted-foreground">我的角色:{space.my_role ?? "—"}</span>
         <div className="ml-auto flex items-center gap-1.5">
           {isOwner ? (
             <>
-              <Button size="sm" variant="outline" className="h-6 gap-1 px-2 text-micro"
+              <Button size="sm" variant="outline" className="h-7 gap-1 px-2 text-micro"
                       disabled={busy !== null} onClick={() => void grant()}>
                 {busy === "grant" ? <Loader2 className="size-3 animate-spin" /> : null}授权 Agent
               </Button>
-              <Button size="sm" variant="outline" className="h-6 gap-1 px-2 text-micro"
+              <Button size="sm" variant="outline" className="h-7 gap-1 px-2 text-micro"
                       onClick={() => setAdding((v) => !v)}>
                 <Users className="size-3" />成员
               </Button>
             </>
           ) : null}
-          <label className="cursor-pointer text-muted-foreground hover:text-foreground"
+          <label className="inline-flex h-7 cursor-pointer items-center gap-1 rounded-md border-[0.5px] border-surface-border bg-surface px-2.5 text-micro shadow-[var(--surface-shadow)] hover:bg-muted/40"
                  title="上传(pdf/docx/xlsx)到此空间">
-            {busy === "upload" ? <Loader2 className="size-3.5 animate-spin" /> : <FileUp className="size-3.5" />}
+            {busy === "upload"
+              ? <Loader2 className="size-3 animate-spin" />
+              : <FileUp className="size-3" />}
+            上传文档
             <input type="file" className="hidden" accept=".pdf,.docx,.doc,.xlsx,.xls"
                    onChange={(e) => e.target.files?.[0] && void upload(e.target.files[0])} />
           </label>
@@ -144,7 +198,7 @@ function SpaceCard({ space, isAdmin }: { space: KbSpace; isAdmin: boolean }) {
       </div>
 
       {adding && isOwner ? (
-        <div className="mt-2 flex flex-wrap items-center gap-1.5 rounded-md bg-muted/30 p-1.5">
+        <div className="flex flex-wrap items-center gap-1.5 rounded-xl border-[0.5px] border-surface-border bg-card p-2">
           <input className={`${FIELD} h-7 max-w-40`} placeholder="用户名"
                  value={memberName} onChange={(e) => setMemberName(e.target.value)} />
           <select className="rounded border-[0.5px] border-surface-border bg-background px-1 text-micro"
@@ -153,40 +207,48 @@ function SpaceCard({ space, isAdmin }: { space: KbSpace; isAdmin: boolean }) {
             <option value="editor">editor(可传)</option>
             <option value="owner">owner(可管)</option>
           </select>
-          <Button size="sm" className="h-6 px-2 text-micro" onClick={() => void addMember()}>添加</Button>
+          <Button size="sm" className="h-7 px-2 text-micro" onClick={() => void addMember()}>添加</Button>
         </div>
       ) : null}
       {isOwner && members.data ? (
-        <p className="mt-1 text-micro text-muted-foreground">
+        <p className="text-micro text-muted-foreground">
           成员:{members.data.map((m: KbMember) => `${m.username}(${m.role})`).join("、") || "仅自己"}
         </p>
       ) : null}
 
-      <ul className="mt-2 space-y-0.5">
-        {(docs.data ?? []).map((d) => (
-          <li key={d.filename} className="flex items-center gap-2 text-micro">
-            <span className="min-w-0 flex-1 truncate" title={d.filename}>{d.filename}</span>
-            <span className="shrink-0 tabular-nums text-muted-foreground">{d.chunk_count ?? "—"} 块</span>
-            {isAdmin ? (
-              <button className="shrink-0 text-muted-foreground/60 hover:text-destructive"
-                      title="删除(需管理员)"
-                      onClick={() => void kbDelete(`/documents/${encodeURIComponent(d.filename)}`)
-                        .then(refresh).catch((e) => toast.error(`删除失败:${e.message}`))}>
-                <Trash2 className="size-3" />
-              </button>
-            ) : null}
-          </li>
-        ))}
-        {!(docs.data ?? []).length
-          ? <li className="text-micro text-muted-foreground">暂无文档;右上角上传</li> : null}
-      </ul>
-    </section>
+      <div className="rounded-xl border-[0.5px] border-surface-border bg-card p-3">
+        <p className="text-micro font-semibold text-muted-foreground">文档({(docs.data ?? []).length})</p>
+        <ul className="mt-1.5 space-y-1">
+          {(docs.data ?? []).map((d) => (
+            <li key={d.filename} className="flex items-center gap-2 rounded-md px-1.5 py-1 text-caption hover:bg-muted/30">
+              <span className="min-w-0 flex-1 truncate" title={d.filename}>{d.filename}</span>
+              <span className="shrink-0 text-micro tabular-nums text-muted-foreground">
+                {d.chunk_count ?? "—"} 块
+              </span>
+              {isAdmin ? (
+                <button className="shrink-0 text-muted-foreground/60 hover:text-destructive"
+                        title="删除(需管理员)" onClick={() => void removeDoc(d.filename)}>
+                  <Trash2 className="size-3" />
+                </button>
+              ) : null}
+            </li>
+          ))}
+          {!(docs.data ?? []).length
+            ? <li className="px-1.5 py-2 text-micro text-muted-foreground">
+                暂无文档;右上角「上传文档」
+              </li> : null}
+        </ul>
+      </div>
+    </div>
   );
 }
+
+/* ------------------------------------------------------------------ 页面 */
 
 export default function SpacesPage() {
   const [authed, setAuthed] = useState(false);
   const [ready, setReady] = useState(false);
+  const [openId, setOpenId] = useState("");
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [priv, setPriv] = useState(true);
@@ -206,6 +268,10 @@ export default function SpacesPage() {
     queryKey: ["kb-spaces-all", authed], enabled: authed,
     queryFn: () => kbGet<KbSpace[]>("/spaces"),
   });
+  const docsAll = useQuery({
+    queryKey: ["kb-docs-all", authed], enabled: authed,
+    queryFn: () => kbGet<KbDoc[]>("/documents"),
+  });
 
   const create = async () => {
     if (!name.trim()) return toast.error("填空间名");
@@ -221,42 +287,40 @@ export default function SpacesPage() {
   };
 
   if (!ready) return null;
+  const opened = (spaces.data ?? []).find((sp) => sp.id === openId);
   return (
     <div className="flex h-full flex-col">
       <PageHeader>
         <FolderPlus className="size-4 text-muted-foreground" />
         <h1 className="text-title-sm font-semibold tracking-tight">知识空间</h1>
         <p className="ml-2 hidden truncate text-caption text-muted-foreground md:block">
-          空间/成员/文档管理;对话在「知识库」页
+          {opened ? (opened.name ?? opened.id) : "论文与笔记按空间组织;对话在「知识库」页"}
         </p>
-        {authed ? (
-          <Button size="sm" variant="outline" className="ml-auto h-7 gap-1 px-2 text-micro"
-                  onClick={() => setCreating((v) => !v)}>
-            <Plus className="size-3" />新建空间
-          </Button>
-        ) : null}
       </PageHeader>
       <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
-        <div className={`${PAGE_RAIL} space-y-3 py-4`}>
-          {!authed ? <LoginCard onOk={() => setAuthed(true)} /> : (
-            <>
-              {creating ? (
-                <section className="rounded-xl border-[0.5px] border-surface-border bg-card p-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <input className={`${FIELD} h-8 max-w-56`} placeholder="空间名"
-                           value={name} onChange={(e) => setName(e.target.value)} />
-                    <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
-                      <input type="checkbox" checked={priv} onChange={(e) => setPriv(e.target.checked)} />
-                      私有(仅自己与受邀成员)
-                    </label>
-                    <Button size="sm" className="h-7" onClick={() => void create()}>创建</Button>
-                  </div>
-                </section>
-              ) : null}
-              {(spaces.data ?? []).map((sp) => (
-                <SpaceCard key={sp.id} space={sp} isAdmin={me.data?.role === "admin"} />
-              ))}
-            </>
+        <div className={`${PAGE_RAIL} py-4`}>
+          {!authed ? <LoginCard onOk={() => setAuthed(true)} />
+          : opened ? <SpaceDetail space={opened} isAdmin={me.data?.role === "admin"}
+                                  onBack={() => setOpenId("")} />
+          : creating ? (
+            <section className="mx-auto mt-10 max-w-sm rounded-xl border-[0.5px] border-surface-border bg-card p-4">
+              <p className="text-caption font-semibold">
+                <Plus className="mr-1 inline size-3.5 align-[-2px]" />新建空间
+              </p>
+              <input className={`${FIELD} mt-3 h-8`} placeholder="空间名"
+                     value={name} onChange={(e) => setName(e.target.value)} />
+              <label className="mt-2 flex items-center gap-1.5 text-micro text-muted-foreground">
+                <input type="checkbox" checked={priv} onChange={(e) => setPriv(e.target.checked)} />
+                私有(仅自己与受邀成员可见)
+              </label>
+              <div className="mt-3 flex gap-2">
+                <Button size="sm" onClick={() => void create()}>创建</Button>
+                <Button size="sm" variant="ghost" onClick={() => setCreating(false)}>取消</Button>
+              </div>
+            </section>
+          ) : (
+            <Lobby spaces={spaces.data ?? []} docsAll={docsAll.data ?? []}
+                   onOpen={setOpenId} onNew={() => setCreating(true)} />
           )}
         </div>
       </div>

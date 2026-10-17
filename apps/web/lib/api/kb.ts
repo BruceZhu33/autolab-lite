@@ -123,6 +123,7 @@ export async function kbChatStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let received = false;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -135,7 +136,7 @@ export async function kbChatStream(
         try {
           const payload = JSON.parse(line.slice(5).trim());
           if (payload.type === "error") throw new Error(payload.content || "知识库错误");
-          if (typeof payload.content === "string") onChunk(payload.content);
+          if (typeof payload.content === "string") { received = true; onChunk(payload.content); }
         } catch (err) {
           if (err instanceof SyntaxError) continue; // 非 JSON 行忽略
           throw err;
@@ -143,4 +144,5 @@ export async function kbChatStream(
       }
     }
   }
+  if (!received) throw new Error("回复为空(知识库流中断)——稍后重试或换问法");
 }
