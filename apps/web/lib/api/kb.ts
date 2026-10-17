@@ -3,7 +3,7 @@
 /** LABNOTE 知识库前端封装:身份 = owner 自己的 labnote 账号(JWT 存本机),
  * 请求经 control 的 /api/kb/* 代理转发——统一入口、统一 UI、PAT 不出服务端。 */
 
-import { apiUrl, request } from "./client";
+import { apiToken, apiUrl, request } from "./client";
 
 const KB_TOKEN_KEY = "autolab.kb_token";
 
@@ -108,7 +108,11 @@ export async function kbChatStream(
 ): Promise<void> {
   const response = await fetch(`${apiUrl}/api/kb/chat/stream`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...kbHeaders() },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiToken()}`,  // control 代理的 owner 身份
+      ...kbHeaders(),                         // labnote 的用户身份
+    },
     body: JSON.stringify({ message, session_id: sessionId }),
   });
   if (!response.ok || !response.body) {
