@@ -17,6 +17,15 @@ export type KbSession = { session_id: string; updated_at: string; message_count:
 export type KbSpace = { id: string; name: string; visibility?: string; is_default?: boolean };
 export type KbDoc = { filename: string; chunk_count?: number; updated_at?: string; space_id?: string };
 
+export async function kbRegister(username: string, password: string): Promise<{ token: string; username: string }> {
+  const data = await request<{ access_token?: string; username?: string }>(
+    "/api/kb/auth/register", { method: "POST", body: { username, password } });
+  const token = data?.access_token;
+  if (!token) throw new Error("注册响应缺少 access_token");
+  setKbToken(token);
+  return { token, username: data.username ?? username };
+}
+
 export async function kbLogin(username: string, password: string): Promise<{ token: string; username: string }> {
   const data = await request<{ access_token?: string; username?: string }>(
     "/api/kb/login", { method: "POST", body: { username, password } });
