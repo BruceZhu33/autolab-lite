@@ -120,8 +120,14 @@ export default function KnowledgePage() {
   };
 
   const bindSpaces = async (next: string[]) => {
-    if (!sessionId || !next.length) return;
-    setSpaceIds(next);
+    if (!sessionId) return;
+    let target = next;
+    if (!target.length) {
+      // 后端要求会话至少绑一个检索空间:取消到最后一个时回落默认空间,而不是弹回刚取消的
+      target = [(spaces.data ?? []).find((sp) => sp.is_default)?.id ?? "lab-shared"];
+      toast.info("会话至少要绑一个检索空间,已回到默认空间");
+    }
+    setSpaceIds(target);
     try {
       await kbPut(`/sessions/${sessionId}/spaces`, { space_ids: next });
     } catch (err) {
@@ -300,7 +306,7 @@ export default function KnowledgePage() {
                     <input type="checkbox" checked={spaceIds.includes(sp.id)}
                            onChange={(e) => void bindSpaces(
                              e.target.checked ? [...spaceIds, sp.id]
-                               : spaceIds.filter((x) => x !== sp.id) || [sp.id])} />
+                               : spaceIds.filter((x) => x !== sp.id))} />
                     <span className="truncate">
                       {sp.visibility === "private" ? "🔒 " : ""}{sp.name ?? sp.id}
                       {sp.is_default ? <span className="text-muted-foreground/60">(默认)</span> : null}
