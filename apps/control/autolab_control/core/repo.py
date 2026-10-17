@@ -545,7 +545,8 @@ class Repo:
             with self.db.tx(conn):
                 conn.execute(
                     "UPDATE jobs SET status = 'RUNNING', remote_job_id = ?,"
-                    " last_observed_at = ?, updated_at = ? WHERE id = ? AND status = 'DISPATCHING'",
+                    " last_observed_at = ?, hold_note = NULL, updated_at = ?"
+                    " WHERE id = ? AND status = 'DISPATCHING'",
                     (remote_job_id, utc_now(), utc_now(), job_id),
                 )
                 row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -834,9 +835,10 @@ class Repo:
         finally:
             conn.close()
 
-    def return_to_queued(self, job_id: str, *, reason: str) -> dict[str, Any]:
+    def return_to_queued(self, job_id: str, *, reason: str = "") -> dict[str, Any]:
         """Release the lease and go back to QUEUED WITHOUT consuming a retry
-        attempt (used when the runner is unreachable: dispatch never happened)."""
+        attempt (used when the runner is unreachable / disk watermark: dispatch
+        never happened). reason 落在 hold_note 上,让"卡住"可解释。"""
 
         conn = self.db.connect()
         try:
@@ -853,8 +855,9 @@ class Repo:
                 )
                 conn.execute(
                     "UPDATE jobs SET status = 'QUEUED', gpu_indices_json = NULL,"
-                    " dispatch_attempts = MAX(dispatch_attempts - 1, 0), updated_at = ? WHERE id = ?",
-                    (utc_now(), job_id),
+                    " dispatch_attempts = MAX(dispatch_attempts - 1, 0),"
+                    " hold_note = ?, updated_at = ? WHERE id = ?",
+                    (reason or None, utc_now(), job_id),
                 )
                 updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
                 return dict(updated)

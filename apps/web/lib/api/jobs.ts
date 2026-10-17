@@ -9,6 +9,7 @@ export type Job = {
   status: string;
   exit_code: number | null;
   failure_summary: string | null;
+  hold_note?: string | null;
   started_at: string | null;
   finished_at: string | null;
   queued_at?: string | null;

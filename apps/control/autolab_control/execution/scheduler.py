@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from typing import Any
@@ -29,6 +30,9 @@ from .manifest import build_manifest
 from .metrics import metric_domain_issue
 
 _MAX_UNCERTAIN_ATTEMPTS = 30
+# 磁盘水位:本地服务器根目录空闲低于该比例时暂停新派发(1.7T 的盘≈85G 缓冲,
+# 够一次训练的 checkpoint 波动;真机事故:盘写满,SQLite disk I/O error 拖崩控制端)
+_DISK_FREE_MIN = 0.05
 _UNCERTAIN_BACKOFF_TICKS = 1
 _MAX_METRIC_ATTEMPTS = 3
 
@@ -54,6 +58,8 @@ class Scheduler:
         self._uncertain_attempts: dict[str, int] = {}
         self._uncertain_wait: dict[str, int] = {}
         self._last_server_touch: dict[str, float] = {}
+        self._disk_low: dict[str, str] = {}
+        self._last_disk_check = 0.0
 
     # ----------------------------------------------------------- transports
 
@@ -85,11 +91,48 @@ class Scheduler:
     # ------------------------------------------------------------------ tick
 
     def tick(self) -> None:
+        self._check_disk_watermark()
         self._poll_observed_jobs()
         self._stop_cancelling_jobs()
         self._reconcile_dispatching_jobs()
         self._dispatch_new_jobs()
         self._extract_metrics()
+
+    # ------------------------------------------------------------ disk guard
+
+    def _check_disk_watermark(self) -> None:
+        """本地服务器根目录水位:空闲低于阈值就停新派发(真机:checkpoint 按
+        epoch 堆了 285G 把盘写满,SQLite I/O 把控制端拖崩)。远端(SSH)服务
+        器的盘由各自运维负责,这里只看 local。恢复空闲后自动放行。"""
+        now = time.monotonic()
+        if now - self._last_disk_check < 15.0:
+            return
+        self._last_disk_check = now
+        for server in self.repo.list_servers():
+            if server["transport_mode"] != "local":
+                continue
+            roots: list[str] = []
+            for column in ("allowed_work_roots_json", "allowed_output_roots_json"):
+                try:
+                    roots += json.loads(server.get(column) or "[]")
+                except ValueError:
+                    continue
+            low_root = ""
+            for root in roots:
+                try:
+                    usage = shutil.disk_usage(root)
+                except OSError:
+                    continue
+                if usage.free / max(usage.total, 1) < _DISK_FREE_MIN:
+                    low_root = root
+                    break
+            server_id = server["id"]
+            if low_root and server_id not in self._disk_low:
+                print(f"autolab-control: 磁盘水位保护开启:{low_root} 空闲"
+                      f"低于 {_DISK_FREE_MIN:.0%},新 Job 暂停派发", flush=True)
+                self._disk_low[server_id] = low_root
+            elif not low_root:
+                self._disk_low.pop(server_id, None)
 
     def run_forever(self, stop: threading.Event | None = None) -> None:
         stop = stop or threading.Event()
@@ -198,11 +241,16 @@ class Scheduler:
     # ----------------------------------------------------------- dispatch new
 
     def _dispatch_new_jobs(self) -> None:
+        held: dict[str, str] = {}  # job_id -> 保护原因(本 tick 已压回过的)
         while True:
             acquired = self.repo.try_acquire_next_job()
             if acquired is None:
                 return
             job = acquired.job
+            if job["id"] in held:
+                # 队首的 Job 都在保护名单里:把它也压回去,本 tick 收手
+                self.repo.return_to_queued(job["id"], reason=held[job["id"]])
+                return
             transport = self._transport_for_server_id(job["server_id"])
             if transport is None:
                 self.repo.requeue_after_rejected_dispatch(
@@ -212,6 +260,15 @@ class Scheduler:
             if self._reachable.get(job["server_id"]) is False:
                 # runner known unreachable: hold the job, do not burn attempts
                 self.repo.return_to_queued(job["id"], reason="runner unreachable")
+                held[job["id"]] = "runner unreachable"
+                continue
+            low_root = self._disk_low.get(job["server_id"])
+            if low_root:
+                # 磁盘水位保护:继续派发只会把盘写爆拖崩控制端;压回队列并留原因
+                reason = (f"磁盘水位保护:{low_root} 所在盘空闲低于"
+                          f"{_DISK_FREE_MIN:.0%},清理 checkpoint 后自动恢复")
+                self.repo.return_to_queued(job["id"], reason=reason)
+                held[job["id"]] = reason
                 continue
             manifest = build_manifest(acquired, self._project_for(job))
             result = transport.dispatch(manifest)
