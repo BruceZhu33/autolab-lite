@@ -80,6 +80,17 @@ export async function kbUpload(file: File, spaceId: string): Promise<{ job_id: s
   });
 }
 
+export type KbMember = { username: string; role: string; created_at?: string };
+
+/** 空间成员列表(owner 可见)。 */
+export const kbMembers = (spaceId: string) =>
+  kbGet<KbMember[]>(`/spaces/${spaceId}/members`);
+
+/** 添加成员(owner):username + role(owner/editor/reader)。 */
+export async function kbAddMember(spaceId: string, username: string, role: string): Promise<void> {
+  await kbPost(`/spaces/${spaceId}/members`, { username, role });
+}
+
 /** 把服务账号加为空间 reader——研究 Agent 才能检索该空间(隐私:显式授权)。 */
 export async function kbGrantAgent(spaceId: string): Promise<void> {
   await kbPost(`/spaces/${spaceId}/members`, { username: "autolab-svc", role: "reader" });
