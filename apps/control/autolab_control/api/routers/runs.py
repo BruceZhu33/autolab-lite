@@ -57,7 +57,9 @@ def build(ctx: Ctx) -> APIRouter:
             repo, project_id, tier=str(payload.get("tier") or "light"),
             idea=str(payload.get("idea") or ""), reference=str(payload.get("reference") or ""),
             network=bool(payload.get("network")), max_rounds=number("max_rounds", int),
-            gpu_hours=number("gpu_hours", float), datasets=datasets or None)}
+            gpu_hours=number("gpu_hours", float), datasets=datasets or None,
+            kb_assist=bool(payload.get("kb_assist")),
+            kb_spaces=[str(s) for s in (payload.get("kb_spaces") or []) if str(s).strip()] or None)}
 
     @router.get("/api/projects/{project_id}/research/rounds", dependencies=[ctx.reader])
     def research_rounds(project_id: str, run_id: str | None = None) -> dict:

@@ -14,7 +14,8 @@ export const setKbToken = (token: string) =>
 export const clearKbToken = () => window.localStorage.removeItem(KB_TOKEN_KEY);
 
 export type KbSession = { session_id: string; updated_at: string; message_count: number };
-export type KbSpace = { id: string; name: string; visibility?: string; is_default?: boolean };
+export type KbSpace = { id: string; name: string; visibility?: string;
+  is_default?: boolean; my_role?: string };
 export type KbDoc = { filename: string; chunk_count?: number; updated_at?: string; space_id?: string };
 
 export async function kbRegister(username: string, password: string): Promise<{ token: string; username: string }> {
@@ -77,6 +78,11 @@ export async function kbUpload(file: File, spaceId: string): Promise<{ job_id: s
   return request(`/api/kb/documents/upload/async`, {
     method: "POST", body: form, headers: kbHeaders(),
   });
+}
+
+/** 把服务账号加为空间 reader——研究 Agent 才能检索该空间(隐私:显式授权)。 */
+export async function kbGrantAgent(spaceId: string): Promise<void> {
+  await kbPost(`/spaces/${spaceId}/members`, { username: "autolab-svc", role: "reader" });
 }
 
 /** 上传任务状态(status: pending/running/completed/failed)。 */

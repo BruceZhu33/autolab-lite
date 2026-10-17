@@ -158,8 +158,18 @@ def knowledge_tool() -> Tool:
         query = (args.get("query") or "").strip()
         if not query:
             raise ToolError("query 不能为空")
+        top_k = max(1, min(int(args.get("top_k") or 5), 10))
+        spaces: list[str] = []
         try:
-            return knowledge.retrieve(query, max(1, min(int(args.get("top_k") or 5), 10)))
+            config = json.loads(str(env.run.get("config_json") or "{}"))
+            if config.get("kb_assist"):
+                spaces = [s for s in (config.get("kb_spaces") or []) if s]
+        except (ValueError, AttributeError):
+            pass
+        try:
+            if spaces:
+                return knowledge.retrieve_spaces(query, spaces, per=top_k)
+            return knowledge.retrieve(query, top_k)
         except Exception as exc:  # noqa: BLE001 - 知识库故障是观察,不是会话失败
             raise ToolError(f"知识库检索失败:{exc}") from exc
 

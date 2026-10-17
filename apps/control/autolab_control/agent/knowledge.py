@@ -27,11 +27,13 @@ def _client() -> httpx.Client:
                         headers={"Authorization": f"Bearer {LABNOTE_PAT}"})
 
 
-def retrieve(query: str, top_k: int = 5) -> str:
+def retrieve(query: str, top_k: int = 5, space_id: str = "") -> str:
     """query → top_k 父块文本(带出处/层级/标题路径);失败抛给调用方降级。"""
+    payload = {"query": query, "top_k": top_k}
+    if space_id:
+        payload["space_id"] = space_id
     with _client() as client:
-        response = client.post(f"{LABNOTE_URL}/api/v1/retrieve",
-                               json={"query": query, "top_k": top_k})
+        response = client.post(f"{LABNOTE_URL}/api/v1/retrieve", json=payload)
     response.raise_for_status()
     docs = response.json().get("docs") or []
     parts = [f"[{i}] {d.get('filename', '')}(L{d.get('chunk_level')}) "
@@ -46,3 +48,23 @@ def ingest(filename: str, text: str, kind: str = "experiment") -> None:
         response = client.post(f"{LABNOTE_URL}/api/v1/ingest",
                                json={"filename": filename, "text": text, "kind": kind})
     response.raise_for_status()
+
+
+def retrieve_spaces(query: str, space_ids: list[str], per: int = 3) -> str:
+    """多空间检索合并(autolab 回流空间由默认值兜底,这里只查额外授权的空间);
+    单个空间 403/超时只跳过并留日志——授权是 owner 在 /kb 页给的。"""
+    seen: set[str] = set()
+    parts: list[str] = []
+    for space_id in space_ids:
+        if space_id in seen:
+            continue
+        seen.add(space_id)
+        try:
+            text = retrieve(query, per, space_id=space_id)
+        except Exception as exc:  # noqa: BLE001 - 单空间失败不拖垮整体
+            print(f"autolab-control: 知识库空间 {space_id} 检索失败(未授权?):{exc}",
+                  flush=True)
+            continue
+        if text and text != "知识库无相关内容":
+            parts.append(f"(空间 {space_id})\n{text}")
+    return "\n---\n".join(parts)

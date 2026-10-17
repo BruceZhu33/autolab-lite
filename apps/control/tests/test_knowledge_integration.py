@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -129,3 +130,33 @@ def test_record_round_ingests_report(kb_configured, monkeypatch, repo, tmp_path)
     body = ingested[0]
     assert body["filename"].startswith("round3-arun-abc123")
     assert "换 GBCM" in body["text"] and "略低于基线" in body["text"]
+
+
+def test_knowledge_tool_reads_run_config_spaces(monkeypatch):
+    """search_knowledge 按会话配置的知识库协助空间检索(owner 在研究启动勾选)。"""
+    called: list[dict] = []
+    monkeypatch.setattr(knowledge, "LABNOTE_URL", "https://kb.test")
+    monkeypatch.setattr(knowledge, "LABNOTE_PAT", "pat-x")
+
+    def fake_retrieve_spaces(query, space_ids, per=3):
+        called.append({"query": query, "spaces": space_ids})
+        return f"(空间 a)命中:{query}"
+
+    monkeypatch.setattr(knowledge, "retrieve_spaces", fake_retrieve_spaces)
+    env = SimpleNamespace(run={"config_json": json.dumps(
+        {"kb_assist": True, "kb_spaces": ["a", "b"]})})
+    out = knowledge_tool().handler(env, {"query": "小数据增强"})
+    assert "空间 a" in out
+    assert called[0]["spaces"] == ["a", "b"]
+
+
+def test_research_start_stores_kb_config(repo):
+    r = repo["repo"]
+    project = repo["project"]
+    r.update_project(project["id"], baseline_passed_at="2026-10-17T00:00:00Z",
+                     baseline_json=json.dumps({"datasets": {
+                         "kvasir": {"metrics": {"dice": 0.9}, "command": "x"}}}))
+    run = research.start(r, project["id"], tier="light", idea="增强", kb_assist=True,
+                         kb_spaces=["my-space"])
+    assert run["config"]["kb_assist"] is True
+    assert run["config"]["kb_spaces"] == ["my-space"]

@@ -215,10 +215,14 @@ def build_task(repo: Repo, project: dict, config: dict, *, run_id: str | None) -
               "- 参考代码库:" + (", ".join(r["name"] for r in registered) or "无")
               + "(用 read_reference 阅读)", ""]
     if knowledge.configured():
-        # §11-1 种子注入:以 idea+项目名为 query 取 top5 父块;不可达不阻塞
+        # §11-1 种子注入:以 idea+项目名为 query 取父块;不可达不阻塞。
+        # owner 选了知识库协助空间时,额外查那些空间(需在 /kb 页授权服务账号)。
         try:
             seed_query = f"{config.get('idea') or ''} {project['name']}".strip()
-            lines += ["## 知识库相关(论文/往轮实验结论,种子注入)",
+            if config.get("kb_assist") and config.get("kb_spaces"):
+                extra = knowledge.retrieve_spaces(seed_query, config["kb_spaces"], per=3)
+                lines += ["## 知识库相关(owner 指定的空间,种子注入)", extra, ""]
+            lines += ["## 知识库相关(往轮实验结论,种子注入)",
                       knowledge.retrieve(seed_query, top_k=5), ""]
         except Exception as exc:  # noqa: BLE001 - 知识库故障不阻塞研究循环
             print(f"autolab-control: 知识库种子注入失败:{exc}", flush=True)
@@ -370,7 +374,8 @@ PROFILE = LoopProfile(
 def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
           reference: str = "", network: bool = False,
           max_rounds: int | None = None, gpu_hours: float | None = None,
-          datasets: list[str] | None = None) -> dict:
+          datasets: list[str] | None = None, kb_assist: bool = False,
+          kb_spaces: list[str] | None = None) -> dict:
     project = repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
@@ -391,6 +396,8 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
         overrides["gpu_hours"] = max(0.0, float(gpu_hours))
     config = {"tier": tier, "idea": idea.strip(), "network": bool(network),
               "overrides": overrides,
-              "datasets": [d for d in (datasets or []) if d in baseline_pool(project)] or None}
+              "datasets": [d for d in (datasets or []) if d in baseline_pool(project)] or None,
+              "kb_assist": bool(kb_assist),
+              "kb_spaces": [s for s in (kb_spaces or []) if s] or None}
     return runtime.start_run(repo, project_id, KIND,
                                 build_task(repo, project, config, run_id=None), config)

@@ -114,7 +114,7 @@ export const confirmBaseline = (runId: string) =>
 
 export const startResearch = (projectId: string, input: {
   tier: ResearchTier; idea?: string; reference?: string; network?: boolean; gpu_hours?: number;
-  datasets?: string[];
+  datasets?: string[]; kb_assist?: boolean; kb_spaces?: string[];
 }) => post<{ run: Run }>(`/api/owner/projects/${projectId}/research/start`, input);
 export const fetchResearchRounds = (projectId: string, runId?: string) =>
   get<{ rounds: ResearchRound[] }>(
