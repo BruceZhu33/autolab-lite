@@ -35,9 +35,8 @@ def build(ctx: Ctx) -> APIRouter:
         try:
             response = client.post(
                 f"{_base()}/auth/login",
-                data={"username": payload.get("username") or "",
-                      "password": payload.get("password") or ""},
-                headers={"Content-Type": "application/x-www-form-urlencoded"})
+                json={"username": payload.get("username") or "",
+                      "password": payload.get("password") or ""})
         except httpx.HTTPError as exc:
             return JSONResponse(status_code=502, content={"detail": f"知识库不可达:{exc}"})
         return JSONResponse(status_code=response.status_code, content=response.json())
