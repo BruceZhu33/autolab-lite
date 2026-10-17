@@ -129,6 +129,11 @@ export default function RunsPage() {
                       <Badge variant="ghost" className={STATUS_TONE[job.status] ?? ""}>
                         {STATUS_LABEL[job.status] ?? job.status}
                       </Badge>
+                      {job.hold_note ? (
+                        <p className="mt-0.5 max-w-44 text-micro text-warning" title={job.hold_note}>
+                          {job.hold_note}
+                        </p>
+                      ) : null}
                     </td>
                     <td className="px-3 py-2 font-mono text-caption tabular-nums">
                       {job.exit_code ?? "—"}

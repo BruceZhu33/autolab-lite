@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_runner_event_seq INTEGER NOT NULL DEFAULT 0,
     last_observed_at TEXT,
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+    hold_note TEXT,
     queued_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
@@ -297,6 +298,12 @@ class Database:
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if legacy:
             _migrate_legacy_projects(conn)
+        if "jobs" in {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")} \
+                and "hold_note" not in _columns(conn, "jobs"):
+            # 卡住原因可见性:磁盘水位/Runner 不可达等把 Job 压回队列时,
+            # 原因落在行上(UI 可见),而不是无声等待(真机:盘满任务干等没人知道为何)
+            conn.execute("ALTER TABLE jobs ADD COLUMN hold_note TEXT")
         conn.executescript(_SCHEMA)
         conn.execute("INSERT OR IGNORE INTO schema_migrations (version, applied_at)"
                      " VALUES (?, ?)", (SCHEMA_VERSION, utc_now()))

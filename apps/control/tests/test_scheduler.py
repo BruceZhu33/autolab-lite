@@ -315,3 +315,32 @@ def test_permanent_rejection_carries_owner_hint(env):
     assert job["status"] == "FAILED"
     assert "ask_human" in job["failure_summary"]
     assert "allowed_work_roots" in job["failure_summary"]
+
+
+def test_disk_watermark_holds_and_resumes(env, monkeypatch):
+    """磁盘空闲低于阈值:新 Job 压回 QUEUED 且 hold_note 说明原因;
+    恢复空闲后自动重新派发(真机:checkpoint 写爆盘拖崩控制端)。"""
+    from autolab_control.execution import scheduler as sched
+
+    approve(env, make_spec(env, seeds=(1,)))
+    fake = FakeTransport(script=[DispatchResult("accepted")])
+    scheduler = scheduler_with(env, fake)
+
+    from types import SimpleNamespace
+    low = SimpleNamespace(total=100, used=99, free=1)
+    monkeypatch.setattr(sched.shutil, "disk_usage", lambda path: low)
+    scheduler._last_disk_check = 0.0  # 绕过 15s 节流
+    scheduler.tick()
+    job = env["repo"].list_jobs()[0]
+    assert job["status"] == "QUEUED"
+    assert "磁盘水位保护" in (job["hold_note"] or "")
+    assert fake.dispatch_ids == []
+
+    high = SimpleNamespace(total=100, used=50, free=50)
+    monkeypatch.setattr(sched.shutil, "disk_usage", lambda path: high)
+    scheduler._last_disk_check = 0.0
+    scheduler.tick()
+    job = env["repo"].list_jobs()[0]
+    assert job["status"] == "RUNNING"
+    assert job["hold_note"] is None
+    assert len(fake.dispatch_ids) == 1
