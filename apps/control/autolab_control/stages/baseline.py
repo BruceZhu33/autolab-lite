@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 
 from ..agent import runtime, tools
+from ..agent import knowledge
 from ..agent.runtime import AgentLoopError, LoopEnv, LoopProfile, Pause, ToolError
 from ..core.db import utc_now
 from ..core.repo import Repo
@@ -173,8 +174,10 @@ def _submit_for_confirmation(env: LoopEnv, args: dict) -> Pause:
 
 
 def build_tools(env: LoopEnv) -> list:
+    knowledge_tools = [tools.knowledge_tool()] if knowledge.configured() else []
     return [
-        *tools.workspace_tools(), tools.shell_tool(), *tools.experiment_tools(),
+        *tools.workspace_tools(), tools.shell_tool(), *knowledge_tools,
+        *tools.experiment_tools(),
         tools.read_paper_tool(), tools.ask_human_tool(),
         tools.finish_tool(
             "提交基线给 owner 确认。每个数据集给出成功的正式 Job;Python 会核验 Job 成功且有合法指标。",
