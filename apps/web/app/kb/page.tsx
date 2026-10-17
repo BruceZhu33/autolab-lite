@@ -9,9 +9,9 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { BookOpen, FileUp, Loader2, LogOut, Plus, Send, Trash2 } from "lucide-react";
 import {
-  clearKbToken, kbChatStream, kbCreateSpace, kbDelete, kbGet, kbLogin, kbPost,
-  kbPut, kbRegister, kbToken, kbUpload, kbUploadJob, type KbDoc, type KbSession,
-  type KbSpace,
+  clearKbToken, kbChatStream, kbCreateSpace, kbDelete, kbGet, kbGrantAgent,
+  kbLogin, kbPost, kbPut, kbRegister, kbToken, kbUpload, kbUploadJob,
+  type KbDoc, type KbSession, type KbSpace,
 } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-header";
@@ -184,6 +184,17 @@ export default function KnowledgePage() {
   const spaceName = (id: string) =>
     (spaces.data ?? []).find((sp) => sp.id === id)?.name ?? id;
 
+  const grantAgent = async (spaceId: string) => {
+    try {
+      await kbGrantAgent(spaceId);
+      toast.success("已授权:研究 Agent 可读取此空间(在研究启动勾选即生效)");
+    } catch (err) {
+      const msg = (err as Error).message;
+      toast.error(msg.includes("409") || msg.includes("冲突")
+        ? "已授权过,无需重复" : `授权失败:${msg}`);
+    }
+  };
+
   const createSpace = async () => {
     const name = newSpaceName.trim();
     if (!name) return toast.error("填空间名");
@@ -284,14 +295,25 @@ export default function KnowledgePage() {
             ) : null}
             <div className="mt-1.5 space-y-1">
               {(spaces.data ?? []).map((sp) => (
-                <label key={sp.id} className="flex items-center gap-1.5 text-micro">
-                  <input type="checkbox" checked={spaceIds.includes(sp.id)}
-                         onChange={(e) => void bindSpaces(
-                           e.target.checked ? [...spaceIds, sp.id]
-                             : spaceIds.filter((x) => x !== sp.id) || [sp.id])} />
-                  {sp.visibility === "private" ? "🔒 " : ""}{sp.name ?? sp.id}
-                  {sp.is_default ? <span className="text-muted-foreground/60">(默认)</span> : null}
-                </label>
+                <div key={sp.id} className="flex items-center gap-1">
+                  <label className="flex min-w-0 flex-1 items-center gap-1.5 text-micro">
+                    <input type="checkbox" checked={spaceIds.includes(sp.id)}
+                           onChange={(e) => void bindSpaces(
+                             e.target.checked ? [...spaceIds, sp.id]
+                               : spaceIds.filter((x) => x !== sp.id) || [sp.id])} />
+                    <span className="truncate">
+                      {sp.visibility === "private" ? "🔒 " : ""}{sp.name ?? sp.id}
+                      {sp.is_default ? <span className="text-muted-foreground/60">(默认)</span> : null}
+                    </span>
+                  </label>
+                  {sp.my_role === "owner" ? (
+                    <button className="shrink-0 text-micro text-brand hover:underline"
+                            title="把服务账号(autolab-svc)加为 reader,研究 Agent 才能检索此空间"
+                            onClick={() => void grantAgent(sp.id)}>
+                      授权 Agent
+                    </button>
+                  ) : null}
+                </div>
               ))}
             </div>
           </div>

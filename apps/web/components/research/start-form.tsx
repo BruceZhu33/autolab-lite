@@ -4,7 +4,8 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Database, Lightbulb, Loader2, PlayCircle } from "lucide-react";
-import { fetchProjectDatasets, startResearch, type Project, type ResearchTier } from "@/lib/api";
+import { fetchProjectDatasets, kbGet, kbToken, startResearch,
+         type KbSpace, type Project, type ResearchTier } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 
 const TIERS: Array<{ key: ResearchTier; title: string; badge: string; desc: string }> = [
@@ -25,7 +26,14 @@ export function ResearchStartForm({ project }: { project: Project }) {
   const [gpuHours, setGpuHours] = useState("");
   const [network, setNetwork] = useState(false);
   const [picked, setPicked] = useState<string[]>([]);
+  const [kbAssist, setKbAssist] = useState(false);
+  const [kbSpaces, setKbSpaces] = useState<string[]>([]);
   const [starting, setStarting] = useState(false);
+  const kbLoggedIn = typeof window !== "undefined" && !!kbToken();
+  const kbSpacesQuery = useQuery({
+    queryKey: ["kb-spaces-research"], enabled: kbLoggedIn,
+    queryFn: () => kbGet<KbSpace[]>("/spaces"),
+  });
   const { data: dsData } = useQuery({
     queryKey: ["datasets", project.id],
     queryFn: () => fetchProjectDatasets(project.id),
@@ -42,6 +50,8 @@ export function ResearchStartForm({ project }: { project: Project }) {
         tier, idea, reference, network,
         gpu_hours: tier === "heavy" && gpuHours ? Number(gpuHours) : undefined,
         datasets: picked.length ? picked : undefined,
+        kb_assist: kbAssist,
+        kb_spaces: kbAssist && kbSpaces.length ? kbSpaces : undefined,
       });
       setIdea("");
       void queryClient.invalidateQueries({ queryKey: ["run-latest", project.id] });
@@ -63,6 +73,28 @@ export function ResearchStartForm({ project }: { project: Project }) {
       <input value={reference} onChange={(e) => setReference(e.target.value)}
              placeholder="参考代码库(可选):GitHub URL 或本机路径;论文在项目页上传"
              className={`${FIELD} h-8`} />
+      {kbLoggedIn ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <label className="flex items-center gap-1.5 text-caption">
+            <input type="checkbox" checked={kbAssist}
+                   onChange={(e) => setKbAssist(e.target.checked)} />
+            知识库协助(Agent 定方向会先查论文/往轮结论)
+          </label>
+          {kbAssist ? (kbSpacesQuery.data ?? []).map((sp) => (
+            <label key={sp.id} className="flex items-center gap-1 text-micro"
+                   title="要在检索范围里就勾上;空间需已在知识库页授权给 Agent">
+              <input type="checkbox" checked={kbSpaces.includes(sp.id)}
+                     onChange={(e) => setKbSpaces((prev) =>
+                       e.target.checked ? [...prev, sp.id] : prev.filter((x) => x !== sp.id))} />
+              {sp.name ?? sp.id}
+            </label>
+          )) : null}
+        </div>
+      ) : (
+        <p className="text-micro text-muted-foreground">
+          知识库未登录(知识库页登录后,这里可以让 Agent 检索你授权的空间;未登录也始终能查实验回流)
+        </p>
+      )}
       {confirmed.length > 1 ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <span className="flex items-center gap-1 text-micro text-muted-foreground">
