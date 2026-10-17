@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..agent import runtime, tools
+from ..agent import knowledge
 from ..agent.runtime import (
     AgentLoopError,
     Finish,
@@ -65,6 +66,8 @@ SYSTEM_PROMPT = """你是 AutoLab 的研究 Agent。工程已经在 GPU 服务�
 
 ## 其他
 - 服务器网络情况见下方「研究状态」;没有外网就不要尝试下载。
+- **知识库**:配了 search_knowledge 工具时,定方向前先查——同类方法试过什么、
+  为什么失败(往轮结论已回流入库);任务说明里的「知识库相关」是按你的想法预取的种子。
 - **离线前缀是常量**:涉及 HuggingFace/transformers 的命令(冒烟、run_experiment)一律加前缀
   `export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`——这些库即使文件已缓存也默认联网校验版本,
   网络不通会挂在重试里假死(真机教训)。命令输出累计 3 次出现网络不可达错误时会被强制暂停问 owner。
@@ -211,6 +214,14 @@ def build_task(repo: Repo, project: dict, config: dict, *, run_id: str | None) -
               "- 论文:工作区 .autolab/papers/(用 read_paper 列出/阅读)",
               "- 参考代码库:" + (", ".join(r["name"] for r in registered) or "无")
               + "(用 read_reference 阅读)", ""]
+    if knowledge.configured():
+        # §11-1 种子注入:以 idea+项目名为 query 取 top5 父块;不可达不阻塞
+        try:
+            seed_query = f"{config.get('idea') or ''} {project['name']}".strip()
+            lines += ["## 知识库相关(论文/往轮实验结论,种子注入)",
+                      knowledge.retrieve(seed_query, top_k=5), ""]
+        except Exception as exc:  # noqa: BLE001 - 知识库故障不阻塞研究循环
+            print(f"autolab-control: 知识库种子注入失败:{exc}", flush=True)
     previous = [r for r in list_rounds(repo, project["id"]) if r["runId"] != run_id]
     if previous:
         lines += ["## 之前研究会话的日志(避免重复)", journal_text(previous, limit=6), ""]
@@ -320,10 +331,27 @@ def _record_round(env: LoopEnv, round_no: int, report: dict) -> None:
     old = ws.read_bytes(JOURNAL_REL).decode("utf-8") if ws.exists(JOURNAL_REL) \
         else "# 研究日志\n\n"
     ws.write_bytes(JOURNAL_REL, (old + _round_markdown(round_no, report)).encode("utf-8"))
+    if knowledge.configured():
+        # §11-3 实验结论回流:下一轮与对话可检索"上次为什么失败"。
+        # 失败只留日志,不阻塞研究循环。
+        try:
+            rows = json.dumps(report.get("evaluation", {}).get("rows") or [],
+                              ensure_ascii=False)
+            knowledge.ingest(
+                filename=f"round{round_no}-{env.run['id'][:12]}.md",
+                text=(f"# 第 {round_no} 轮实验记录(项目 {env.project['name']})\n\n"
+                      f"## 假设\n{report.get('hypothesis', '')}\n\n"
+                      f"## 改动\n{report.get('changes', '')}\n\n"
+                      f"## 分析\n{report.get('analysis', '')}\n\n"
+                      f"## 下一步\n{report.get('nextIdea', '')}\n\n"
+                      f"## 判定\n{rows}\n"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"autolab-control: 知识库回流失败(round {round_no}):{exc}", flush=True)
 
 
 def build_tools(env: LoopEnv) -> list[Tool]:
-    return [*tools.workspace_tools(), tools.shell_tool(),
+    knowledge_tools = [tools.knowledge_tool()] if knowledge.configured() else []
+    return [*tools.workspace_tools(), tools.shell_tool(), *knowledge_tools,
             *tools.experiment_tools(
                 baseline_ref=lambda e: _baseline_exp_ref(e.repo, e.project),
                 allowed_datasets=lambda e: set(baseline_pool(e.project)),

@@ -149,6 +149,28 @@ def shell_tool(*, max_timeout: int = 900) -> Tool:
 
 # ------------------------------------------------------------------ 与 owner 交互
 
+def knowledge_tool() -> Tool:
+    """LABNOTE 知识库检索(链路 C):论文/笔记/往轮实验结论。只在
+    LABNOTE_URL/LABNOTE_PAT 配好时由阶段 build_tools 注册。"""
+
+    def handler(env: LoopEnv, args: dict) -> str:
+        from . import knowledge
+        query = (args.get("query") or "").strip()
+        if not query:
+            raise ToolError("query 不能为空")
+        try:
+            return knowledge.retrieve(query, max(1, min(int(args.get("top_k") or 5), 10)))
+        except Exception as exc:  # noqa: BLE001 - 知识库故障是观察,不是会话失败
+            raise ToolError(f"知识库检索失败:{exc}") from exc
+
+    return Tool(
+        "search_knowledge",
+        "检索 LABNOTE 知识库:论文、笔记、往轮实验结论(含失败原因),返回相关片段与出处。"
+        "定研究方向前先查:同类方法试过什么、为什么失败;遇到怪现象也可以查。",
+        _schema({"query": {"type": "string"}, "top_k": {"type": "integer"}}, ["query"]),
+        handler)
+
+
 def ask_human_tool() -> Tool:
     """结构化求助:kind 决定前端渲染(上传 / 选目录 / 文字回答)。"""
 
