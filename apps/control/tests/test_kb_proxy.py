@@ -43,9 +43,9 @@ def test_kb_proxy_requires_owner(kb_env):
 def test_kb_login_forwards(kb_env, monkeypatch):
     from autolab_control.api.routers import kb as kb_router
 
-    def fake_post(url, data=None, headers=None, **_):
+    def fake_post(url, json=None, **_):
         assert url == "https://kb.test/auth/login"
-        assert data["username"] == "u"
+        assert json["username"] == "u"
         return SimpleNamespace(status_code=200,
                                json=lambda: {"access_token": "jwt-1", "username": "u"})
 
