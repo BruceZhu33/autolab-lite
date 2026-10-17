@@ -252,30 +252,39 @@ export default function KnowledgePage() {
         </button>
       </PageHeader>
       <div className={`flex flex-1 gap-3 overflow-hidden ${PAGE_GUTTER}`}>
-        <aside className={`${PAGE_RAIL} w-56 shrink-0 space-y-3 overflow-y-auto py-3`}>
-          <div className="rounded-xl border-[0.5px] border-surface-border bg-card p-2.5">
-            <div className="flex items-center justify-between">
-              <p className="text-caption font-semibold">会话</p>
-              <button className="text-muted-foreground hover:text-foreground" onClick={newChat}
-                      title="新会话"><Plus className="size-3.5" /></button>
-            </div>
-            <ul className="mt-1.5 space-y-0.5">
-              {(sessions.data?.sessions ?? []).slice().reverse().slice(0, 20).map((s) => (
-                <li key={s.session_id}>
+        <aside className={`${PAGE_GUTTER} ${PAGE_RAIL} flex w-60 shrink-0 flex-col gap-2 py-3`}>
+          <Button size="sm" variant="outline" className="w-full gap-1" onClick={newChat}>
+            <Plus className="size-3.5" />新会话
+          </Button>
+          <div className="flex min-h-0 flex-1 flex-col rounded-xl border-[0.5px] border-surface-border bg-card p-2">
+            <p className="text-micro font-semibold text-muted-foreground">会话</p>
+            <ul className="mt-1 min-h-0 flex-1 space-y-0.5 overflow-y-auto">
+              {(sessions.data?.sessions ?? []).slice().reverse().slice(0, 30).map((s) => (
+                <li key={s.session_id} className="flex items-center">
                   <button
-                    className={`w-full truncate rounded-md px-1.5 py-1 text-left text-micro ${
+                    className={`flex min-w-0 flex-1 items-center gap-1 rounded-md px-1.5 py-1 text-left text-micro ${
                       s.session_id === sessionId ? "bg-accent" : "hover:bg-muted/50"}`}
                     onClick={() => setSessionId(s.session_id)}
                     title={`${s.session_id} · ${s.message_count} 条`}>
-                    {s.session_id}
+                    <span className="min-w-0 flex-1 truncate">
+                      {s.session_id.startsWith("autolab-") ? s.session_id.slice(7) : s.session_id}
+                    </span>
+                    {s.message_count
+                      ? <span className="shrink-0 rounded-full bg-muted/60 px-1 text-micro tabular-nums text-muted-foreground">
+                          {s.message_count}
+                        </span> : null}
                   </button>
                 </li>
               ))}
+              {!(sessions.data?.sessions ?? []).length
+                ? <li className="px-1.5 py-2 text-micro text-muted-foreground">
+                    还没有会话;点上面「新会话」开始
+                  </li> : null}
             </ul>
           </div>
-          <div className="rounded-xl border-[0.5px] border-surface-border bg-card p-2.5">
+          <div className="shrink-0 rounded-xl border-[0.5px] border-surface-border bg-card p-2">
             <div className="flex items-center justify-between">
-              <p className="text-caption font-semibold">检索空间</p>
+              <p className="text-micro font-semibold text-muted-foreground">检索空间</p>
               <button className="text-muted-foreground hover:text-foreground"
                       title="新建空间(私有=仅自己可见)" onClick={() => setCreatingSpace((v) => !v)}>
                 <Plus className="size-3.5" />
@@ -323,9 +332,9 @@ export default function KnowledgePage() {
               ))}
             </div>
           </div>
-          <div className="rounded-xl border-[0.5px] border-surface-border bg-card p-2.5">
+          <div className="flex max-h-52 shrink-0 flex-col rounded-xl border-[0.5px] border-surface-border bg-card p-2">
             <div className="flex items-center justify-between">
-              <p className="text-caption font-semibold">文档</p>
+              <p className="text-micro font-semibold text-muted-foreground">文档</p>
               <div className="flex items-center gap-1.5">
                 <select className="max-w-24 rounded border-[0.5px] border-surface-border bg-background px-1 text-micro"
                         value={uploadSpace} onChange={(e) => setUploadSpace(e.target.value)}
@@ -350,7 +359,7 @@ export default function KnowledgePage() {
                 <option key={sp.id} value={sp.id}>{sp.name ?? sp.id}</option>
               ))}
             </select>
-            <ul className="mt-1.5 space-y-0.5">
+            <ul className="mt-1.5 min-h-0 flex-1 space-y-0.5 overflow-y-auto">
               {(documents.data ?? [])
                 .filter((d) => !docFilter || d.space_id === docFilter).slice(0, 30).map((d) => (
                 <li key={`${d.space_id}/${d.filename}`} className="flex items-center gap-1">
@@ -373,9 +382,20 @@ export default function KnowledgePage() {
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden pb-3">
           <div className="flex-1 overflow-y-auto rounded-xl border-[0.5px] border-surface-border bg-card p-3">
             {messages.length === 0 ? (
-              <p className="mt-8 text-center text-caption text-muted-foreground">
-                问点什么——比如「EGDK 在低标注预算下的结论是什么」「往轮 25% 预算为什么失败」
-              </p>
+              <div className="flex h-full flex-col items-center justify-center gap-3">
+                <BookOpen className="size-6 text-muted-foreground/50" />
+                <p className="text-caption text-muted-foreground">
+                  与知识库对话——论文、笔记、往轮实验结论
+                  {spaceIds.length ? `(检索域:${spaceIds.map((x) => spaceName(x)).join("、")})` : ""}
+                </p>
+                <div className="flex flex-wrap justify-center gap-1.5">
+                  {["EGDK 在低标注预算下的结论是什么", "往轮 25% 预算为什么失败", "这个方向有哪些可行改进"].map((q) => (
+                    <button key={q}
+                            className="rounded-full border-[0.5px] border-surface-border px-2.5 py-1 text-micro text-muted-foreground hover:bg-muted/40 hover:text-foreground"
+                            onClick={() => setInput(q)}>{q}</button>
+                  ))}
+                </div>
+              </div>
             ) : messages.map((m, i) => (
               <div key={i} className={`mb-2 max-w-[85%] rounded-lg px-2.5 py-1.5 text-caption ${
                 m.role === "user" ? "ml-auto bg-accent" : "bg-muted/40"}`}>
