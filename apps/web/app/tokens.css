@@ -1,4 +1,11 @@
-/* Multica design tokens — shared across Web + Desktop */
+/* Design tokens — shared across Web + Desktop.
+ *
+ * Palette and geometry are ported from the Claude Design System (CDS) as
+ * extracted by the open-claude-ui project (MIT): warm paper neutrals, a
+ * terracotta brand ramp, hairline alpha borders, diffuse double-ring
+ * shadows. Token ROLE names are unchanged from the previous Multica set, so
+ * every `bg-surface` / `text-brand` / `border-input` call site reskins
+ * itself; only the values moved. */
 
 @theme inline {
     --font-heading: var(--font-sans);
@@ -51,9 +58,10 @@
     --color-card: var(--card);
     --color-foreground: var(--foreground);
     --color-background: var(--background);
-    /* Compact product radius ladder. Keep the roles stable even when the base
-       value changes: xs=micro controls, sm=nested surfaces, md=rows/menus,
-       lg=controls/compact surfaces, xl=cards/dialogs. */
+    /* Radius ladder roles are stable: xs=micro controls, sm=nested surfaces,
+       md=rows/menus, lg=controls/compact surfaces, xl=cards/dialogs.
+       Base 10px = CDS panel radius, so cards land on 15px and the composer
+       carries its own 20px token below. */
     --radius-xs: calc(var(--radius) * 0.375);
     --radius-sm: calc(var(--radius) * 0.5);
     --radius-md: calc(var(--radius) * 0.75);
@@ -66,28 +74,15 @@
 
 /* Type scale — the only font sizes product UI may use.
  *
- * There was no `--text-*` token here before, so sizes grew ad hoc: 51 distinct
- * font sizes across web + desktop, 370 of them written as arbitrary values,
- * including half-pixel steps (10.5 / 11.5 / 12.5 / 13.5 / 14.5 / 15.5px) that
- * nobody chose deliberately — they appeared because there was no step to reach
- * for. Hierarchy does not come from having more sizes; past a handful, every
- * extra size makes the hierarchy blurrier, because two values a pixel apart
- * read as "the same, but wrong" rather than as two levels.
- *
  * The steps are named for the role the text plays, not for a t-shirt size.
  * That is what keeps the scale from drifting again: "what is this text for"
  * has an answer a reader can check, "is this sm or base" does not.
  *
  * Six of the ten steps replace Tailwind's default scale and deliberately keep
  * that scale's exact size/line-height pairs, so `text-sm` -> `text-body` moves
- * nothing on screen. Only the steps that fill the old gaps — micro (11), label
- * (13), body-lg (15) — are new sizes; those are the gaps the arbitrary values
- * were papering over. Every step carries its own line-height so leading cannot
+ * nothing on screen. Every step carries its own line-height so leading cannot
  * fragment the way size did; a `leading-*` utility still wins where a specific
- * block needs to override it.
- *
- * Landing-page display type (rem/clamp, 2.2-6.4rem) is marketing typography on
- * a separate ramp and stays out of this scale on purpose. */
+ * block needs to override it. */
 @theme {
     /* counters, badges, timestamps, overline labels */
     --text-micro: 11px;
@@ -121,101 +116,104 @@
     --text-display--line-height: 40px;
 }
 
+/* CDS additive tokens — shadows and motion physics without a Multica
+ * equivalent. Used by the chat surfaces via arbitrary values; the shadow
+ * triples implement the CDS three-state composer elevation (rest / hover /
+ * focus-within), each a diffuse drop + hairline inset ring. */
+:root {
+    --shadow-composer: 0 4px 20px rgba(0, 0, 0, 0.035), inset 0 0 0 1px rgba(0, 0, 0, 0.10);
+    --shadow-composer-hover: 0 4px 24px rgba(0, 0, 0, 0.06), inset 0 0 0 1px rgba(0, 0, 0, 0.20);
+    --shadow-composer-focus: 0 4px 24px rgba(0, 0, 0, 0.08), inset 0 0 0 1px rgba(0, 0, 0, 0.20), 0 0 0 1px rgba(0, 0, 0, 0.20);
+    --radius-composer: 20px;
+    --message-bubble-radius: 12px;
+    --message-bubble-measure: 85%;
+    --scroll-fade-size: 28px;
+    --ease-enter: cubic-bezier(0.22, 1, 0.36, 1);
+    --ease-swift: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-overshoot: cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+.dark {
+    --shadow-composer: 0 4px 20px rgba(0, 0, 0, 0.4), inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+    --shadow-composer-hover: 0 4px 24px rgba(0, 0, 0, 0.55), inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+    --shadow-composer-focus: 0 4px 24px rgba(0, 0, 0, 0.65), inset 0 0 0 1px rgba(255, 255, 255, 0.22), 0 0 0 1px rgba(255, 255, 255, 0.22);
+}
+
 :root {
     color-scheme: light;
-    /* Surface system: the app shell is the quiet outer frame; the page canvas
-       is where lists, boards, and conversations live; surfaces are reserved
-       for bounded content groups; raised surfaces are ephemeral overlays. */
-    --app-shell: oklch(0.964435 0.001327 286.375);
-    --page-canvas: oklch(0.988087 0 0);
-    --surface: oklch(1 0 0);
-    --surface-foreground: oklch(0.141 0.005 285.823);
-    --surface-raised: oklch(1 0 0);
-    --surface-hover: oklch(0.967 0.001 286.375);
-    --surface-selected: oklch(0.95 0.002 286.375);
-    --surface-selected-foreground: oklch(0.141 0.005 285.823);
-    --surface-border: oklch(0.92 0.004 286.32);
-    --surface-shadow: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 1px rgb(15 23 42 / 0.03);
-    --floating-shadow: 0 16px 40px rgb(15 23 42 / 0.14), 0 3px 10px rgb(15 23 42 / 0.08);
-
-    /* The chat launcher is an overlay pinned to the dashboard's bottom-right
-       corner on every workspace page, so that corner is not available to page
-       content. Its geometry lives here rather than in the button so that the
-       clearance is derived from it: anything reaching that corner — a footer's
-       action buttons, a floating toolbar — reserves --chat-launcher-clearance
-       and stays correct if the launcher ever moves or changes size. */
+    /* Surface system on the CDS warm-paper ramp: the shell and sidebar sit
+       one step warmer/darker than the page canvas; surfaces are bounded
+       content groups on white; raised surfaces are ephemeral overlays. */
+    --app-shell: #f9f9f7;
+    --page-canvas: #fcfcfb;
+    --surface: #ffffff;
+    --surface-foreground: #262624;
+    --surface-raised: #ffffff;
+    --surface-hover: rgba(21, 21, 21, 0.05);
+    --surface-selected: rgba(21, 21, 21, 0.10);
+    --surface-selected-foreground: #262624;
+    --surface-border: rgba(21, 21, 21, 0.10);
+    --surface-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05), 0 2px 8px 0 rgba(0, 0, 0, 0.08);
+    --floating-shadow: 0 4px 8px 0 rgba(0, 0, 0, 0.06), 0 12px 28px -2px rgba(0, 0, 0, 0.08);
     --chat-launcher-size: 2.5rem;
     --chat-launcher-inset: 0.5rem;
     --chat-launcher-clearance: calc(
       var(--chat-launcher-size) + var(--chat-launcher-inset) * 2
     );
-    /* Menus (dropdown/context/select/popover) hover just above their trigger,
-       so they carry a lighter shadow than window-level overlays (dialogs,
-       sheets), which keep --floating-shadow. */
-    --menu-shadow: 0 8px 24px rgb(15 23 42 / 0.08), 0 2px 6px rgb(15 23 42 / 0.05);
+    /* Menus hover just above their trigger, so they carry a lighter shadow
+       than window-level overlays (dialogs, sheets), which keep
+       --floating-shadow. */
+    --menu-shadow: 0 8px 24px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.08);
     --background: var(--page-canvas);
-    --foreground: oklch(0.141 0.005 285.823);
+    --foreground: #262624;
     --card: var(--surface);
-    --card-foreground: oklch(0.141 0.005 285.823);
+    --card-foreground: #262624;
     --popover: var(--surface-raised);
-    --popover-foreground: oklch(0.141 0.005 285.823);
-    --primary: oklch(0.21 0.006 285.885);
-    --primary-foreground: oklch(0.985 0 0);
-    --secondary: oklch(0.967 0.001 286.375);
-    --secondary-foreground: oklch(0.21 0.006 285.885);
-    --muted: oklch(0.967 0.001 286.375);
-    /* Lightness is pinned by WCAG AA, not by taste: muted text sits on every
-       light surface we have, and the darkest of them — --sidebar-accent, the
-       nav hover state — is the binding constraint. At the old 0.552 that pair
-       was 3.98:1; 0.505 clears 4.5:1 on all of app-shell / page-canvas /
-       sidebar / sidebar-accent / muted / surface-selected / surface, with the
-       worst case at 4.88:1. Raise it and the nav labels fail again. Hue and
-       chroma are unchanged so the neutral ramp keeps its cast. */
-    --muted-foreground: oklch(0.505 0.016 285.938);
+    --popover-foreground: #262624;
+    /* Primary stays a warm near-black like Claude's primary CTAs; the
+       terracotta lives in --brand so tinted states (bg-brand/10, text-brand)
+       and the composer's send button carry the accent, not every button. */
+    --primary: #262624;
+    --primary-foreground: #faf9f7;
+    --secondary: #edece8;
+    --secondary-foreground: #262624;
+    --muted: #edece8;
+    /* Pinned by WCAG AA on every light surface including --sidebar-accent
+       (the nav hover state): #6d6b67 clears 4.5:1 on all of them. */
+    --muted-foreground: #6d6b67;
     /* The quiet step below muted, for marks that are not text: disclosure
-       chevrons, separator glyphs, the em dash standing in for an empty cell,
-       the large icon in an empty state. It exists because the alternative
-       people reached for was alpha — 152 call sites of
-       text-muted-foreground/30..80 — and alpha on light surfaces lands
-       between 1.5:1 and 3.8:1, which fails even the 3:1 floor for non-text.
-       0.606 is the lightest step that still clears 3:1 (WCAG 1.4.11) on every
-       surface, worst case --sidebar-accent at 3.19:1. Deliberately NOT valid
-       for text: text has one floor, --muted-foreground, and there is no room
-       for a third readable step (AA caps a lighter text tone at L 0.523 here,
-       0.018 away from muted — a difference no one can see). */
-    --faint-foreground: oklch(0.606 0.016 285.938);
-    --accent: oklch(0.967 0.001 286.375);
-    --accent-foreground: oklch(0.21 0.006 285.885);
-    --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.945 0.003 286.32);
-    --input: oklch(0.92 0.004 286.32);
-    --ring: oklch(0.705 0.015 286.067);
-    /* Brand-derived blue gradient (h=255 = brand hue). chart-1 equals brand
-       so the most important series visually anchors to the product colour;
-       chart-2..5 step lighter + less saturated so a stacked bar reads
-       "primary → secondary → tertiary" at a glance instead of fighting
-       for attention as five equally-weighted greys. */
-    --chart-1: oklch(0.55 0.16 255);
-    --chart-2: oklch(0.66 0.13 255);
-    --chart-3: oklch(0.76 0.10 255);
-    --chart-4: oklch(0.85 0.06 255);
-    --chart-5: oklch(0.92 0.03 255);
-    --radius: 0.5rem;
-    --sidebar: oklch(0.964435 0.001327 286.375);
-    --sidebar-foreground: oklch(0.141 0.005 285.823);
-    --sidebar-primary: oklch(0.21 0.006 285.885);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.935 0.003 286.375);
-    --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
-    --sidebar-border: oklch(0.92 0.004 286.32);
-    --sidebar-ring: oklch(0.705 0.015 286.067);
-    --brand: oklch(0.55 0.16 255);
-    --brand-foreground: oklch(0.985 0 0);
-    --success: oklch(0.55 0.16 145);
-    --warning: oklch(0.75 0.16 85);
-    --info: oklch(0.55 0.18 250);
-    --scrollbar-thumb: oklch(0 0 0 / 10%);
-    --scrollbar-thumb-hover: oklch(0 0 0 / 18%);
+       chevrons, separator glyphs, the large icon in an empty state. Clears
+       the 3:1 non-text floor (WCAG 1.4.11) on every surface; NOT valid for
+       body text. */
+    --faint-foreground: #97958d;
+    --accent: #edece8;
+    --accent-foreground: #262624;
+    --destructive: #b33025;
+    --border: rgba(21, 21, 21, 0.10);
+    --input: rgba(21, 21, 21, 0.16);
+    --ring: #c6613f;
+    /* Chart ramp rides the terracotta scale so the most important series
+       anchors to the brand hue and trailing series fade into the paper. */
+    --chart-1: #c6613f;
+    --chart-2: #d97757;
+    --chart-3: #ec835a;
+    --chart-4: #f4ae94;
+    --chart-5: #f7e5dd;
+    --radius: 0.625rem;
+    --sidebar: #f9f9f7;
+    --sidebar-foreground: #262624;
+    --sidebar-primary: #c6613f;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #f0efec;
+    --sidebar-accent-foreground: #262624;
+    --sidebar-border: rgba(21, 21, 21, 0.10);
+    --sidebar-ring: #c6613f;
+    --brand: #c6613f;
+    --brand-foreground: #ffffff;
+    --success: #4d7c0f;
+    --warning: #a16207;
+    --info: #31618f;
+    --scrollbar-thumb: rgba(21, 21, 21, 0.12);
+    --scrollbar-thumb-hover: rgba(21, 21, 21, 0.2);
     --scrollbar-track: transparent;
     /* In-page find (Cmd/Ctrl+F) match tints, painted via the CSS Custom
        Highlight API. Bright fill + dark text so matches stay legible in
@@ -227,65 +225,61 @@
 
 .dark {
     color-scheme: dark;
-    --app-shell: oklch(0.155 0.005 285.823);
-    --page-canvas: oklch(0.18 0.005 285.823);
-    --surface: oklch(0.21 0.006 285.885);
-    --surface-foreground: oklch(0.985 0 0);
-    --surface-raised: oklch(0.235 0.007 285.885);
-    --surface-hover: oklch(0.274 0.006 286.033);
-    --surface-selected: oklch(0.3 0.006 286.033);
-    --surface-selected-foreground: oklch(0.985 0 0);
-    --surface-border: oklch(1 0 0 / 10%);
-    --surface-shadow: 0 1px 2px rgb(0 0 0 / 0.2), 0 1px 1px rgb(0 0 0 / 0.16);
-    --floating-shadow: 0 20px 48px rgb(0 0 0 / 0.46), 0 4px 12px rgb(0 0 0 / 0.28);
-    --menu-shadow: 0 10px 28px rgb(0 0 0 / 0.3), 0 2px 8px rgb(0 0 0 / 0.18);
+    /* CDS dark ramp: warm ink neutrals (#0b0b0b shell -> #151515 canvas ->
+       #1a1a19 cards), white-alpha hairlines, brighter clay accent. */
+    --app-shell: #0b0b0b;
+    --page-canvas: #151515;
+    --surface: #1a1a19;
+    --surface-foreground: #f5f5f4;
+    --surface-raised: #20201f;
+    --surface-hover: rgba(255, 255, 255, 0.05);
+    --surface-selected: rgba(255, 255, 255, 0.09);
+    --surface-selected-foreground: #f5f5f4;
+    --surface-border: rgba(255, 255, 255, 0.09);
+    --surface-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.4), 0 2px 8px 0 rgba(0, 0, 0, 0.4);
+    --floating-shadow: 0 4px 8px 0 rgba(0, 0, 0, 0.5), 0 16px 36px -2px rgba(0, 0, 0, 0.4);
+    --menu-shadow: 0 8px 28px rgba(0, 0, 0, 0.65), 0 2px 8px rgba(0, 0, 0, 0.45);
     --background: var(--page-canvas);
-    --foreground: oklch(0.985 0 0);
+    --foreground: #f5f5f4;
     --card: var(--surface);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: var(--surface-raised);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.92 0.004 286.32);
-    --primary-foreground: oklch(0.21 0.006 285.885);
-    --secondary: oklch(0.274 0.006 286.033);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.274 0.006 286.033);
-    --muted-foreground: oklch(0.705 0.015 286.067);
-    /* Same role as light mode, mirrored: fainter means darker here. 0.60 is
-       the darkest step still clearing 3:1 on every dark surface, worst case
-       --surface-selected at 3.45:1. The step away from muted (0.105 L) matches
-       light mode's, so a chevron reads equally quiet in both themes. */
-    --faint-foreground: oklch(0.60 0.015 286.067);
-    --accent: oklch(0.274 0.006 286.033);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 6%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.552 0.016 285.938);
-    /* Dark mode mirrors light mode's "primary → secondary" gradient on the
-       brand hue, but flips the lightness curve: the most important series
-       is the brightest (so it pops on the dark background) and trailing
-       series get progressively darker / less saturated. */
-    --chart-1: oklch(0.72 0.16 255);
-    --chart-2: oklch(0.62 0.13 255);
-    --chart-3: oklch(0.52 0.10 255);
-    --chart-4: oklch(0.42 0.06 255);
-    --chart-5: oklch(0.32 0.03 255);
-    --sidebar: oklch(0.21 0.006 285.885);
-    --sidebar-foreground: oklch(0.985 0 0);
-    --sidebar-primary: oklch(0.488 0.243 264.376);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.274 0.006 286.033);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.552 0.016 285.938);
-    --brand: oklch(0.65 0.16 255);
-    --brand-foreground: oklch(0.985 0 0);
-    --success: oklch(0.65 0.15 145);
-    --warning: oklch(0.70 0.16 85);
-    --info: oklch(0.65 0.18 250);
-    --scrollbar-thumb: oklch(1 0 0 / 8%);
-    --scrollbar-thumb-hover: oklch(1 0 0 / 18%);
+    --card-foreground: #f5f5f4;
+    --popover: #2c2c2a;
+    --popover-foreground: #f5f5f4;
+    --primary: #ececea;
+    --primary-foreground: #1a1a19;
+    --secondary: #262624;
+    --secondary-foreground: #f5f5f4;
+    --muted: #262624;
+    --muted-foreground: #a3a29d;
+    /* Same role as light mode, mirrored: fainter means darker here. */
+    --faint-foreground: #6d6c67;
+    --accent: #262624;
+    --accent-foreground: #f5f5f4;
+    --destructive: #f87171;
+    --border: rgba(255, 255, 255, 0.09);
+    --input: rgba(255, 255, 255, 0.16);
+    --ring: #d97757;
+    /* Brightest series first: on ink, the leading series must pop. */
+    --chart-1: #ec835a;
+    --chart-2: #d97757;
+    --chart-3: #c6613f;
+    --chart-4: #993d19;
+    --chart-5: #5d230b;
+    --sidebar: #0b0b0b;
+    --sidebar-foreground: #f5f5f4;
+    --sidebar-primary: #d97757;
+    --sidebar-primary-foreground: #151515;
+    --sidebar-accent: #20201f;
+    --sidebar-accent-foreground: #f5f5f4;
+    --sidebar-border: rgba(255, 255, 255, 0.09);
+    --sidebar-ring: #d97757;
+    --brand: #d97757;
+    --brand-foreground: #151515;
+    --success: #84cc16;
+    --warning: #eab308;
+    --info: #7ab3e0;
+    --scrollbar-thumb: rgba(255, 255, 255, 0.09);
+    --scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
     --scrollbar-track: transparent;
     --find-match: oklch(0.82 0.16 100);
     --find-match-active: oklch(0.76 0.18 60);

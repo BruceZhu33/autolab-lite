@@ -12,3 +12,15 @@ attribution for non-interface use. See the LICENSE file for the full text.
 
 This NOTICE file is provided for attribution purposes only and does not
 modify the Multica License.
+
+---
+
+open-claude-ui
+Copyright 2026 Caho1
+https://github.com/Caho1/open-claude-ui
+
+The Claude Design System (CDS) palette, shadow values, message typography
+parameters, and scroll-pinning interaction physics used by the chat surfaces
+(components/chat/*, app/tokens.css) are adapted from open-claude-ui, a
+clean-room reverse engineering of the Claude desktop client. open-claude-ui
+is distributed under the MIT License.

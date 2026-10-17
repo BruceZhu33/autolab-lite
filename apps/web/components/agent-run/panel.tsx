@@ -4,12 +4,12 @@
  * 等待项按类型渲染:要材料(选服务器目录链接 / 上传 zip)、要回答、等 GPU、
  * 基线提案确认。Baseline 页使用;研究阶段复用同一面板。 */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   AlertTriangle, Bot, CheckCircle2, FileUp, FolderOpen, Hourglass, Loader2,
-  MessageSquare, Send, Square, Terminal, User,
+  MessageSquare, Square, Terminal,
 } from "lucide-react";
 import {
   confirmBaseline, fetchRunEvents, isActive, linkAsset, sendRunMessage, stopRun, uploadAsset,
@@ -17,6 +17,9 @@ import {
 } from "@/lib/api";
 import { FolderBrowserDialog } from "@/components/folder-browser";
 import { MiniMarkdown } from "@/components/mini-markdown";
+import { ChatComposer } from "@/components/chat/chat-composer";
+import { AssistantMessage, JumpToLatest, UserMessage } from "@/components/chat/chat-message";
+import { useScrollPinning } from "@/components/chat/use-scroll-pinning";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { Input } from "~/vendor/ui/components/ui/input";
 
@@ -38,33 +41,27 @@ function EventRow({ event }: { event: RunEvent }) {
   const p = event.payload as Record<string, unknown>;
   switch (event.kind) {
     case "assistant":
-      return (
-        <p className="whitespace-pre-wrap text-caption leading-relaxed">
-          <Bot className="mr-1 inline size-3 align-[-2px] text-brand" />{String(p.text ?? "")}
-        </p>
-      );
+      return <AssistantMessage text={String(p.text ?? "")} className="py-0.5 text-[14px]" />;
     case "owner_message":
-      return (
-        <p className="rounded-lg border-[0.5px] border-brand/40 bg-brand/10 px-2 py-1 text-caption text-brand">
-          <User className="mr-1 inline size-3 align-[-2px]" />你:{String(p.text ?? "")}
-        </p>
-      );
+      return <UserMessage text={String(p.text ?? "")} />;
     case "tool_call": {
       const input = (p.input ?? {}) as Record<string, unknown>;
       const args = Object.entries(input).map(([k, v]) => `${k}=${brief(v, 60)}`).join(" ");
       return (
-        <p className="font-mono text-micro text-foreground/90">
-          <Terminal className="mr-1 inline size-3 align-[-2px] text-muted-foreground" />
-          <span className="font-semibold">{String(p.name ?? "")}</span>
-          <span className="ml-1 text-muted-foreground">{args}</span>
-        </p>
+        <div className="flex items-center gap-1.5 py-0.5">
+          <Terminal className="size-3 shrink-0 text-muted-foreground" />
+          <code className="min-w-0 flex-1 truncate rounded-md bg-muted/70 px-1.5 py-0.5 font-mono text-micro">
+            <span className="font-semibold text-foreground">{String(p.name ?? "")}</span>
+            <span className="ml-1 text-muted-foreground">{args}</span>
+          </code>
+        </div>
       );
     }
     case "tool_result":
     case "tool_error":
     case "jobs_done":
       return (
-        <pre className={`ml-4 max-h-28 overflow-y-auto whitespace-pre-wrap rounded-lg border-[0.5px] px-2 py-1 font-mono text-micro leading-relaxed ${
+        <pre className={`ml-4 max-h-28 overflow-y-auto whitespace-pre-wrap rounded-xl border-[0.5px] px-2 py-1 font-mono text-micro leading-relaxed ${
           event.kind === "tool_error"
             ? "border-destructive/30 bg-destructive/5 text-destructive"
             : "border-surface-border bg-muted/40 text-muted-foreground"}`}>
@@ -257,8 +254,9 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const lastSeq = events.length ? events[events.length - 1].seq : 0;
+  const { containerRef, showJumpControl, handleScroll, scrollToBottom } =
+    useScrollPinning([events.length]);
 
   const { data } = useQuery({
     queryKey: ["agent-run", run.id, lastSeq],
@@ -275,7 +273,6 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
     }
   }, [data]);
   useEffect(() => { setEvents([]); }, [run.id]);
-  useEffect(() => { bottomRef.current?.scrollIntoView({ block: "nearest" }); }, [events.length]);
 
   const current = data?.run ?? run;
   const active = isActive(current);
@@ -304,7 +301,7 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
   };
 
   return (
-    <div className="space-y-3 rounded-xl border-[0.5px] border-surface-border bg-card p-3">
+    <div className="space-y-3 rounded-2xl border-[0.5px] border-surface-border bg-card p-3.5 shadow-[var(--surface-shadow)]">
       <div className="flex items-center gap-2">
         <Bot className="size-4 text-brand" />
         <span className="text-caption font-semibold">Agent 会话</span>
@@ -321,23 +318,22 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
       </div>
       {current.stopReason ? <p className="text-micro text-muted-foreground">{current.stopReason}</p> : null}
 
-      <div className="max-h-[50vh] space-y-1.5 overflow-y-auto pr-1">
-        {events.map((e) => <EventRow key={e.seq} event={e} />)}
-        <div ref={bottomRef} />
+      <div className="relative">
+        {showJumpControl ? <JumpToLatest onClick={() => scrollToBottom(true)} /> : null}
+        <div ref={containerRef} onScroll={handleScroll}
+             className="cds-scroll-fade-y max-h-[50vh] min-h-40 space-y-1.5 overflow-y-auto py-1 pr-1">
+          {events.map((e) => <EventRow key={e.seq} event={e} />)}
+        </div>
       </div>
 
       {active ? <PendingCard project={project} run={current} /> : null}
 
       {active ? (
-        <div className="flex gap-1.5">
-          <Input value={text} onChange={(e) => setText(e.target.value)}
-                 onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing) void send(); }}
-                 placeholder={current.status === "waiting_human" ? "回复 Agent…" : "给 Agent 插一句话(下一步生效)…"}
-                 className="h-8 text-caption" />
-          <Button size="sm" className="h-8 gap-1" disabled={sending || !text.trim()} onClick={() => void send()}>
-            {sending ? <Loader2 className="size-3.5 animate-spin" /> : <Send className="size-3.5" />}发送
-          </Button>
-        </div>
+        <ChatComposer
+          value={text} onChange={setText} onSend={() => void send()} sending={sending}
+          placeholder={current.status === "waiting_human" ? "回复 Agent…" : "给 Agent 插一句话(下一步生效)…"}
+          footer={<span className="hidden sm:inline">Enter 发送 · Shift + Enter 换行</span>}
+        />
       ) : null}
     </div>
   );

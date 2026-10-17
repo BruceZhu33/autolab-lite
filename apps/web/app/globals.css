@@ -2,10 +2,15 @@
 @import "./tokens.css";
 @import "./base.css";
 
-/* AutoLab console: dark-first, dense workbench (Multica-derived tokens, D-001) */
+/* AutoLab console: CDS (Claude Design System) reskin — warm paper light
+   default, ink dark mode. Serif stack mirrors Claude's assistant typography:
+   Latin glyphs render in a serif (Georgia etc.) while CJK falls back to the
+   platform sans, exactly like the official client; no webfont dependency. */
 :root {
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --font-serif: ui-serif, Georgia, "Times New Roman", "PingFang SC",
+    "Microsoft YaHei", "Noto Serif CJK SC", serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
