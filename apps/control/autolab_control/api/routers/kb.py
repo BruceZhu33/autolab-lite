@@ -18,6 +18,16 @@ from ...agent import knowledge
 from ..app import Ctx
 
 
+def _unconfigured() -> JSONResponse | None:
+    """LABNOTE_URL 没配时给明确报错,而不是把空 base 拼成无协议 URL
+    (httpx 抛 UnsupportedProtocol,用户只看到晦涩的 502)。"""
+    if knowledge.LABNOTE_URL:
+        return None
+    return JSONResponse(status_code=503, content={
+        "detail": "LABNOTE_URL 未配置:control 启动环境缺少知识库地址,"
+                  "无法代理登录/检索(服务侧链路 C 还需 LABNOTE_PAT)"})
+
+
 def _base() -> str:
     return knowledge.LABNOTE_URL.rstrip("/")
 
@@ -34,6 +44,8 @@ def build(ctx: Ctx) -> APIRouter:
     @router.post("/api/kb/login", dependencies=[ctx.owner])
     def login(payload: dict) -> JSONResponse:
         """labnote 账号登录:用户名密码 → JWT(浏览器存,后续走 X-KB-Token)。"""
+        if unconfigured := _unconfigured():
+            return unconfigured
         try:
             response = client.post(
                 f"{_base()}/auth/login",
@@ -47,6 +59,8 @@ def build(ctx: Ctx) -> APIRouter:
                       dependencies=[ctx.owner])
     async def forward(path: str, request: Request):
         """通用转发:JSON/表单体透传;chat/stream 走 SSE 流式透传。"""
+        if unconfigured := _unconfigured():
+            return unconfigured
         url = f"{_base()}/{path}"
         headers = _forward_headers(request)
         body = await request.body()
