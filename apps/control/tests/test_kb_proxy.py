@@ -84,3 +84,18 @@ def test_kb_generic_forward_injects_token(kb_env, monkeypatch):
     assert resp.status_code == 200
     assert seen["url"] == "https://kb.test/sessions"
     assert seen["headers"]["Authorization"] == "Bearer jwt-2"
+
+
+def test_kb_unconfigured_gives_clear_error(kb_env, monkeypatch):
+    """LABNOTE_URL 未注入时,登录/转发应报 503 明确提示,而非 httpx 无协议 502。"""
+    monkeypatch.setattr(knowledge, "LABNOTE_URL", "")
+    monkeypatch.setattr(knowledge, "LABNOTE_PAT", "")
+    client, OWNER, _ = _client(kb_env)
+    for resp in (
+        client.post("/api/kb/login", json={"username": "u", "password": "p"},
+                    headers={"Authorization": f"Bearer {OWNER}"}),
+        client.get("/api/kb/sessions",
+                   headers={"Authorization": f"Bearer {OWNER}"}),
+    ):
+        assert resp.status_code == 503
+        assert "LABNOTE_URL" in resp.json()["detail"]
