@@ -31,6 +31,15 @@ export type PaperCard = {
   source?: { name?: string } | null;
 };
 
+/** 论文站首页热点条目(简化:排名/标题/热度/跳转)。 */
+export type PaperHotEntry = {
+  rank: number;
+  title: string;
+  heat: number;
+  storyPublicId?: string | null;
+  itemId?: string | null;
+};
+
 export const fetchPaperColumns = () =>
   request<{ topics: PaperColumn[] }>("/api/papers/columns");
 
@@ -39,4 +48,5 @@ export const fetchPaperColumn = (slug: string, page = 1) =>
     `/api/papers/columns/${slug}?page=${page}`);
 
 export const fetchPaperTimeline = (page = 1) =>
-  request<{ cards: Array<{ item: PaperCard }> }>(`/api/papers/timeline?page=${page}&limit=20`);
+  request<{ cards: Array<{ item: PaperCard }>; hot: PaperHotEntry[] | null }>(
+    `/api/papers/timeline?page=${page}&limit=20`);
