@@ -1,6 +1,6 @@
 "use client";
 
-/** 知识空间管理:文件夹式导航——大厅是空间瓷砖网格(图标+名称+徽标+文档数),
+/** 空间与文档管理:文件夹式导航——大厅是空间瓷砖网格(图标+名称+徽标+文档数),
  * 点进去是该空间的详情(成员/授权/文档上传与浏览)。风格沿用控制台 tokens。 */
 
 import { useEffect, useState } from "react";
@@ -292,9 +292,9 @@ export default function SpacesPage() {
     <div className="flex h-full flex-col">
       <PageHeader>
         <FolderPlus className="size-4 text-muted-foreground" />
-        <h1 className="text-title-sm font-semibold tracking-tight">知识空间</h1>
+        <h1 className="text-title-sm font-semibold tracking-tight">空间与文档</h1>
         <p className="ml-2 hidden truncate text-caption text-muted-foreground md:block">
-          {opened ? (opened.name ?? opened.id) : "论文与笔记按空间组织;对话在「知识库」页"}
+          {opened ? (opened.name ?? opened.id) : "论文与笔记按空间组织;问答在「知识对话」页"}
         </p>
       </PageHeader>
       <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>

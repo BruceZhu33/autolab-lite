@@ -82,7 +82,7 @@ export function ResearchStartForm({ project }: { project: Project }) {
           </label>
           {kbAssist ? (kbSpacesQuery.data ?? []).map((sp) => (
             <label key={sp.id} className="flex items-center gap-1 text-micro"
-                   title="要在检索范围里就勾上;空间需已在知识库页授权给 Agent">
+                   title="要在检索范围里就勾上;空间需已在「空间与文档」页授权给 Agent">
               <input type="checkbox" checked={kbSpaces.includes(sp.id)}
                      onChange={(e) => setKbSpaces((prev) =>
                        e.target.checked ? [...prev, sp.id] : prev.filter((x) => x !== sp.id))} />
@@ -92,7 +92,7 @@ export function ResearchStartForm({ project }: { project: Project }) {
         </div>
       ) : (
         <p className="text-micro text-muted-foreground">
-          知识库未登录(知识库页登录后,这里可以让 Agent 检索你授权的空间;未登录也始终能查实验回流)
+          知识库未登录(在「知识对话」或「空间与文档」页登录后,这里可以让 Agent 检索你授权的空间;未登录也始终能查实验回流)
         </p>
       )}
       {confirmed.length > 1 ? (

@@ -1,6 +1,6 @@
 "use client";
 
-/** 知识库(LABNOTE)内嵌页:与论文/笔记/往轮实验结论对话。
+/** 知识对话(LABNOTE)页:与论文/笔记/往轮实验结论问答。
  * 身份 = owner 自己的 labnote 账号(登录一次存本机);请求经 control 代理,
  * 能看到自己有权限的全部空间。autolab 服务链路(PAT)不受影响。 */
 
@@ -179,7 +179,7 @@ export default function KnowledgePage() {
       <div className="flex h-full flex-col">
         <PageHeader>
           <BookOpen className="size-4 text-muted-foreground" />
-          <h1 className="text-title-sm font-semibold tracking-tight">知识库</h1>
+          <h1 className="text-title-sm font-semibold tracking-tight">知识对话</h1>
         </PageHeader>
         <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
           <LoginCard onOk={setUser} />
@@ -192,7 +192,7 @@ export default function KnowledgePage() {
     <div className="flex h-full flex-col">
       <PageHeader>
         <BookOpen className="size-4 text-muted-foreground" />
-        <h1 className="text-title-sm font-semibold tracking-tight">知识库</h1>
+        <h1 className="text-title-sm font-semibold tracking-tight">知识对话</h1>
         <p className="ml-2 hidden truncate text-caption text-muted-foreground md:block">
           {user}{spaceIds.length ? ` · 空间:${spaceIds.join(",")}` : ""}
         </p>

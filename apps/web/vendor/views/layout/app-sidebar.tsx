@@ -24,8 +24,8 @@ import {
 const PERSONAL = [
   { label: "论文雷达", icon: Newspaper, href: "/papers", key: "papers" },
   { label: "实验运行", icon: GitBranch, href: "/runs", key: "runs" },
-  { label: "知识库", icon: BookOpen, href: "/kb", key: "kb" },
-  { label: "知识空间", icon: FolderPlus, href: "/spaces", key: "spaces" },
+  { label: "知识对话", icon: BookOpen, href: "/kb", key: "kb" },
+  { label: "空间与文档", icon: FolderPlus, href: "/spaces", key: "spaces" },
   { label: "GPU 服务器", icon: Gpu, href: "/gpus", key: "gpus" },
 ];
 
