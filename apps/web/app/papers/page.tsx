@@ -9,7 +9,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, Flame, Loader2, Newspaper } from "lucide-react";
 import {
-  PAPERPULSE_WEB, fetchPaperColumn, fetchPaperColumns, fetchPaperTimeline,
+  PAPERPULSE_WEB, fetchPaperColumn, fetchPaperColumns, fetchPaperStats, fetchPaperTimeline,
   paperpulseItemUrl, type PaperCard, type PaperColumn, type PaperHotEntry,
 } from "@/lib/api/papers";
 import { PageHeader, PAGE_GUTTER } from "~/vendor/views/layout/page-header";
@@ -55,7 +55,7 @@ function HotStrip({ entries }: { entries: PaperHotEntry[] }) {
 
 /** 专栏卡:论文站首页专栏卡的移植(名称 + 收录数 + 方向简介),点卡切换专栏。 */
 function ColumnCard({ active, name, blurb, total, onClick }: {
-  active: boolean; name: string; blurb?: string; total: number; onClick: () => void;
+  active: boolean; name: string; blurb?: string; total: number | null; onClick: () => void;
 }) {
   return (
     <button onClick={onClick}
@@ -64,7 +64,9 @@ function ColumnCard({ active, name, blurb, total, onClick }: {
                      : "border-surface-border bg-card shadow-[var(--surface-shadow)] hover:border-brand/40"}`}>
       <div className="flex items-baseline justify-between gap-2">
         <span className={`text-body-lg font-semibold ${active ? "text-brand" : "text-foreground"}`}>{name}</span>
-        <span className="shrink-0 text-caption tabular-nums text-muted-foreground">{total} 篇</span>
+        <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
+          {total == null ? "—" : `${total} 篇`}
+        </span>
       </div>
       {blurb ? <p className="mt-0.5 line-clamp-1 text-micro leading-relaxed text-muted-foreground">{blurb}</p> : null}
     </button>
@@ -144,6 +146,10 @@ export default function PapersPage() {
     queryKey: ["paper-columns"],
     queryFn: fetchPaperColumns,
   });
+  const stats = useQuery({
+    queryKey: ["paper-stats"],
+    queryFn: fetchPaperStats,
+  });
   const content = useQuery({
     queryKey: ["paper-content", slug, page],
     queryFn: async (): Promise<{ items: PaperCard[]; pageCount: number; hot: PaperHotEntry[] | null }> => {
@@ -180,7 +186,7 @@ export default function PapersPage() {
         <div className={`${READ_COL} pb-6 pt-3`}>
           {/* 专栏卡片区:论文站首页的第一入口结构 */}
           <div className="grid gap-2.5 sm:grid-cols-2">
-            <ColumnCard active={slug === null} name="全站精选" total={0}
+            <ColumnCard active={slug === null} name="全站精选" total={stats.data?.selected ?? null}
                         blurb="双重评分入选的各方向论文" onClick={() => { setSlug(null); setPage(1); }} />
             {(columns.data?.topics ?? []).filter((c) => c.total > 0).slice(0, 5).map((c) => (
               <ColumnCard key={c.slug} active={slug === c.slug} name={c.name} total={c.total}

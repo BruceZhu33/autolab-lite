@@ -46,6 +46,11 @@ def build(ctx: Ctx) -> APIRouter:
         """单个专栏的分页内容(论文卡列表)。"""
         return _proxy(f"/api/site/topics/{slug}", {"page": page})
 
+    @router.get("/api/papers/stats", dependencies=[ctx.reader])
+    def stats() -> JSONResponse:
+        """论文站内容统计(信源数/收录数/精选数/日报期数)。"""
+        return _proxy("/api/site/stats")
+
     @router.get("/api/papers/timeline", dependencies=[ctx.reader])
     def timeline(page: int = 1, limit: int = 20) -> JSONResponse:
         """全站精选时间线(「全部论文」默认视图)。"""
