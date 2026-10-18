@@ -50,3 +50,7 @@ export const fetchPaperColumn = (slug: string, page = 1) =>
 export const fetchPaperTimeline = (page = 1) =>
   request<{ cards: Array<{ item: PaperCard }>; hot: PaperHotEntry[] | null }>(
     `/api/papers/timeline?page=${page}&limit=20`);
+
+/** 论文站内容统计(全站精选卡的真实计数来源)。 */
+export const fetchPaperStats = () =>
+  request<{ sources: number; items: number; selected: number; dailies: number }>("/api/papers/stats");
