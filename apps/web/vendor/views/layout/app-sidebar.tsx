@@ -5,7 +5,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
   BarChart3, BookOpen, ChevronDown, FlaskConical, FolderKanban, FolderPlus,
-  GitBranch, Gpu, Lightbulb, ListChecks, Moon, Search, Settings, Sun, User,
+  GitBranch, Gpu, Lightbulb, ListChecks, Moon, Newspaper, Search, Settings, Sun, User,
 } from "lucide-react";
 
 import {
@@ -22,6 +22,7 @@ import {
 
 /** 全局入口:研究与工作流之外的工具页。 */
 const PERSONAL = [
+  { label: "论文雷达", icon: Newspaper, href: "/papers", key: "papers" },
   { label: "实验运行", icon: GitBranch, href: "/runs", key: "runs" },
   { label: "知识库", icon: BookOpen, href: "/kb", key: "kb" },
   { label: "知识空间", icon: FolderPlus, href: "/spaces", key: "spaces" },
