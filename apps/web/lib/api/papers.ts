@@ -54,3 +54,16 @@ export const fetchPaperTimeline = (page = 1) =>
 /** 论文站内容统计(全站精选卡的真实计数来源)。 */
 export const fetchPaperStats = () =>
   request<{ sources: number; items: number; selected: number; dailies: number }>("/api/papers/stats");
+
+/** 信源目录条目(「信源与说明」视图)。 */
+export type PaperSource = {
+  id: string;
+  name: string;
+  kind: string;
+  tier: string;
+  tags: string[];
+  health: string;
+};
+
+export const fetchPaperSources = () =>
+  request<{ sources: PaperSource[] }>("/api/papers/sources");

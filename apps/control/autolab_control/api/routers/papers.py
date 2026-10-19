@@ -51,6 +51,11 @@ def build(ctx: Ctx) -> APIRouter:
         """论文站内容统计(信源数/收录数/精选数/日报期数)。"""
         return _proxy("/api/site/stats")
 
+    @router.get("/api/papers/sources", dependencies=[ctx.reader])
+    def sources() -> JSONResponse:
+        """信源目录(名称/类型/分级/标签/健康度)——论文雷达「信源与说明」视图的数据。"""
+        return _proxy("/api/site/sources")
+
     @router.get("/api/papers/timeline", dependencies=[ctx.reader])
     def timeline(page: int = 1, limit: int = 20) -> JSONResponse:
         """全站精选时间线(「全部论文」默认视图)。"""

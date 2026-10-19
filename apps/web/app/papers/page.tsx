@@ -7,10 +7,11 @@
 
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ExternalLink, Flame, Loader2, Newspaper } from "lucide-react";
+import { ExternalLink, Flame, Info, Loader2, Newspaper } from "lucide-react";
 import {
-  PAPERPULSE_WEB, fetchPaperColumn, fetchPaperColumns, fetchPaperStats, fetchPaperTimeline,
-  paperpulseItemUrl, type PaperCard, type PaperColumn, type PaperHotEntry,
+  PAPERPULSE_WEB, fetchPaperColumn, fetchPaperColumns, fetchPaperSources, fetchPaperStats,
+  fetchPaperTimeline, paperpulseItemUrl, type PaperCard, type PaperColumn, type PaperHotEntry,
+  type PaperSource,
 } from "@/lib/api/papers";
 import { PageHeader, PAGE_GUTTER } from "~/vendor/views/layout/page-header";
 
@@ -138,9 +139,81 @@ function groupByDay(cards: PaperCard[]): Array<{ day: string; cards: PaperCard[]
   return groups;
 }
 
+/** 「信源与说明」视图:这个页面是什么、数据从哪来、怎么被筛选、想补充去哪提。 */
+function AboutView({ sources, stats }: {
+  sources: PaperSource[] | undefined;
+  stats: { sources: number; items: number; selected: number; dailies: number } | undefined;
+}) {
+  const KIND_LABEL: Record<string, string> = { rss: "RSS 订阅", json_list: "开放接口", web_list: "网页解析" };
+  const byKind = useMemo(() => {
+    const groups = new Map<string, PaperSource[]>();
+    for (const s of sources ?? []) {
+      const k = KIND_LABEL[s.kind] ?? s.kind;
+      groups.set(k, [...(groups.get(k) ?? []), s]);
+    }
+    return [...groups.entries()];
+  }, [sources]);
+
+  return (
+    <div className="space-y-5">
+      <section>
+        <h2 className="text-title font-semibold tracking-tight">论文雷达是什么</h2>
+        <p className="mt-2 text-body leading-relaxed text-muted-foreground">
+          这里展示 PaperPulse 论文站的数据:自动盯住 {stats?.sources ?? "…"} 个信源(arXiv 学科、核心期刊、社区精选),
+          抓取、判重、模型按学术重要性独立打两次分,过线的写中文标题、摘要和推荐理由;
+          同一项工作的多个入口会归并成一条,专栏按研究方向收录 ≥35 分的论文,全站精选只放 60 分以上。
+          目前收录 {stats?.items ?? "…"} 篇,精选 {stats?.selected ?? "…"} 篇。
+        </p>
+      </section>
+
+      <section>
+        <h2 className="text-title font-semibold tracking-tight">信源目录</h2>
+        <p className="mt-1 text-caption text-muted-foreground">
+          绿点 = 抓取正常;灰点 = 暂时不可达(自动退避重试)。分级 T1/T1_5 对应全站精选门槛 60/65 分。
+        </p>
+        <div className="mt-3 space-y-4">
+          {byKind.map(([kind, list]) => (
+            <div key={kind}>
+              <p className="text-caption font-medium text-muted-foreground">{kind} · {list.length} 个</p>
+              <div className="mt-1.5 grid gap-1.5 sm:grid-cols-2">
+                {list.map((s) => (
+                  <div key={s.id}
+                       className="flex items-center gap-2 rounded-lg border-[0.5px] border-surface-border bg-card px-2.5 py-1.5">
+                    <span className={`size-1.5 shrink-0 rounded-full ${
+                      s.health === "ok" ? "bg-success" : "bg-muted-foreground/40"}`}
+                          title={s.health === "ok" ? "正常" : `健康度:${s.health}`} />
+                    <span className="min-w-0 flex-1 truncate text-caption text-foreground">{s.name}</span>
+                    <span className="shrink-0 rounded-full bg-muted/70 px-1.5 py-0.5 text-micro tabular-nums text-muted-foreground">{s.tier}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+          {sources === undefined ? (
+            <div className="flex justify-center py-6"><Loader2 className="size-4 animate-spin text-muted-foreground" /></div>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="rounded-2xl border-[0.5px] border-surface-border bg-card p-4 shadow-[var(--surface-shadow)]">
+        <h2 className="text-body font-semibold">想补充信源?</h2>
+        <p className="mt-1.5 text-caption leading-relaxed text-muted-foreground">
+          课题组同学想加自己方向的信源(某本期刊、某个会议、某类 arXiv 分类),把网址发到论文站反馈页,
+          管理员核实后一行配置即可上线;期刊只要有 ISSN 就能接。
+        </p>
+        <a href={`${PAPERPULSE_WEB}/feedback`} target="_blank" rel="noreferrer"
+           className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-brand px-3.5 py-1.5 text-caption font-medium text-brand-foreground transition-opacity hover:opacity-90">
+          去论文站提议信源<ExternalLink className="size-3" />
+        </a>
+      </section>
+    </div>
+  );
+}
+
 export default function PapersPage() {
   const [slug, setSlug] = useState<string | null>(null); // null = 全站精选时间线
   const [page, setPage] = useState(1);
+  const [view, setView] = useState<"feed" | "about">("feed");
 
   const columns = useQuery({
     queryKey: ["paper-columns"],
@@ -149,6 +222,11 @@ export default function PapersPage() {
   const stats = useQuery({
     queryKey: ["paper-stats"],
     queryFn: fetchPaperStats,
+  });
+  const sourcesList = useQuery({
+    queryKey: ["paper-sources"],
+    queryFn: fetchPaperSources,
+    enabled: view === "about",
   });
   const content = useQuery({
     queryKey: ["paper-content", slug, page],
@@ -176,12 +254,25 @@ export default function PapersPage() {
         <p className="ml-2 hidden truncate text-caption text-muted-foreground md:block">
           每日论文精选 · 专栏订阅 · 中文导读
         </p>
+        <button
+          className={`ml-auto inline-flex items-center gap-1 text-micro transition-colors ${
+            view === "about" ? "text-brand" : "text-muted-foreground hover:text-foreground"}`}
+          onClick={() => setView(view === "about" ? "feed" : "about")}>
+          <Info className="size-3" />信源与说明
+        </button>
         <a href={PAPERPULSE_WEB} target="_blank" rel="noreferrer"
-           className="ml-auto inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-brand">
+           className="inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-brand">
           在论文站打开<ExternalLink className="size-3" />
         </a>
       </PageHeader>
 
+      {view === "about" ? (
+        <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
+          <div className="mx-auto w-full max-w-3xl py-4">
+            <AboutView sources={sourcesList.data?.sources} stats={stats.data} />
+          </div>
+        </div>
+      ) : (
       <div className={`flex flex-1 flex-col overflow-y-auto ${PAGE_GUTTER}`}>
         <div className={`${READ_COL} pb-6 pt-3`}>
           {/* 专栏卡片区:论文站首页的第一入口结构 */}
@@ -250,6 +341,7 @@ export default function PapersPage() {
           ) : null}
         </div>
       </div>
+      )}
     </div>
   );
 }
