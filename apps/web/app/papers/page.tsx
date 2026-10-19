@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, ExternalLink, Flame, Info, Loader2, Newspaper } from "lucide-react";
+import { ExternalLink, Flame, Loader2, Newspaper } from "lucide-react";
 import {
   PAPERPULSE_WEB, fetchPaperColumn, fetchPaperColumns, fetchPaperSources, fetchPaperStats,
   fetchPaperTimeline, paperpulseItemUrl, type PaperCard, type PaperColumn, type PaperHotEntry,
@@ -168,11 +168,10 @@ function Latest({ item }: {
   );
 }
 
-/** 「信源与说明」视图:移植论文站 about 页的编排——大标题 + 信源河动画 + 四步联动 + 信源目录 + 补充入口。 */
-function AboutView({ sources, stats, onBrowse }: {
+/** 「信源与说明」区块(论文流下方):大标题 + 信源河动画 + 四步联动 + 信源目录 + 补充入口。 */
+function AboutView({ sources, stats }: {
   sources: PaperSource[] | undefined;
   stats: { sources: number; items: number; selected: number; dailies: number } | undefined;
-  onBrowse: () => void;
 }) {
   const [focus, setFocus] = useState<number | null>(null);
   const [at, setAt] = useState(0);
@@ -220,10 +219,6 @@ function AboutView({ sources, stats, onBrowse }: {
           每天早上出一份论文日报。
         </p>
         <div className="mt-5 flex flex-wrap gap-2.5">
-          <button onClick={onBrowse}
-                  className="inline-flex items-center gap-1.5 rounded-full bg-brand px-4 py-2 text-caption font-medium text-brand-foreground transition-opacity hover:opacity-90">
-            看今天的精选<ArrowRight className="size-3.5" />
-          </button>
           <a href={`${PAPERPULSE_WEB}/daily`} target="_blank" rel="noreferrer"
              className="inline-flex items-center gap-1.5 rounded-full border-[0.5px] border-surface-border bg-card px-4 py-2 text-caption font-medium text-foreground shadow-[var(--surface-shadow)] transition-colors hover:bg-muted/50">
             读最新论文日报<ExternalLink className="size-3.5" />
@@ -311,17 +306,6 @@ function AboutView({ sources, stats, onBrowse }: {
 export default function PapersPage() {
   const [slug, setSlug] = useState<string | null>(null); // null = 全站精选时间线
   const [page, setPage] = useState(1);
-  const [view, setView] = useState<"feed" | "about">("feed");
-
-  // 首次访问默认展示「信源与说明」(信源河动画介绍);看过一次后直达论文流。
-  // localStorage 读取放 useEffect,避免 SSR 水合不一致。
-  useEffect(() => {
-    if (!window.localStorage.getItem("papers.intro.seen")) setView("about");
-  }, []);
-  const goFeed = () => {
-    setView("feed");
-    window.localStorage.setItem("papers.intro.seen", "1");
-  };
 
   const columns = useQuery({
     queryKey: ["paper-columns"],
@@ -334,7 +318,6 @@ export default function PapersPage() {
   const sourcesList = useQuery({
     queryKey: ["paper-sources"],
     queryFn: fetchPaperSources,
-    enabled: view === "about",
   });
   const content = useQuery({
     queryKey: ["paper-content", slug, page],
@@ -362,28 +345,12 @@ export default function PapersPage() {
         <p className="ml-2 hidden truncate text-caption text-muted-foreground md:block">
           每日论文精选 · 专栏订阅 · 中文导读
         </p>
-        <button
-          className={`ml-auto inline-flex items-center gap-1 rounded-full border-[0.5px] px-2.5 py-1 text-caption transition-colors ${
-            view === "about"
-              ? "border-brand bg-brand/5 font-medium text-brand"
-              : "border-surface-border bg-card text-muted-foreground shadow-[var(--surface-shadow)] hover:text-foreground"}`}
-          onClick={() => (view === "about" ? goFeed() : setView("about"))}>
-          <Info className="size-3.5" />信源与说明
-        </button>
         <a href={PAPERPULSE_WEB} target="_blank" rel="noreferrer"
-           className="inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-brand">
+           className="ml-auto inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-brand">
           在论文站打开<ExternalLink className="size-3" />
         </a>
       </PageHeader>
 
-      {view === "about" ? (
-        <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
-          <div className="mx-auto w-full max-w-3xl py-4">
-            <AboutView sources={sourcesList.data?.sources} stats={stats.data}
-                       onBrowse={goFeed} />
-          </div>
-        </div>
-      ) : (
       <div className={`flex flex-1 flex-col overflow-y-auto ${PAGE_GUTTER}`}>
         <div className={`${READ_COL} pb-6 pt-3`}>
           {/* 专栏卡片区:论文站首页的第一入口结构 */}
@@ -450,9 +417,13 @@ export default function PapersPage() {
                       disabled={page >= pageCount} onClick={() => setPage((p) => p + 1)}>下一页</button>
             </div>
           ) : null}
+
+          {/* 论文流下方:信源与说明整段(标题/信源河/四步/信源目录/补充入口) */}
+          <div className="mt-10 border-t border-surface-border pt-8">
+            <AboutView sources={sourcesList.data?.sources} stats={stats.data} />
+          </div>
         </div>
       </div>
-      )}
     </div>
   );
 }
