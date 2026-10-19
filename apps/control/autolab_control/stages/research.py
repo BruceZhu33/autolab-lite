@@ -355,7 +355,9 @@ def _record_round(env: LoopEnv, round_no: int, report: dict) -> None:
 
 def build_tools(env: LoopEnv) -> list[Tool]:
     knowledge_tools = [tools.knowledge_tool()] if knowledge.configured() else []
-    return [*tools.workspace_tools(), tools.shell_tool(), *knowledge_tools,
+    from ..agent import paper_radar
+    paper_tools = [tools.paper_radar_tool()] if paper_radar.available() else []
+    return [*tools.workspace_tools(), tools.shell_tool(), *knowledge_tools, *paper_tools,
             *tools.experiment_tools(
                 baseline_ref=lambda e: _baseline_exp_ref(e.repo, e.project),
                 allowed_datasets=lambda e: set(baseline_pool(e.project)),

@@ -181,6 +181,34 @@ def knowledge_tool() -> Tool:
         handler)
 
 
+def paper_radar_tool() -> Tool:
+    """论文雷达检索(PaperPulse):世界刚发表的论文——arXiv 学科/核心期刊每日新文,
+    模型双重评分+中文导读。论文站不可达时不注册(阶段 build_tools 探测)。"""
+
+    def handler(env: LoopEnv, args: dict) -> str:
+        from . import paper_radar
+        query = (args.get("query") or "").strip()
+        top_k = max(1, min(int(args.get("top_k") or 6), 20))
+        window = args.get("window") or "7d"
+        try:
+            return paper_radar.search(query, top_k, window)
+        except Exception as exc:  # noqa: BLE001 - 论文站故障是观察,不是会话失败
+            raise ToolError(f"论文雷达检索失败:{exc}") from exc
+
+    return Tool(
+        "search_papers",
+        "检索论文雷达(PaperPulse):世界最近发表的 AI 论文,arXiv 学科+核心期刊每日新文,"
+        "已按学术重要性筛选并写中文摘要。定研究方向/选基线方法/实验连续失败找原因时查:"
+        "同行刚用什么方法、什么指标、是否已有人做过同样的事。"
+        "query 用中文或英文关键词(如\"医学图像分割 半监督\"),留空返回最近时间线。",
+        _schema({
+            "query": {"type": "string", "description": "关键词,留空=最新"},
+            "top_k": {"type": "integer", "description": "返回条数,默认 6"},
+            "window": {"type": "string", "enum": ["24h", "7d"], "description": "时间窗,默认 7d"},
+        }, []),
+        handler)
+
+
 def ask_human_tool() -> Tool:
     """结构化求助:kind 决定前端渲染(上传 / 选目录 / 文字回答)。"""
 
