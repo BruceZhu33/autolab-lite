@@ -175,8 +175,10 @@ def _submit_for_confirmation(env: LoopEnv, args: dict) -> Pause:
 
 def build_tools(env: LoopEnv) -> list:
     knowledge_tools = [tools.knowledge_tool()] if knowledge.configured() else []
+    from ..agent import paper_radar
+    paper_tools = [tools.paper_radar_tool()] if paper_radar.available() else []
     return [
-        *tools.workspace_tools(), tools.shell_tool(), *knowledge_tools,
+        *tools.workspace_tools(), tools.shell_tool(), *knowledge_tools, *paper_tools,
         *tools.experiment_tools(),
         tools.read_paper_tool(), tools.ask_human_tool(),
         tools.finish_tool(
