@@ -5,14 +5,15 @@
  * 排版规格(标题 17px/摘要 14.5px/推荐理由沉底块)对齐论文站,配色走控制台 CDS 令牌。
  * 数据经 control 代理(/api/papers/*, reader 即可),详情与原文在论文站(隧道 3310)。 */
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ExternalLink, Flame, Info, Loader2, Newspaper } from "lucide-react";
+import { ArrowRight, ExternalLink, Flame, Info, Loader2, Newspaper } from "lucide-react";
 import {
   PAPERPULSE_WEB, fetchPaperColumn, fetchPaperColumns, fetchPaperSources, fetchPaperStats,
   fetchPaperTimeline, paperpulseItemUrl, type PaperCard, type PaperColumn, type PaperHotEntry,
   type PaperSource,
 } from "@/lib/api/papers";
+import { SignalRiver, type RiverSource } from "@/components/papers/signal-river";
 import { PageHeader, PAGE_GUTTER } from "~/vendor/views/layout/page-header";
 
 /** 阅读栏宽度:与论文站时间线版心一致。 */
@@ -139,11 +140,61 @@ function groupByDay(cards: PaperCard[]): Array<{ day: string; cards: PaperCard[]
   return groups;
 }
 
-/** 「信源与说明」视图:这个页面是什么、数据从哪来、怎么被筛选、想补充去哪提。 */
-function AboutView({ sources, stats }: {
+/** 河下方四步卡(与画布四阶段对齐,hover 联动高亮)。 */
+const STEPS = [
+  { no: "01", title: "采集", text: "arXiv 主要学科、化工与医学影像专属分类、五个核心期刊与社区精选源都在盯;同一篇论文的多个入口只留一条。" },
+  { no: "02", title: "归并", text: "抓到的都存下来,同一项工作的 arXiv 版本、期刊版本与解读归到一起:一篇论文全网转载,你只需要读一次。" },
+  { no: "03", title: "精选", text: "模型按学术重要性独立打两次分:方法有多新、证据有多硬、多少研究者会关心、能不能马上用;灌水与增量拼装进不来。" },
+  { no: "04", title: "成刊", text: "每天 08:00 出论文日报;专栏按方向收录 35 分以上的论文,全站精选只放 60 分以上。" },
+];
+
+/** 「最近精选」轮播:信源河里每有一束脉冲汇入报纸,这里换下一条。 */
+function Latest({ item }: {
+  item?: { id: string; title: string | null; source?: { name?: string } | null } | null;
+}) {
+  if (!item?.title) return null;
+  return (
+    <a href={paperpulseItemUrl(item.id)} target="_blank" rel="noreferrer" className="group block">
+      <span className="text-micro font-semibold tracking-[0.2em] text-brand">最近精选</span>
+      <span key={item.id} className="mt-1.5 block [animation:message-fade-up_0.45s_var(--ease-enter)_both]">
+        <span className="line-clamp-2 text-[13.5px] font-semibold leading-[1.55] text-foreground transition-colors group-hover:text-brand">
+          {item.title}
+        </span>
+        {item.source?.name ? (
+          <span className="mt-1 block truncate text-micro text-muted-foreground">{item.source.name}</span>
+        ) : null}
+      </span>
+    </a>
+  );
+}
+
+/** 「信源与说明」视图:移植论文站 about 页的编排——大标题 + 信源河动画 + 四步联动 + 信源目录 + 补充入口。 */
+function AboutView({ sources, stats, onBrowse }: {
   sources: PaperSource[] | undefined;
   stats: { sources: number; items: number; selected: number; dailies: number } | undefined;
+  onBrowse: () => void;
 }) {
+  const [focus, setFocus] = useState<number | null>(null);
+  const [at, setAt] = useState(0);
+  const shownAt = useRef(0);
+
+  const latest = useQuery({
+    queryKey: ["paper-latest"],
+    queryFn: async () => (await fetchPaperTimeline(1)).cards.map((c) => c.item),
+  });
+
+  // 脉冲约每秒一束汇入报纸;标题轮换最快 2.8s 一次。
+  const onArrive = useCallback(() => {
+    const now = Date.now();
+    if (now - shownAt.current < 2800 || (latest.data?.length ?? 0) < 2) return;
+    shownAt.current = now;
+    setAt((i) => (i + 1) % (latest.data?.length ?? 1));
+  }, [latest.data?.length]);
+
+  const riverSources: RiverSource[] = useMemo(
+    () => (sources ?? []).map((s) => ({ name: s.name, kind: s.kind, heatOnly: false })),
+    [sources]);
+
   const KIND_LABEL: Record<string, string> = { rss: "RSS 订阅", json_list: "开放接口", web_list: "网页解析" };
   const byKind = useMemo(() => {
     const groups = new Map<string, PaperSource[]>();
@@ -155,21 +206,68 @@ function AboutView({ sources, stats }: {
   }, [sources]);
 
   return (
-    <div className="space-y-5">
-      <section>
-        <h2 className="text-title font-semibold tracking-tight">论文雷达是什么</h2>
-        <p className="mt-2 text-body leading-relaxed text-muted-foreground">
-          这里展示 PaperPulse 论文站的数据:自动盯住 {stats?.sources ?? "…"} 个信源(arXiv 学科、核心期刊、社区精选),
-          抓取、判重、模型按学术重要性独立打两次分,过线的写中文标题、摘要和推荐理由;
-          同一项工作的多个入口会归并成一条,专栏按研究方向收录 ≥35 分的论文,全站精选只放 60 分以上。
-          目前收录 {stats?.items ?? "…"} 篇,精选 {stats?.selected ?? "…"} 篇。
+    <div className="space-y-8 pb-6">
+      <header>
+        <span className="text-micro font-semibold tracking-[0.22em] text-brand">关于论文雷达</span>
+        <h1 className="mt-3 max-w-[22em] text-display-sm font-bold leading-[1.2] tracking-tight text-foreground [text-wrap:balance] sm:text-[38px]">
+          AI 每天涌出几百篇新论文,
+          <br />
+          <span className="text-brand">值得读的,只有几篇。</span>
+        </h1>
+        <p className="mt-4 max-w-[36em] text-body-lg leading-[1.85] text-muted-foreground">
+          论文雷达替你盯着 {stats?.sources ?? "…"} 个信源:arXiv 学科、化工与医学影像专属分类、核心期刊与社区精选,
+          抓取、归并、模型双重评分,过线的写中文导读;目前收录 {stats?.items ?? "…"} 篇,精选 {stats?.selected ?? "…"} 篇,
+          每天早上出一份论文日报。
         </p>
+        <div className="mt-5 flex flex-wrap gap-2.5">
+          <button onClick={onBrowse}
+                  className="inline-flex items-center gap-1.5 rounded-full bg-brand px-4 py-2 text-caption font-medium text-brand-foreground transition-opacity hover:opacity-90">
+            看今天的精选<ArrowRight className="size-3.5" />
+          </button>
+          <a href={`${PAPERPULSE_WEB}/daily`} target="_blank" rel="noreferrer"
+             className="inline-flex items-center gap-1.5 rounded-full border-[0.5px] border-surface-border bg-card px-4 py-2 text-caption font-medium text-foreground shadow-[var(--surface-shadow)] transition-colors hover:bg-muted/50">
+            读最新论文日报<ExternalLink className="size-3.5" />
+          </a>
+        </div>
+      </header>
+
+      <section aria-label="论文雷达怎么工作">
+        <div className="relative rounded-2xl border-[0.5px] border-surface-border bg-card shadow-[var(--surface-shadow)]">
+          <SignalRiver sources={riverSources} focus={focus} onArrive={onArrive}
+                        className="h-[230px] sm:h-[300px] lg:h-[340px]">
+            <div className="absolute left-[75%] top-[calc(42%+40px)] hidden w-[23%] lg:block">
+              <Latest item={latest.data?.[at]} />
+            </div>
+          </SignalRiver>
+          <p className="sr-only">
+            示意图:每条线是一个信源;线汇成一束束,代表同一项工作的多个入口;
+            经过「精选」闸门只有少数几束通过,汇入每天 08:00 出刊的论文日报。
+          </p>
+        </div>
+        <div className="mt-2 border-t border-surface-border lg:hidden">
+          <div className="py-3"><Latest item={latest.data?.[at]} /></div>
+        </div>
+        <ol className="mt-4 grid grid-cols-1 divide-y divide-surface-border border-y border-surface-border sm:grid-cols-2 sm:divide-y-0 lg:grid-cols-4 lg:divide-x">
+          {STEPS.map((s, i) => (
+            <li key={s.no}
+                onPointerEnter={() => setFocus(i)}
+                onPointerLeave={() => setFocus(null)}
+                className={`px-1 py-5 transition-colors sm:px-4 ${focus === i ? "bg-brand/5" : ""}`}>
+              <div className="flex items-baseline gap-2.5">
+                <span className="text-micro font-bold tracking-[0.12em] text-brand tabular-nums">{s.no}</span>
+                <h3 className="text-body-lg font-semibold text-foreground">{s.title}</h3>
+              </div>
+              <p className="mt-1.5 text-caption leading-relaxed text-muted-foreground">{s.text}</p>
+            </li>
+          ))}
+        </ol>
       </section>
 
       <section>
         <h2 className="text-title font-semibold tracking-tight">信源目录</h2>
         <p className="mt-1 text-caption text-muted-foreground">
-          绿点 = 抓取正常;灰点 = 暂时不可达(自动退避重试)。分级 T1/T1_5 对应全站精选门槛 60/65 分。
+          河里每条线对应下面一个信源(悬停画布可看名称)。绿点 = 抓取正常;灰点 = 暂时不可达(自动退避重试)。
+          分级 T1/T1_5 对应全站精选门槛 60/65 分。
         </p>
         <div className="mt-3 space-y-4">
           {byKind.map(([kind, list]) => (
@@ -269,7 +367,8 @@ export default function PapersPage() {
       {view === "about" ? (
         <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
           <div className="mx-auto w-full max-w-3xl py-4">
-            <AboutView sources={sourcesList.data?.sources} stats={stats.data} />
+            <AboutView sources={sourcesList.data?.sources} stats={stats.data}
+                       onBrowse={() => setView("feed")} />
           </div>
         </div>
       ) : (

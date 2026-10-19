@@ -12,6 +12,10 @@
   --font-serif: ui-serif, Georgia, "Times New Roman", "PingFang SC",
     "Microsoft YaHei", "Noto Serif CJK SC", serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* 信源河动画(移植自 PaperPulse)取色:映射到 CDS 令牌,亮暗主题随动 */
+  --ink: var(--foreground);
+  --accent: var(--brand);
+  --line-strong: var(--surface-border);
 }
 
 html,
