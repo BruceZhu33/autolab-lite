@@ -5,7 +5,7 @@
  * 排版规格(标题 17px/摘要 14.5px/推荐理由沉底块)对齐论文站,配色走控制台 CDS 令牌。
  * 数据经 control 代理(/api/papers/*, reader 即可),详情与原文在论文站(隧道 3310)。 */
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, ExternalLink, Flame, Info, Loader2, Newspaper } from "lucide-react";
 import {
@@ -313,6 +313,16 @@ export default function PapersPage() {
   const [page, setPage] = useState(1);
   const [view, setView] = useState<"feed" | "about">("feed");
 
+  // 首次访问默认展示「信源与说明」(信源河动画介绍);看过一次后直达论文流。
+  // localStorage 读取放 useEffect,避免 SSR 水合不一致。
+  useEffect(() => {
+    if (!window.localStorage.getItem("papers.intro.seen")) setView("about");
+  }, []);
+  const goFeed = () => {
+    setView("feed");
+    window.localStorage.setItem("papers.intro.seen", "1");
+  };
+
   const columns = useQuery({
     queryKey: ["paper-columns"],
     queryFn: fetchPaperColumns,
@@ -353,10 +363,12 @@ export default function PapersPage() {
           每日论文精选 · 专栏订阅 · 中文导读
         </p>
         <button
-          className={`ml-auto inline-flex items-center gap-1 text-micro transition-colors ${
-            view === "about" ? "text-brand" : "text-muted-foreground hover:text-foreground"}`}
-          onClick={() => setView(view === "about" ? "feed" : "about")}>
-          <Info className="size-3" />信源与说明
+          className={`ml-auto inline-flex items-center gap-1 rounded-full border-[0.5px] px-2.5 py-1 text-caption transition-colors ${
+            view === "about"
+              ? "border-brand bg-brand/5 font-medium text-brand"
+              : "border-surface-border bg-card text-muted-foreground shadow-[var(--surface-shadow)] hover:text-foreground"}`}
+          onClick={() => (view === "about" ? goFeed() : setView("about"))}>
+          <Info className="size-3.5" />信源与说明
         </button>
         <a href={PAPERPULSE_WEB} target="_blank" rel="noreferrer"
            className="inline-flex items-center gap-1 text-micro text-muted-foreground hover:text-brand">
@@ -368,7 +380,7 @@ export default function PapersPage() {
         <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
           <div className="mx-auto w-full max-w-3xl py-4">
             <AboutView sources={sourcesList.data?.sources} stats={stats.data}
-                       onBrowse={() => setView("feed")} />
+                       onBrowse={goFeed} />
           </div>
         </div>
       ) : (
