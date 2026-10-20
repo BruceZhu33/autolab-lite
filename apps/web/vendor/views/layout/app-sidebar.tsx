@@ -23,7 +23,6 @@ import {
 /** 全局入口:研究与工作流之外的工具页。 */
 const PERSONAL = [
   { label: "论文雷达", icon: Newspaper, href: "/papers", key: "papers" },
-  { label: "实验运行", icon: GitBranch, href: "/runs", key: "runs" },
   { label: "知识对话", icon: BookOpen, href: "/kb", key: "kb" },
   { label: "空间与文档", icon: FolderPlus, href: "/spaces", key: "spaces" },
   { label: "GPU 服务器", icon: Gpu, href: "/gpus", key: "gpus" },
@@ -118,11 +117,11 @@ export function AppSidebar({ agentsWorking = 0 }: { agentsWorking?: number }) {
               ))}
               <SidebarMenuItem>
                 <SidebarMenuButton
-                  isActive={active("/runs")} tooltip="Runs"
+                  isActive={active("/runs")} tooltip="实验运行日志"
                   onClick={() => router.push("/runs")}
                 >
                   <GitBranch />
-                  <span>Runs</span>
+                  <span>实验运行日志</span>
                   {agentsWorking > 0 ? <SidebarMenuBadge>{agentsWorking}</SidebarMenuBadge> : null}
                 </SidebarMenuButton>
               </SidebarMenuItem>
