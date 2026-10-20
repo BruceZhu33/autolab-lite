@@ -13,7 +13,8 @@ export const setKbToken = (token: string) =>
   window.localStorage.setItem(KB_TOKEN_KEY, token);
 export const clearKbToken = () => window.localStorage.removeItem(KB_TOKEN_KEY);
 
-export type KbSession = { session_id: string; updated_at: string; message_count: number };
+export type KbSession = { session_id: string; updated_at: string; message_count: number;
+  title?: string | null };
 export type KbSpace = { id: string; name: string; visibility?: string;
   is_default?: boolean; my_role?: string };
 export type KbDoc = { filename: string; chunk_count?: number; updated_at?: string; space_id?: string };

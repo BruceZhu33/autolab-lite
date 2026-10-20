@@ -220,7 +220,10 @@ export default function KnowledgePage() {
                     onClick={() => setSessionId(s.session_id)}
                     title={`${s.session_id} · ${s.message_count} 条`}>
                     <span className="min-w-0 flex-1 truncate">
-                      {s.session_id.startsWith("autolab-") ? s.session_id.slice(7) : s.session_id}
+                      {s.title
+                        || (s.message_count
+                          ? (s.session_id.startsWith("autolab-") ? s.session_id.slice(7) : s.session_id)
+                          : "新会话")}
                     </span>
                     {s.message_count
                       ? <span className="shrink-0 rounded-full bg-muted/60 px-1 text-micro tabular-nums text-muted-foreground">
