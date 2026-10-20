@@ -104,8 +104,8 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
     ctx = Ctx(repo=repo, credentials=credentials,
               owner=Depends(_auth(owner_token, agent_token, repo, "owner")),
               reader=Depends(_auth(owner_token, agent_token, repo, "agent")))
-    from .routers import jobs, kb, papers, projects, runs, servers, system
+    from .routers import auth, jobs, kb, papers, projects, runs, servers, system
 
-    for module in (system, servers, projects, jobs, runs, kb, papers):
+    for module in (auth, system, servers, projects, jobs, runs, kb, papers):
         app.include_router(module.build(ctx))
     return app
