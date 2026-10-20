@@ -202,7 +202,10 @@ export default function KnowledgePage() {
         </button>
       </PageHeader>
       <div className={`flex flex-1 gap-3 overflow-hidden ${PAGE_GUTTER}`}>
-        <aside className={`${PAGE_GUTTER} ${PAGE_RAIL} flex w-44 shrink-0 flex-col gap-2 py-3`}>
+        {/* PAGE_RAIL(w-full max-w-1440)是页面内容容器的类,挂在固定宽侧栏上会
+            让 w-full 覆盖 w-44(编译 CSS 中 .w-full 在后),侧栏吞掉整行、对话区
+            被挤为 0 宽(真机 2026-10-20)。侧栏只要定宽 + 不收缩。 */}
+        <aside className="flex w-44 shrink-0 flex-col gap-2 py-3">
           <Button size="sm" variant="outline" className="w-full gap-1" onClick={newChat}>
             <Plus className="size-3.5" />新会话
           </Button>
