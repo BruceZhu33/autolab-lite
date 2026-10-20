@@ -24,7 +24,7 @@ def build(ctx: Ctx) -> APIRouter:
         kind, _, name = identity.partition(":")
         return {"kind": kind, "name": name or kind, "identity": identity}
 
-    @router.get("/api/owner/accounts")
+    @router.get("/api/owner/accounts", dependencies=[ctx.owner])
     def list_accounts() -> list[dict]:
         """账号列表(owner)。token 完整返回——owner 本就能读凭据文件,便于补发。"""
         conn = repo.db.connect()
@@ -36,7 +36,7 @@ def build(ctx: Ctx) -> APIRouter:
         return [{"id": r[0], "name": r[1], "token": r[2], "created_at": r[3],
                  "revoked": bool(r[4])} for r in rows]
 
-    @router.post("/api/owner/accounts")
+    @router.post("/api/owner/accounts", dependencies=[ctx.owner])
     def create_account(payload: dict) -> dict:
         """开账号(owner):一人一 token,member 权限=只读浏览。"""
         name = str(payload.get("name") or "").strip()
@@ -52,7 +52,7 @@ def build(ctx: Ctx) -> APIRouter:
             conn.close()
         return {"id": account_id, "name": name, "token": token}
 
-    @router.post("/api/owner/accounts/{account_id}/revoke")
+    @router.post("/api/owner/accounts/{account_id}/revoke", dependencies=[ctx.owner])
     def revoke_account(account_id: str) -> dict:
         """吊销账号(owner):token 立即失效。"""
         conn = repo.db.connect()
