@@ -82,8 +82,8 @@ function Lobby({ spaces, docsAll, onOpen, onNew }: {
 
 /* ------------------------------------------------------------------ 详情 */
 
-function SpaceDetail({ space, isAdmin, onBack }: {
-  space: KbSpace; isAdmin: boolean; onBack: () => void;
+function SpaceDetail({ space, onBack }: {
+  space: KbSpace; onBack: () => void;
 }) {
   const queryClient = useQueryClient();
   const [adding, setAdding] = useState(false);
@@ -91,6 +91,8 @@ function SpaceDetail({ space, isAdmin, onBack }: {
   const [memberRole, setMemberRole] = useState("reader");
   const [busy, setBusy] = useState<string | null>(null);
   const isOwner = space.my_role === "owner";
+  // 删除与上传同级:空间 editor+(服务端同门槛);全局 admin 不再隐式跨空间可删
+  const canDelete = ["owner", "editor"].includes(space.my_role ?? "");
 
   const docs = useQuery({
     queryKey: ["kb-space-docs", space.id],
@@ -150,7 +152,7 @@ function SpaceDetail({ space, isAdmin, onBack }: {
 
   const removeDoc = async (filename: string) => {
     try {
-      await kbDelete(`/documents/${encodeURIComponent(filename)}`);
+      await kbDelete(`/documents/${encodeURIComponent(filename)}?space_id=${space.id}`);
       void queryClient.invalidateQueries({ queryKey: ["kb-space-docs", space.id] });
       void queryClient.invalidateQueries({ queryKey: ["kb-docs-all"] });
     } catch (err) {
@@ -225,9 +227,9 @@ function SpaceDetail({ space, isAdmin, onBack }: {
               <span className="shrink-0 text-micro tabular-nums text-muted-foreground">
                 {d.chunk_count ?? "—"} 块
               </span>
-              {isAdmin ? (
+              {canDelete ? (
                 <button className="shrink-0 text-muted-foreground/60 hover:text-destructive"
-                        title="删除(需管理员)" onClick={() => void removeDoc(d.filename)}>
+                        title="删除(向量/父块/账本/记录;本地文件保留)" onClick={() => void removeDoc(d.filename)}>
                   <Trash2 className="size-3" />
                 </button>
               ) : null}
@@ -260,10 +262,6 @@ export default function SpacesPage() {
       .finally(() => setReady(true));
   }, []);
 
-  const me = useQuery({
-    queryKey: ["kb-me", authed], enabled: authed,
-    queryFn: () => kbGet<{ username: string; role: string }>("/auth/me"),
-  });
   const spaces = useQuery({
     queryKey: ["kb-spaces-all", authed], enabled: authed,
     queryFn: () => kbGet<KbSpace[]>("/spaces"),
@@ -300,8 +298,7 @@ export default function SpacesPage() {
       <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
         <div className={`${PAGE_RAIL} py-4`}>
           {!authed ? <LoginCard onOk={() => setAuthed(true)} />
-          : opened ? <SpaceDetail space={opened} isAdmin={me.data?.role === "admin"}
-                                  onBack={() => setOpenId("")} />
+          : opened ? <SpaceDetail space={opened} onBack={() => setOpenId("")} />
           : creating ? (
             <section className="mx-auto mt-10 max-w-sm rounded-xl border-[0.5px] border-surface-border bg-card p-4">
               <p className="text-caption font-semibold">
