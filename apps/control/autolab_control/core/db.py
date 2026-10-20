@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -202,6 +202,15 @@ CREATE TABLE IF NOT EXISTS research_rounds (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_research_rounds ON research_rounds(project_id, created_at);
+
+-- 控制台账号(一人一 token):member=只读浏览;写操作仍要求 owner token。
+CREATE TABLE IF NOT EXISTS accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
 """
 
 

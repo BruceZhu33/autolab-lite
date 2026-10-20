@@ -1,10 +1,14 @@
-"""总览、看板、模型设置。"""
+"""总览、看板、模型设置、控制台账号。"""
 
 from __future__ import annotations
+
+import secrets
+from datetime import datetime, timezone
 
 from fastapi import APIRouter
 
 from ...agent import model
+from ...core.ids import new_id
 from ...stages import board
 from ...workspace.host import LocalHost, browse_dirs
 from ..app import Ctx
@@ -13,6 +17,52 @@ from ..app import Ctx
 def build(ctx: Ctx) -> APIRouter:
     router = APIRouter()
     repo = ctx.repo
+
+    @router.get("/api/whoami")
+    def whoami(identity: str = ctx.reader) -> dict:
+        """当前登录身份:owner / agent / member:<名字>。"""
+        kind, _, name = identity.partition(":")
+        return {"kind": kind, "name": name or kind, "identity": identity}
+
+    @router.get("/api/owner/accounts")
+    def list_accounts() -> list[dict]:
+        """账号列表(owner)。token 完整返回——owner 本就能读凭据文件,便于补发。"""
+        conn = repo.db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, name, token, created_at, revoked_at FROM accounts ORDER BY created_at").fetchall()
+        finally:
+            conn.close()
+        return [{"id": r[0], "name": r[1], "token": r[2], "created_at": r[3],
+                 "revoked": bool(r[4])} for r in rows]
+
+    @router.post("/api/owner/accounts")
+    def create_account(payload: dict) -> dict:
+        """开账号(owner):一人一 token,member 权限=只读浏览。"""
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return {"error": "name required"}
+        account_id, token = new_id("acct"), f"member-{secrets.token_hex(8)}"
+        conn = repo.db.connect()
+        try:
+            conn.execute("INSERT INTO accounts (id, name, token, created_at) VALUES (?, ?, ?, ?)",
+                         (account_id, name, token, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"id": account_id, "name": name, "token": token}
+
+    @router.post("/api/owner/accounts/{account_id}/revoke")
+    def revoke_account(account_id: str) -> dict:
+        """吊销账号(owner):token 立即失效。"""
+        conn = repo.db.connect()
+        try:
+            conn.execute("UPDATE accounts SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                         (datetime.now(timezone.utc).isoformat(timespec="seconds"), account_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"ok": True}
 
     @router.get("/api/overview", dependencies=[ctx.reader])
     def overview() -> dict:
