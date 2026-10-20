@@ -36,7 +36,7 @@ def build(ctx: Ctx) -> APIRouter:
             if row:
                 return row[0]
             token = f"member-{secrets.token_hex(8)}"
-                    conn.execute("INSERT INTO accounts (id, name, token, created_at) VALUES (?, ?, ?, ?)",
+            conn.execute("INSERT INTO accounts (id, name, token, created_at) VALUES (?, ?, ?, ?)",
                          (new_id("acct"), username, token,
                           datetime.now(timezone.utc).isoformat(timespec="seconds")))
             conn.commit()
