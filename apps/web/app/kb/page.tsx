@@ -7,9 +7,9 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { BookOpen, FolderPlus, Loader2, LogOut, Plus } from "lucide-react";
+import { BookOpen, FolderPlus, Loader2, LogOut, Plus, Trash2 } from "lucide-react";
 import {
-  clearKbToken, kbChatStream, kbGet, kbLogin, kbPut, kbRegister, kbToken,
+  clearKbToken, kbChatStream, kbDelete, kbGet, kbLogin, kbPut, kbRegister, kbToken,
   type KbSession, type KbSpace,
 } from "@/lib/api";
 import { ChatComposer } from "@/components/chat/chat-composer";
@@ -108,6 +108,21 @@ export default function KnowledgePage() {
   const newChat = () => {
     setSessionId(`autolab-${Date.now().toString(36)}`);
     setMessages([]);
+  };
+
+  const removeSession = async (sid: string) => {
+    if (!window.confirm("删除该会话?聊天记录不可恢复。")) return;
+    try {
+      await kbDelete(`/sessions/${encodeURIComponent(sid)}`);
+      if (sessionId === sid) {  // 删的是当前打开的会话:回到空白新会话态
+        setSessionId("");
+        setMessages([]);
+      }
+      toast.success("会话已删除");
+      void sessions.refetch();
+    } catch (err) {
+      toast.error(`删除会话失败:${(err as Error).message}`);
+    }
   };
 
   const bindSpaces = async (next: string[]) => {
@@ -229,6 +244,11 @@ export default function KnowledgePage() {
                       ? <span className="shrink-0 rounded-full bg-muted/60 px-1 text-micro tabular-nums text-muted-foreground">
                           {s.message_count}
                         </span> : null}
+                  </button>
+                  <button
+                    className="shrink-0 rounded-md p-1 text-muted-foreground/50 hover:bg-muted/50 hover:text-destructive"
+                    title="删除该会话" onClick={() => void removeSession(s.session_id)}>
+                    <Trash2 className="size-3" />
                   </button>
                 </li>
               ))}
