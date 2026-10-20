@@ -43,12 +43,24 @@ export async function request<T>(path: string, init?: { method?: string; body?: 
     body: init?.body ? (isForm ? (init.body as FormData) : JSON.stringify(init.body)) : undefined,
     cache: "no-store",
   });
-  if (response.status === 401) {
-    clearApiToken();
-    throw new ApiRequestError("未授权:请在 Settings 中设置 API token", 401);
-  }
-  if (response.status === 403) {
-    throw new ApiRequestError("未授权:该操作需要 owner token(在 Settings 中设置)", 403);
+  if (response.status === 401 || response.status === 403) {
+    // 代理会把上游(labnote)的 401/403 原样透传——先读 body 里的真实 detail,
+    // 别一律翻译成"去 Settings 设置 token"(曾把空间权限 403 误报成 owner token
+    // 缺失,误导排查方向)。
+    let detail = "";
+    try { detail = (await response.json())?.detail ?? ""; } catch { /* 非 JSON 响应 */ }
+    if (typeof detail !== "string") detail = detail ? JSON.stringify(detail) : "";
+    if (response.status === 401) {
+      // 只有 control 自身的 401(无 detail / missing bearer token)才意味着
+      // 本机 token 失效要清掉;上游 401(如 labnote JWT 过期)不动 control token。
+      if (!detail || detail.includes("missing bearer token")) {
+        clearApiToken();
+        detail = "未授权:请在 Settings 中设置 API token";
+      }
+      throw new ApiRequestError(detail, 401);
+    }
+    throw new ApiRequestError(
+      detail || "未授权:该操作需要 owner token(在 Settings 中设置)", 403);
   }
   if (!response.ok) {
     let detail = `${response.status}`;
