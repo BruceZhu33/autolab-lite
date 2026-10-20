@@ -26,6 +26,10 @@ export type Overview = {
 
 export type ModelSettings = { configured: boolean; baseUrl: string; model: string };
 
+export type Account = { id: string; name: string; token: string; created_at: string; revoked: boolean };
+
+export type WhoAmI = { kind: "owner" | "agent" | "member"; name: string; identity: string };
+
 export type FsListing = {
   path: string;
   parent: string | null;
@@ -34,6 +38,10 @@ export type FsListing = {
 
 export const fetchOverview = () => get<Overview>("/api/overview");
 export const fetchBoard = () => get<BoardCard[]>("/api/board");
+export const whoami = () => get<WhoAmI>("/api/whoami");
+export const listAccounts = () => get<Account[]>("/api/owner/accounts");
+export const createAccount = (name: string) => post<Account>("/api/owner/accounts", { name });
+export const revokeAccount = (id: string) => post<{ ok: boolean }>(`/api/owner/accounts/${id}/revoke`, {});
 export const fetchModelSettings = () => get<ModelSettings>("/api/settings/model");
 export const saveModelSettings = (input: { api_key: string; base_url?: string; model?: string }) =>
   post<ModelSettings>("/api/owner/settings/model", input);

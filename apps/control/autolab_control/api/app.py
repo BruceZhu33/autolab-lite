@@ -29,22 +29,37 @@ class Ctx:
     repo: Repo
     credentials: CredentialStore
     owner: object   # Depends(...):要求 owner token
-    reader: object  # Depends(...):owner 或 agent token 均可
+    reader: object  # Depends(...):owner / agent token / 账号 token(member 只读)均可
 
     @property
     def hostkeys_path(self):
         return hostkeys_path_for(self.credentials)
 
 
-def _auth(owner_token: str, agent_token: str, scope: str):
+def _account_name_for_token(repo: Repo, token: str) -> str | None:
+    """账号 token → 账号名;已吊销/不存在返回 None。"""
+    conn = repo.db.connect()
+    try:
+        row = conn.execute(
+            "SELECT name FROM accounts WHERE token = ? AND revoked_at IS NULL", (token,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _auth(owner_token: str, agent_token: str, repo: Repo, scope: str):
     def check(authorization: str = Header(default="")) -> str:
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not token:
             raise HTTPException(status_code=401, detail="missing bearer token")
         if hmac.compare_digest(token, owner_token):
             return "owner"
-        if scope == "agent" and agent_token and hmac.compare_digest(token, agent_token):
-            return "agent"
+        if scope == "agent":
+            if agent_token and hmac.compare_digest(token, agent_token):
+                return "agent"
+            name = _account_name_for_token(repo, token)
+            if name:
+                return f"member:{name}"
         raise HTTPException(status_code=403, detail=f"requires {scope} scope")
     return check
 
@@ -87,8 +102,8 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
                       "在服务器上 df -h 检查运行目录所在盘,清理后自动恢复"})
 
     ctx = Ctx(repo=repo, credentials=credentials,
-              owner=Depends(_auth(owner_token, agent_token, "owner")),
-              reader=Depends(_auth(owner_token, agent_token, "agent")))
+              owner=Depends(_auth(owner_token, agent_token, repo, "owner")),
+              reader=Depends(_auth(owner_token, agent_token, repo, "agent")))
     from .routers import jobs, kb, papers, projects, runs, servers, system
 
     for module in (system, servers, projects, jobs, runs, kb, papers):

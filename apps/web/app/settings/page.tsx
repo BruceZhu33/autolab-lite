@@ -1,14 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Copy, Loader2, Plug, Sun, Moon, Monitor } from "lucide-react";
+import { Copy, Loader2, Plug, Sun, Moon, Monitor, UserCog, UserPlus } from "lucide-react";
 import { useTheme } from "next-themes";
 import {
-  apiToken, apiUrl, clearApiToken, fetchModelSettings, fetchOverview,
-  saveModelSettings, setApiToken,
+  apiToken, apiUrl, clearApiToken, createAccount, fetchModelSettings, fetchOverview,
+  listAccounts, revokeAccount, saveModelSettings, setApiToken, whoami,
 } from "@/lib/api";
+import type { Account } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { Input } from "~/vendor/ui/components/ui/input";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "@/vendor/views/layout/page-header";
@@ -52,6 +53,81 @@ function AppearanceSettings() {
           </Button>
         ))}
       </div>
+    </Card>
+  );
+}
+
+function IdentityCard() {
+  const me = useQuery({ queryKey: ["whoami"], queryFn: whoami, retry: false });
+  const accounts = useQuery({ queryKey: ["accounts"], queryFn: listAccounts, enabled: me.data?.kind === "owner", retry: false });
+  const qc = useQueryClient();
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const kindLabel = me.data?.kind === "owner" ? "Owner(管理员)" : me.data?.kind === "member" ? `成员:${me.data.name}` : me.data?.kind === "agent" ? "Agent(只读)" : "…";
+
+  const onCreate = async () => {
+    if (!name.trim()) return;
+    setBusy(true);
+    try {
+      const acct = await createAccount(name.trim());
+      toast.success(`账号「${acct.name}」已创建,token 已复制`, {
+        description: acct.token,
+      });
+      await navigator.clipboard.writeText(acct.token).catch(() => {});
+      setName("");
+      void qc.invalidateQueries({ queryKey: ["accounts"] });
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onRevoke = async (acct: Account) => {
+    try {
+      await revokeAccount(acct.id);
+      toast.success(`「${acct.name}」已吊销`);
+      void qc.invalidateQueries({ queryKey: ["accounts"] });
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  };
+
+  return (
+    <Card title="当前身份" desc={me.data ? `登录为 ${kindLabel}` : "未登录(下方粘贴 token 登录)"}>
+      {accounts.data ? (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Input className="max-w-60" placeholder="同学名字" value={name}
+                   onChange={(e) => setName(e.target.value)} />
+            <Button size="sm" className="gap-1.5" disabled={busy || !name.trim()} onClick={() => void onCreate()}>
+              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <UserPlus className="size-3.5" />}开账号
+            </Button>
+          </div>
+          {accounts.data.length > 0 ? (
+            <div className="space-y-1">
+              {accounts.data.map((acct) => (
+                <div key={acct.id}
+                     className="flex items-center gap-2 rounded-lg border-[0.5px] border-surface-border px-2.5 py-1.5">
+                  <UserCog className={`size-3.5 ${acct.revoked ? "text-muted-foreground/40" : "text-brand"}`} />
+                  <span className={`text-caption font-medium ${acct.revoked ? "text-muted-foreground/50 line-through" : "text-foreground"}`}>
+                    {acct.name}
+                  </span>
+                  <code className="min-w-0 flex-1 truncate font-mono text-micro text-muted-foreground">{acct.token}</code>
+                  {acct.revoked ? (
+                    <span className="text-micro text-muted-foreground">已吊销</span>
+                  ) : (
+                    <Button size="xs" variant="ghost" className="text-micro" onClick={() => void onRevoke(acct)}>吊销</Button>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-caption text-muted-foreground">还没有成员账号。开账号后把 token 发给同学,粘贴即可登录(只读)。</p>
+          )}
+        </div>
+      ) : null}
     </Card>
   );
 }
@@ -101,7 +177,7 @@ function ConnectionSettings() {
   };
 
   return (
-    <Card title="Control 连接" desc="token 只存在本机浏览器:agent 只读,owner 可批准。">
+    <Card title="Control 连接" desc="token 只存在本机浏览器:owner 可批准,成员/agent 只读。">
       <div className="flex flex-wrap items-center gap-2">
         <code className="rounded-md border border-surface-border bg-muted/40 px-2 py-1.5 font-mono text-caption">
           {apiUrl}
@@ -111,14 +187,11 @@ function ConnectionSettings() {
           复制
         </Button>
       </div>
-      <p className="mt-1 text-micro text-muted-foreground">
-        构建时可用环境变量 NEXT_PUBLIC_AUTOLAB_API 覆盖。
-      </p>
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <Input
           type="password"
           className="max-w-md font-mono text-caption"
-          placeholder="粘贴 API token(owner-… 或 agent-…)"
+          placeholder="粘贴你的 token(owner-… / member-… / agent-…)"
           value={token}
           onChange={(e) => setToken(e.target.value)}
           spellCheck={false}
@@ -193,6 +266,7 @@ export default function SettingsPage() {
       </PageHeader>
       <div className={`flex-1 overflow-y-auto ${PAGE_GUTTER}`}>
         <div className={`${PAGE_RAIL} max-w-2xl space-y-3 py-4`}>
+          <IdentityCard />
           <ConnectionSettings />
           <ModelSettings />
           <AppearanceSettings />
