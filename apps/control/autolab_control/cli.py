@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import socket
 import sys
@@ -51,10 +52,11 @@ def _start_http(repo: Repo, credentials: CredentialStore, port: int) -> bool:
         print(f"autolab-control: http port {port} unavailable; another control instance?"
               " refusing to start", file=sys.stderr, flush=True)
         return False
+    host = os.getenv("AUTOLAB_HTTP_HOST", "127.0.0.1")
     threading.Thread(target=uvicorn.run, args=(create_api_app(repo, credentials),),
-                     kwargs={"host": "127.0.0.1", "port": port, "log_level": "warning"},
+                     kwargs={"host": host, "port": port, "log_level": "warning"},
                      daemon=True, name="http-api").start()
-    print(f"autolab-control: web api on 127.0.0.1:{port}", flush=True)
+    print(f"autolab-control: web api on {host}:{port}", flush=True)
     return True
 
 

@@ -7,6 +7,8 @@ agent token 只读。路由按资源分在 api/routers/*;业务错误统一在�
 from __future__ import annotations
 
 import hmac
+import os
+import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -56,9 +58,15 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
             f"credentials file lacks an '{API_REF}' entry with owner_token/agent_token") from exc
 
     app = FastAPI(title="autolab-control", version="2")
-    # 只允许本机任意端口的控制台访问(API 本身只监听 loopback)
+    # 只允许本机与本机局域网 IP 的控制台访问(AUTOLAB_HTTP_HOST 放开绑定时,
+    # 局域网内可用 http://<server-ip>:3430 直达控制台,API 同样仅限这些来源)
+    lan = os.getenv("AUTOLAB_API_ALLOWED_LAN", "192.0.2.46")
+    allowed = r"^https?://(127\.0\.0\.1|localhost"
+    if lan:
+        allowed += "|" + re.escape(lan)
+    allowed += r")(:\d+)?$"
     app.add_middleware(CORSMiddleware,
-                       allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
+                       allow_origin_regex=allowed,
                        allow_methods=["*"], allow_headers=["*"])
 
     @app.exception_handler(UserError)
