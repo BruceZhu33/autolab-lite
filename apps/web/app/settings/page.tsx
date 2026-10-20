@@ -119,15 +119,23 @@ function IdentityCard() {
     <Card title="账户与访问"
           desc="账号与知识库(LABNOTE)通用:一个账号登录两处。管理员可管理实验;成员只读浏览。">
       {me.data ? (
-        <div className="flex flex-wrap items-center gap-3">
-          <UserCircle2 className="size-8 text-brand" />
-          <div className="min-w-0">
-            <p className="text-body font-medium">{me.data.name}</p>
-            <p className="text-caption text-muted-foreground">{roleLabel}</p>
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-3">
+            <UserCircle2 className="size-8 text-brand" />
+            <div className="min-w-0">
+              <p className="text-body font-medium">{me.data.name}</p>
+              <p className="text-caption text-muted-foreground">{roleLabel}</p>
+            </div>
+            <Button size="sm" variant="outline" className="ml-auto gap-1.5" onClick={logout}>
+              <LogOut className="size-3.5" />退出登录
+            </Button>
           </div>
-          <Button size="sm" variant="outline" className="ml-auto gap-1.5" onClick={logout}>
-            <LogOut className="size-3.5" />退出登录
-          </Button>
+          {typeof window !== "undefined" && !window.localStorage.getItem(KB_TOKEN_KEY) ? (
+            <p className="rounded-lg bg-warning/10 px-3 py-2 text-caption text-warning">
+              知识库会话未关联——当前是令牌直登。退出后用「用户名 + 密码」重新登录,
+              即可同时启用知识库与知识空间页面。
+            </p>
+          ) : null}
         </div>
       ) : (
         <div className="space-y-2">
