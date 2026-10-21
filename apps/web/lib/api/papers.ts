@@ -4,8 +4,8 @@
 
 import { request } from "./client";
 
-/** 论文站浏览器入口(SSH 隧道 3310 端口);详情页跳转用。 */
-export const PAPERPULSE_WEB = "http://localhost:3310";
+/** 论文站浏览器入口(局域网 IP 直达);详情页跳转用。 */
+export const PAPERPULSE_WEB = "http://192.0.2.46:3310";
 export const paperpulseItemUrl = (id: string) => `${PAPERPULSE_WEB}/items/${id}`;
 
 export type PaperColumn = {
