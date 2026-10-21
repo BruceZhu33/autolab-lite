@@ -45,7 +45,7 @@ cd ~/paperpulse && docker compose ps|logs -f|up -d --build
 
 ## 2. autolab-lite 要点
 
-- 分支 `refactor/stage-agents`。部署:`scripts/deploy-to-server.sh`(push origin+server)→ 服务器 `cd apps/web && NEXT_PUBLIC_AUTOLAB_API=http://192.0.2.46:8710 npm run build && systemctl --user restart autolab-web`;control 改动需 `systemctl --user restart autolab-control`
+- 分支 `main`(2026-10-21 起统一,原 refactor/stage-agents 已并入)。部署:`scripts/deploy-to-server.sh`(push origin+server)→ 服务器 `cd apps/web && NEXT_PUBLIC_AUTOLAB_API=http://192.0.2.46:8710 npm run build && systemctl --user restart autolab-web`;control 改动需 `systemctl --user restart autolab-control`
 - **web 必须带 NEXT_PUBLIC_AUTOLAB_API 构建**(IP 口径,localhost/IP 两种访问都通)
 - UI:CDS(Claude 风格)暖纸亮色默认/墨黑暗色,令牌单一事实源 `apps/web/app/tokens.css`
 - 侧栏 IA:Work 组=实验看板/项目/Baseline/研究/实验运行日志;全局组=论文雷达/知识对话/空间与文档/GPU 服务器
