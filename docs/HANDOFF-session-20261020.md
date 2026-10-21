@@ -100,3 +100,10 @@ cd ~/paperpulse && docker compose ps|logs -f|up -d --build
 2. 三仓在 Mac 本地,全部 clean 同步;服务器服务全在线(IP 直达见 §0)
 3. 部署命令逐条在 §1/§2;改 industry/ 提示词后 paperpulse 需 `docker compose up -d --build`
 4. 用户当前关注点:专栏质量校准、深读质量、课题组同学使用反馈
+
+## 8. 仓库谱系(2026-10-21 补记)
+
+- `archive/v0-freehands` 分支:v0 时代(FREEHANDS 工作区,2026-09-13~16,44 个提交,
+  邮箱已统一重写为本账号邮箱,原始日期保留)
+- main 经 ours 合并挂入该历史(文件树零变更)
+- 2026-09-19~10-05 为真机联调期,HANDOFF-iteration.md 有该期工作记录,无提交(产物并入 10 月提交)
