@@ -2,9 +2,13 @@
 
 /** Control API 的唯一请求出口:token、JSON / 表单、错误解析都在这里。 */
 
+/** API 出口跟随页面来源主机:走隧道(localhost)或直连(192.0.2.46)时,
+ * 都指向同主机的 8710;显式 env 优先。SSR 预渲染无 window,回落本机。 */
 export const apiUrl =
   (typeof process !== "undefined" && process.env.NEXT_PUBLIC_AUTOLAB_API) ||
-  "http://127.0.0.1:8710";
+  (typeof window !== "undefined"
+    ? `http://${window.location.hostname}:8710`
+    : "http://127.0.0.1:8710");
 
 const TOKEN_KEY = "autolab.api_token";
 
