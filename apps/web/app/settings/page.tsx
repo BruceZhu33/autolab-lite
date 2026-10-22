@@ -64,29 +64,32 @@ function IdentityCard() {
   const me = useQuery({ queryKey: ["whoami"], queryFn: whoami, retry: false });
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: listAccounts, enabled: me.data?.kind === "owner", retry: false });
   const qc = useQueryClient();
+  const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const login = async () => {
+  const submit = async () => {
     if (!username.trim() || !password) return;
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(`${apiUrl}/api/auth/login`, {
+      const res = await fetch(`${apiUrl}/api/auth/${mode === "login" ? "login" : "register"}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
-        setError(data.error || data.detail || `登录失败(${res.status})`);
+        setError(data.error || data.detail || `${mode === "login" ? "登录" : "注册"}失败(${res.status})`);
         return;
       }
       setApiToken(data.token);
       if (data.kb_token) window.localStorage.setItem(KB_TOKEN_KEY, data.kb_token);
-      toast.success(`已登录:${data.name}(${data.role})`);
+      toast.success(mode === "login"
+        ? `已登录:${data.name}(${data.role})`
+        : `已注册并登录:${data.name}(${data.role})`);
       setPassword("");
       void qc.invalidateQueries();
     } catch (e) {
@@ -139,19 +142,35 @@ function IdentityCard() {
         </div>
       ) : (
         <div className="space-y-2">
+          <div className="flex gap-2">
+            {(["login", "register"] as const).map((m) => (
+              <button key={m}
+                      className={`rounded-full px-2.5 py-0.5 text-caption transition-colors ${
+                        mode === m ? "bg-accent font-medium" : "text-muted-foreground hover:text-foreground"}`}
+                      onClick={() => { setMode(m); setError(null); }}>
+                {m === "login" ? "登录" : "注册新账号"}
+              </button>
+            ))}
+          </div>
+          <p className="text-micro text-muted-foreground">
+            {mode === "login"
+              ? "账号与知识库(LABNOTE)通用;管理员可管理实验,成员只读浏览。"
+              : "没有账号?注册一个实验室成员账号(普通成员,可读共享空间);注册即登录。"}
+          </p>
           <div className="flex flex-wrap items-center gap-2">
             <Input className="max-w-44" placeholder="用户名" value={username}
                    onChange={(e) => setUsername(e.target.value)} spellCheck={false} />
             <Input className="max-w-44" type="password" placeholder="密码" value={password}
                    onChange={(e) => setPassword(e.target.value)}
-                   onKeyDown={(e) => e.key === "Enter" && void login()} />
-            <Button size="sm" className="gap-1.5" disabled={busy || !username.trim() || !password} onClick={() => void login()}>
-              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <LogIn className="size-3.5" />}登录
+                   onKeyDown={(e) => e.key === "Enter" && void submit()} />
+            <Button size="sm" className="gap-1.5" disabled={busy || !username.trim() || !password} onClick={() => void submit()}>
+              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <LogIn className="size-3.5" />}
+              {mode === "login" ? "登录" : "注册并登录"}
             </Button>
           </div>
           {error ? <p className="text-caption text-destructive">{error}</p> : null}
           <p className="text-micro text-muted-foreground">
-            没有账号?在「知识库」页注册一个即可登录此处;忘记密码请联系知识库管理员。
+            忘记密码请联系知识库管理员;管理员账号只能在 LABNOTE 站点(凭邀请码)注册。
           </p>
         </div>
       )}
