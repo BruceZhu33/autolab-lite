@@ -1,8 +1,9 @@
-"""统一登录:控制台与 LABNOTE 知识库共用一套账号。
+"""统一登录与注册:控制台与 LABNOTE 知识库共用一套账号。
 
 用户名密码经 LABNOTE 校验;登录成功后按角色映射控制台权限——
 LABNOTE 管理员获得 owner token(全权),普通成员自动开通只读账号(member token,按用户名幂等)。
-账号即知识库账号:没有账号的人在知识库页注册,注册后即可登录控制台。
+注册在设置页「账户与访问」:只创建普通成员账号(admin 需邀请码,仅在 labnote 站点),
+注册成功直接返回控制台会话,注册即登录。
 """
 
 from __future__ import annotations
@@ -44,27 +45,14 @@ def build(ctx: Ctx) -> APIRouter:
         finally:
             conn.close()
 
-    @router.post("/api/auth/login")
-    def login(payload: dict) -> dict:
-        username = str(payload.get("username") or "").strip()
-        password = str(payload.get("password") or "")
-        if not labnote:
-            return {"error": "知识库地址未配置(control 缺 LABNOTE_URL),统一登录不可用;可暂时使用访问令牌"}
+    def _upstream_error(response: httpx.Response) -> str:
         try:
-            response = client.post(f"{labnote}/auth/login",
-                                   json={"username": username, "password": password})
-        except httpx.HTTPError as exc:
-            return {"error": f"知识库不可达:{exc}"}
-        if response.status_code != 200:
-            try:
-                detail = response.json().get("detail") or f"HTTP {response.status_code}"
-            except ValueError:
-                detail = f"HTTP {response.status_code}"
-            return {"error": str(detail)}
-        jwt = (response.json() or {}).get("access_token") or ""
-        if not jwt:
-            return {"error": "知识库未返回令牌"}
-        # 角色映射:labnote admin → 控制台管理员(owner);其余 → 只读成员
+            return str(response.json().get("detail") or f"HTTP {response.status_code}")
+        except ValueError:
+            return f"HTTP {response.status_code}"
+
+    def _session_payload(jwt: str, username: str) -> dict:
+        """labnote JWT → 控制台会话:admin → owner token;其余 → 幂等只读 member token。"""
         role = "member"
         try:
             me = client.get(f"{labnote}/auth/me", headers={"Authorization": f"Bearer {jwt}"})
@@ -78,4 +66,48 @@ def build(ctx: Ctx) -> APIRouter:
                     "kb_token": jwt}
         return {"kind": "member", "name": username, "role": "只读成员",
                 "token": _member_token_for(username), "kb_token": jwt}
+
+    def _username_password(payload: dict) -> tuple[str, str]:
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+        return username, password
+
+    @router.post("/api/auth/login")
+    def login(payload: dict) -> dict:
+        username, password = _username_password(payload)
+        if not labnote:
+            return {"error": "知识库地址未配置(control 缺 LABNOTE_URL),统一登录不可用;可暂时使用访问令牌"}
+        try:
+            response = client.post(f"{labnote}/auth/login",
+                                   json={"username": username, "password": password})
+        except httpx.HTTPError as exc:
+            return {"error": f"知识库不可达:{exc}"}
+        if response.status_code != 200:
+            return {"error": _upstream_error(response)}
+        jwt = (response.json() or {}).get("access_token") or ""
+        if not jwt:
+            return {"error": "知识库未返回令牌"}
+        return _session_payload(jwt, username)
+
+    @router.post("/api/auth/register")
+    def register(payload: dict) -> dict:
+        """注册 labnote 普通成员账号,成功即返回控制台会话(注册即登录)。
+
+        只透传用户名密码——不传 role/admin_code,网页端无法自助注册管理员。"""
+        username, password = _username_password(payload)
+        if not username or not password:
+            return {"error": "用户名和密码不能为空"}
+        if not labnote:
+            return {"error": "知识库地址未配置(control 缺 LABNOTE_URL),注册不可用"}
+        try:
+            response = client.post(f"{labnote}/auth/register",
+                                   json={"username": username, "password": password})
+        except httpx.HTTPError as exc:
+            return {"error": f"知识库不可达:{exc}"}
+        if response.status_code != 200:
+            return {"error": _upstream_error(response)}
+        jwt = (response.json() or {}).get("access_token") or ""
+        if not jwt:
+            return {"error": "知识库未返回令牌"}
+        return _session_payload(jwt, username)
     return router
