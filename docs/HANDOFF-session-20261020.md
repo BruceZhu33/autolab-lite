@@ -35,9 +35,10 @@ cd ~/paperpulse && docker compose ps|logs -f|up -d --build
 - `.env`:GLM key(Anthropic 协议端点 open.bigmodel.cn/api/anthropic)、分步模型(glm-5.3 默认/flash 预筛/flash-selection 评分)、PORT=3310、ADMIN_PASSWORD
 - SQL 快捷:`~/pp-dbq.sh "select …"`(docker compose exec db psql)
 
-### LABNOTE(注意:root 进程)
-- `backend/app.py` 由 root 跑(Caddy 443 TLS + 后端 127.0.0.1:8000);无 systemd(挂账见 §6)
-- 升级方式:本地 autolab-kb 改完 rsync 到 `~/labnote`(排除 data/inbox/backups/volumes/.venv),重启 root 进程需 root 权限
+### LABNOTE(2026-10-22 起为 docker 容器,非 root 进程)
+- `docker ps` 可见:labnote-api(127.0.0.1:8000)、labnote-caddy(80/443)、labnote-postgres(127.0.0.1:5432,库 langchain_app,postgres/postgres)、labnote-redis、milvus-*(attu/minio/standalone/etcd)
+- 直查库:`docker exec labnote-postgres psql -U postgres -d langchain_app -Atc '…'`;`.env` 在 `~/labnote/.env`(PAT_AUTOLAB_TOKEN)
+- 升级方式:本地 autolab-kb 改完 rsync 到 `~/labnote` 后重启 labnote-api 容器
 
 ### 备份(每日自动,保留 14 天)
 - `~/bin/autolab-backups.sh`(cron 3:30):control SQLite 快照 → `~/backups/autolab/`;**PaperPulse 整库 pg_dump → `~/backups/paperpulse/`**(分析结果是付费产出,库丢了要重花钱)
@@ -49,7 +50,8 @@ cd ~/paperpulse && docker compose ps|logs -f|up -d --build
 - **web 必须带 NEXT_PUBLIC_AUTOLAB_API 构建**(IP 口径,localhost/IP 两种访问都通)
 - UI:CDS(Claude 风格)暖纸亮色默认/墨黑暗色,令牌单一事实源 `apps/web/app/tokens.css`
 - 侧栏 IA:Work 组=实验看板/项目/Baseline/研究/实验运行日志;全局组=论文雷达/知识对话/空间与文档/GPU 服务器
-- **统一登录**:`/api/auth/login`(用户名密码→LABNOTE 校验;labnote admin→owner token,普通成员自动开只读 member 账号,幂等);`/api/whoami` 查身份;accounts 表(schema v21);Settings 页=账户与访问(登录/成员表/停用)+服务连接(令牌高级入口)+模型+外观
+- **统一登录**:`/api/auth/login`(用户名密码→LABNOTE 校验;labnote admin→owner token,普通成员自动开只读 member 账号,幂等);`/api/whoami` 查身份;accounts 表(schema v21);Settings 页=账户与访问(登录/**注册**/成员表/停用)+服务连接(令牌高级入口)+模型+外观
+  - **注册在 Settings 账户卡**(2026-10-22 从知识对话页挪入):公开 `/api/auth/register` 只建普通成员(不透传 role/admin_code,管理员仅 labnote 站点凭邀请码),注册成功直接返回控制台+KB 双令牌=注册即登录;知识对话/空间页只留登录。坑:labnote 注册是开放注册,重名才 409——冒烟测试请用已存在用户名(如 zwm),别拿 "admin" 这类未占用名试探,会真建账号(踩过,已清)
   - 两层会话:控制台 token(`autolab.api_token`)+ 知识库 JWT(`autolab.kb_token`)。令牌直登没有后者→KB/空间页进不去,设置页有琥珀提示引导重新账号登录
 - **论文雷达页** `/papers`:单页滚动=专栏卡→热点条→时间线(按天分组)→信源河动画(移植自论文站,579 行 canvas,取色映射 CDS 令牌)→信源目录→提议补充入口。数据经 control 代理 `/api/papers/*`(columns/columns/{slug}/timeline/stats/sources)
 - **Agent 工具 search_papers**(`agent/paper_radar.py` + `tools.paper_radar_tool()`):研究循环查最新论文,v1 API,7 天窗,baseline/research 两阶段已接线;论文站不可达自动不注册
@@ -90,7 +92,7 @@ cd ~/paperpulse && docker compose ps|logs -f|up -d --build
 2. **深读质量抽查**:明天看方向论文的深读(方法对不对/数字准不准),不对→调 `industry/prompts/deep-read.md`
 3. **HF 源**:被墙,要么配 EGRESS_PROXY_URL 要么放弃(社区精选信号缺失,arXiv 可兜)
 4. **聚类"多篇合并"路径未被真实触发**(HF 缺失+arXiv 双源入库层判重);等期刊+arXiv 同工作双版本出现自然验证
-5. **LABNOTE root 进程无 systemd**(重启需 root);可协调管理员做,或保持现状(有备份+自启不做但常驻)
+5. ~~LABNOTE root 进程无 systemd~~(2026-10-22 已容器化,见 §1)
 6. PaperPulse 热度条按新闻口径(多来源才算热),论文场景可能长期空;若要"今日最值得看"可改为评分×新鲜度(用户未拍板)
 7. 论文站域名/HTTPS(现为 IP:3310;对外可加 Caddy,已有 https profile)
 
