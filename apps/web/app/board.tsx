@@ -72,8 +72,13 @@ export function Board() {
                   <tr key={card.projectId}
                       className={`bg-surface shadow-[var(--surface-shadow)] ${card.needsYou ? "outline outline-1 outline-warning/40" : ""}`}>
                     <td className="rounded-l-lg px-3 py-2">
-                      <p className="truncate text-body font-medium">{card.title}</p>
-                      <p className="text-micro text-muted-foreground">{timeAgo(card.updatedAt)}</p>
+                      {/* 项目名直达该项目当前阶段页;三格阶段各自有独立链接 */}
+                      <Link href={card.stages[card.stage].link} className="group block">
+                        <p className="truncate text-body font-medium group-hover:underline group-hover:underline-offset-2">
+                          {card.title}
+                        </p>
+                        <p className="text-micro text-muted-foreground">{timeAgo(card.updatedAt)}</p>
+                      </Link>
                     </td>
                     {STAGES.map((s, i) => (
                       <td key={s.key} className={i === STAGES.length - 1 ? "rounded-r-lg" : ""}>
