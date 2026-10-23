@@ -1,5 +1,9 @@
 # AutoLab Lite 交接文档:开启 Iteration 模块
 
+> **术语基准(2026-10-23 起)**:用户可见概念统一叫**「研究」**(/research 页,Agent 会话 + 轮次)。
+> 本文档及早期文档中的 Iteration / 方案评审 / 评审均指同一概念;内部机制名
+> (round_review、iteration loop、Plan DRAFT→APPROVED 等)不变。新文档不要再引入新叫法。
+
 > 生成于 2026-09-19。前情:方案评审模块已完成闭环,本文档供新会话无缝接手 Iteration 模块开发。
 >
 > **✅ 2026-09-19 当天已完成 Iteration 模块并全链实测通过**(设计决策见 docs/decisions.md D-016):

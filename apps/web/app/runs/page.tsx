@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronRight, GitBranch } from "lucide-react";
-import { fetchJobs, type Job } from "@/lib/api";
+import { fetchJobs, fetchPlans, fetchProjects, type Job, type Plan } from "@/lib/api";
 import { ApiError } from "@/components/api-error";
 import { Badge } from "~/vendor/ui/components/ui/badge";
 import { PageHeader } from "~/vendor/views/layout/page-header";
@@ -26,6 +26,17 @@ const STATUS_LABEL: Record<string, string> = {
   QUEUED: "排队中",
   CANCELLING: "取消中",
 };
+
+const PLAN_STATUS: Record<string, { label: string; cls: string }> = {
+  DRAFT: { label: "草稿", cls: "bg-warning/10 text-warning" },
+  APPROVED: { label: "已批准", cls: "bg-info/10 text-info" },
+  ABANDONED: { label: "已废弃", cls: "bg-muted text-muted-foreground" },
+};
+
+const TAB_TEXT = {
+  jobs: "每个 Job 的运行事实:状态 · 退出码 · 起止与时长",
+  plans: "研究阶段的实验计划:草案 → 批准 → 派发为 Job",
+} as const;
 
 function fmtDateTime(iso?: string | null): string {
   if (!iso) return "—";
@@ -56,7 +67,10 @@ function fmtParams(params: Job["params_json"]): string {
 
 export default function RunsPage() {
   const router = useRouter();
+  const [tab, setTab] = useState<"jobs" | "plans">("jobs");
   const [jobs, setJobs] = useState<Job[] | null>(null);
+  const [plans, setPlans] = useState<Plan[] | null>(null);
+  const [projectNames, setProjectNames] = useState<Record<string, string>>({});
   const [error, setError] = useState<unknown>(null);
 
   const refresh = useCallback(() => {
@@ -66,6 +80,7 @@ export default function RunsPage() {
         setError(null);
       })
       .catch((e: unknown) => setError(e));
+    fetchPlans().then(setPlans).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -74,25 +89,39 @@ export default function RunsPage() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  useEffect(() => {
+    fetchProjects()
+      .then((projects) => setProjectNames(
+        Object.fromEntries(projects.map((p) => [p.id, p.name]))))
+      .catch(() => {});
+  }, []);
+
   return (
     <div className="flex h-full flex-col">
       <PageHeader>
         <GitBranch className="size-4 text-muted-foreground" />
-        <h1 className="text-title-sm font-semibold tracking-tight">Runs</h1>
-        {jobs && jobs.length > 0 ? (
-          <span className="font-mono text-caption tabular-nums text-muted-foreground">
-            {jobs.length}
-          </span>
-        ) : null}
+        <h1 className="text-title-sm font-semibold tracking-tight">运行与计划</h1>
+        <div className="ml-2 flex items-center gap-0.5 rounded-lg border border-surface-border bg-surface p-0.5">
+          {(["jobs", "plans"] as const).map((key) => (
+            <button key={key} onClick={() => setTab(key)}
+                    className={`rounded-md px-2.5 py-1 text-caption transition-colors ${
+                      tab === key ? "bg-muted font-medium text-foreground"
+                                  : "text-muted-foreground hover:text-foreground"}`}>
+              {key === "jobs"
+                ? `实验 Job${jobs?.length ? ` ${jobs.length}` : ""}`
+                : `计划${plans?.length ? ` ${plans.length}` : ""}`}
+            </button>
+          ))}
+        </div>
         <p className="ml-2 hidden min-w-0 truncate text-caption text-muted-foreground md:block">
-          每个 Job 的运行事实:状态 · 退出码 · 起止与时长
+          {TAB_TEXT[tab]}
         </p>
       </PageHeader>
 
       <div className="flex-1 overflow-y-auto px-4 pb-4 pt-4">
         {error && (jobs === null || jobs.length === 0) ? (
           <ApiError error={error} onRetry={refresh} />
-        ) : (
+        ) : tab === "jobs" ? (
           <div className="mx-auto w-full max-w-[1100px] overflow-hidden rounded-xl border border-surface-border bg-surface shadow-[var(--surface-shadow)]">
             <table className="w-full text-left text-body">
               <thead className="border-b border-surface-border text-micro uppercase tracking-wide text-muted-foreground">
@@ -155,7 +184,67 @@ export default function RunsPage() {
                 {jobs && jobs.length === 0 ? (
                   <tr>
                     <td colSpan={7} className="px-3 py-10 text-center text-caption text-muted-foreground">
-                      还没有 Job——在看板或 Plan 页批准一个实验计划后,派发的 Job 会出现在这里。
+                      还没有 Job——在计划页批准一个实验计划后,派发的 Job 会出现在这里。
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="mx-auto w-full max-w-[1100px] overflow-hidden rounded-xl border border-surface-border bg-surface shadow-[var(--surface-shadow)]">
+            <table className="w-full text-left text-body">
+              <thead className="border-b border-surface-border text-micro uppercase tracking-wide text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2 font-normal">计划</th>
+                  <th className="px-3 py-2 font-normal">项目</th>
+                  <th className="px-3 py-2 font-normal">状态</th>
+                  <th className="px-3 py-2 font-normal">版本</th>
+                  <th className="px-3 py-2 font-normal">批准</th>
+                  <th className="px-3 py-2 font-normal">创建</th>
+                  <th className="w-8 px-2 py-2" aria-hidden />
+                </tr>
+              </thead>
+              <tbody>
+                {(plans ?? []).map((plan) => (
+                  <tr
+                    key={plan.id}
+                    onClick={() => router.push(`/plans/${plan.id}`)}
+                    className="cursor-pointer border-b border-surface-border/60 transition-colors
+                               last:border-0 hover:bg-muted/40"
+                  >
+                    <td className="min-w-0 px-3 py-2">
+                      <div className="flex min-w-0 flex-col">
+                        <span className="truncate text-caption">{plan.summary || "(无摘要)"}</span>
+                        <span className="truncate font-mono text-micro text-muted-foreground">
+                          {plan.id}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 text-caption">
+                      {projectNames[plan.project_id] ?? plan.project_id}
+                    </td>
+                    <td className="px-3 py-2">
+                      <Badge variant="ghost" className={PLAN_STATUS[plan.status]?.cls ?? ""}>
+                        {PLAN_STATUS[plan.status]?.label ?? plan.status}
+                      </Badge>
+                    </td>
+                    <td className="px-3 py-2 font-mono text-caption tabular-nums">
+                      v{plan.revision_no}
+                    </td>
+                    <td className="px-3 py-2 text-caption">{plan.approved_by ?? "—"}</td>
+                    <td className="px-3 py-2 font-mono text-caption tabular-nums">
+                      {fmtDateTime(plan.created_at)}
+                    </td>
+                    <td className="px-2 py-2 text-muted-foreground">
+                      <ChevronRight className="size-3.5" />
+                    </td>
+                  </tr>
+                ))}
+                {plans && plans.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-3 py-10 text-center text-caption text-muted-foreground">
+                      还没有计划——研究 Agent 提出的实验计划会出现在这里,批准后派发为 Job。
                     </td>
                   </tr>
                 ) : null}

@@ -112,11 +112,11 @@ export function AppSidebar({ agentsWorking = 0 }: { agentsWorking?: number }) {
               ))}
               <SidebarMenuItem>
                 <SidebarMenuButton
-                  isActive={active("/runs")} tooltip="实验运行日志"
+                  isActive={active("/runs")} tooltip="运行与计划"
                   onClick={() => router.push("/runs")}
                 >
                   <GitBranch />
-                  <span>实验运行日志</span>
+                  <span>运行与计划</span>
                   {agentsWorking > 0 ? <SidebarMenuBadge>{agentsWorking}</SidebarMenuBadge> : null}
                 </SidebarMenuButton>
               </SidebarMenuItem>
