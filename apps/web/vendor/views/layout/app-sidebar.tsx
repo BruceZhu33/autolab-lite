@@ -6,7 +6,7 @@ import { useTheme } from "next-themes";
 import { useQuery } from "@tanstack/react-query";
 import {
   BarChart3, BookOpen, ChevronDown, FlaskConical, FolderKanban, FolderPlus,
-  GitBranch, Gpu, Lightbulb, ListChecks, Moon, Newspaper, Search, Settings, Sun, User,
+  GitBranch, Gpu, Lightbulb, ListChecks, Moon, Newspaper, Settings, Sun, User,
 } from "lucide-react";
 
 import { whoami } from "@/lib/api";
@@ -18,18 +18,9 @@ import {
 } from "~/vendor/ui/components/ui/sidebar";
 
 /**
- * 侧栏:Work 分组(立项 → Baseline → 研究 三段工作流)、全局入口
- * (实验运行 / GPU 服务器)、底部 Analytics/Settings/用户。
- * 未接线的项禁用并标「待接线」,不假装可用。
+ * 侧栏:Work 分组(立项 → Baseline → 研究 三段工作流)在最前——工作台第一眼
+ * 是实验进展;工具分组(雷达/知识/空间/GPU)在后;底部主题/设置/用户。
  */
-
-/** 全局入口:研究与工作流之外的工具页。 */
-const PERSONAL = [
-  { label: "论文雷达", icon: Newspaper, href: "/papers", key: "papers" },
-  { label: "知识对话", icon: BookOpen, href: "/kb", key: "kb" },
-  { label: "空间与文档", icon: FolderPlus, href: "/spaces", key: "spaces" },
-  { label: "GPU 服务器", icon: Gpu, href: "/gpus", key: "gpus" },
-];
 
 /** Work:研究流程三段——立项 → Baseline → 研究。 */
 const WORK = [
@@ -37,6 +28,14 @@ const WORK = [
   { label: "项目", icon: FolderKanban, href: "/projects", key: "projects" },
   { label: "Baseline", icon: FlaskConical, href: "/baseline", key: "baseline" },
   { label: "研究", icon: Lightbulb, href: "/research", key: "research" },
+];
+
+/** 工具:研究与工作流之外的全局页。 */
+const TOOLS = [
+  { label: "论文雷达", icon: Newspaper, href: "/papers", key: "papers" },
+  { label: "知识对话", icon: BookOpen, href: "/kb", key: "kb" },
+  { label: "空间与文档", icon: FolderPlus, href: "/spaces", key: "spaces" },
+  { label: "GPU 服务器", icon: Gpu, href: "/gpus", key: "gpus" },
 ];
 
 /** 侧栏身份:whoami 真实登录者;未登录/令牌未配置显示占位并引导去设置页。 */
@@ -91,37 +90,10 @@ export function AppSidebar({ agentsWorking = 0 }: { agentsWorking?: number }) {
               <ChevronDown className="ml-auto size-4 text-muted-foreground" />
             </SidebarMenuButton>
           </SidebarMenuItem>
-          <SidebarMenuItem>
-            <SidebarMenuButton size="sm" disabled tooltip="搜索待接线">
-              <Search className="size-4" />
-              <span className="text-muted-foreground">Search…</span>
-              <SidebarMenuBadge>⌘K</SidebarMenuBadge>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
 
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {PERSONAL.map((item) => (
-                <SidebarMenuItem key={item.key}>
-                  <SidebarMenuButton
-                    isActive={active(item.href)}
-                    tooltip={item.href ? item.label : `${item.label} 待接线`}
-                    disabled={!item.href}
-                    onClick={item.href ? () => router.push(item.href!) : undefined}
-                  >
-                    <item.icon />
-                    <span>{item.label}</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
         <SidebarGroup>
           <SidebarGroupLabel>Work</SidebarGroupLabel>
           <SidebarGroupContent>
@@ -151,17 +123,31 @@ export function AppSidebar({ agentsWorking = 0 }: { agentsWorking?: number }) {
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
+
+        <SidebarGroup>
+          <SidebarGroupLabel>工具</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {TOOLS.map((item) => (
+                <SidebarMenuItem key={item.key}>
+                  <SidebarMenuButton
+                    isActive={active(item.href)}
+                    tooltip={item.label}
+                    onClick={() => router.push(item.href!)}
+                  >
+                    <item.icon />
+                    <span>{item.label}</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
       </SidebarContent>
 
       <SidebarFooter className="gap-1 pb-2.5">
         <SidebarSeparator className="mb-1" />
         <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton disabled tooltip="Analytics 待接线">
-              <BarChart3 />
-              <span>Analytics</span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
           <SidebarMenuItem>
             <SidebarMenuButton
               tooltip="切换深浅色"
