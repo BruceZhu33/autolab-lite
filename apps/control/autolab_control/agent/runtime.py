@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..core import notify
 from ..core.credentials import CredentialStore
 from ..core.db import utc_now
 from ..core.errors import NotFound, UserError
@@ -369,6 +370,7 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
     project = repo.get_project(row["project_id"])
     if project is None:
         _update(repo, run_id, status="failed", stop_reason="项目已删除")
+        notify.notify_run(repo, row, "failed", detail="项目已删除")
         return "failed"
     messages: list[dict] = _loads(row["messages_json"], [])
     pending = _loads(row["pending_json"], None)
@@ -526,6 +528,11 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
             fields.update(status="running", pending_json=None)
         fields["messages_json"] = _dumps(messages)
         _update(repo, run_id, **fields)
+        if new_status == "waiting_human":
+            notify.notify_run(repo, row, "waiting_human", detail=str(
+                ((new_pending or {}).get("payload") or {}).get("question") or "")[:500])
+        elif new_status == "done":
+            notify.notify_run(repo, row, "done", detail=notify.finish_detail(result))
         return new_status
     finally:
         env.close()
@@ -533,9 +540,11 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
 
 def _finish_by_budget(repo: Repo, run_id: str, messages: list[dict],
                       reason: str) -> str:
+    row = _row(repo, run_id) or {"id": run_id}
     _update(repo, run_id, status="stopped", stop_reason=f"预算耗尽:{reason}",
             messages_json=_dumps(messages), pending_json=None)
     record_event(repo, run_id, "stopped", {"by": "budget", "reason": reason})
+    notify.notify_run(repo, row, "stopped", detail=f"预算耗尽:{reason}")
     return "stopped"
 
 
@@ -599,6 +608,8 @@ class AgentLoopManager:
                 _update(self.repo, run_id, status="failed",
                         stop_reason=f"运行时异常:{str(exc)[:300]}")
                 record_event(self.repo, run_id, "failed", {"error": str(exc)[:2000]})
+                notify.notify_run(self.repo, _row(self.repo, run_id) or {"id": run_id},
+                                  "failed", detail=f"运行时异常:{str(exc)[:300]}")
             except Exception:  # 磁盘满/IO 故障时连留痕都写不进:至少别炸线程
                 print(f"autolab-control: driver crash-logging failed (run {run_id}):"
                       f" {exc}", flush=True)

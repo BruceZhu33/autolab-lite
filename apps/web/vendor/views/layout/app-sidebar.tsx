@@ -3,10 +3,13 @@
 import { useEffect, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
+import { useQuery } from "@tanstack/react-query";
 import {
   BarChart3, BookOpen, ChevronDown, FlaskConical, FolderKanban, FolderPlus,
   GitBranch, Gpu, Lightbulb, ListChecks, Moon, Newspaper, Search, Settings, Sun, User,
 } from "lucide-react";
+
+import { whoami } from "@/lib/api";
 
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent,
@@ -35,6 +38,26 @@ const WORK = [
   { label: "Baseline", icon: FlaskConical, href: "/baseline", key: "baseline" },
   { label: "研究", icon: Lightbulb, href: "/research", key: "research" },
 ];
+
+/** 侧栏身份:whoami 真实登录者;未登录/令牌未配置显示占位并引导去设置页。 */
+function UserChip() {
+  const router = useRouter();
+  const me = useQuery({ queryKey: ["whoami"], queryFn: whoami, retry: false });
+  const label = me.isError ? "未登录"
+    : me.data ? (me.data.kind === "member" ? (me.data.name || "成员") : me.data.kind)
+    : "…";
+  const tooltip = me.isError ? "未登录——去设置页用账号登录或填入令牌"
+    : me.data ? `当前身份:${me.data.identity}` : "读取身份中";
+  return (
+    <SidebarMenuButton size="sm" tooltip={tooltip} onClick={() => router.push("/settings")}>
+      <span className="flex size-5 items-center justify-center rounded-full bg-sidebar-accent text-micro font-semibold">
+        {label.slice(0, 1).toUpperCase()}
+      </span>
+      <span className="truncate">{label}</span>
+      <User className="ml-auto size-3.5 text-muted-foreground" />
+    </SidebarMenuButton>
+  );
+}
 
 export function AppSidebar({ agentsWorking = 0 }: { agentsWorking?: number }) {
   const pathname = usePathname();
@@ -157,13 +180,7 @@ export function AppSidebar({ agentsWorking = 0 }: { agentsWorking?: number }) {
             </SidebarMenuButton>
           </SidebarMenuItem>
           <SidebarMenuItem className="mt-1.5">
-            <SidebarMenuButton size="sm" tooltip="owner（本地会话）">
-              <span className="flex size-5 items-center justify-center rounded-full bg-sidebar-accent text-micro font-semibold">
-                O
-              </span>
-              <span className="truncate">owner</span>
-              <User className="ml-auto size-3.5 text-muted-foreground" />
-            </SidebarMenuButton>
+            <UserChip />
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
