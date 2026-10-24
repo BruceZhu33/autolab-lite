@@ -67,3 +67,15 @@ export type PaperSource = {
 
 export const fetchPaperSources = () =>
   request<{ sources: PaperSource[] }>("/api/papers/sources");
+
+/** 知识回流:雷达论文 → 知识库(autolab 回流空间,知识对话可检索)。 */
+export const importPaperToKb = (itemId: string) =>
+  request<{ ok: boolean; filename: string }>("/api/owner/papers/import", {
+    method: "POST", body: { item_id: itemId },
+  });
+
+/** 知识回流:雷达论文 → 项目工作区 .autolab/papers/(研究 Agent read_paper 可读)。 */
+export const adoptPaperToProject = (itemId: string, projectId: string) =>
+  request<{ ok: boolean; filename: string; notified: boolean }>("/api/owner/papers/adopt", {
+    method: "POST", body: { item_id: itemId, project_id: projectId },
+  });

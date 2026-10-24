@@ -31,7 +31,7 @@ function ResearchSection({ project }: { project: Project }) {
     <div className="space-y-3">
       {!isActive(run) ? <ResearchStartForm project={project} /> : null}
       {run ? <RunPanel key={run.id} project={project} run={run} /> : null}
-      <ResearchJournal rounds={rounds?.rounds ?? []} />
+      <ResearchJournal rounds={rounds?.rounds ?? []} projectTitle={project.name} />
     </div>
   );
 }

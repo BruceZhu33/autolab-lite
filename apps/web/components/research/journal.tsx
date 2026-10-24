@@ -1,12 +1,15 @@
 "use client";
 
-/** 研究日志:每轮的假设 / 改动 / 分析,以及 Python 对照基线的判定。 */
+/** 研究日志:每轮的假设 / 改动 / 分析,以及 Python 对照基线的判定;
+ * 结论自动回流知识库的轮次带「已回流」徽标,可一键去知识对话提问。 */
 
+import Link from "next/link";
+import { BookDown } from "lucide-react";
 import type { ResearchRound } from "@/lib/api";
 
 const fmt = (v: number | null | undefined) => (v == null ? "-" : v.toFixed(4));
 
-function RoundItem({ round }: { round: ResearchRound }) {
+function RoundItem({ round, projectTitle }: { round: ResearchRound; projectTitle: string }) {
   const ev = round.evaluation;
   return (
     <details className="rounded-md border-[0.5px] border-surface-border px-2 py-1">
@@ -23,6 +26,23 @@ function RoundItem({ round }: { round: ResearchRound }) {
         <p><span className="text-muted-foreground">改动:</span>{round.changes}</p>
         <p><span className="text-muted-foreground">分析:</span>{round.analysis}</p>
         {round.nextIdea ? <p><span className="text-muted-foreground">下一步:</span>{round.nextIdea}</p> : null}
+        {round.kbReflow ? (
+          round.kbReflow.ok ? (
+            <p className="flex flex-wrap items-center gap-2 text-micro">
+              <span className="inline-flex items-center gap-1 rounded-full bg-info/10 px-1.5 py-0.5 text-info">
+                <BookDown className="size-3" />已回流知识库
+              </span>
+              <Link className="text-brand underline underline-offset-2"
+                    href={`/kb?q=${encodeURIComponent(`${projectTitle} 第 ${round.roundNo} 轮的实验结论是什么?`)}`}>
+                去知识对话问
+              </Link>
+            </p>
+          ) : (
+            <p className="text-micro text-warning">
+              回流知识库失败:{round.kbReflow.error ?? "未知原因"}(不影响研究)
+            </p>
+          )
+        ) : null}
         <table className="w-full text-micro">
           <tbody>
             {ev.rows.map((row) => (
@@ -43,12 +63,14 @@ function RoundItem({ round }: { round: ResearchRound }) {
   );
 }
 
-export function ResearchJournal({ rounds }: { rounds: ResearchRound[] }) {
+export function ResearchJournal({ rounds, projectTitle }: {
+  rounds: ResearchRound[]; projectTitle: string;
+}) {
   if (!rounds.length) return null;
   return (
     <div className="space-y-1.5 rounded-xl border-[0.5px] border-surface-border bg-card p-3">
       <p className="text-caption font-semibold">研究日志</p>
-      {rounds.map((r) => <RoundItem key={r.id} round={r} />)}
+      {rounds.map((r) => <RoundItem key={r.id} round={r} projectTitle={projectTitle} />)}
     </div>
   );
 }

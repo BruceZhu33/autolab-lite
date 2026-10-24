@@ -76,6 +76,12 @@ export default function KnowledgePage() {
       .catch(() => clearKbToken());
   }, []);
 
+  // 站内跳转预填(如研究页「去知识对话问」),只填不自动发送
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("q");
+    if (q) setInput(q);
+  }, []);
+
   const sessions = useQuery({
     queryKey: ["kb-sessions", user], enabled: !!user,
     queryFn: () => kbGet<{ sessions: KbSession[] }>("/sessions"),

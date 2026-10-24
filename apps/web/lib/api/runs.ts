@@ -92,6 +92,8 @@ export type ResearchRound = {
       gain: number | null; improved: boolean;
     }>;
   };
+  /** 知识回流结果(control _record_round 记录;旧轮次无此字段) */
+  kbReflow?: { ok: boolean; filename?: string; error?: string };
 };
 
 export const isActive = (run: Run | null | undefined) =>
