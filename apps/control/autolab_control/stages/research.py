@@ -321,6 +321,26 @@ def _end_round_tool() -> Tool:
 
 
 def _record_round(env: LoopEnv, round_no: int, report: dict) -> None:
+    if knowledge.configured():
+        # §11-3 实验结论回流:下一轮与对话可检索"上次为什么失败"。
+        # 结果记进报告(report_json 透出到研究页「已回流知识库」徽标);
+        # 失败只留日志,不阻塞研究循环。
+        filename = f"round{round_no}-{env.run['id'][:12]}.md"
+        try:
+            rows = json.dumps(report.get("evaluation", {}).get("rows") or [],
+                              ensure_ascii=False)
+            knowledge.ingest(
+                filename=filename,
+                text=(f"# 第 {round_no} 轮实验记录(项目 {env.project['name']})\n\n"
+                      f"## 假设\n{report.get('hypothesis', '')}\n\n"
+                      f"## 改动\n{report.get('changes', '')}\n\n"
+                      f"## 分析\n{report.get('analysis', '')}\n\n"
+                      f"## 下一步\n{report.get('nextIdea', '')}\n\n"
+                      f"## 判定\n{rows}\n"))
+            report["kbReflow"] = {"ok": True, "filename": filename}
+        except Exception as exc:  # noqa: BLE001
+            print(f"autolab-control: 知识库回流失败(round {round_no}):{exc}", flush=True)
+            report["kbReflow"] = {"ok": False, "error": str(exc)[:200]}
     conn = env.repo.db.connect()
     try:
         with env.repo.db.tx(conn):
@@ -335,22 +355,6 @@ def _record_round(env: LoopEnv, round_no: int, report: dict) -> None:
     old = ws.read_bytes(JOURNAL_REL).decode("utf-8") if ws.exists(JOURNAL_REL) \
         else "# 研究日志\n\n"
     ws.write_bytes(JOURNAL_REL, (old + _round_markdown(round_no, report)).encode("utf-8"))
-    if knowledge.configured():
-        # §11-3 实验结论回流:下一轮与对话可检索"上次为什么失败"。
-        # 失败只留日志,不阻塞研究循环。
-        try:
-            rows = json.dumps(report.get("evaluation", {}).get("rows") or [],
-                              ensure_ascii=False)
-            knowledge.ingest(
-                filename=f"round{round_no}-{env.run['id'][:12]}.md",
-                text=(f"# 第 {round_no} 轮实验记录(项目 {env.project['name']})\n\n"
-                      f"## 假设\n{report.get('hypothesis', '')}\n\n"
-                      f"## 改动\n{report.get('changes', '')}\n\n"
-                      f"## 分析\n{report.get('analysis', '')}\n\n"
-                      f"## 下一步\n{report.get('nextIdea', '')}\n\n"
-                      f"## 判定\n{rows}\n"))
-        except Exception as exc:  # noqa: BLE001
-            print(f"autolab-control: 知识库回流失败(round {round_no}):{exc}", flush=True)
 
 
 def build_tools(env: LoopEnv) -> list[Tool]:

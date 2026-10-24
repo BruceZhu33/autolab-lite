@@ -28,9 +28,20 @@ def list_papers(ws: Workspace) -> list[str]:
 
 
 def read_pages(ws: Workspace, filename: str, first: int = 1, last: int | None = None) -> str:
+    name = _safe_name(filename)
+    # 文本类(论文雷达送入的全文提炼)按 150 行一页切片,分页语义与 PDF 一致
+    if name.lower().endswith((".md", ".markdown", ".txt")):
+        lines = ws.read_bytes(f"{PAPERS_REL}/{name}").decode("utf-8", errors="replace").splitlines()
+        pages = max(1, (len(lines) + 149) // 150)
+        first = max(1, first)
+        last = min(pages, last or first + 7)
+        parts = [f"--- 第 {p} / {pages} 页 ---\n" + "\n".join(lines[(p - 1) * 150:p * 150])
+                 for p in range(first, last + 1)]
+        return "\n".join(parts)[:20000]
+
     from pypdf import PdfReader
 
-    data = ws.read_bytes(f"{PAPERS_REL}/{_safe_name(filename)}")
+    data = ws.read_bytes(f"{PAPERS_REL}/{name}")
     reader = PdfReader(io.BytesIO(data))
     total = len(reader.pages)
     first = max(1, first)

@@ -7,13 +7,18 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ExternalLink, Flame, Loader2, Newspaper } from "lucide-react";
+import { BookDown, ExternalLink, Flame, Lightbulb, Loader2, Newspaper } from "lucide-react";
+import { toast } from "sonner";
 import {
-  PAPERPULSE_WEB, fetchPaperColumn, fetchPaperColumns, fetchPaperSources, fetchPaperStats,
-  fetchPaperTimeline, paperpulseItemUrl, type PaperCard, type PaperColumn, type PaperHotEntry,
-  type PaperSource,
+  PAPERPULSE_WEB, adoptPaperToProject, fetchPaperColumn, fetchPaperColumns, fetchPaperSources,
+  fetchPaperStats, fetchPaperTimeline, importPaperToKb, paperpulseItemUrl,
+  type PaperCard, type PaperColumn, type PaperHotEntry, type PaperSource,
 } from "@/lib/api/papers";
+import { fetchProjects } from "@/lib/api";
 import { SignalRiver, type RiverSource } from "@/components/papers/signal-river";
+import {
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
+} from "~/vendor/ui/components/ui/dialog";
 import { PageHeader, PAGE_GUTTER } from "~/vendor/views/layout/page-header";
 
 /** 阅读栏宽度:与论文站时间线版心一致。 */
@@ -75,40 +80,118 @@ function ColumnCard({ active, name, blurb, total, onClick }: {
   );
 }
 
-/** 论文卡:论文站 FeedItem 的版式移植(17px 标题 / 14.5px 摘要 / 推荐理由沉底块 / 来源页脚)。 */
-function PaperRow({ paper }: { paper: PaperCard }) {
+/** 论文卡:论文站 FeedItem 的版式移植(17px 标题 / 14.5px 摘要 / 推荐理由沉底块 / 来源页脚)。
+ * 页脚右侧是知识回流动作:送进研究(项目论文区)/ 存知识库(知识对话可检索)。 */
+function PaperRow({ paper, onAdopt }: { paper: PaperCard; onAdopt: (p: PaperCard) => void }) {
+  const [savingKb, setSavingKb] = useState(false);
+  const saveToKb = async () => {
+    setSavingKb(true);
+    try {
+      await importPaperToKb(paper.id);
+      toast.success("已存入知识库,在「知识对话」可检索");
+    } catch (e) {
+      toast.error(`存入知识库失败:${(e as Error).message}`);
+    } finally {
+      setSavingKb(false);
+    }
+  };
   return (
-    <a href={paperpulseItemUrl(paper.id)} target="_blank" rel="noreferrer"
-       className="group block rounded-2xl border-[0.5px] border-surface-border bg-card p-4 shadow-[var(--surface-shadow)] transition-colors hover:border-brand/40">
-      <div className="flex items-start justify-between gap-3">
-        <h3 className="min-w-0 flex-1 text-[17px] font-semibold leading-[1.5] text-foreground group-hover:text-brand">
-          {paper.title ?? "(未命名)"}
-        </h3>
-        {paper.score != null ? (
-          <span className={`mt-0.5 shrink-0 rounded-full px-1.5 py-0.5 text-micro font-medium tabular-nums ${
-            paper.selected ? "bg-brand/10 text-brand" : "bg-muted text-muted-foreground"}`}>
-            {Math.round(paper.score)}
-          </span>
+    <div className="group rounded-2xl border-[0.5px] border-surface-border bg-card p-4 shadow-[var(--surface-shadow)] transition-colors hover:border-brand/40">
+      <a href={paperpulseItemUrl(paper.id)} target="_blank" rel="noreferrer" className="block">
+        <div className="flex items-start justify-between gap-3">
+          <h3 className="min-w-0 flex-1 text-[17px] font-semibold leading-[1.5] text-foreground group-hover:text-brand">
+            {paper.title ?? "(未命名)"}
+          </h3>
+          {paper.score != null ? (
+            <span className={`mt-0.5 shrink-0 rounded-full px-1.5 py-0.5 text-micro font-medium tabular-nums ${
+              paper.selected ? "bg-brand/10 text-brand" : "bg-muted text-muted-foreground"}`}>
+              {Math.round(paper.score)}
+            </span>
+          ) : null}
+        </div>
+        {paper.summary ? (
+          <p className="mt-2 line-clamp-3 text-[14.5px] leading-[1.7] text-foreground/75">
+            {paper.summary}
+          </p>
         ) : null}
-      </div>
-      {paper.summary ? (
-        <p className="mt-2 line-clamp-3 text-[14.5px] leading-[1.7] text-foreground/75">
-          {paper.summary}
-        </p>
-      ) : null}
-      {paper.reason ? (
-        <p className="mt-3 rounded-lg bg-muted/50 px-3 py-2 text-[13px] leading-[1.65] text-muted-foreground">
-          推荐理由:{paper.reason}
-        </p>
-      ) : null}
+        {paper.reason ? (
+          <p className="mt-3 rounded-lg bg-muted/50 px-3 py-2 text-[13px] leading-[1.65] text-muted-foreground">
+            推荐理由:{paper.reason}
+          </p>
+        ) : null}
+      </a>
       <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-micro text-muted-foreground">
         {paper.source?.name ? <span className="font-medium">{paper.source.name}</span> : null}
         <span aria-hidden>·</span>
         {paper.tags.slice(0, 4).map((t) => (
           <span key={t} className="rounded-full bg-muted/70 px-1.5 py-0.5">{t}</span>
         ))}
+        <div className="ml-auto flex items-center gap-1">
+          <button onClick={() => onAdopt(paper)} title="放到项目的 .autolab/papers/,研究 Agent 可读;有活跃研究会话会即时通知"
+                  className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-micro text-muted-foreground transition-colors hover:bg-brand/10 hover:text-brand">
+            <Lightbulb className="size-3.5" />送进研究
+          </button>
+          <button onClick={saveToKb} disabled={savingKb} title="存入知识库(autolab 回流空间),知识对话可检索"
+                  className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-micro text-muted-foreground transition-colors hover:bg-brand/10 hover:text-brand disabled:opacity-50">
+            {savingKb ? <Loader2 className="size-3.5 animate-spin" /> : <BookDown className="size-3.5" />}
+            存知识库
+          </button>
+        </div>
       </div>
-    </a>
+    </div>
+  );
+}
+
+/** 「送进研究」项目选择:选完即写入该项目论文区并提示结果。 */
+function AdoptDialog({ paper, onClose }: { paper: PaperCard | null; onClose: () => void }) {
+  const projects = useQuery({ queryKey: ["projects"], queryFn: fetchProjects });
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const adopt = async (projectId: string, name: string) => {
+    if (!paper) return;
+    setBusyId(projectId);
+    try {
+      const r = await adoptPaperToProject(paper.id, projectId);
+      toast.success(r.notified
+        ? `已放入「${name}」的论文区,研究 Agent 已收到通知`
+        : `已放入「${name}」的论文区,下次研究开始时会读到`);
+      onClose();
+    } catch (e) {
+      toast.error(`送进研究失败:${(e as Error).message}`);
+    } finally {
+      setBusyId(null);
+    }
+  };
+  return (
+    <Dialog open={!!paper} onOpenChange={(next) => (next ? null : onClose())}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>送进研究</DialogTitle>
+          <DialogDescription>
+            《{paper?.title ?? ""}》放到哪个项目?写入项目的 .autolab/papers/(全文提炼),
+            研究 Agent 用 read_paper 阅读;项目有活跃研究会话时会即时收到通知。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="max-h-72 overflow-y-auto">
+          {projects.isLoading ? (
+            <div className="flex justify-center py-6"><Loader2 className="size-4 animate-spin text-muted-foreground" /></div>
+          ) : (projects.data ?? []).length === 0 ? (
+            <p className="py-6 text-center text-caption text-muted-foreground">还没有项目——先到「项目」页立项</p>
+          ) : (
+            <ul className="space-y-1">
+              {(projects.data ?? []).map((p) => (
+                <li key={p.id}>
+                  <button onClick={() => adopt(p.id, p.name)} disabled={busyId !== null}
+                          className="flex w-full items-center justify-between rounded-lg border-[0.5px] border-surface-border px-3 py-2 text-left text-body transition-colors hover:border-brand/40 hover:bg-brand/5 disabled:opacity-50">
+                    <span className="min-w-0 truncate">{p.name}</span>
+                    {busyId === p.id ? <Loader2 className="size-3.5 animate-spin text-muted-foreground" /> : <Lightbulb className="size-3.5 text-muted-foreground" />}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -306,6 +389,7 @@ function AboutView({ sources, stats }: {
 export default function PapersPage() {
   const [slug, setSlug] = useState<string | null>(null); // null = 全站精选时间线
   const [page, setPage] = useState(1);
+  const [adoptTarget, setAdoptTarget] = useState<PaperCard | null>(null);
 
   const columns = useQuery({
     queryKey: ["paper-columns"],
@@ -403,7 +487,7 @@ export default function PapersPage() {
                 <span className="text-caption font-medium text-muted-foreground">{g.day}</span>
               </div>
               <div className="space-y-3.5">
-                {g.cards.map((p) => <PaperRow key={p.id} paper={p} />)}
+                {g.cards.map((p) => <PaperRow key={p.id} paper={p} onAdopt={setAdoptTarget} />)}
               </div>
             </section>
           ))}
@@ -424,6 +508,7 @@ export default function PapersPage() {
           </div>
         </div>
       </div>
+      <AdoptDialog paper={adoptTarget} onClose={() => setAdoptTarget(null)} />
     </div>
   );
 }
