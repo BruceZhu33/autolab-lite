@@ -32,10 +32,11 @@ def _client(kb_env):
     return TestClient(app), OWNER, AGENT
 
 
-def test_kb_proxy_requires_owner(kb_env):
+def test_kb_proxy_requires_console_identity(kb_env):
+    """无控制台身份一律 403;有身份(owner/agent/member)放行,真实授权在 LABNOTE 侧。"""
     client, OWNER, AGENT = _client(kb_env)
     assert client.post("/api/kb/login", json={"username": "u", "password": "p"},
-                       headers={"Authorization": f"Bearer {AGENT}"}).status_code == 403
+                       headers={"Authorization": "Bearer none"}).status_code == 403
     assert client.get("/api/kb/sessions",
                       headers={"Authorization": "Bearer none"}).status_code == 403
 
