@@ -9,7 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { BookOpen, FolderPlus, Loader2, LogOut, Plus, Trash2 } from "lucide-react";
 import {
-  clearKbToken, kbChatStream, kbDelete, kbGet, kbLogin, kbPut, kbToken,
+  apiToken, clearKbToken, kbChatStream, kbDelete, kbGet, kbLogin, kbPut, kbToken,
   type KbSession, type KbSpace,
 } from "@/lib/api";
 import { ChatComposer } from "@/components/chat/chat-composer";
@@ -24,6 +24,20 @@ function LoginCard({ onOk }: { onOk: (username: string) => void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
+  // 本表单只服务「令牌直登的 owner 补知识库身份」(/api/kb/login 要 owner 令牌);
+  // 没有控制台令牌时直接引导统一登录,别给一个注定 403 的表单。
+  if (!apiToken()) {
+    return (
+      <div className="mx-auto mt-10 max-w-sm rounded-xl border-[0.5px] border-surface-border bg-card p-4 text-center">
+        <p className="text-caption font-semibold">先登录控制台账号</p>
+        <p className="mt-1.5 text-micro leading-relaxed text-muted-foreground">
+          知识库身份随控制台登录一起发放:到「设置 → 账户与访问」用 labnote 账号登录后,
+          这里即可直接使用,无需单独登录。
+        </p>
+        <a href="/settings"><Button size="sm" className="mt-3">去设置页登录</Button></a>
+      </div>
+    );
+  }
   const go = async () => {
     if (!username.trim() || !password) return toast.error("填用户名和密码");
     setBusy(true);
