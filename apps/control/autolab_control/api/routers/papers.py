@@ -107,7 +107,8 @@ def build(ctx: Ctx) -> APIRouter:
         if not knowledge.configured():
             raise UserError("知识库未配置(control 缺 LABNOTE_URL/PAT 环境变量)")
         _, text = _item_markdown(client, item_id)
-        knowledge.ingest(filename=f"paper-{item_id}.md", text=text, kind="paper")
+        # LABNOTE 的 ingest kind 只认 experiment|note;论文用 note(文件名 paper-<id> 可辨识)
+        knowledge.ingest(filename=f"paper-{item_id}.md", text=text, kind="note")
         return {"ok": True, "filename": f"paper-{item_id}.md"}
 
     @router.post("/api/owner/papers/adopt", dependencies=[ctx.owner])
