@@ -56,9 +56,12 @@ def build(ctx: Ctx) -> APIRouter:
         return JSONResponse(status_code=response.status_code, content=response.json())
 
     @router.api_route("/api/kb/{path:path}", methods=["GET", "POST", "PUT", "DELETE"],
-                      dependencies=[ctx.owner])
+                      dependencies=[ctx.reader])
     async def forward(path: str, request: Request):
-        """通用转发:JSON/表单体透传;chat/stream 走 SSE 流式透传。"""
+        """通用转发:JSON/表单体透传;chat/stream 走 SSE 流式透传。
+        鉴权两层:control 认控制台身份(reader 及以上,member 也可);
+        LABNOTE 按请求头里用户自己的 X-KB-Token 逐用户授权——成员只能动
+        自己有权限的空间,个人空间(放自己的论文)由此支持。"""
         if unconfigured := _unconfigured():
             return unconfigured
         url = f"{_base()}/{path}"
