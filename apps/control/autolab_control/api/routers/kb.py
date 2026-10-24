@@ -41,9 +41,11 @@ def build(ctx: Ctx) -> APIRouter:
     router = APIRouter()
     client = httpx.Client(verify=False, timeout=120, trust_env=False)
 
-    @router.post("/api/kb/login", dependencies=[ctx.owner])
+    @router.post("/api/kb/login", dependencies=[ctx.reader])
     def login(payload: dict) -> JSONResponse:
-        """labnote 账号登录:用户名密码 → JWT(浏览器存,后续走 X-KB-Token)。"""
+        """labnote 账号登录:用户名密码 → JWT(浏览器存,后续走 X-KB-Token)。
+        member 也要能走(成员的浏览器持 member 令牌时在此换取自己的 KB 身份);
+        只是把账密转发给 labnote,不涉及 PAT。"""
         if unconfigured := _unconfigured():
             return unconfigured
         try:
