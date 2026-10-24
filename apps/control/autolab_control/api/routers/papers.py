@@ -21,12 +21,12 @@ import httpx
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from ..agent import knowledge, runtime
+from ...agent import knowledge, runtime
+from ...core.errors import NotFound, UserError
+from ...workspace import papers as paper_files
+from ...workspace.fs import Workspace
+from ...workspace.host import open_host
 from ..app import Ctx
-from ..core.errors import NotFound, UserError
-from ..workspace import papers as paper_files
-from ..workspace.fs import Workspace
-from ..workspace.host import open_host
 
 
 def _base() -> str:
