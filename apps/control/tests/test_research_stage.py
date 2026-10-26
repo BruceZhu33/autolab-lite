@@ -33,8 +33,9 @@ def confirm_baseline(repo, pid, dice=0.80):
                                        "command": "python train.py", "dataset_path": ""}}}))
 
 
-def experiment_round(state, prefix, value_holder=None):
-    """一轮的脚本:提交 → 记下 job → 等 → end_round。"""
+def experiment_round(state, prefix, value_holder=None, command="python train.py --attn"):
+    """一轮的脚本:提交 → 记下 job → 等 → end_round。
+    多数据集池里 --config-file 是身分参数,命令必须显式带上(会被校验拦)。"""
 
     def remember(messages):
         state["job"] = job_id_from(messages)
@@ -42,7 +43,7 @@ def experiment_round(state, prefix, value_holder=None):
 
     return [
         [use(f"{prefix}r", "run_experiment", purpose="试注意力",
-             jobs=[{"name": "kvasir", "dataset": "kvasir", "command": "python train.py --attn"}],
+             jobs=[{"name": "kvasir", "dataset": "kvasir", "command": command}],
              metrics=[{"name": "val_dice"}])],
         remember,
         [use(f"{prefix}e", "end_round", hypothesis="加注意力", changes="model.py",
@@ -289,10 +290,11 @@ def test_dataset_command_consistency_guard_in_session(api, tmp_path):
         [{"type": "text", "text": "?"}],
     ])
     step = stepper(repo, run_id, model)
-    assert step() == "running"
+    assert step() == "running"           # 第一次提交:错标被拒
+    assert step() == "running"           # 第二次提交:改对标注,提交成功
     err = model.seen[1][-1]["content"][0]
     assert err["is_error"] and "数据集标注不一致" in err["content"] and "kvasir10" in err["content"]
-    assert step() == "waiting_jobs"      # 改对标注:提交成功,wait_jobs 暂停
+    assert step() == "waiting_human"     # 文本回复:等人
 
 
 def test_validation_session_e2e(api, tmp_path):
@@ -303,7 +305,8 @@ def test_validation_session_e2e(api, tmp_path):
     # 来源:一次判定成功的研究会话(medium 单 seed 即成功)
     src = start(client, pid, tier="medium", max_rounds=1)
     state: dict = {}
-    step0 = stepper(repo, src, ScriptModel(experiment_round(state, "a")))
+    step0 = stepper(repo, src, ScriptModel(experiment_round(
+        state, "a", command="python train.py --config-file configs/kvasir.yaml --attn")))
     assert step0() == "running" and step0() == "waiting_jobs"
     finish_job(repo, state["job"], {"val_dice": 0.85})
     assert step0() == "done"
