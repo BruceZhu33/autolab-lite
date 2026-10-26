@@ -305,6 +305,9 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
       <div className="flex items-center gap-2">
         <Bot className="size-4 text-brand" />
         <span className="text-caption font-semibold">Agent 会话</span>
+        {current.config?.mode === "validation" ? (
+          <span className="rounded-full bg-info/10 px-2 py-0.5 text-micro font-medium text-info">全量验证</span>
+        ) : null}
         <span className={`rounded-full px-2 py-0.5 text-micro font-medium ${status.cls}`}>{status.label}</span>
         {current.status === "running" ? <Loader2 className="size-3.5 animate-spin text-brand" /> : null}
         <span className="ml-auto font-mono text-micro tabular-nums text-muted-foreground">

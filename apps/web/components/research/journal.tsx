@@ -8,13 +8,14 @@ import { BookDown } from "lucide-react";
 import type { ResearchRound } from "@/lib/api";
 
 const fmt = (v: number | null | undefined) => (v == null ? "-" : v.toFixed(4));
+const sgn = (v: number | null | undefined) => (v == null ? "-" : `${v >= 0 ? "+" : ""}${v.toFixed(4)}`);
 
 function RoundItem({ round, projectTitle }: { round: ResearchRound; projectTitle: string }) {
   const ev = round.evaluation;
   return (
     <details className="rounded-md border-[0.5px] border-surface-border px-2 py-1">
       <summary className="cursor-pointer text-caption">
-        <span className="font-medium">第 {round.roundNo} 轮</span>
+        <span className="font-medium">第 {round.roundNo} 轮{round.validation ? " · 全量验证" : ""}</span>
         <span className={`ml-2 rounded-full px-1.5 text-micro ${ev.anyImproved
           ? "bg-success/10 text-success" : "bg-muted/60 text-muted-foreground"}`}>
           {ev.anyImproved ? "有提升" : "未提升"}
@@ -26,6 +27,15 @@ function RoundItem({ round, projectTitle }: { round: ResearchRound; projectTitle
         <p><span className="text-muted-foreground">改动:</span>{round.changes}</p>
         <p><span className="text-muted-foreground">分析:</span>{round.analysis}</p>
         {round.nextIdea ? <p><span className="text-muted-foreground">下一步:</span>{round.nextIdea}</p> : null}
+        {round.verdict ? (
+          <p className="text-micro"><span className="text-muted-foreground">Python 判定:</span>{round.verdict}</p>
+        ) : null}
+        {round.champion ? (
+          <p className="text-micro">🏆 当前冠军:「{round.champion.label ?? round.champion.planId}」
+            [{round.champion.dataset ?? "-"}] {round.champion.n} seed 均值增益
+            <span className="font-mono">{sgn(round.champion.meanGain)}</span>
+            (第 {round.champion.round} 轮)</p>
+        ) : null}
         {round.kbReflow ? (
           round.kbReflow.ok ? (
             <p className="flex flex-wrap items-center gap-2 text-micro">
@@ -42,6 +52,32 @@ function RoundItem({ round, projectTitle }: { round: ResearchRound; projectTitle
               回流知识库失败:{round.kbReflow.error ?? "未知原因"}(不影响研究)
             </p>
           )
+        ) : null}
+        {ev.means?.length ? (
+          <table className="w-full text-micro">
+            <tbody>
+              <tr className="text-muted-foreground">
+                <td className="pr-2 font-medium">变体均值</td>
+                <td className="pr-2">数据集</td>
+                <td className="pr-2">seed</td>
+                <td className="pr-2">均值(基线)</td>
+                <td>增益</td>
+              </tr>
+              {ev.means.map((m) => (
+                <tr key={`${m.planId}-${m.dataset}`}>
+                  <td className="pr-2">{m.label ?? m.planId}</td>
+                  <td className="pr-2 text-muted-foreground">{m.dataset ?? "-"}</td>
+                  <td className="pr-2">{m.n}</td>
+                  <td className="font-mono tabular-nums">
+                    {fmt(m.meanValue)}({fmt(m.baseline ?? null)})
+                  </td>
+                  <td className={`font-mono tabular-nums ${m.improved ? "text-success" : "text-muted-foreground"}`}>
+                    {sgn(m.meanGain)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         ) : null}
         <table className="w-full text-micro">
           <tbody>

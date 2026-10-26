@@ -4,12 +4,13 @@
 
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
-import { Lightbulb } from "lucide-react";
+import { BadgeCheck, Lightbulb } from "lucide-react";
 import { fetchLatestRun, fetchResearchRounds, isActive, type Project } from "@/lib/api";
 import { RunPanel } from "@/components/agent-run/panel";
 import { ProjectTabs, useProjectSelection } from "@/components/project-picker";
 import { ResearchJournal } from "@/components/research/journal";
 import { ResearchStartForm } from "@/components/research/start-form";
+import { ValidateLaunch } from "@/components/research/validate-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-header";
@@ -27,10 +28,33 @@ function ResearchSection({ project }: { project: Project }) {
     enabled: !!run,
     refetchInterval: isActive(run) ? 5000 : false,
   });
+  const result = (run?.result ?? null) as { success?: boolean; champion?: {
+    round: number; label?: string | null; dataset?: string | null;
+    n: number; meanGain: number;
+  } } | null;
+  const validated = run?.config?.mode === "validation";
+  const canValidate = !!run && !isActive(run) && !validated && !!result?.success;
   return (
     <div className="space-y-3">
       {!isActive(run) ? <ResearchStartForm project={project} /> : null}
       {run ? <RunPanel key={run.id} project={project} run={run} /> : null}
+      {canValidate ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border-[0.5px] border-success/40 bg-success/5 p-3">
+          <BadgeCheck className="size-4 text-success" />
+          <p className="min-w-0 flex-1 text-caption">
+            研究已判定有提升
+            {result?.champion ? (
+              <>——冠军「{result.champion.label ?? "?"}」[{result.champion.dataset ?? "-"}]
+                {" "}{result.champion.n} seed 均值增益
+                <span className="font-mono">
+                  {result.champion.meanGain >= 0 ? "+" : ""}{result.champion.meanGain.toFixed(4)}
+                </span>(第 {result.champion.round} 轮)</>
+            ) : null}
+            。是否在全部数据集上验证该方案?
+          </p>
+          <ValidateLaunch project={project} />
+        </div>
+      ) : null}
       <ResearchJournal rounds={rounds?.rounds ?? []} projectTitle={project.name} />
     </div>
   );

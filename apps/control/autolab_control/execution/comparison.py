@@ -33,12 +33,44 @@ def compare_plan(repo: Repo, plan: dict, pool: dict[str, dict]) -> dict:
         gain = None
         if isinstance(value, (int, float)) and isinstance(baseline, (int, float)):
             gain = (value - baseline) if direction == "maximize" else (baseline - value)
-        rows.append({"jobId": job["id"], "name": params.get("name"), "dataset": dataset,
-                     "params": params, "status": job["status"], "metric": primary,
-                     "value": value, "baseline": baseline, "gain": gain,
+        rows.append({"planId": plan["id"], "jobId": job["id"], "name": params.get("name"),
+                     "dataset": dataset, "params": params, "status": job["status"],
+                     "metric": primary, "value": value, "baseline": baseline, "gain": gain,
                      "improved": gain is not None and gain > 0})
     return {"metric": primary, "direction": direction, "rows": rows,
             "warning": param_insensitivity(rows)}
+
+
+def variant_means(rows: list[dict]) -> list[dict]:
+    """按 (planId, dataset) 聚合 SUCCEEDED 行 → 变体均值组,按均值增益降序。
+
+    一次 run_experiment(一个 plan)在同一数据集上的多个 job 即同一变体的多 seed;
+    成功判定与冠军追踪都以这里的均值为口径,不信单 seed 冒尖。"""
+    groups: dict[tuple, dict] = {}
+    for row in rows:
+        if row["status"] != "SUCCEEDED" or not isinstance(row["value"], (int, float)):
+            continue
+        key = (row.get("planId"), row.get("dataset") or "")
+        g = groups.setdefault(key, {
+            "planId": row.get("planId"), "dataset": row.get("dataset"),
+            "metric": row.get("metric"), "baseline": None,
+            "values": [], "gains": [], "jobIds": []})
+        if g["baseline"] is None and isinstance(row.get("baseline"), (int, float)):
+            g["baseline"] = row["baseline"]
+        g["values"].append(row["value"])
+        if isinstance(row["gain"], (int, float)):
+            g["gains"].append(row["gain"])
+        g["jobIds"].append(row["jobId"])
+    out = []
+    for g in groups.values():
+        mean_gain = sum(g["gains"]) / len(g["gains"]) if g["gains"] else None
+        out.append({"planId": g["planId"], "dataset": g["dataset"], "metric": g["metric"],
+                    "baseline": g["baseline"],
+                    "n": len(g["values"]), "meanValue": sum(g["values"]) / len(g["values"]),
+                    "meanGain": mean_gain, "improved": mean_gain is not None and mean_gain > 0,
+                    "jobIds": g["jobIds"]})
+    out.sort(key=lambda m: (m["meanGain"] is not None, m["meanGain"] or 0.0), reverse=True)
+    return out
 
 
 def param_insensitivity(rows: list[dict]) -> str | None:

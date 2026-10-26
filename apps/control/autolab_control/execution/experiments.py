@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from dataclasses import dataclass, field
 
 from autolab_protocol import (
@@ -42,6 +43,7 @@ class ExperimentRequest:
     timeout_minutes: int = 120
     gpus_per_job: int = 1
     allowed_datasets: set[str] | None = field(default=None)
+    dataset_commands: dict[str, str] | None = field(default=None)  # {数据集: 基线命令}
 
 
 def list_experiments(ws: Workspace) -> list[str]:
@@ -82,9 +84,75 @@ def _clean_jobs(request: ExperimentRequest) -> list[dict]:
             if allowed is not None and dataset not in allowed:
                 raise UserError(f"数据集 {dataset} 不在基线确认池里(可选:"
                                 f"{', '.join(sorted(allowed)) or '无'})")
+            if request.dataset_commands:
+                check_dataset_command_consistency(dataset, command, request.dataset_commands)
             job["dataset"] = dataset  # 对照时按它找该数据集的基线
         out.append(job)
     return out
+
+
+# dataset 标注 vs 命令的「身分参数」比对。真机事故:agent 把 BUSI@10% 的实验
+# 标成 BUSI,对照挂到 100% 基线(0.85 vs 0.68),判定链失明三轮才触发停止。
+# 身分参数 = 值/存在性在确认池各数据集命令间有差异的 flag=值对
+# (如 --config-file configs/BUSI.yaml、--data-percentage 10);seed 类 flag
+# (研究本来就要换 seed)和无值 flag(如 python -u)不参与。
+_SEED_FLAG_NAMES = frozenset({"seed", "random-seed", "random_seed"})
+
+
+def _flag_pairs(command: str) -> dict[str, str]:
+    """只解析 `--长旗标 值` / `--长旗标=值` 对。单短旗标(-u/-s)与 getopt 的取值
+    歧义无法判定,一律不参与——身分比对宁可漏报不可误拦。"""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return {}
+    pairs: dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok.startswith("--"):
+            i += 1
+            continue
+        if "=" in tok:
+            name, _, value = tok.partition("=")
+        else:
+            if i + 1 >= len(tokens) or tokens[i + 1].startswith("-"):
+                i += 1
+                continue  # 无值旗标不构成数据集身分
+            name, value = tok, tokens[i + 1]
+            i += 1
+        if name.lstrip("-") not in _SEED_FLAG_NAMES:
+            pairs[name] = value
+        i += 1
+    return pairs
+
+
+def check_dataset_command_consistency(dataset: str, command: str,
+                                      commands: dict[str, str]) -> None:
+    """标注的 dataset 与命令实际跑的数据口径不一致时 UserError 拦下并点名。"""
+    tagged = _flag_pairs(commands.get(dataset) or "")
+    others = {name: _flag_pairs(cmd or "") for name, cmd in commands.items()
+              if name != dataset}
+    all_flags = set(tagged) | {f for pairs in others.values() for f in pairs}
+    for flag in sorted(all_flags):
+        # 身分参数:存在性或取值与其他数据集不同 → 提交的命令必须与标注数据集一致
+        differs = any(flag not in pairs or pairs[flag] != tagged.get(flag)
+                      for pairs in others.values()) if others else False
+        if not differs:
+            continue
+        submitted = _flag_pairs(command)
+        expected = tagged.get(flag)
+        if flag in submitted and (expected is None or submitted[flag] != expected):
+            owners = "/".join(sorted(n for n, p in others.items() if p.get(flag) == submitted[flag])
+                              ) or "其他数据集"
+            raise UserError(
+                f"数据集标注不一致:命令带 `{flag} {submitted[flag]}`,但 {dataset} 的基线命令"
+                f"{'没有这个参数' if expected is None else f'里它是 `{flag} {expected}`'}"
+                f"——该参数属于 {owners}。请把 dataset 改成实际跑的数据集,或修正命令。")
+        if flag not in submitted and expected is not None:
+            raise UserError(
+                f"数据集标注不一致:{dataset} 的基线命令带 `{flag} {expected}`,你的命令没有"
+                "——数据口径对不上会让对照失真。请补上该参数,或改 dataset 标注。")
 
 
 def _clean_metrics(raw: list) -> list[MetricDefinition]:

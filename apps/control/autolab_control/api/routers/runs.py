@@ -61,6 +61,19 @@ def build(ctx: Ctx) -> APIRouter:
             kb_assist=bool(payload.get("kb_assist")),
             kb_spaces=[str(s) for s in (payload.get("kb_spaces") or []) if str(s).strip()] or None)}
 
+    @router.post("/api/owner/projects/{project_id}/research/validate",
+                 dependencies=[ctx.owner])
+    def research_validate(project_id: str, payload: dict) -> dict:
+        """把最近一次成功研究会话的冠军改动做成全量验证会话(不改代码,
+        选定数据集 × N seed 按基线口径重跑,一轮收束)。"""
+        gpu_hours = payload.get("gpu_hours")
+        return {"run": research.start_validation(
+            repo, project_id,
+            datasets=[str(d) for d in (payload.get("datasets") or []) if str(d).strip()] or None,
+            seeds=int(payload.get("seeds") or 3),
+            source_run_id=str(payload.get("source_run_id") or "").strip() or None,
+            gpu_hours=float(gpu_hours) if gpu_hours not in (None, "") else None)}
+
     @router.get("/api/projects/{project_id}/research/rounds", dependencies=[ctx.reader])
     def research_rounds(project_id: str, run_id: str | None = None) -> dict:
         return {"rounds": research.list_rounds(repo, project_id, run_id),
