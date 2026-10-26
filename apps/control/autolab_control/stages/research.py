@@ -29,7 +29,7 @@ from ..agent.runtime import (
 from ..core.db import utc_now
 from ..core.ids import new_id
 from ..core.repo import TERMINAL_JOB_STATUSES, Repo
-from ..execution.comparison import compare_plan
+from ..execution.comparison import compare_plan, variant_means
 from ..workspace import refs
 from .baseline import baseline_pool
 
@@ -40,12 +40,18 @@ JOURNAL_REL = ".autolab/research_journal.md"
 TIERS: dict[str, dict] = {
     # 轻量 = 人机协作:每轮结束停下,owner 看完报告回话才进下一轮
     "light": {"label": "轻量 · 人机协作", "max_rounds": 3, "threshold": 0.0,
-              "gpu_hours": 0.0, "confirm_each_round": True},
+              "gpu_hours": 0.0, "confirm_each_round": True, "min_seeds": 1},
     "medium": {"label": "中量", "max_rounds": 5, "threshold": 0.0,
-               "gpu_hours": 0.0, "confirm_each_round": False},
-    # 重量 = 过夜:不限轮,只有达到显著阈值才算成功,GPU 小时兜底
+               "gpu_hours": 0.0, "confirm_each_round": False, "min_seeds": 1},
+    # 重量 = 过夜:不限轮,只有达到显著阈值才算成功,GPU 小时兜底。
+    # 判定按变体均值:单 seed 冒尖不再触发停止(真机教训:hflip TTA 变体均值
+    # 更差,却靠一个 seed 的 +0.0175 触发了会话结束)。
     "heavy": {"label": "重量 · 过夜", "max_rounds": 0, "threshold": 0.01,
-              "gpu_hours": 24.0, "confirm_each_round": False},
+              "gpu_hours": 24.0, "confirm_each_round": False, "min_seeds": 3},
+    # 全量验证 = 把冠军改动在选定数据集上按基线口径多 seed 重跑,一轮收束;
+    # 每 dataset 需要的 seed 数在 config.seeds(判定用它,不用这里的 min_seeds)
+    "validation": {"label": "全量验证", "max_rounds": 1, "threshold": 0.0,
+                   "gpu_hours": 0.0, "confirm_each_round": False, "min_seeds": 1},
 }
 
 
@@ -63,6 +69,10 @@ SYSTEM_PROMPT = """你是 AutoLab 的研究 Agent。工程已经在 GPU 服务�
 - 正式实验的训练口径(epoch、数据比例、batch、seed 等)要与该数据集的基线命令一致,只改你要验证的东西。
 - 不得修改评测代码、指标定义、数据划分来抬高数字;指标必须真实评测得到。
 - 失败或没提升也是结论:写清楚原因,下一轮换思路,不要原样重复。
+- **多 seed 均值纪律**:同一变体的多个 seed 放在同一次 run_experiment 提交(一个 Job 一个 seed),
+  成功判定按变体均值(需要的 seed 数见「研究状态」),单个 seed 冒尖不算数。
+- **dataset 标注必须与命令实际跑的数据口径一致**(数据比例、config 等身分参数会被校验,
+  标错会被拒绝):标了 BUSI 就不能带 10% 数据比例的参数,反之亦然。
 
 ## 其他
 - 服务器网络情况见下方「研究状态」;没有外网就不要尝试下载。
@@ -147,18 +157,24 @@ def _baseline_exp_ref(repo: Repo, project: dict) -> str:
 
 
 def evaluate_plans(repo: Repo, project: dict, plans: list[dict]) -> dict:
-    """Python 判定:逐 Job 对照该数据集的确认基线。"""
+    """Python 判定:逐 Job 对照该数据集的确认基线,并按 (plan, dataset) 聚合变体均值。"""
     pool = baseline_pool(project)
-    rows, warnings = [], []
+    rows, warnings, labels = [], [], {}
     for plan in plans:
         comparison = compare_plan(repo, plan, pool)
-        rows += [{k: r[k] for k in ("jobId", "name", "dataset", "status", "metric",
-                                    "value", "baseline", "gain", "improved")}
+        labels[plan["id"]] = str(plan.get("summary") or plan["id"])[:80]
+        rows += [{k: r[k] for k in ("planId", "jobId", "name", "dataset", "status",
+                                    "metric", "value", "baseline", "gain", "improved")}
                  for r in comparison["rows"]]
         if comparison["warning"]:
             warnings.append(comparison["warning"])
+    means = variant_means(rows)
+    for m in means:
+        m["label"] = labels.get(m["planId"], str(m["planId"]))
     gains = [r["gain"] for r in rows if r["gain"] is not None and r["status"] == "SUCCEEDED"]
-    return {"rows": rows, "bestGain": max(gains) if gains else None,
+    return {"rows": rows, "means": means, "labels": labels,
+            "bestGain": max(gains) if gains else None,
+            "bestMean": means[0]["meanGain"] if means and means[0]["meanGain"] is not None else None,
             "anyImproved": any(r["improved"] for r in rows),
             "succeeded": sum(1 for r in rows if r["status"] == "SUCCEEDED"),
             "warnings": warnings}
@@ -166,12 +182,26 @@ def evaluate_plans(repo: Repo, project: dict, plans: list[dict]) -> dict:
 
 def _round_markdown(round_no: int, report: dict) -> str:
     ev = report["evaluation"]
-    lines = [f"## 第 {round_no} 轮", "",
+    verdict = report.get("verdict")
+    if not verdict:  # 旧轮次(均值口径上线前)回落单 job 渲染
+        verdict = ("有提升" if ev.get("anyImproved") else "未提升") + (
+            f",最佳改善 {ev['bestGain']:+.4g}"
+            if ev.get("bestGain") is not None else "")
+    lines = [f"## 第 {round_no} 轮" + ("(全量验证)" if report.get("validation") else ""), "",
              f"- 假设:{report['hypothesis']}", f"- 改动:{report['changes']}",
              f"- 分析:{report['analysis']}", f"- 下一步想法:{report.get('nextIdea') or '-'}",
              f"- 保留改动:{'是' if report.get('kept') else '否'}",
-             f"- Python 判定:{'有提升' if ev['anyImproved'] else '未提升'}"
-             + (f",最佳改善 {ev['bestGain']:+.4g}" if ev["bestGain"] is not None else ""), ""]
+             f"- Python 判定:{verdict}", ""]
+    for m in ev.get("means") or []:
+        value = "-" if m.get("meanValue") is None else f"{m['meanValue']:.4g}"
+        gain = "" if m.get("meanGain") is None else f",增益 {m['meanGain']:+.4g}"
+        lines.append(f"  - 变体「{m.get('label') or m.get('planId')}」[{m.get('dataset') or '-'}]"
+                     f" {m.get('n', 0)} seed 均值 {value}{gain}")
+    ch = report.get("champion")
+    if ch:
+        lines.append(f"  - 🏆 当前冠军:「{ch.get('label') or ch.get('planId')}」"
+                     f"[{ch.get('dataset') or '-'}] {ch.get('n')} seed 均值增益"
+                     f" {ch.get('meanGain'):+.4g}(第 {ch.get('round')} 轮)")
     for row in ev["rows"]:
         value = "-" if row["value"] is None else f"{row['value']:.4g}"
         base = "-" if row["baseline"] is None else f"{row['baseline']:.4g}"
@@ -195,7 +225,38 @@ def _tier(env_or_config) -> dict:
     return {**TIERS[config.get("tier") or "light"], **(config.get("overrides") or {})}
 
 
+def _validation_task(repo: Repo, project: dict, config: dict) -> str:
+    """全量验证任务书:工作区代码即被验证状态,原样在各数据集上按基线口径多 seed 重跑。"""
+    pool = baseline_pool(project)
+    chosen = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
+    seeds = int(config.get("seeds") or 3)
+    ch = config.get("champion") or {}
+    lines = ["# 全量验证任务", "",
+             "## 被验证的方案(研究阶段的冠军)", "",
+             f"- 假设:{ch.get('hypothesis') or ch.get('label') or '(见研究日志)'}",
+             f"- 改动:{ch.get('changes') or '(工作区当前状态)'}",
+             f"- 来源会话:{config.get('source_run_id') or '?'}"
+             + (f",第 {ch.get('round')} 轮,{ch.get('n')} seed 均值增益 {ch.get('meanGain'):+.4g}"
+                f"({ch.get('dataset')})" if ch.get("round") is not None else ""), "",
+             "## 验证规则(硬规则)", "",
+             "- **不改任何代码、不改评测与指标定义**:工作区就是被验证状态,原样运行;"
+             "发现代码问题用 ask_human 报告,不要修。",
+             f"- 每个数据集跑 **{seeds} 个 seed**:命令与该数据集的基线命令同口径,"
+             "只把 seed 参数换成不同取值,其余参数一律不动。",
+             "- 一次最多 8 个 Job,可以分批提交;全部数据集的 Job 终态后用 end_round 收束,"
+             "analysis 里逐数据集给出均值对比结论。",
+             "- 某数据集跑不通(环境/材料)时:报告失败原因,不要为了跑通而改口径。", "",
+             "## 基线(确认过的,对比对象)"]
+    for name in chosen:
+        info = pool.get(name) or {}
+        lines.append(f"- {name}: 指标 {json.dumps(info.get('metrics') or {}, ensure_ascii=False)}"
+                     f";命令 `{info.get('command') or ''}`")
+    return "\n".join(lines)
+
+
 def build_task(repo: Repo, project: dict, config: dict, *, run_id: str | None) -> str:
+    if config.get("mode") == "validation":
+        return _validation_task(repo, project, config)
     pool = baseline_pool(project)
     chosen = config.get("datasets") or None
     if chosen:
@@ -241,6 +302,7 @@ def build_task(repo: Repo, project: dict, config: dict, *, run_id: str | None) -
 def _status_suffix(env: LoopEnv) -> str:
     tier = _tier(env)
     rounds = list_rounds(env.repo, env.project["id"], env.run["id"])
+    validation = env.config.get("mode") == "validation"
     lines = ["## 研究状态",
              f"- 档位:{tier['label']}",
              f"- 已完成轮数:{len(rounds)}"
@@ -249,8 +311,14 @@ def _status_suffix(env: LoopEnv) -> str:
     if tier["gpu_hours"]:
         lines.append(f"- GPU 用量:{gpu_hours_used(env.repo, env.run['id']):.1f}"
                      f" / {tier['gpu_hours']:g} 小时")
-    if tier["threshold"]:
-        lines.append(f"- 成功标准:最佳改善 ≥ {tier['threshold']:g}")
+    if validation:
+        seeds = int(env.config.get("seeds") or 3)
+        lines.append(f"- 成功标准:每个数据集 ≥{seeds} seed 的均值不恶化(容忍 "
+                     f"{float(env.config.get('regress_tol') or 0.005):g}),且至少一个数据集改善")
+    elif tier["threshold"]:
+        lines.append(f"- 成功标准:任一变体 ≥{tier['min_seeds']} seed 的均值改善 ≥ {tier['threshold']:g}")
+    elif tier.get("min_seeds", 1) > 1:
+        lines.append(f"- 成功标准:任一变体 ≥{tier['min_seeds']} seed 的均值改善 > 0")
     return "\n".join(lines)
 
 
@@ -260,6 +328,44 @@ def _check_gpu_budget(env: LoopEnv) -> None:
     budget = _tier(env)["gpu_hours"]
     if budget and gpu_hours_used(env.repo, env.run["id"]) >= budget:
         raise ToolError(f"GPU 预算 {budget:g} 小时已用完:不能再提交实验,请用 end_round 总结本轮")
+
+
+def _finish_validation(env: LoopEnv, round_no: int, report: dict,
+                       evaluation: dict) -> Finish:
+    """全量验证收束:逐数据集取达标均值组,一轮结束;reason 带逐数据集结论表。"""
+    config = env.config
+    seeds = max(1, int(config.get("seeds") or 3))
+    tol = float(config.get("regress_tol") or 0.005)
+    pool = baseline_pool(env.project)
+    selected = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
+    verdicts, gains, success = [], [], bool(selected)
+    for dataset in selected:
+        group = next((m for m in evaluation["means"]
+                      if m["dataset"] == dataset and m["n"] >= seeds
+                      and m["meanGain"] is not None), None)
+        if group is None:
+            have = max((m["n"] for m in evaluation["means"] if m["dataset"] == dataset),
+                       default=0)
+            verdicts.append(f"{dataset}:证据不足({have}/{seeds} 有效 seed)")
+            success = False
+            continue
+        gain = group["meanGain"]
+        gains.append(gain)
+        mark = "✓" if gain > 0 else ("~" if gain >= -tol else "✗")
+        verdicts.append(f"{dataset}:{gain:+.4g} {mark}"
+                        f"({group['n']} seed 均值 {group['meanValue']:.4g})")
+        if gain < -tol:
+            success = False
+    if not any(g > 0 for g in gains):
+        success = False
+    verdict = f"全量验证{'通过' if success else '未通过'}:" + ";".join(verdicts)
+    report["verdict"] = verdict
+    report["validation"] = True
+    _record_round(env, round_no, report)
+    return Finish({"rounds": round_no, "success": success,
+                   "bestGain": max(gains) if gains else None,
+                   "validation": {"datasets": verdicts},
+                   "reason": verdict, "lastRound": report})
 
 
 def _end_round_tool() -> Tool:
@@ -282,17 +388,53 @@ def _end_round_tool() -> Tool:
                   "kept": bool(args.get("kept")),
                   "planIds": [p["id"] for p in plans], "evaluation": evaluation}
         round_no = len(rounds) + 1
-        _record_round(env, round_no, report)
+
+        if env.config.get("mode") == "validation":
+            return _finish_validation(env, round_no, report, evaluation)
 
         tier = _tier(env)
-        best = evaluation["bestGain"]
-        success = evaluation["anyImproved"] and best is not None and best > 0 \
-            and (tier["threshold"] <= 0 or best >= tier["threshold"])
-        verdict = (f"第 {round_no} 轮 Python 判定:"
-                   + ("有提升" if evaluation["anyImproved"] else "未提升")
-                   + (f",最佳改善 {best:+.4g}" if best is not None else ""))
-        result = {"rounds": round_no, "success": success, "bestGain": best,
+        means = evaluation["means"]
+        eligible = [m for m in means
+                    if m["n"] >= tier["min_seeds"] and m["meanGain"] is not None]
+        best = eligible[0] if eligible else None  # variant_means 已按均值增益降序
+        success = best is not None and best["meanGain"] > 0 \
+            and (tier["threshold"] <= 0 or best["meanGain"] >= tier["threshold"])
+
+        # 冠军:跨轮保留最优的达标变体。判定/报告/通知都以它为准——真机教训:
+        # 最后一轮一个次优变体的单 seed 冒尖触发了停止,而它均值比冠军更差。
+        champion = rounds[-1].get("champion") if rounds else None
+        if best is not None and best["meanGain"] > 0:
+            candidate = {"round": round_no, "planId": best["planId"],
+                         "label": best.get("label"), "dataset": best["dataset"],
+                         "n": best["n"], "meanValue": best["meanValue"],
+                         "meanGain": best["meanGain"]}
+            if not champion or candidate["meanGain"] > (champion.get("meanGain") or 0):
+                champion = candidate
+        if champion:
+            report["champion"] = champion
+
+        if best is not None:
+            verdict = (f"{'有提升' if success else '未提升'}——变体"
+                       f"「{best.get('label') or best['planId']}」[{best['dataset'] or '-'}]"
+                       f" {best['n']} seed 均值增益 {best['meanGain']:+.4g}")
+            if champion and champion.get("round") != round_no:
+                verdict += (f";当前冠军:第 {champion['round']} 轮「{champion.get('label')}」"
+                            f"[{champion.get('dataset')}] {champion.get('meanGain'):+.4g}")
+        elif means:
+            top = means[0]
+            verdict = (f"证据不足——最好的变体「{top.get('label') or top['planId']}」只有 "
+                       f"{top['n']} 个有效 seed(判定需要 ≥{tier['min_seeds']} seed 的均值);"
+                       "补齐 seed 或换方向")
+        else:
+            verdict = "未提升(本轮没有成功产出指标的实验)"
+        report["verdict"] = verdict
+        _record_round(env, round_no, report)
+
+        result = {"rounds": round_no, "success": success,
+                  "bestGain": (champion or best or {}).get("meanGain"),
                   "lastRound": report}
+        if champion:
+            result["champion"] = champion
         if tier["max_rounds"] and round_no >= tier["max_rounds"]:
             return Finish({**result, "reason": f"已达轮数上限 {tier['max_rounds']}"})
         if tier["gpu_hours"] and gpu_hours_used(repo, run_id) >= tier["gpu_hours"]:
@@ -300,10 +442,11 @@ def _end_round_tool() -> Tool:
         if tier["confirm_each_round"]:
             return Pause("human", {
                 "kind": ROUND_REVIEW_KIND, "roundNo": round_no,
-                "question": f"{verdict}。请看本轮报告,回复意见后进入下一轮(或停止会话)。",
+                "question": f"第 {round_no} 轮 Python 判定:{verdict}。"
+                            "请看本轮报告,回复意见后进入下一轮(或停止会话)。",
                 "report": _round_markdown(round_no, report)})
         if success:
-            return Finish({**result, "reason": verdict})
+            return Finish({**result, "reason": f"第 {round_no} 轮 Python 判定:{verdict}"})
         return NewContext(build_task(repo, project, env.config, run_id=run_id))
 
     return Tool(
@@ -361,12 +504,19 @@ def build_tools(env: LoopEnv) -> list[Tool]:
     knowledge_tools = [tools.knowledge_tool()] if knowledge.configured() else []
     from ..agent import paper_radar
     paper_tools = [tools.paper_radar_tool()] if paper_radar.available() else []
+    experiment = tools.experiment_tools(
+        baseline_ref=lambda e: _baseline_exp_ref(e.repo, e.project),
+        allowed_datasets=lambda e: set(baseline_pool(e.project)),
+        dataset_commands=lambda e: {name: (info.get("command") or "")
+                                    for name, info in baseline_pool(e.project).items()},
+        before_submit=_check_gpu_budget)
+    if env.config.get("mode") == "validation":
+        # 验证会话只读 + 只跑:改代码/shell 都不给,保证验证的是来源会话结束时的代码
+        return [*tools.workspace_tools(writable=False), *knowledge_tools, *paper_tools,
+                *experiment, tools.read_paper_tool(), tools.read_reference_tool(),
+                tools.ask_human_tool(), _end_round_tool()]
     return [*tools.workspace_tools(), tools.shell_tool(), *knowledge_tools, *paper_tools,
-            *tools.experiment_tools(
-                baseline_ref=lambda e: _baseline_exp_ref(e.repo, e.project),
-                allowed_datasets=lambda e: set(baseline_pool(e.project)),
-                before_submit=_check_gpu_budget),
-            tools.read_paper_tool(), tools.read_reference_tool(),
+            *experiment, tools.read_paper_tool(), tools.read_reference_tool(),
             tools.ask_human_tool(), _end_round_tool()]
 
 
@@ -407,3 +557,44 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
               "kb_spaces": [s for s in (kb_spaces or []) if s] or None}
     return runtime.start_run(repo, project_id, KIND,
                                 build_task(repo, project, config, run_id=None), config)
+
+
+def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None = None,
+                     seeds: int = 3, source_run_id: str | None = None,
+                     gpu_hours: float | None = None) -> dict:
+    """把来源研究会话的冠军改动做成一次全量验证会话:不改代码,在选定数据集上
+    按基线口径多 seed 重跑,一轮收束出逐数据集均值结论。owner 点按钮即授权。"""
+    project = repo.get_project(project_id)
+    if project is None:
+        raise AgentLoopError(f"项目 {project_id} 不存在")
+    pool = baseline_pool(project)
+    if not pool:
+        raise AgentLoopError("还没有确认过的基线:先完成 Baseline")
+    source = runtime.get_run(repo, source_run_id) if source_run_id else \
+        runtime.latest_run(repo, project_id, KIND)
+    if source is None or source.get("status") != "done" \
+            or not (source.get("result") or {}).get("success"):
+        raise AgentLoopError("没有「已完成且判定有提升」的研究会话可作验证对象;"
+                             "先跑出一轮成功的研究会话")
+    result = source.get("result") or {}
+    champion = result.get("champion") or {}
+    src_rounds = list_rounds(repo, project_id, source["id"])
+    src_round = next((r for r in src_rounds
+                      if r.get("roundNo") == champion.get("round")), None)
+    # 旧会话(冠军字段上线前)回落 lastRound;验证对象终究是工作区当前代码
+    carrier = src_round or result.get("lastRound") or {}
+    seeds = max(1, min(int(seeds or 3), 5))
+    chosen = [d for d in (datasets or []) if d in pool] or list(pool)
+    overrides = {"gpu_hours": max(0.0, float(gpu_hours))} if gpu_hours is not None else {}
+    config = {"tier": "validation", "mode": "validation", "idea": "", "network": False,
+              "overrides": overrides, "datasets": chosen, "seeds": seeds,
+              "regress_tol": 0.005, "source_run_id": source["id"],
+              "champion": {"round": champion.get("round"),
+                           "label": champion.get("label"),
+                           "dataset": champion.get("dataset"),
+                           "n": champion.get("n"), "meanGain": champion.get("meanGain"),
+                           "hypothesis": str(carrier.get("hypothesis") or "")[:2000],
+                           "changes": str(carrier.get("changes") or "")[:2000]},
+              "kb_assist": False, "kb_spaces": None}
+    return runtime.start_run(repo, project_id, KIND,
+                             build_task(repo, project, config, run_id=None), config)

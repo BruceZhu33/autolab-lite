@@ -51,7 +51,7 @@ def message(run: dict, project: dict | None, status: str, detail: str = "") -> s
 
 
 def finish_detail(result: Any) -> str:
-    """Finish 载荷 → 一行摘要(研究会话:轮数/判定/原因)。"""
+    """Finish 载荷 → 一行摘要(研究会话:轮数/判定/原因/冠军)。"""
     if not isinstance(result, dict):
         return str(result or "")[:300]
     parts: list[str] = []
@@ -61,6 +61,10 @@ def finish_detail(result: Any) -> str:
         parts.append(f"共 {result['rounds']} 轮")
     if isinstance(result.get("bestGain"), (int, float)):
         parts.append(f"最佳改善 {result['bestGain']:+.4g}")
+    ch = result.get("champion")
+    if isinstance(ch, dict) and isinstance(ch.get("meanGain"), (int, float)):
+        parts.append(f"冠军:第{ch.get('round')}轮「{ch.get('label') or ch.get('planId')}」"
+                     f"@{ch.get('dataset')} {ch.get('n')}seed均值{ch['meanGain']:+.4g}")
     return ";".join(parts) or json.dumps(result, ensure_ascii=False)[:300]
 
 

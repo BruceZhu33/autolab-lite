@@ -72,3 +72,13 @@ def test_finish_detail():
     detail = notify.finish_detail(
         {"reason": "已达轮数上限 5", "rounds": 5, "success": True, "bestGain": 0.02})
     assert "轮数上限" in detail and "5 轮" in detail and "+0.02" in detail
+
+
+def test_finish_detail_with_champion():
+    detail = notify.finish_detail({
+        "reason": "第 2 轮 Python 判定:有提升", "rounds": 2, "success": True,
+        "bestGain": 0.0177,
+        "champion": {"round": 2, "label": "EMA-PVL 多 seed", "dataset": "BUSI@10%",
+                     "n": 5, "meanGain": 0.0177}})
+    assert "冠军" in detail and "EMA-PVL 多 seed" in detail and "BUSI@10%" in detail
+    assert "5seed" in detail and "+0.0177" in detail

@@ -52,10 +52,15 @@ def project_card(repo: Repo, project: dict) -> dict:
         res = _cell(state, f"第 {rounds + 1} 轮 · {text}", link)
     elif res_run["status"] == "done":
         result = res_run.get("result") or {}
-        best = result.get("bestGain")
-        res = (_cell("done", f"{rounds} 轮,超越基线 {best:+.4g}", link)
-               if result.get("success") and isinstance(best, (int, float))
-               else _cell("attention", f"{rounds} 轮未超越基线", link))
+        if (res_run.get("config") or {}).get("mode") == "validation":
+            summary = str(result.get("reason") or "全量验证完成")
+            res = _cell("done" if result.get("success") else "attention",
+                        summary[:60], link)
+        else:
+            best = result.get("bestGain")
+            res = (_cell("done", f"{rounds} 轮,超越基线 {best:+.4g}", link)
+                   if result.get("success") and isinstance(best, (int, float))
+                   else _cell("attention", f"{rounds} 轮未超越基线", link))
     else:
         res = _cell("pending", f"已停止({rounds} 轮)", link)
 

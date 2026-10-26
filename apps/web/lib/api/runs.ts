@@ -71,6 +71,19 @@ export const fetchProjectDatasets = (projectId: string) =>
 
 export type ResearchTier = "light" | "medium" | "heavy";
 
+/** 变体 = 一次 run_experiment 在同一数据集上的多 seed;(planId, dataset) 聚合均值 */
+export type VariantMean = {
+  planId: string | null; dataset: string | null; label?: string;
+  n: number; meanValue: number; baseline?: number | null;
+  meanGain: number | null; improved: boolean;
+  metric: string | null; jobIds: string[];
+};
+
+export type RoundChampion = {
+  round: number; planId: string; label?: string | null; dataset?: string | null;
+  n: number; meanValue?: number; meanGain: number;
+};
+
 export type ResearchRound = {
   id: string;
   runId: string;
@@ -81,9 +94,13 @@ export type ResearchRound = {
   analysis: string;
   nextIdea: string;
   kept: boolean;
+  verdict?: string;
+  validation?: boolean;
+  champion?: RoundChampion;
   evaluation: {
     anyImproved: boolean;
     bestGain: number | null;
+    bestMean?: number | null;
     succeeded: number;
     warnings: string[];
     rows: Array<{
@@ -91,6 +108,8 @@ export type ResearchRound = {
       metric: string | null; value: number | null; baseline: number | null;
       gain: number | null; improved: boolean;
     }>;
+    /** 均值口径上线后的轮次才有 */
+    means?: VariantMean[];
   };
   /** 知识回流结果(control _record_round 记录;旧轮次无此字段) */
   kbReflow?: { ok: boolean; filename?: string; error?: string };
@@ -118,6 +137,12 @@ export const startResearch = (projectId: string, input: {
   tier: ResearchTier; idea?: string; reference?: string; network?: boolean; gpu_hours?: number;
   datasets?: string[]; kb_assist?: boolean; kb_spaces?: string[];
 }) => post<{ run: Run }>(`/api/owner/projects/${projectId}/research/start`, input);
+
+/** 全量验证:把最近一次成功研究会话的冠军改动在选定数据集上按基线口径多 seed 重跑。 */
+export const startValidation = (projectId: string, input: {
+  datasets?: string[]; seeds?: number; source_run_id?: string; gpu_hours?: number;
+}) => post<{ run: Run }>(`/api/owner/projects/${projectId}/research/validate`, input);
+
 export const fetchResearchRounds = (projectId: string, runId?: string) =>
   get<{ rounds: ResearchRound[] }>(
     `/api/projects/${projectId}/research/rounds${runId ? `?run_id=${runId}` : ""}`);

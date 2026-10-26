@@ -1,12 +1,15 @@
-"""研究阶段会话:自由实验 → end_round → Python 对照基线判定 → 按档位继续/等人/翻篇/结束。"""
+"""研究阶段会话:自由实验 → end_round → Python 对照基线判定(变体多 seed 均值)
+→ 按档位继续/等人/翻篇/结束;dataset 标注校验;全量验证会话。"""
 
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from autolab_control.agent import runtime as al
 from autolab_control.core.errors import UserError
+from autolab_control.execution.experiments import check_dataset_command_consistency
 from autolab_control.stages import research as research_stage
 
 from .test_baseline_stage import (
@@ -15,6 +18,7 @@ from .test_baseline_stage import (
     ScriptModel,
     finish_job,
     job_id_from,
+    last_tool_text,
     make_project,
     use,
 )
@@ -43,6 +47,26 @@ def experiment_round(state, prefix, value_holder=None):
         remember,
         [use(f"{prefix}e", "end_round", hypothesis="加注意力", changes="model.py",
              analysis="见指标", kept=True)],
+    ]
+
+
+def multi_seed_round(state, prefix, dataset_jobs):
+    """一轮的脚本:一次 run_experiment 提交同一变体的多个 seed(= 一个 plan 多 job)。
+    dataset_jobs = [(name, dataset, command)]。"""
+
+    def remember(messages):
+        text = last_tool_text(messages)
+        found = re.findall(r"^- (\S+): (\S+)$", text, re.MULTILINE)
+        assert found, text
+        state.setdefault("jobs", []).extend(jid for _, jid in found)
+        return [use(f"{prefix}w", "wait_jobs", job_ids=[jid for _, jid in found])]
+
+    return [
+        [use(f"{prefix}r", "run_experiment", purpose="多 seed 验证",
+             jobs=[{"name": n, "dataset": d, "command": c} for n, d, c in dataset_jobs],
+             metrics=[{"name": "val_dice"}])],
+        remember,
+        [use(f"{prefix}e", "end_round", hypothesis="h", changes="c", analysis="a", kept=True)],
     ]
 
 
@@ -108,20 +132,68 @@ def test_heavy_tier_turns_page_until_significant(api, tmp_path):
     confirm_baseline(repo, pid)
     run_id = start(client, pid, tier="heavy")
     state: dict = {}
-    model = ScriptModel([*experiment_round(state, "a"), *experiment_round(state, "b")])
+    model = ScriptModel([
+        *experiment_round(state, "a"),
+        *multi_seed_round(state, "b", [
+            ("s1", "kvasir", "python train.py --attn --seed 1"),
+            ("s2", "kvasir", "python train.py --attn --seed 2"),
+            ("s3", "kvasir", "python train.py --attn --seed 3")]),
+    ])
     step = stepper(repo, run_id, model)
     assert step() == "running" and step() == "waiting_jobs"
-    finish_job(repo, state["job"], {"val_dice": 0.805})   # +0.005 < 阈值 0.01
+    finish_job(repo, state["job"], {"val_dice": 0.805})   # 单 seed +0.005:阈值与 seed 数都不够
     assert step() == "running"
     messages = json.loads(_row(repo, run_id)["messages_json"])
     assert len(messages) == 1   # 翻篇:新上下文只剩种子
     seed = messages[0]["content"][0]["text"]
     assert "本会话的研究日志" in seed and "继续第 2 轮" in seed
     assert step() == "running" and step() == "waiting_jobs"
-    finish_job(repo, state["job"], {"val_dice": 0.85})
+    for jid, value in zip(state["jobs"], (0.84, 0.85, 0.86), strict=True):   # 3 seed 均值 0.85(+0.05)
+        finish_job(repo, jid, {"val_dice": value})
     assert step() == "done"
     result = al.get_run(repo, run_id)["result"]
-    assert result["success"] and result["rounds"] == 2 and result["bestGain"] == pytest.approx(0.05)
+    assert result["success"] and result["rounds"] == 2
+    assert result["bestGain"] == pytest.approx(0.05)
+    assert result["champion"]["round"] == 2 and result["champion"]["n"] == 3
+    assert result["champion"]["meanGain"] == pytest.approx(0.05)
+
+
+def test_mean_judgment_needs_min_seeds_and_tracks_champion(api, tmp_path):
+    """均值过阈值但 seed 不齐 = 证据不足,继续;补齐后判成功,冠军指向达标变体。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="heavy")
+    state: dict = {}
+    model = ScriptModel([
+        *multi_seed_round(state, "a", [            # 2 seed 均值 +0.02:过阈值但 <3 seed
+            ("s1", "kvasir", "python train.py --attn --seed 1"),
+            ("s2", "kvasir", "python train.py --attn --seed 2")]),
+        *multi_seed_round(state, "b", [            # 3 seed 均值 +0.02:达标 → 冠军
+            ("s1", "kvasir", "python train.py --attn --seed 1"),
+            ("s2", "kvasir", "python train.py --attn --seed 2"),
+            ("s3", "kvasir", "python train.py --attn --seed 3")]),
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    for jid in state["jobs"]:
+        finish_job(repo, jid, {"val_dice": 0.82})
+    assert step() == "running"          # 证据不足:自动翻篇,不触发成功停止
+    journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
+    assert "证据不足" in journal and "≥3" in journal
+    rounds = client.get(f"/api/projects/{pid}/research/rounds",
+                        headers=AGENT_H).json()["rounds"]
+    assert rounds[0]["evaluation"]["means"][0]["n"] == 2
+    assert rounds[0]["evaluation"]["means"][0]["meanGain"] == pytest.approx(0.02)
+    assert "champion" not in rounds[0]          # 未达标不当冠军
+    assert step() == "running" and step() == "waiting_jobs"
+    for jid in state["jobs"][2:]:
+        finish_job(repo, jid, {"val_dice": 0.82})
+    assert step() == "done"
+    result = al.get_run(repo, run_id)["result"]
+    assert result["success"] and result["rounds"] == 2
+    assert result["champion"]["round"] == 2 and result["champion"]["n"] == 3
+    assert result["champion"]["meanGain"] == pytest.approx(0.02)
 
 
 def test_round_cap_finishes_without_success(api, tmp_path):
@@ -159,6 +231,120 @@ def test_dataset_pool_and_gpu_budget_guard(api, tmp_path, monkeypatch):
     first, second = model.seen[1][-1]["content"][0], model.seen[2][-1]["content"][0]
     assert first["is_error"] and "不在基线确认池" in first["content"]
     assert second["is_error"] and "GPU 预算" in second["content"]
+
+
+def confirm_two(repo, pid, names=("kvasir", "kvasir10"), d1=0.80, d2=0.70):
+    n1, n2 = names
+    datasets = {
+        n1: {"metrics": {"val_dice": d1},
+             "command": f"python train.py --config-file configs/{n1}.yaml", "dataset_path": ""},
+        n2: {"metrics": {"val_dice": d2},
+             "command": f"python train.py --config-file configs/{n2}.yaml"
+                        + (" --data-percentage 10" if n2.endswith("10") else ""),
+             "dataset_path": ""},
+    }
+    repo.update_project(pid, baseline_passed_at="2026-10-01T00:00:00Z",
+                        baseline_json=json.dumps({"datasets": datasets}))
+
+
+def test_dataset_command_consistency_unit():
+    """身分参数(--config-file 值 / --data-percentage 存在性)错标即拦;seed/自定义参数放行。"""
+    cmds = {
+        "BUSI": "python train.py --config-file configs/BUSI.yaml --seed 1",
+        "BUSI@10%": "python train.py --config-file configs/BUSI.yaml --data-percentage 10",
+        "Kvasir": "python train.py --config-file configs/Kvasir.yaml --seed 1",
+    }
+    check_dataset_command_consistency(
+        "BUSI", "python train.py --config-file configs/BUSI.yaml --seed 9 --opts beta=3.0", cmds)
+    check_dataset_command_consistency(
+        "BUSI@10%", "python train.py --config-file configs/BUSI.yaml"
+                    " --data-percentage 10 --seed 9", cmds)
+    with pytest.raises(UserError, match="BUSI@10%"):
+        check_dataset_command_consistency(
+            "BUSI", "python train.py --config-file configs/BUSI.yaml"
+                    " --data-percentage 10 --seed 1", cmds)
+    with pytest.raises(UserError, match="你的命令没有"):
+        check_dataset_command_consistency(
+            "BUSI@10%", "python train.py --config-file configs/BUSI.yaml --seed 1", cmds)
+    with pytest.raises(UserError, match="Kvasir"):
+        check_dataset_command_consistency(
+            "BUSI", "python train.py --config-file configs/Kvasir.yaml --seed 1", cmds)
+
+
+def test_dataset_command_consistency_guard_in_session(api, tmp_path):
+    """会话内错标被拒(错误观察回给 agent),改对标注后正常提交。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_two(repo, pid)
+    run_id = start(client, pid, tier="light")
+    model = ScriptModel([
+        [use("a", "run_experiment", purpose="p", metrics=["val_dice"],
+             jobs=[{"name": "x", "dataset": "kvasir",
+                    "command": "python train.py --config-file configs/kvasir.yaml"
+                               " --data-percentage 10 --seed 2"}])],
+        [use("b", "run_experiment", purpose="p", metrics=["val_dice"],
+             jobs=[{"name": "x", "dataset": "kvasir10",
+                    "command": "python train.py --config-file configs/kvasir.yaml"
+                               " --data-percentage 10 --seed 2"}])],
+        [{"type": "text", "text": "?"}],
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running"
+    err = model.seen[1][-1]["content"][0]
+    assert err["is_error"] and "数据集标注不一致" in err["content"] and "kvasir10" in err["content"]
+    assert step() == "waiting_jobs"      # 改对标注:提交成功,wait_jobs 暂停
+
+
+def test_validation_session_e2e(api, tmp_path):
+    """全量验证:来源会话成功后一键发起;只读工具面;逐数据集均值结论,一轮收束。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_two(repo, pid, names=("kvasir", "polyp"))
+    # 来源:一次判定成功的研究会话(medium 单 seed 即成功)
+    src = start(client, pid, tier="medium", max_rounds=1)
+    state: dict = {}
+    step0 = stepper(repo, src, ScriptModel(experiment_round(state, "a")))
+    assert step0() == "running" and step0() == "waiting_jobs"
+    finish_job(repo, state["job"], {"val_dice": 0.85})
+    assert step0() == "done"
+    assert al.get_run(repo, src)["result"]["success"]
+
+    resp = client.post(f"/api/owner/projects/{pid}/research/validate",
+                       json={"datasets": ["kvasir", "polyp"], "seeds": 2}, headers=OWNER_H)
+    assert resp.status_code == 200, resp.text
+    vrun = resp.json()["run"]["id"]
+    vrow = al.get_run(repo, vrun)
+    assert vrow["config"]["mode"] == "validation" and vrow["config"]["seeds"] == 2
+    task = json.loads(_row(repo, vrun)["messages_json"])[0]["content"][0]["text"]
+    assert "全量验证任务" in task and "被验证的方案" in task
+    assert "kvasir" in task and "polyp" in task and "2 个 seed" in task
+
+    # 验证会话工具面:没有 write_file / shell
+    env = al.LoopEnv(repo, None,
+                     {"id": vrun, "kind": research_stage.KIND,
+                      "config_json": _row(repo, vrun)["config_json"]},
+                     repo.get_project(pid))
+    names = [t.name for t in research_stage.build_tools(env)]
+    assert "write_file" not in names and "shell" not in names
+    assert "run_experiment" in names and "end_round" in names and "read_file" in names
+
+    vstate: dict = {}
+    jobs = [(f"kv-s{i}", "kvasir", f"python train.py --config-file configs/kvasir.yaml --seed {i}")
+            for i in (1, 2)] + \
+           [(f"po-s{i}", "polyp", f"python train.py --config-file configs/polyp.yaml --seed {i}")
+            for i in (1, 2)]
+    model = ScriptModel([*multi_seed_round(vstate, "v", jobs)])
+    step = stepper(repo, vrun, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    for jid, value in zip(vstate["jobs"], (0.83, 0.83, 0.705, 0.705), strict=True):
+        finish_job(repo, jid, {"val_dice": value})
+    assert step() == "done"
+    result = al.get_run(repo, vrun)["result"]
+    assert result["success"] is True
+    assert len(result["validation"]["datasets"]) == 2
+    assert "kvasir:+0.03" in result["reason"] and "polyp:+0.005" in result["reason"]
+    journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
+    assert "全量验证通过" in journal and "第 1 轮(全量验证)" in journal
 
 
 def test_read_reference_local_and_bounded(api, tmp_path):

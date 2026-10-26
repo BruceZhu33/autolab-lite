@@ -38,8 +38,9 @@ def _schema(properties: dict, required: list[str] | None = None) -> dict:
 
 # ------------------------------------------------------------------ 工作区
 
-def workspace_tools() -> list[Tool]:
-    return [
+def workspace_tools(*, writable: bool = True) -> list[Tool]:
+    """writable=False 供验证型会话:只读诊断,不能改代码(验证的就是当前工作区)。"""
+    tools_list = [
         Tool("read_file", "读工作区文件(带行号,分片)",
              _schema({"path": {"type": "string"}, "offset": {"type": "integer"},
                       "limit": {"type": "integer"}}, ["path"]),
@@ -51,11 +52,14 @@ def workspace_tools() -> list[Tool]:
         Tool("grep", "在工作区搜索(py/yaml/json/md/sh/cfg)",
              _schema({"pattern": {"type": "string"}, "path": {"type": "string"}}, ["pattern"]),
              lambda env, a: env.workspace.grep(a["pattern"], a.get("path") or "")),
-        Tool("write_file", "写整个文件(首次改动前备份原件;.py 语法检查不过自动回滚)",
-             _schema({"path": {"type": "string"}, "content": {"type": "string"},
-                      "reason": {"type": "string"}}, ["path", "content", "reason"]),
-             lambda env, a: env.workspace.write_file(a["path"], a["content"], a["reason"])),
     ]
+    if writable:
+        tools_list.append(
+            Tool("write_file", "写整个文件(首次改动前备份原件;.py 语法检查不过自动回滚)",
+                 _schema({"path": {"type": "string"}, "content": {"type": "string"},
+                          "reason": {"type": "string"}}, ["path", "content", "reason"]),
+                 lambda env, a: env.workspace.write_file(a["path"], a["content"], a["reason"])))
+    return tools_list
 
 
 # 治理(真机前科:agent 用 shell 直改控制端 DB 的 projects 表自救、给平台
@@ -248,9 +252,10 @@ def finish_tool(description: str, properties: dict, required: list[str],
 
 def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
                      allowed_datasets: Callable[[LoopEnv], set[str] | None] | None = None,
+                     dataset_commands: Callable[[LoopEnv], dict[str, str] | None] | None = None,
                      before_submit: Callable[[LoopEnv], None] | None = None) -> list[Tool]:
-    """baseline_ref / allowed_datasets 按会话惰性求值;before_submit 抛 ToolError
-    可拦截提交(如 GPU 预算用完)。"""
+    """baseline_ref / allowed_datasets / dataset_commands 按会话惰性求值;
+    before_submit 抛 ToolError 可拦截提交(如 GPU 预算用完)。"""
 
     def run_experiment(env: LoopEnv, args: dict) -> str:
         if before_submit is not None:
@@ -262,7 +267,8 @@ def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
             metric_file=args.get("metric_file") or "metrics.json",
             timeout_minutes=args.get("timeout_minutes") or 120,
             gpus_per_job=args.get("gpus_per_job") or 1,
-            allowed_datasets=allowed_datasets(env) if allowed_datasets else None)
+            allowed_datasets=allowed_datasets(env) if allowed_datasets else None,
+            dataset_commands=dataset_commands(env) if dataset_commands else None)
         result = experiments.submit(
             env.repo, env.workspace, env.project, request,
             approved_by=f"agent-run:{env.run['id']}",
