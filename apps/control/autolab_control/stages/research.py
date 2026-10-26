@@ -14,8 +14,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..agent import runtime, tools
-from ..agent import knowledge
+from ..agent import knowledge, runtime, tools
 from ..agent.runtime import (
     AgentLoopError,
     Finish,
