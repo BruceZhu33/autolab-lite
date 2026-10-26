@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import json
 
-from ..agent import runtime, tools
-from ..agent import knowledge
+from ..agent import knowledge, runtime, tools
 from ..agent.runtime import AgentLoopError, LoopEnv, LoopProfile, Pause, ToolError
 from ..core.db import utc_now
 from ..core.repo import Repo

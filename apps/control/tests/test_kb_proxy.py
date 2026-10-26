@@ -23,6 +23,7 @@ def _client(kb_env):
     from autolab_control.core.db import Database
     from autolab_control.core.repo import Repo
     from fastapi.testclient import TestClient
+
     from .test_http_api import AGENT, OWNER
 
     tmp = Path(tempfile.mkdtemp())

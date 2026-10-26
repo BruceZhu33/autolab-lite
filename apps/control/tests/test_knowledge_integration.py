@@ -7,7 +7,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-
 from autolab_control.agent import knowledge
 from autolab_control.agent.runtime import ToolError
 from autolab_control.agent.tools import knowledge_tool
