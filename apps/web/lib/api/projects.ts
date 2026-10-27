@@ -30,6 +30,23 @@ export type NewProject =
   | { name: string; server_id: string; source: { kind: "dir"; path: string }; local_workspace?: string }
   | { name: string; server_id: string; source: { kind: "github"; url: string }; local_workspace?: string };
 
+/** 基线版本(研究分叉用):key = current / 历史序号字符串 */
+export type BaselineVersion = {
+  key: string;
+  label: string;
+  passed_at: string | null;
+  run_id: string | null;
+  datasets: string[];
+};
+
+export const fetchBaselineVersions = (projectId: string) =>
+  get<{ versions: BaselineVersion[] }>(`/api/projects/${projectId}/baseline/versions`);
+
+/** 研究分叉:从现有项目的一个基线版本开新方向(worktree 检出代码,数据链接共享,基线继承)。 */
+export const forkProject = (input: {
+  source_project_id: string; name: string; baseline_version?: string;
+}) => post<{ project: Project; code_commit: string }>("/api/owner/projects/fork", input);
+
 export const fetchProjects = () => get<Project[]>("/api/projects");
 export const fetchServerOptions = () => get<ServerOption[]>("/api/servers");
 

@@ -6,6 +6,7 @@ GitHub 重新同步代码」。本机与 SSH 服务器共用同一套逻辑(经�
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import tarfile
@@ -49,6 +50,37 @@ def use_existing_dir(host: Host, workdir: str) -> str:
     if not host.run(f"test -w {q(workdir)}").ok:
         raise UserError(f"目录不可写:{workdir}")
     return workdir.rstrip("/")
+
+
+def fork_workspace(host: Host, source_workdir: str, new_workdir: str, commit: str) -> str:
+    """研究分叉的工作区侧:git worktree 检出目标基线版本的代码(秒级,零拷贝),
+    源工作区里未被 git 跟踪的大目录(数据集/预训练权重)以符号链接共享;
+    .autolab(实验记录/研究日志)与 output*(训练产物)不共享,各自独立。
+    返回新分支名。"""
+    git = f"git -C {q(source_workdir)}"
+    if not host.run(f"{git} rev-parse --is-inside-work-tree").ok:
+        raise UserError("源项目工作区不是 git 仓库,无法分叉;只有 git 工作区支持分叉")
+    if host.run(f"test -e {q(new_workdir)}").ok:
+        raise UserError(f"目标目录已存在:{new_workdir}")
+    branch = "autolab/fork-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = host.run(f"{git} worktree add -b {q(branch)} {q(new_workdir)} {q(commit)}", timeout=120)
+    if not out.ok:
+        raise UserError(f"git worktree 检出失败:{(out.err or out.out).strip()[:200]}")
+    # 共享未跟踪的顶层条目:目录(数据/权重等大件)做符号链接,文件复制;
+    # .autolab 各自记账;output* 是训练产物,共享会互相覆盖,跳过
+    listing = host.run(f"{git} ls-files --others --directory --exclude-standard")
+    tops = sorted({line.strip().split("/")[0]
+                   for line in (listing.out or "").splitlines()
+                   if line.strip() and not line.startswith(".autolab")
+                   and not line.split("/")[0].startswith("output")})
+    for top in tops:
+        src, dst = f"{source_workdir}/{top}", f"{new_workdir}/{top}"
+        if host.run(f"test -d {q(src)}").ok:
+            host.run(f"ln -s {q(src)} {q(dst)}")
+        else:
+            host.run(f"cp -a {q(src)} {q(dst)}")
+    host.run(f"mkdir -p {q(new_workdir)}/.autolab")
+    return branch
 
 
 def _within(path: str, roots: list[str]) -> bool:

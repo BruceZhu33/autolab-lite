@@ -395,7 +395,7 @@ def test_adopt_validation_as_new_baseline(api, tmp_path):
     snapshot = json.loads(project["baseline_json"])
     assert snapshot["run_id"] == vrun and "owner 拍板采纳" in snapshot["notes"]
     assert project["baseline_passed_at"] == snapshot["passed_at"]
-    assert snapshot["history"][0]["datasets"]["kvasir"]["val_dice"] == pytest.approx(0.80)
+    assert snapshot["history"][0]["datasets"]["kvasir"]["metrics"]["val_dice"] == pytest.approx(0.80)
     assert snapshot["datasets"]["kvasir"]["promoted_from"]["run_id"] == vrun
     assert al.get_run(repo, vrun)["result"]["adopted"] is True
     journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
@@ -411,6 +411,81 @@ def test_adopt_validation_as_new_baseline(api, tmp_path):
     cell = next(c for c in board if c["projectId"] == pid)
     assert cell["stages"]["research"]["summary"] == "已采纳为新基线"
     assert cell["stages"]["baseline"]["summary"] == "2 个数据集已确认"
+
+
+def test_fork_project_from_oldest_baseline(api, tmp_path):
+    """研究分叉:worktree 检出目标版本代码、数据目录链接共享、基线整份继承;
+    非 git 工作区拒绝。"""
+    import subprocess as sp
+
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    ws = tmp_path / "ws"
+
+    def git(*args):
+        sp.run(["git", "-C", str(ws), *args], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (ws / "train.py").write_text("print('v1')\n", encoding="utf-8")
+    (ws / "data").mkdir()
+    (ws / "data" / "kvasir.bin").write_text("dataset", encoding="utf-8")
+    git("add", "train.py")
+    git("commit", "-qm", "baseline snapshot")
+    root = sp.run(["git", "-C", str(ws), "rev-parse", "HEAD"],
+                  capture_output=True, text=True).stdout.strip()
+    (ws / "train.py").write_text("print('v2-ema')\n", encoding="utf-8")
+    git("add", "train.py")
+    git("commit", "-qm", "ema-pvl")
+    repo.update_project(pid, baseline_passed_at="2026-10-16T00:00:00Z", baseline_json=json.dumps({
+        "passed_at": "2026-10-27T00:00:00Z", "run_id": "arun-x", "conda_env": "env",
+        "datasets": {"kvasir": {"metrics": {"val_dice": 0.85},
+                                "command": "python train.py --config-file configs/kvasir.yaml",
+                                "dataset_path": "/d"}},
+        "history": [{"passed_at": "2026-10-16T00:00:00Z", "run_id": "arun-v1",
+                     "datasets": {"kvasir": {"val_dice": 0.80}}}]}))
+
+    resp = client.post("/api/owner/projects/fork", headers=OWNER_H, json={
+        "source_project_id": pid, "name": "newdir", "baseline_version": "oldest"})
+    assert resp.status_code == 200, resp.text
+    forked = resp.json()["project"]
+    assert resp.json()["code_commit"] == root
+    assert forked["baselinePassedAt"] == "2026-10-16T00:00:00Z"
+
+    new_ws = tmp_path / "ws-newdir"
+    assert (new_ws / "train.py").read_text(encoding="utf-8") == "print('v1')\n"  # 代码=根提交
+    assert (new_ws / "data" / "kvasir.bin").exists()      # 未跟踪数据目录跟着走(链接)
+    fp = repo.get_project(forked["id"])
+    snap = json.loads(fp["baseline_json"])
+    # 旧格式 history(只有 metrics):指标取 v1,command/dataset_path 从当前条目重建
+    assert snap["datasets"]["kvasir"]["metrics"]["val_dice"] == pytest.approx(0.80)
+    assert snap["datasets"]["kvasir"]["command"] == "python train.py --config-file configs/kvasir.yaml"
+    assert "研究分叉" in snap["notes"]
+    # 源项目原样不动
+    src_snap = json.loads(repo.get_project(pid)["baseline_json"])
+    assert src_snap["datasets"]["kvasir"]["metrics"]["val_dice"] == pytest.approx(0.85)
+
+    # 版本列表
+    resp = client.get(f"/api/projects/{pid}/baseline/versions", headers=OWNER_H)
+    assert resp.status_code == 200
+    keys = [v["key"] for v in resp.json()["versions"]]
+    assert keys[0] == "current" and "0" in keys
+
+    # 非 git 工作区 → 409
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "train.py").write_text("print('x')\n", encoding="utf-8")
+    resp = api["client"].post("/api/owner/projects", json={
+        "name": "plain", "server_id": api["fixture"]["server"]["id"],
+        "workdir": str(plain), "source": {"kind": "dir", "path": str(plain)}}, headers=OWNER_H)
+    pid2 = resp.json()["project"]["id"]
+    repo.update_project(pid2, baseline_passed_at="2026-10-16T00:00:00Z",
+                        baseline_json=json.dumps({"passed_at": "2026-10-16T00:00:00Z",
+                                                  "datasets": {"kvasir": {"metrics": {"val_dice": 0.8}}}}))
+    resp = client.post("/api/owner/projects/fork", headers=OWNER_H, json={
+        "source_project_id": pid2, "name": "fork2"})
+    assert resp.status_code == 409 and "git" in resp.json()["detail"]
 
 
 def test_read_reference_local_and_bounded(api, tmp_path):
