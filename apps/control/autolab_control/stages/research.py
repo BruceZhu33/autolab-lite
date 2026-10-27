@@ -563,6 +563,19 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
 
 # ------------------------------------------------------------------ 采纳为新基线
 
+def code_commit_of_run(repo: Repo, run_id: str) -> str | None:
+    """会话的代码锚点:其 plan 的 code_anchor.git_commit(基线会话早于 git
+    时代时为 None,调用方自行回落,如仓库根提交)。研究分叉用它定位版本代码。"""
+    for plan in _run_plans(repo, run_id, None):
+        try:
+            anchor = json.loads(plan["spec_json"]).get("code_anchor") or {}
+        except ValueError:
+            continue
+        if anchor.get("git_commit"):
+            return str(anchor["git_commit"])
+    return None
+
+
 def _mark_adopted(repo: Repo, run_id: str, result: dict) -> None:
     result = {**(result or {}), "adopted": True, "adoptedAt": utc_now()}
     conn = repo.db.connect()
@@ -652,8 +665,8 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
     history.append({"passed_at": old_snapshot.get("passed_at"),
                     "run_id": old_snapshot.get("run_id"),
                     "notes": old_snapshot.get("notes"),
-                    "datasets": {n: (i or {}).get("metrics")
-                                 for n, i in old_datasets.items()}})
+                    # 完整条目(metrics+command+dataset_path…):研究分叉要整份继承口径
+                    "datasets": old_datasets})
     snapshot = {"passed_at": now, "run_id": run_id,
                 "conda_env": old_snapshot.get("conda_env") or "",
                 "notes": notes[:2000], "datasets": new_datasets,

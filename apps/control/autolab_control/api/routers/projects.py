@@ -1,15 +1,20 @@
-"""项目(立项):登记 / 补全 / 删除、代码同步、论文、资料供给。"""
+"""项目(立项):登记 / 补全 / 删除、代码同步、论文、资料供给、研究分叉。"""
 
 from __future__ import annotations
+
+import json
+import re
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from ...core.errors import NotFound, UserError
 from ...core.ids import new_id
+from ...stages import baseline as baseline_stage
 from ...stages import board
+from ...stages import research as research_stage
 from ...workspace import assets, papers, projects
 from ...workspace.fs import Workspace, open_workspace
-from ...workspace.host import open_host
+from ...workspace.host import open_host, q
 from ..app import Ctx
 
 MAX_UPLOAD = 2 * 1024 * 1024 * 1024  # 2 GiB
@@ -22,6 +27,46 @@ async def _read_zip(file: UploadFile | None) -> bytes:
     if len(data) > MAX_UPLOAD:
         raise HTTPException(413, "zip 超过 2 GiB 上限")
     return data
+
+
+def _slug(name: str) -> str:
+    return (re.sub(r"[^0-9A-Za-z._-]+", "-", name.strip()).strip("-") or "fork")[:40]
+
+
+def _baseline_versions(snapshot: dict) -> list[dict]:
+    """当前 + 历史版本,新(当前)在前;history 旧格式(只有 metrics)也能列出。"""
+    out = [{"key": "current", "label": "当前基线",
+            "passed_at": snapshot.get("passed_at"), "run_id": snapshot.get("run_id"),
+            "datasets": sorted((snapshot.get("datasets") or {}).keys())}]
+    for idx, entry in enumerate(reversed(snapshot.get("history") or [])):
+        out.append({"key": str(len(snapshot.get("history") or []) - 1 - idx),
+                    "label": f"历史基线 v{len(snapshot.get('history') or []) - idx}",
+                    "passed_at": entry.get("passed_at"), "run_id": entry.get("run_id"),
+                    "datasets": sorted((entry.get("datasets") or {}).keys())})
+    return out
+
+
+def _fork_datasets(target: dict, current_snapshot: dict) -> dict:
+    """目标版本的完整数据集条目。history 新格式(完整条目)直接用;
+    旧格式(只有 metrics)用当前条目的 command/dataset_path 重建。"""
+    entries = target.get("datasets") or {}
+    if all(isinstance(v, dict) and v.get("metrics") is not None for v in entries.values()) \
+            and any("command" in v for v in entries.values()):
+        return {str(k): dict(v) for k, v in entries.items()}
+    current = current_snapshot.get("datasets") or {}
+    out: dict = {}
+    for name, metrics in entries.items():
+        base = {k: v for k, v in (current.get(str(name)) or {}).items()
+                if k not in ("metrics", "job_id", "promoted_from")}
+        out[str(name)] = {**base, "metrics": metrics}
+    return out
+
+
+def _version_commit(repo, target: dict) -> str | None:
+    """目标基线版本的代码锚点:该版本来源会话的 plan code_anchor;
+    基线会话早于 git 时代时为 None(调用方回落到仓库根提交)。"""
+    run_id = str(target.get("run_id") or "")
+    return research_stage.code_commit_of_run(repo, run_id) if run_id else None
 
 
 def build(ctx: Ctx) -> APIRouter:
@@ -68,6 +113,83 @@ def build(ctx: Ctx) -> APIRouter:
     @router.get("/api/projects", dependencies=[ctx.reader])
     def list_projects() -> list[dict]:
         return [view(p) for p in repo.list_projects()]
+
+    @router.get("/api/projects/{project_id}/baseline/versions", dependencies=[ctx.reader])
+    def baseline_versions(project_id: str) -> dict:
+        """基线版本(当前+历史),研究分叉的版本选择器用。"""
+        project = project_or_404(project_id)
+        snapshot = baseline_stage.baseline_snapshot(project)
+        if not snapshot.get("datasets"):
+            raise HTTPException(409, "还没有确认过的基线")
+        return {"versions": _baseline_versions(snapshot)}
+
+    @router.post("/api/owner/projects/fork", dependencies=[ctx.owner])
+    def fork_project(payload: dict) -> dict:
+        """研究分叉:从现有项目的一个基线版本开新方向。git worktree 检出该版本
+        代码(秒级零拷贝),数据/权重目录符号链接共享,基线快照整份继承,
+        研究记录从零开始;源项目原地不动。"""
+        source = repo.get_project(str(payload.get("source_project_id") or ""))
+        if source is None:
+            raise HTTPException(404, "源项目不存在")
+        name = (payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "name 为必填")
+        source_dir = (source.get("remote_workdir") or "").strip().rstrip("/")
+        if not source_dir:
+            raise HTTPException(409, "源项目没有服务器工作区,无法分叉")
+        snapshot = baseline_stage.baseline_snapshot(source)
+        if not snapshot.get("datasets"):
+            raise HTTPException(409, "源项目还没有确认过的基线,无法分叉")
+        history = snapshot.get("history") or []
+        pick = str(payload.get("baseline_version") or "oldest")
+        if pick in ("oldest", "0") and not history:
+            target, label = snapshot, "当前基线"
+        elif pick == "current":
+            target, label = snapshot, "当前基线"
+        else:
+            try:
+                idx = int(pick)
+            except ValueError:
+                raise HTTPException(400, "baseline_version 取值:oldest/current/历史序号") from None
+            if not 0 <= idx < len(history):
+                raise HTTPException(400, f"版本序号超出(可选 0..{len(history) - 1})")
+            target, label = history[idx], f"历史基线(第 {idx + 1} 个)"
+
+        with open_host(repo, credentials, source["server_id"]) as host:
+            commit = _version_commit(repo, target)
+            if commit is None:  # 早于 git 时代的版本:仓库根提交 = 第一次改码前的原始代码
+                out = host.run(f"git -C {q(source_dir)} rev-list --max-parents=0 HEAD")
+                if not out.ok or not out.out.strip():
+                    raise HTTPException(409, "无法定位该版本的代码锚点(工作区不是 git 仓库?)")
+                commit = out.out.strip().splitlines()[-1]
+            suffix = _slug(name)
+            new_dir = f"{source_dir}-{suffix}"
+            n = 2
+            while host.run(f"test -e {q(new_dir)}").ok:  # 同名分叉:追加序号
+                new_dir = f"{source_dir}-{suffix}-{n}"
+                n += 1
+            try:
+                projects.fork_workspace(host, source_dir, new_dir, commit)
+            except UserError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            projects.prepare_workspace(host, new_dir)
+            server = repo.get_server(source["server_id"])
+            out_root = f"{new_dir}/output"
+            if server:
+                projects.ensure_within_roots(server, new_dir, out_root)
+        project = repo.add_project(name=name, server_id=source["server_id"],
+                                   workdir=new_dir, output_root=out_root,
+                                   project_id=new_id("proj"))
+        datasets = _fork_datasets(target, snapshot)
+        forked = {"passed_at": target.get("passed_at"), "run_id": target.get("run_id"),
+                  "conda_env": snapshot.get("conda_env") or "",
+                  "notes": (f"研究分叉:源自 {source['name']} 的{label}"
+                            f"(代码 {commit[:8]})。\n{target.get('notes') or ''}")[:2000],
+                  "datasets": datasets}
+        repo.update_project(project["id"],
+                            baseline_json=json.dumps(forked, ensure_ascii=False),
+                            baseline_passed_at=target.get("passed_at"))
+        return {"project": view(repo.get_project(project["id"])), "code_commit": commit}
 
     @router.post("/api/owner/projects", dependencies=[ctx.owner])
     def create_project(payload: dict) -> dict:
