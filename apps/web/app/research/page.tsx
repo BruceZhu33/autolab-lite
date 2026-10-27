@@ -4,8 +4,8 @@
 
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
-import { BadgeCheck, Lightbulb } from "lucide-react";
-import { fetchLatestRun, fetchResearchRounds, isActive, type Project } from "@/lib/api";
+import { BadgeCheck, FlaskConical, Lightbulb } from "lucide-react";
+import { fetchLatestRun, fetchProjectDatasets, fetchResearchRounds, isActive, type Project } from "@/lib/api";
 import { RunPanel } from "@/components/agent-run/panel";
 import { ProjectTabs, useProjectSelection } from "@/components/project-picker";
 import { ResearchJournal } from "@/components/research/journal";
@@ -15,6 +15,46 @@ import { ValidateLaunch } from "@/components/research/validate-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-header";
+
+function BaselineCard({ project }: { project: Project }) {
+  const { data } = useQuery({
+    queryKey: ["datasets", project.id],
+    queryFn: () => fetchProjectDatasets(project.id),
+  });
+  const badge = data?.baseline;
+  const confirmed = (data?.datasets ?? []).filter((d) => d.state === "confirmed");
+  if (!badge) return null;
+  return (
+    <div className="rounded-xl border-[0.5px] border-surface-border bg-card p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <FlaskConical className="size-4 text-brand" />
+        <span className="text-caption font-semibold">对比基线</span>
+        <span className={`rounded-full px-2 py-0.5 text-micro font-medium ${
+          badge.kind === "adopted" ? "bg-success/10 text-success"
+            : badge.kind === "forked" ? "bg-info/10 text-info" : "bg-muted/60 text-muted-foreground"}`}>
+          {badge.version} · {badge.label}({badge.kindLabel} {badge.date})
+        </span>
+        {badge.forkedFrom ? (
+          <span className="text-micro text-muted-foreground">← 分叉自 {badge.forkedFrom}</span>
+        ) : null}
+        <span className="ml-auto text-micro text-muted-foreground">
+          研究会话的实验都和下面这组数字比
+        </span>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {confirmed.map((d) => (
+          <span key={d.name} className="rounded-full bg-muted/50 px-2 py-0.5 font-mono text-micro tabular-nums"
+                title={d.command}>
+            {d.name}{" "}
+            {Object.entries(d.metrics ?? {})
+              .map(([k, v]) => `${k} ${typeof v === "number" ? v.toFixed(4) : v}`)
+              .join(" · ")}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function ResearchSection({ project }: { project: Project }) {
   const { data } = useQuery({
@@ -41,6 +81,7 @@ function ResearchSection({ project }: { project: Project }) {
   const canAdopt = !!run && !isActive(run) && validated && !result?.adopted;
   return (
     <div className="space-y-3">
+      <BaselineCard project={project} />
       {!isActive(run) ? <ResearchStartForm project={project} /> : null}
       {run ? <RunPanel key={run.id} project={project} run={run} /> : null}
       {canAdopt ? (

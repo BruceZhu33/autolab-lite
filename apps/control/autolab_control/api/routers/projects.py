@@ -91,6 +91,7 @@ def build(ctx: Ctx) -> APIRouter:
             "localWorkspace": project.get("local_workspace"),
             "papersCount": project.get("papers_count") or 0,
             "baselinePassedAt": project.get("baseline_passed_at"),
+            "baseline": baseline_stage.baseline_label(project),
             "stage": card["stage"], "stages": card["stages"], "needsYou": card["needsYou"],
             "updated_at": card["updatedAt"],
         }
@@ -183,6 +184,10 @@ def build(ctx: Ctx) -> APIRouter:
         datasets = _fork_datasets(target, snapshot)
         forked = {"passed_at": target.get("passed_at"), "run_id": target.get("run_id"),
                   "conda_env": snapshot.get("conda_env") or "",
+                  "version_label": target.get("version_label")
+                  or ("原始基线" if (pick == "oldest" or pick == "0") else label),
+                  "fork": {"source_project_id": source["id"], "source_name": source["name"],
+                           "base_label": label, "code_commit": commit},
                   "notes": (f"研究分叉:源自 {source['name']} 的{label}"
                             f"(代码 {commit[:8]})。\n{target.get('notes') or ''}")[:2000],
                   "datasets": datasets}

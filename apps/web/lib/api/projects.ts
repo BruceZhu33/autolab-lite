@@ -3,6 +3,16 @@
 import { get, post, request } from "./client";
 import type { StageCell, StageKey } from "./system";
 
+/** 基线版本徽标:一眼分清项目现在拿什么当对比对象 */
+export type BaselineBadge = {
+  version: string;       // v1 / v2 …
+  label: string;         // 原始基线 / EMA-PVL / …
+  kind: "confirmed" | "adopted" | "forked";
+  kindLabel: string;     // 原始 / 采纳 / 分叉
+  date: string;          // YYYY-MM-DD
+  forkedFrom?: string;   // 分叉来源项目名
+};
+
 export type Project = {
   id: string;
   name: string;
@@ -13,6 +23,7 @@ export type Project = {
   localWorkspace: string | null;
   papersCount: number;
   baselinePassedAt: string | null;
+  baseline?: BaselineBadge | null;
   stage: StageKey;
   stages: Record<StageKey, StageCell>;
   needsYou: boolean;

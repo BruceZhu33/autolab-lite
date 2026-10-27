@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import {
-  FileText, FlaskConical, FolderKanban, Link2, MoreHorizontal, Pencil, RefreshCw,
+  FileText, FlaskConical, FolderKanban, GitFork, Link2, MoreHorizontal, Pencil, RefreshCw,
   Server as ServerIcon, Trash2,
 } from "lucide-react";
 import type { Project, StageKey, StageState } from "@/lib/api";
@@ -15,6 +15,11 @@ import {
 const STAGE_LABEL: Record<StageKey, string> = { setup: "立项", baseline: "Baseline", research: "研究" };
 const DOT: Record<StageState, string> = {
   done: "bg-success", active: "bg-brand", attention: "bg-warning", pending: "bg-muted-foreground/30",
+};
+const BASELINE_KIND_CLS: Record<string, string> = {
+  confirmed: "bg-muted/60 text-muted-foreground",
+  adopted: "bg-success/10 text-success",
+  forked: "bg-info/10 text-info",
 };
 
 export function ProjectCard({ project, onEdit, onSync, onDelete }: {
@@ -42,6 +47,23 @@ export function ProjectCard({ project, onEdit, onSync, onDelete }: {
       <p className="mt-1 truncate font-mono text-micro text-muted-foreground" title={project.workdir}>
         {project.workdir || "未设置工作区(编辑补全)"}
       </p>
+      {project.baseline ? (
+        <div className="mt-2 flex items-center gap-1.5">
+          <span className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-micro font-medium ${
+            BASELINE_KIND_CLS[project.baseline.kind] ?? BASELINE_KIND_CLS.confirmed}`}
+                title={`对比基线 ${project.baseline.version} · ${project.baseline.label}`
+                       + (project.baseline.forkedFrom ? ` · 分叉自 ${project.baseline.forkedFrom}` : "")}>
+            {project.baseline.kind === "forked" ? <GitFork className="size-3" /> : null}
+            基线 {project.baseline.version} · {project.baseline.label}
+            <span className="opacity-60">({project.baseline.kindLabel} {project.baseline.date})</span>
+          </span>
+          {project.baseline.forkedFrom ? (
+            <span className="truncate text-micro text-muted-foreground">
+              ← {project.baseline.forkedFrom}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
       <div className="mt-2 flex flex-wrap items-center gap-1.5 text-micro">
         {project.githubUrl ? (
           <span className="inline-flex items-center gap-1 rounded-full bg-muted/60 px-1.5 py-0.5 text-muted-foreground"

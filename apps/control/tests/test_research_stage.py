@@ -394,6 +394,8 @@ def test_adopt_validation_as_new_baseline(api, tmp_path):
     project = repo.get_project(pid)
     snapshot = json.loads(project["baseline_json"])
     assert snapshot["run_id"] == vrun and "owner 拍板采纳" in snapshot["notes"]
+    assert snapshot["version_label"]                     # adopt 打版本标签
+    assert snapshot["history"][0]["version_label"] == "原始基线"
     assert project["baseline_passed_at"] == snapshot["passed_at"]
     assert snapshot["history"][0]["datasets"]["kvasir"]["metrics"]["val_dice"] == pytest.approx(0.80)
     assert snapshot["datasets"]["kvasir"]["promoted_from"]["run_id"] == vrun
@@ -462,6 +464,14 @@ def test_fork_project_from_oldest_baseline(api, tmp_path):
     assert snap["datasets"]["kvasir"]["metrics"]["val_dice"] == pytest.approx(0.80)
     assert snap["datasets"]["kvasir"]["command"] == "python train.py --config-file configs/kvasir.yaml"
     assert "研究分叉" in snap["notes"]
+    assert snap["version_label"] == "原始基线"
+    assert snap["fork"]["source_name"] == "bl"
+    # datasets 端点带基线徽标(研究页「对比基线」卡数据源)
+    resp = client.get(f"/api/projects/{forked['id']}/datasets", headers=OWNER_H)
+    assert resp.status_code == 200
+    badge = resp.json()["baseline"]
+    assert badge["version"] == "v1" and badge["kind"] == "forked"
+    assert badge["forkedFrom"] == "bl"
     # 源项目原样不动
     src_snap = json.loads(repo.get_project(pid)["baseline_json"])
     assert src_snap["datasets"]["kvasir"]["metrics"]["val_dice"] == pytest.approx(0.85)
