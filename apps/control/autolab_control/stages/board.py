@@ -53,9 +53,12 @@ def project_card(repo: Repo, project: dict) -> dict:
     elif res_run["status"] == "done":
         result = res_run.get("result") or {}
         if (res_run.get("config") or {}).get("mode") == "validation":
-            summary = str(result.get("reason") or "全量验证完成")
-            res = _cell("done" if result.get("success") else "attention",
-                        summary[:60], link)
+            if result.get("adopted"):
+                res = _cell("done", "已采纳为新基线", link)
+            else:
+                summary = str(result.get("reason") or "全量验证完成")
+                res = _cell("done" if result.get("success") else "attention",
+                            summary[:60], link)
         else:
             best = result.get("bestGain")
             res = (_cell("done", f"{rounds} 轮,超越基线 {best:+.4g}", link)
