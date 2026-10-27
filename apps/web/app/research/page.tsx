@@ -10,6 +10,7 @@ import { RunPanel } from "@/components/agent-run/panel";
 import { ProjectTabs, useProjectSelection } from "@/components/project-picker";
 import { ResearchJournal } from "@/components/research/journal";
 import { ResearchStartForm } from "@/components/research/start-form";
+import { AdoptButton } from "@/components/research/adopt-button";
 import { ValidateLaunch } from "@/components/research/validate-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "~/vendor/ui/components/ui/button";
@@ -28,16 +29,49 @@ function ResearchSection({ project }: { project: Project }) {
     enabled: !!run,
     refetchInterval: isActive(run) ? 5000 : false,
   });
-  const result = (run?.result ?? null) as { success?: boolean; champion?: {
-    round: number; label?: string | null; dataset?: string | null;
-    n: number; meanGain: number;
-  } } | null;
+  const result = (run?.result ?? null) as { success?: boolean; adopted?: boolean; adoptedAt?: string;
+    champion?: {
+      round: number; label?: string | null; dataset?: string | null;
+      n: number; meanGain: number;
+    };
+    validation?: { datasets?: string[] };
+  } | null;
   const validated = run?.config?.mode === "validation";
   const canValidate = !!run && !isActive(run) && !validated && !!result?.success;
+  const canAdopt = !!run && !isActive(run) && validated && !result?.adopted;
   return (
     <div className="space-y-3">
       {!isActive(run) ? <ResearchStartForm project={project} /> : null}
       {run ? <RunPanel key={run.id} project={project} run={run} /> : null}
+      {canAdopt ? (
+        <div className={`space-y-2 rounded-xl border-[0.5px] p-3 ${
+          result?.success ? "border-success/40 bg-success/5" : "border-warning/50 bg-warning/5"}`}>
+          <div className="flex flex-wrap items-center gap-2">
+            <BadgeCheck className={`size-4 ${result?.success ? "text-success" : "text-warning"}`} />
+            <p className="min-w-0 flex-1 text-caption">
+              验证完成{result?.success ? "" : "(结论:未通过)"},是否把这套实测
+              <span className="font-medium">采纳为新的基线</span>?
+              {!result?.success ? "——你可以拍板采纳,验证结论会原样留痕。" : ""}
+            </p>
+            <AdoptButton project={project} runId={run.id} />
+          </div>
+          <ul className="space-y-0.5 pl-6 text-micro text-muted-foreground">
+            {(result?.validation?.datasets ?? []).map((d) => <li key={d}>{d}</li>)}
+          </ul>
+          <p className="text-micro text-muted-foreground">
+            采纳 = 每个数据集的基线更新为本次实测均值(旧快照入历史);下一轮研究将对比新基线。
+          </p>
+        </div>
+      ) : null}
+      {validated && result?.adopted ? (
+        <div className="flex items-center gap-2 rounded-xl border-[0.5px] border-success/40 bg-success/5 p-3">
+          <BadgeCheck className="size-4 text-success" />
+          <p className="text-caption">
+            已采纳为新基线{result.adoptedAt ? `(${result.adoptedAt.slice(0, 16).replace("T", " ")})` : ""}
+            ——研究页可以开始下一轮迭代,对比对象已是新基线。
+          </p>
+        </div>
+      ) : null}
       {canValidate ? (
         <div className="flex flex-wrap items-center gap-2 rounded-xl border-[0.5px] border-success/40 bg-success/5 p-3">
           <BadgeCheck className="size-4 text-success" />

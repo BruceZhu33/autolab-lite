@@ -143,6 +143,11 @@ export const startValidation = (projectId: string, input: {
   datasets?: string[]; seeds?: number; source_run_id?: string; gpu_hours?: number;
 }) => post<{ run: Run }>(`/api/owner/projects/${projectId}/research/validate`, input);
 
+/** 采纳全量验证会话的实测为新基线(owner 决策;未通过也可拍板,留痕)。 */
+export const adoptValidation = (projectId: string, runId: string) =>
+  post<{ adopted: { baseline: Record<string, Record<string, number>>; unmeasured: string[] } }>(
+    `/api/owner/projects/${projectId}/research/adopt`, { run_id: runId });
+
 export const fetchResearchRounds = (projectId: string, runId?: string) =>
   get<{ rounds: ResearchRound[] }>(
     `/api/projects/${projectId}/research/rounds${runId ? `?run_id=${runId}` : ""}`);

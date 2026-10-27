@@ -74,6 +74,13 @@ def build(ctx: Ctx) -> APIRouter:
             source_run_id=str(payload.get("source_run_id") or "").strip() or None,
             gpu_hours=float(gpu_hours) if gpu_hours not in (None, "") else None)}
 
+    @router.post("/api/owner/projects/{project_id}/research/adopt",
+                 dependencies=[ctx.owner])
+    def research_adopt(project_id: str, payload: dict) -> dict:
+        """采纳全量验证会话的实测为新基线(owner 决策;验证未通过也可拍板采纳,留痕)。"""
+        return {"adopted": research.adopt(repo, ctx.credentials, project_id,
+                                          str(payload.get("run_id") or "").strip())}
+
     @router.get("/api/projects/{project_id}/research/rounds", dependencies=[ctx.reader])
     def research_rounds(project_id: str, run_id: str | None = None) -> dict:
         return {"rounds": research.list_rounds(repo, project_id, run_id),

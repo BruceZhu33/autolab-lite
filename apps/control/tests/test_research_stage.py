@@ -350,6 +350,69 @@ def test_validation_session_e2e(api, tmp_path):
     assert "全量验证通过" in journal and "第 1 轮(全量验证)" in journal
 
 
+def test_adopt_validation_as_new_baseline(api, tmp_path):
+    """采纳:验证实测(全指标均值)覆盖基线,旧快照入历史;未通过也可拍板,留痕。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_two(repo, pid, names=("kvasir", "polyp"))
+    src = start(client, pid, tier="medium", max_rounds=1)
+    state: dict = {}
+    step0 = stepper(repo, src, ScriptModel(experiment_round(
+        state, "a", command="python train.py --config-file configs/kvasir.yaml --attn")))
+    assert step0() == "running" and step0() == "waiting_jobs"
+    finish_job(repo, state["job"], {"val_dice": 0.85})
+    assert step0() == "done"
+
+    resp = client.post(f"/api/owner/projects/{pid}/research/validate",
+                       json={"datasets": ["kvasir", "polyp"], "seeds": 2}, headers=OWNER_H)
+    vrun = resp.json()["run"]["id"]
+    vstate: dict = {}
+    jobs = [(f"kv-s{i}", "kvasir", f"python train.py --config-file configs/kvasir.yaml --seed {i}")
+            for i in (1, 2)] + \
+           [(f"po-s{i}", "polyp", f"python train.py --config-file configs/polyp.yaml --seed {i}")
+            for i in (1, 2)]
+    step = stepper(repo, vrun, ScriptModel([*multi_seed_round(vstate, "v", jobs)]))
+    assert step() == "running" and step() == "waiting_jobs"
+    # kvasir 均值 0.835(+0.035 ✓);polyp 均值 0.6925(-0.0075 ✗)→ 验证未通过
+    for jid, value in zip(vstate["jobs"], (0.83, 0.84, 0.69, 0.695), strict=True):
+        finish_job(repo, jid, {"val_dice": value})
+    assert step() == "done"
+    assert al.get_run(repo, vrun)["result"]["success"] is False
+
+    # 非验证会话不可采纳
+    resp = client.post(f"/api/owner/projects/{pid}/research/adopt",
+                       json={"run_id": src}, headers=OWNER_H)
+    assert resp.status_code == 409 and "全量验证" in resp.json()["detail"]
+
+    # 采纳(未通过,owner 拍板)
+    resp = client.post(f"/api/owner/projects/{pid}/research/adopt",
+                       json={"run_id": vrun}, headers=OWNER_H)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["adopted"]
+    assert body["baseline"]["kvasir"]["val_dice"] == pytest.approx(0.835)
+    assert body["baseline"]["polyp"]["val_dice"] == pytest.approx(0.6925)
+    project = repo.get_project(pid)
+    snapshot = json.loads(project["baseline_json"])
+    assert snapshot["run_id"] == vrun and "owner 拍板采纳" in snapshot["notes"]
+    assert project["baseline_passed_at"] == snapshot["passed_at"]
+    assert snapshot["history"][0]["datasets"]["kvasir"]["val_dice"] == pytest.approx(0.80)
+    assert snapshot["datasets"]["kvasir"]["promoted_from"]["run_id"] == vrun
+    assert al.get_run(repo, vrun)["result"]["adopted"] is True
+    journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
+    assert "基线晋级" in journal and "owner 拍板采纳" in journal
+
+    # 重复采纳 → 拒绝
+    resp = client.post(f"/api/owner/projects/{pid}/research/adopt",
+                       json={"run_id": vrun}, headers=OWNER_H)
+    assert resp.status_code == 409 and "已采纳" in resp.json()["detail"]
+
+    # 看板:研究格显示已采纳;基线格仍是确认池
+    board = client.get("/api/board", headers=OWNER_H).json()
+    cell = next(c for c in board if c["projectId"] == pid)
+    assert cell["stages"]["research"]["summary"] == "已采纳为新基线"
+    assert cell["stages"]["baseline"]["summary"] == "2 个数据集已确认"
+
+
 def test_read_reference_local_and_bounded(api, tmp_path):
     repo = api["repo"]
     pid = make_project(api, tmp_path)

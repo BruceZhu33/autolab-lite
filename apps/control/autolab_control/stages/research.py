@@ -29,8 +29,11 @@ from ..core.db import utc_now
 from ..core.ids import new_id
 from ..core.repo import TERMINAL_JOB_STATUSES, Repo
 from ..execution.comparison import compare_plan, variant_means
+from ..execution.experiments import job_metrics
 from ..workspace import refs
-from .baseline import baseline_pool
+from ..workspace.fs import Workspace
+from ..workspace.host import open_host
+from .baseline import baseline_pool, baseline_snapshot
 
 KIND = "research"
 ROUND_REVIEW_KIND = "round_review"
@@ -555,7 +558,119 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
               "kb_assist": bool(kb_assist),
               "kb_spaces": [s for s in (kb_spaces or []) if s] or None}
     return runtime.start_run(repo, project_id, KIND,
-                                build_task(repo, project, config, run_id=None), config)
+                             build_task(repo, project, config, run_id=None), config)
+
+
+# ------------------------------------------------------------------ 采纳为新基线
+
+def _mark_adopted(repo: Repo, run_id: str, result: dict) -> None:
+    result = {**(result or {}), "adopted": True, "adoptedAt": utc_now()}
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            conn.execute("UPDATE agent_runs SET result_json = ?, updated_at = ?"
+                         " WHERE id = ?",
+                         (json.dumps(result, ensure_ascii=False), utc_now(), run_id))
+    finally:
+        conn.close()
+
+
+def _append_journal(repo: Repo, credentials, project: dict, text: str) -> None:
+    """研究日志(.md)落一笔基线晋级——会话外写入,自建 host 句柄。"""
+    host = open_host(repo, credentials, project["server_id"])
+    try:
+        ws = Workspace(host, project.get("remote_workdir") or "")
+        old = ws.read_bytes(JOURNAL_REL).decode("utf-8") if ws.exists(JOURNAL_REL) \
+            else "# 研究日志\n\n"
+        ws.write_bytes(JOURNAL_REL, (old + text).encode("utf-8"))
+    finally:
+        host.close()
+
+
+def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
+    """采纳全量验证会话的实测为新基线(owner 决策动作,闭环最后一环)。
+
+    - 逐数据集汇总该验证会话全部成功 Job 的**全指标均值**覆盖基线;
+      未测到的次指标沿用旧值,完全没跑的数据集保持旧基线并在 notes 标注
+    - 旧快照进 history(留最近 5 版),notes 记溯源与逐数据集结论
+    - 会话 result 标 adopted(看板/研究页显示「已采纳」);研究日志落一笔
+    - 允许在验证「未通过」时由 owner 拍板采纳(局部取舍),结论原样留痕
+    """
+    project = repo.get_project(project_id)
+    if project is None:
+        raise AgentLoopError(f"项目 {project_id} 不存在")
+    old_snapshot = baseline_snapshot(project)
+    if not old_snapshot.get("datasets"):
+        raise AgentLoopError("还没有确认过的基线快照")
+    run = runtime.get_run(repo, run_id) if run_id else None
+    if run is None or run.get("projectId") != project_id or run.get("kind") != KIND:
+        raise AgentLoopError("会话不存在或不属于本项目")
+    if run.get("status") != "done":
+        raise AgentLoopError("只能采纳已完成的会话")
+    if (run.get("config") or {}).get("mode") != "validation":
+        raise AgentLoopError("只能采纳全量验证会话的结果;研究探索会话请先跑全量验证")
+    result = run.get("result") or {}
+    if result.get("adopted"):
+        raise AgentLoopError("该会话的结果已采纳过")
+
+    measured: dict[str, dict[str, list[float]]] = {}
+    jobs_of: dict[str, list[str]] = {}
+    for plan in _run_plans(repo, run_id, None):
+        for job in repo.list_jobs(plan_id=plan["id"]):
+            dataset = str((json.loads(job["params_json"] or "{}")).get("dataset") or "")
+            if job["status"] != "SUCCEEDED" or dataset not in old_snapshot["datasets"]:
+                continue
+            for key, value in (job_metrics(repo, job["id"]) or {}).items():
+                if isinstance(value, (int, float)):
+                    measured.setdefault(dataset, {}).setdefault(key, []).append(float(value))
+            jobs_of.setdefault(dataset, []).append(job["id"])
+    if not measured:
+        raise AgentLoopError("该验证会话没有成功的实验,无从采纳")
+
+    now = utc_now()
+    old_datasets = dict(old_snapshot["datasets"])
+    new_datasets: dict[str, dict] = {}
+    for name, info in old_datasets.items():
+        values = measured.get(name)
+        if not values:
+            new_datasets[name] = {**info}          # 没跑到的:保持旧基线
+            continue
+        averaged = {k: sum(v) / len(v) for k, v in values.items() if v}
+        new_datasets[name] = {
+            **info,
+            "metrics": {**(info.get("metrics") or {}), **averaged},   # 未测到的次指标沿用
+            "job_id": jobs_of[name][0],
+            "promoted_from": {"run_id": run_id, "at": now, "jobs": jobs_of[name]},
+        }
+    verdicts = (result.get("validation") or {}).get("datasets") or []
+    unmeasured = [n for n in old_datasets if n not in measured]
+    notes = (f"采纳全量验证会话 {run_id} 的实测为新基线(验证结论:"
+             f"{'通过' if result.get('success') else '未通过,owner 拍板采纳'});"
+             + ";".join(str(v) for v in verdicts)[:800]
+             + (f";未实测沿用旧基线:{','.join(unmeasured)}" if unmeasured else ""))
+    history = list(old_snapshot.get("history") or [])
+    history.append({"passed_at": old_snapshot.get("passed_at"),
+                    "run_id": old_snapshot.get("run_id"),
+                    "notes": old_snapshot.get("notes"),
+                    "datasets": {n: (i or {}).get("metrics")
+                                 for n, i in old_datasets.items()}})
+    snapshot = {"passed_at": now, "run_id": run_id,
+                "conda_env": old_snapshot.get("conda_env") or "",
+                "notes": notes[:2000], "datasets": new_datasets,
+                "history": history[-5:]}
+    repo.update_project(project_id, baseline_passed_at=now,
+                        baseline_json=json.dumps(snapshot, ensure_ascii=False))
+    _mark_adopted(repo, run_id, result)
+    champion_hypothesis = ((run.get("config") or {}).get("champion") or {}).get("hypothesis")
+    _append_journal(repo, credentials, project, (
+        f"\n## 基线晋级({now[:10]})\n\n"
+        f"- 采纳全量验证会话 {run_id} 的实测为新基线"
+        f"(验证结论:{'通过' if result.get('success') else '未通过,owner 拍板采纳'})。\n"
+        f"- 方案:{champion_hypothesis or '见上轮研究记录'}\n"
+        + "".join(f"- {v}\n" for v in verdicts)
+        + (f"- 未实测沿用旧基线:{','.join(unmeasured)}\n" if unmeasured else "")))
+    return {"baseline": {n: i.get("metrics") for n, i in new_datasets.items()},
+            "unmeasured": unmeasured}
 
 
 def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None = None,
