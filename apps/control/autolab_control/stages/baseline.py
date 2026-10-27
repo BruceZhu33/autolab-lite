@@ -70,6 +70,31 @@ def baseline_pool(project: dict) -> dict[str, dict]:
         if isinstance(datasets, dict) else {}
 
 
+def baseline_label(project: dict) -> dict | None:
+    """基线版本徽标(UI 投影):v 几、是什么(原始/采纳/分叉)、何时、分叉自谁。
+    version_label / fork 结构化字段缺失时按形态推断,老数据也有合理显示——
+    用户需要一眼分清「这个项目现在拿什么当对比对象」。"""
+    snapshot = baseline_snapshot(project)
+    if not snapshot.get("datasets"):
+        return None
+    history = snapshot.get("history") or []
+    fork = snapshot.get("fork") or {}
+    if fork.get("source_name"):
+        kind, kind_label = "forked", "分叉"
+    elif any("promoted_from" in (d or {}) for d in snapshot["datasets"].values()) \
+            or str(snapshot.get("notes") or "").startswith("采纳"):
+        kind, kind_label = "adopted", "采纳"
+    else:
+        kind, kind_label = "confirmed", "原始"
+    label = snapshot.get("version_label") or ("原始基线" if not history else "")
+    if not label:
+        label = f"第 {len(history) + 1} 版基线"
+    return {"version": f"v{len(history) + 1}", "label": str(label)[:40],
+            "kind": kind, "kindLabel": kind_label,
+            "date": str(snapshot.get("passed_at") or "")[:10],
+            "forkedFrom": fork.get("source_name")}
+
+
 def dataset_states(repo: Repo, project_id: str) -> list[dict]:
     """按数据集聚合状态(UI 投影,全部从事实派生,不依赖 agent 自报):
     confirmed = owner 已确认的基线快照;ran/running/failed = Job 实况;

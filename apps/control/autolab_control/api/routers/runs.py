@@ -43,8 +43,11 @@ def build(ctx: Ctx) -> APIRouter:
 
     @router.get("/api/projects/{project_id}/datasets", dependencies=[ctx.reader])
     def project_datasets(project_id: str) -> dict:
-        """按数据集聚合状态:已确认 / 已跑 / 待补充(UI 投影,事实派生)。"""
-        return {"datasets": baseline.dataset_states(repo, project_id)}
+        """按数据集聚合状态:已确认 / 已跑 / 待补充(UI 投影,事实派生)。
+        baseline = 当前对比基线的版本徽标(v 几/原始·采纳·分叉/日期/分叉自谁)。"""
+        project = repo.get_project(project_id)
+        return {"datasets": baseline.dataset_states(repo, project_id),
+                "baseline": baseline.baseline_label(project) if project else None}
 
     @router.post("/api/owner/projects/{project_id}/research/start", dependencies=[ctx.owner])
     def research_start(project_id: str, payload: dict) -> dict:

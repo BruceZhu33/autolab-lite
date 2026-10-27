@@ -665,10 +665,17 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
     history.append({"passed_at": old_snapshot.get("passed_at"),
                     "run_id": old_snapshot.get("run_id"),
                     "notes": old_snapshot.get("notes"),
+                    "version_label": old_snapshot.get("version_label")
+                    or ("原始基线" if not history else ""),
                     # 完整条目(metrics+command+dataset_path…):研究分叉要整份继承口径
                     "datasets": old_datasets})
+    champion = result.get("champion") or {}
+    config_champion = (run.get("config") or {}).get("champion") or {}
+    version_label = str(champion.get("label") or config_champion.get("label") or "") \
+        .strip()[:40] or f"采纳晋级({now[:10]})"
     snapshot = {"passed_at": now, "run_id": run_id,
                 "conda_env": old_snapshot.get("conda_env") or "",
+                "version_label": version_label,
                 "notes": notes[:2000], "datasets": new_datasets,
                 "history": history[-5:]}
     repo.update_project(project_id, baseline_passed_at=now,

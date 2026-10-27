@@ -67,7 +67,8 @@ export type DatasetState = {
   runId?: string;
 };
 export const fetchProjectDatasets = (projectId: string) =>
-  get<{ datasets: DatasetState[] }>(`/api/projects/${projectId}/datasets`);
+  get<{ datasets: DatasetState[]; baseline?: import("./projects").BaselineBadge | null }>(
+    `/api/projects/${projectId}/datasets`);
 
 export type ResearchTier = "light" | "medium" | "heavy";
 
