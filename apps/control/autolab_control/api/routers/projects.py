@@ -142,10 +142,10 @@ def build(ctx: Ctx) -> APIRouter:
             raise HTTPException(409, "源项目还没有确认过的基线,无法分叉")
         history = snapshot.get("history") or []
         pick = str(payload.get("baseline_version") or "oldest")
-        if pick in ("oldest", "0") and not history:
+        if pick == "current" or (pick == "oldest" and not history):
             target, label = snapshot, "当前基线"
-        elif pick == "current":
-            target, label = snapshot, "当前基线"
+        elif pick == "oldest":
+            target, label = history[0], "最初基线"
         else:
             try:
                 idx = int(pick)
