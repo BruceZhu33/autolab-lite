@@ -1,5 +1,7 @@
 # AutoLab Lite
 
+[![CI](https://github.com/BruceZhu33/autolab-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/BruceZhu33/autolab-lite/actions/workflows/ci.yml)
+
 个人研究者的 GPU 自动化科研工作台。研究流程 = 三段 workflow,段内交给 agent:
 
 - **立项**(无 agent):选服务器,放代码(已有目录 / GitHub / zip)与论文;
@@ -120,4 +122,5 @@ uv run autolab project add ...
 ```
 
 - 模型 key:控制台 Settings 页(存凭据文件 `model:api-key`;旧 `chatagent:api-key` 兼容)。
-- CI 尚未建立;Runner 的 Python 3.10 兼容目前靠语法约束与本地审查保证。
+- CI(GitHub Actions):每个 push/PR 跑 `ruff check` + 单测(不含 `tests/e2e_local`)
+  + agent eval replay;Runner 的 Python 3.10 兼容仍靠语法约束与本地审查保证。
