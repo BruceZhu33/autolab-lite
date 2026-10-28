@@ -5,8 +5,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from autolab_control.execution.comparison import param_insensitivity
-from autolab_control.execution.experiments import job_log_tail
+import pytest
+from autolab_control.core.errors import UserError
+from autolab_control.execution.comparison import (
+    bootstrap_ci,
+    evaluate_guardrails,
+    param_insensitivity,
+    variant_means,
+)
+from autolab_control.execution.experiments import ExperimentRequest, _clean_jobs, job_log_tail
 from autolab_control.execution.metrics import metric_domain_issue, metrics_sanity_issues
 from autolab_control.workspace import refs
 
@@ -80,3 +87,96 @@ def test_register_local_reference(tmp_path):
     assert ref == {"name": "fusion-ref", "source": str(root), "path": str(root)}
     assert "models/fusion.py" in refs.read([ref], "fusion-ref")
     assert "1\tclass GatedFusion:" in refs.read([ref], "fusion-ref", "models/fusion.py")
+
+
+def test_bootstrap_ci_deterministic_and_edges():
+    """n<2 → None;常数序列 CI 退化为点;同输入同 seed 可复现;下界符号正确。"""
+    assert bootstrap_ci([]) is None and bootstrap_ci([0.05]) is None
+    assert bootstrap_ci([0.02, 0.02, 0.02]) == (0.02, 0.02)
+    assert bootstrap_ci([0.04, 0.05, 0.06]) == bootstrap_ci([0.04, 0.05, 0.06])
+    low, high = bootstrap_ci([0.04, 0.05, 0.06])
+    assert 0.04 <= low <= high <= 0.06 and low > 0
+    assert bootstrap_ci([0.03, -0.01, 0.02])[0] <= 0     # 均值>0 但下界≤0:不显著
+
+
+def _mean_row(plan_id, dataset, value, gain, variant=None, seed=None,
+              status="SUCCEEDED", baseline=0.8):
+    return {"planId": plan_id, "jobId": f"job-{plan_id}-{variant}-{seed}-{value}",
+            "variant": variant, "seed": seed, "dataset": dataset, "metric": "val_dice",
+            "baseline": baseline, "value": value, "gain": gain, "status": status}
+
+
+def test_variant_means_groups_by_variant_and_seed():
+    """显式 variant 优先作分组身份;无 variant 的旧提交仍按 planId 聚合。"""
+    rows = [
+        _mean_row("p1", "kvasir", 0.84, 0.04, variant="attn", seed=2),
+        _mean_row("p1", "kvasir", 0.85, 0.05, variant="attn", seed=1),
+        _mean_row("p1", "kvasir", 0.81, 0.01, variant="hflip", seed=1),
+        _mean_row("p1", "kvasir", 0.79, -0.01, variant="hflip", seed=2),
+    ]
+    means = variant_means(rows)
+    assert len(means) == 2                                    # 同一 plan 两个变体不混合
+    attn = next(m for m in means if m["variant"] == "attn")
+    assert attn["planId"] == "p1" and attn["seeds"] == [1, 2] and attn["n"] == 2
+    assert attn["meanGain"] == 0.045 and attn["significant"] is True and attn["stdGain"] > 0
+    assert attn["ciLow"] is not None and 0.01 <= attn["ciLow"] <= 0.045
+    assert means[0]["variant"] == "attn"                      # 按均值增益降序
+    hflip = next(m for m in means if m["variant"] == "hflip")
+    assert hflip["meanGain"] == 0.0 and hflip["significant"] is False
+    legacy = variant_means([_mean_row("p9", "kvasir", 0.85, 0.05),
+                            _mean_row("p9", "kvasir", 0.83, 0.03)])
+    assert len(legacy) == 1 and legacy[0]["variant"] is None
+    assert legacy[0]["seeds"] == [] and legacy[0]["n"] == 2   # n = 有效指标行数
+    mixed = variant_means([_mean_row("p8", "kvasir", 0.85, 0.05, variant="m", seed=1),
+                           _mean_row("p8", "kvasir", 0.79, -0.01, variant="m", seed=2)])
+    assert mixed[0]["meanGain"] == 0.02 and mixed[0]["significant"] is False
+
+
+def test_clean_jobs_variant_seed_rules():
+    """variant/seed 元数据门:长度/类型/全有或全无/(variant, dataset) seed 去重。"""
+
+    def clean(jobs):
+        return _clean_jobs(ExperimentRequest(jobs=jobs, metrics=["val_dice"], purpose="p"))
+
+    out = clean([{"name": "a", "command": "c", "variant": "attn", "seed": 1},
+                 {"name": "b", "command": "c", "variant": "attn", "seed": 2}])
+    assert [j["seed"] for j in out] == [1, 2] and all(j["variant"] == "attn" for j in out)
+    assert "variant" not in clean([{"name": "a", "command": "c"}])[0]   # 旧提交不带
+    with pytest.raises(UserError, match="seed 重复"):
+        clean([{"name": "a", "command": "c", "variant": "attn", "seed": 1, "dataset": "kvasir"},
+               {"name": "b", "command": "c", "variant": "attn", "seed": 1, "dataset": "kvasir"}])
+    with pytest.raises(UserError, match="全有或全无"):
+        clean([{"name": "a", "command": "c", "variant": "attn", "seed": 1},
+               {"name": "b", "command": "c"}])
+    with pytest.raises(UserError, match="seed 必须是整数"):
+        clean([{"name": "a", "command": "c", "variant": "attn", "seed": True}])
+    with pytest.raises(UserError, match="variant 名过长"):
+        clean([{"name": "a", "command": "c", "variant": "v" * 81}])
+    ok = clean([{"name": "a", "command": "c", "variant": "x", "seed": 1},
+                {"name": "b", "command": "c", "variant": "y", "seed": 1}])
+    assert len(ok) == 2        # 不同变体同 seed:允许
+
+
+def test_evaluate_guardrails():
+    """guardrail:均值朝自身方向回退超过 max_regress 判违规;无契约不判定。"""
+    contract = {"primary": "val_dice", "direction": "maximize",
+                "guardrails": [{"metric": "val_hd95", "direction": "minimize",
+                                "max_regress": 0.01}]}
+
+    def row(variant, hd95, status="SUCCEEDED"):
+        return {"variant": variant, "planId": "p1", "dataset": "kvasir", "status": status,
+                "allMetrics": {"val_dice": 0.85, "val_hd95": hd95},
+                "baselineMetrics": {"val_dice": 0.80, "val_hd95": 0.20}}
+
+    rows = [row("attn", 0.22), row("attn", 0.22),   # 主指标升但 hd95 回退 0.02:违规
+            row("safe", 0.21)]                       # 回退恰为 0.01:允许
+    result = evaluate_guardrails(rows, contract)
+    assert result["checked"] == 2                    # 2 个变体组 × 1 条 guardrail
+    (v,) = result["violations"]
+    assert v["variant"] == "attn" and v["dataset"] == "kvasir"
+    assert v["metric"] == "val_hd95" and v["value"] == 0.22 and v["baseline"] == 0.20
+    assert v["maxRegress"] == 0.01 and v["direction"] == "minimize"
+    assert evaluate_guardrails(rows, None) == {"violations": [], "checked": 0}
+    assert evaluate_guardrails(rows, {"guardrails": []})["checked"] == 0
+    # 失败 Job 不参与判定
+    assert evaluate_guardrails([row("bad", 0.9, status="FAILED")], contract)["checked"] == 0

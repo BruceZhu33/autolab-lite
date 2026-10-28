@@ -312,3 +312,131 @@ def test_dataset_states_confirmed_ran_pending(repo):
     states = {d["name"]: d for d in baseline_stage.dataset_states(r, project["id"])}
     assert states["kvasir"]["state"] == "confirmed"
     assert states["kvasir"]["metrics"] == {"val_dice": 0.8}
+
+
+def _confirm_plain(repo, pid, metrics):
+    repo.update_project(pid, baseline_passed_at="2026-10-01T00:00:00Z",
+                        baseline_json=json.dumps({"datasets": {
+                            "kvasir": {"metrics": metrics, "command": "python train.py",
+                                       "dataset_path": ""}}}))
+
+
+def test_metric_contract_get_and_patch_validation(api, tmp_path):
+    """契约 API:GET 未配置 null;PATCH 校验指标/方向/回退量/相对路径,写入快照。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    # 没有确认基线:无从绑定契约
+    resp = client.patch(f"/api/owner/projects/{pid}/baseline/contract",
+                        json={"primary": "val_dice"}, headers=OWNER_H)
+    assert resp.status_code == 409 and "基线" in resp.json()["detail"]
+    _confirm_plain(repo, pid, {"val_dice": 0.8, "val_hd95": 0.2})
+
+    resp = client.get(f"/api/projects/{pid}/baseline/contract", headers=AGENT_H)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["contract"] is None                       # 未配置:GET 返回 null
+    assert body["metrics"] == {"kvasir": ["val_dice", "val_hd95"]}
+    assert body["default"]["primary"] == "val_dice"       # 预填默认 = 第一个指标
+
+    url = f"/api/owner/projects/{pid}/baseline/contract"
+    for bad, fragment in [
+        ({"primary": "auc"}, "不在任何数据集"),
+        ({"primary": "", "direction": "maximize"}, "primary 不能为空"),
+        ({"primary": "val_dice", "direction": "up"}, "direction"),
+        ({"primary": "val_dice", "guardrails": [{"metric": "auc"}]}, "不在基线指标里"),
+        ({"primary": "val_dice",
+          "guardrails": [{"metric": "val_hd95", "max_regress": -0.1}]}, "≥ 0"),
+        ({"primary": "val_dice", "eval": {"code_paths": ["../etc"]}}, "相对路径"),
+        ({"primary": "val_dice", "eval": "x"}, "eval 必须是对象"),
+    ]:
+        resp = client.patch(url, json=bad, headers=OWNER_H)
+        assert resp.status_code == 409 and fragment in resp.json()["detail"], bad
+    # agent token 只读
+    assert client.patch(url, json={"primary": "val_dice"},
+                        headers=AGENT_H).status_code == 403
+
+    good = {"primary": "val_dice", "direction": "maximize",
+            "guardrails": [{"metric": "val_hd95", "direction": "minimize",
+                            "max_regress": 0.01}],
+            "eval": {}}
+    resp = client.patch(url, json=good, headers=OWNER_H)
+    assert resp.status_code == 200, resp.text
+    contract = resp.json()["contract"]
+    assert contract["primary"] == "val_dice"
+    assert contract["guardrails"] == [{"metric": "val_hd95", "direction": "minimize",
+                                       "max_regress": 0.01}]
+    snapshot = json.loads(repo.get_project(pid)["baseline_json"])
+    assert snapshot["metric_contract"] == contract        # 只加顶层字段,快照其余原样
+    assert snapshot["datasets"]["kvasir"]["metrics"]["val_dice"] == 0.8
+    assert client.get(f"/api/projects/{pid}/baseline/contract",
+                      headers=OWNER_H).json()["contract"] == contract
+
+    # eval 保护路径:配置后立刻计算指纹
+    (tmp_path / "ws" / "eval").mkdir()
+    (tmp_path / "ws" / "eval" / "x.py").write_text("def score():\n    return 1\n",
+                                                   encoding="utf-8")
+    resp = client.patch(url, json={"primary": "val_dice",
+                                   "eval": {"code_paths": ["eval/"]}}, headers=OWNER_H)
+    assert resp.status_code == 200
+    assert re.fullmatch(r"[0-9a-f]{64}", resp.json()["contract"]["eval"]["code_hash"])
+
+
+def test_confirm_preserves_metric_contract(api, tmp_path):
+    """追加确认基线:已固化的契约原样保留,eval 指纹按确认时工作区重算。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    eval_dir = tmp_path / "ws" / "eval"
+    eval_dir.mkdir()
+    (eval_dir / "x.py").write_text("def score():\n    return 1\n", encoding="utf-8")
+    state: dict = {}
+
+    def run_baseline(dataset):
+        resp = client.post(f"/api/owner/projects/{pid}/baseline/start", json={},
+                           headers=OWNER_H)
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run"]["id"]
+
+        def remember(messages):
+            match = re.search(rf"{dataset}: (job-\S+)", last_tool_text(messages))
+            assert match, last_tool_text(messages)
+            state["job"] = match.group(1)
+            return [use("w", "wait_jobs", job_ids=[state["job"]])]
+
+        def submit_finish(messages):
+            return [use("f", "finish", notes="补跑",
+                        datasets=[{"name": dataset, "job_id": state["job"]}])]
+
+        model = ScriptModel([
+            [use("r", "run_experiment", purpose="基线",
+                 jobs=[{"name": dataset, "dataset": dataset,
+                        "command": f"python train.py --{dataset}"}],
+                 metrics=["val_dice"])],
+            remember,
+            submit_finish,
+        ])
+
+        def step():
+            return al.step(repo, None, run_id, baseline_stage.PROFILE, model=model)
+        assert step() == "running" and step() == "waiting_jobs"
+        finish_job(repo, state["job"], {"val_dice": 0.7, "val_hd95": 0.2})
+        assert step() == "waiting_human"
+        resp = client.post(f"/api/owner/runs/{run_id}/baseline/confirm", headers=OWNER_H)
+        assert resp.status_code == 200, resp.text
+
+    run_baseline("kvasir")
+    # 未配置契约:确认后的快照没有 metric_contract(旧行为不变)
+    assert "metric_contract" not in baseline_stage.baseline_snapshot(repo.get_project(pid))
+    resp = client.patch(f"/api/owner/projects/{pid}/baseline/contract", json={
+        "primary": "val_dice", "direction": "maximize",
+        "guardrails": [{"metric": "val_hd95", "direction": "minimize", "max_regress": 0.01}],
+        "eval": {"code_paths": ["eval/"]}}, headers=OWNER_H)
+    assert resp.status_code == 200, resp.text
+    contract = resp.json()["contract"]
+    first_hash = contract["eval"]["code_hash"]
+    assert re.fullmatch(r"[0-9a-f]{64}", first_hash)
+
+    run_baseline("polyp")                               # 追加确认不动契约
+    snapshot = baseline_stage.baseline_snapshot(repo.get_project(pid))
+    assert snapshot["metric_contract"] == contract
+    assert set(snapshot["datasets"]) == {"kvasir", "polyp"}
+    assert snapshot["metric_contract"]["eval"]["code_hash"] == first_hash

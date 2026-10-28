@@ -28,12 +28,13 @@ from ..agent.runtime import (
 from ..core.db import utc_now
 from ..core.ids import new_id
 from ..core.repo import TERMINAL_JOB_STATUSES, Repo
-from ..execution.comparison import compare_plan, variant_means
+from ..execution.comparison import compare_plan, evaluate_guardrails, variant_means
+from ..execution.evidence import protected_state, round_evidence
 from ..execution.experiments import job_metrics
 from ..workspace import refs
 from ..workspace.fs import Workspace
 from ..workspace.host import open_host
-from .baseline import baseline_pool, baseline_snapshot
+from .baseline import baseline_contract, baseline_pool, baseline_snapshot, refresh_contract_hashes
 
 KIND = "research"
 ROUND_REVIEW_KIND = "round_review"
@@ -159,14 +160,18 @@ def _baseline_exp_ref(repo: Repo, project: dict) -> str:
 
 
 def evaluate_plans(repo: Repo, project: dict, plans: list[dict]) -> dict:
-    """Python 判定:逐 Job 对照该数据集的确认基线,并按 (plan, dataset) 聚合变体均值。"""
+    """Python 判定:逐 Job 对照该数据集的确认基线,并按 (variant|plan, dataset)
+    聚合变体均值。契约(B1.3)由 owner 固化 primary/direction/guardrails,
+    没配置时保持旧的「第一个命中基线的声明指标」行为。"""
     pool = baseline_pool(project)
+    contract = baseline_contract(project)
     rows, warnings, labels = [], [], {}
     for plan in plans:
-        comparison = compare_plan(repo, plan, pool)
+        comparison = compare_plan(repo, plan, pool, contract)
         labels[plan["id"]] = str(plan.get("summary") or plan["id"])[:80]
-        rows += [{k: r[k] for k in ("planId", "jobId", "name", "dataset", "status",
-                                    "metric", "value", "baseline", "gain", "improved")}
+        rows += [{k: r[k] for k in ("planId", "jobId", "name", "dataset", "variant", "seed",
+                                    "status", "metric", "value", "baseline", "gain", "improved",
+                                    "allMetrics", "baselineMetrics")}
                  for r in comparison["rows"]]
         if comparison["warning"]:
             warnings.append(comparison["warning"])
@@ -175,6 +180,8 @@ def evaluate_plans(repo: Repo, project: dict, plans: list[dict]) -> dict:
         m["label"] = labels.get(m["planId"], str(m["planId"]))
     gains = [r["gain"] for r in rows if r["gain"] is not None and r["status"] == "SUCCEEDED"]
     return {"rows": rows, "means": means, "labels": labels,
+            "contract": contract,
+            "guardrails": evaluate_guardrails(rows, contract),
             "bestGain": max(gains) if gains else None,
             "bestMean": means[0]["meanGain"] if means and means[0]["meanGain"] is not None else None,
             "anyImproved": any(r["improved"] for r in rows),
@@ -197,8 +204,12 @@ def _round_markdown(round_no: int, report: dict) -> str:
     for m in ev.get("means") or []:
         value = "-" if m.get("meanValue") is None else f"{m['meanValue']:.4g}"
         gain = "" if m.get("meanGain") is None else f",增益 {m['meanGain']:+.4g}"
-        lines.append(f"  - 变体「{m.get('label') or m.get('planId')}」[{m.get('dataset') or '-'}]"
-                     f" {m.get('n', 0)} seed 均值 {value}{gain}")
+        ci = "" if m.get("ciLow") is None else \
+            f",95% CI [{m['ciLow']:+.4f}, {m['ciHigh']:+.4f}]"
+        mark = "✓" if m.get("significant") else ""
+        label = m.get("variant") or m.get("label") or m.get("planId")
+        lines.append(f"  - 变体「{label}」[{m.get('dataset') or '-'}]"
+                     f" {m.get('n', 0)} seed 均值 {value}{gain}{ci}{mark}")
     ch = report.get("champion")
     if ch:
         lines.append(f"  - 🏆 当前冠军:「{ch.get('label') or ch.get('planId')}」"
@@ -211,6 +222,15 @@ def _round_markdown(round_no: int, report: dict) -> str:
                      f" {row['metric']}={value}(基线 {base})")
     for warning in ev["warnings"]:
         lines.append(f"  - ⚠ {warning}")
+    evd = report.get("evidence")
+    if evd:
+        code = evd.get("code") or {}
+        protected = evd.get("protected") or {}
+        prot = "未配置" if protected.get("ok") is None else \
+            ("ok" if protected.get("ok") else "changed")
+        lines.append(f"  - 证据:代码 {code.get('gitHead') or 'non-git'}"
+                     f" / dirty {'是' if code.get('dirty') else '否'}"
+                     f" / 保护路径 {prot} / evidence {evd.get('evidenceHash', '')[:12]}")
     return "\n".join(lines) + "\n"
 
 
@@ -318,7 +338,8 @@ def _status_suffix(env: LoopEnv) -> str:
         lines.append(f"- 成功标准:每个数据集 ≥{seeds} seed 的均值不恶化(容忍 "
                      f"{float(env.config.get('regress_tol') or 0.005):g}),且至少一个数据集改善")
     elif tier["threshold"]:
-        lines.append(f"- 成功标准:任一变体 ≥{tier['min_seeds']} seed 的均值改善 ≥ {tier['threshold']:g}")
+        lines.append(f"- 成功标准:任一变体 ≥{tier['min_seeds']} seed 的均值改善 ≥"
+                     f" {tier['threshold']:g} 且 95% CI 下界 > 0")
     elif tier.get("min_seeds", 1) > 1:
         lines.append(f"- 成功标准:任一变体 ≥{tier['min_seeds']} seed 的均值改善 > 0")
     return "\n".join(lines)
@@ -354,13 +375,18 @@ def _finish_validation(env: LoopEnv, round_no: int, report: dict,
         gain = group["meanGain"]
         gains.append(gain)
         mark = "✓" if gain > 0 else ("~" if gain >= -tol else "✗")
+        ci = "" if group.get("ciLow") is None else \
+            f",95% CI [{group['ciLow']:+.4f}, {group['ciHigh']:+.4f}]"
         verdicts.append(f"{dataset}:{gain:+.4g} {mark}"
-                        f"({group['n']} seed 均值 {group['meanValue']:.4g})")
+                        f"({group['n']} seed 均值 {group['meanValue']:.4g}{ci})")
         if gain < -tol:
             success = False
     if not any(g > 0 for g in gains):
         success = False
     verdict = f"全量验证{'通过' if success else '未通过'}:" + ";".join(verdicts)
+    verdict += _guardrail_verdict(evaluation)
+    if (evaluation.get("guardrails") or {}).get("violations"):
+        success = False
     report["verdict"] = verdict
     report["validation"] = True
     _record_round(env, round_no, report)
@@ -369,6 +395,18 @@ def _finish_validation(env: LoopEnv, round_no: int, report: dict,
                    "validation": {"datasets": verdicts},
                    "reason": verdict, "lastRound": report})
 
+
+def _guardrail_verdict(evaluation: dict) -> str:
+    """guardrail 违规摘要(最多 3 条),拼进 verdict;无契约/无违规为空串。"""
+    violations = (evaluation.get("guardrails") or {}).get("violations") or []
+    if not violations:
+        return ""
+    listed = ";".join(
+        f"{v['metric']}({v['dataset'] or '-'}) {v['value']:+.4g}"
+        f" vs 基线 {v['baseline']:+.4g}(允许回退 {v['maxRegress']:g})"
+        for v in violations[:3])
+    more = f" 等 {len(violations)} 项" if len(violations) > 3 else ""
+    return f";guardrail 违规:{listed}{more}"
 
 def _end_round_tool() -> Tool:
     def handler(env: LoopEnv, args: dict):
@@ -391,6 +429,22 @@ def _end_round_tool() -> Tool:
                   "planIds": [p["id"] for p in plans], "evaluation": evaluation}
         round_no = len(rounds) + 1
 
+        # B1.4:保护路径门。契约配置了 eval 路径且 expected hash 非空时,
+        # 评测代码/数据划分被改过 → 本轮结论无效,拒绝收束(只读 hash,不记内容)。
+        protected = protected_state(env.workspace, evaluation.get("contract"))
+        for kind, info in (("code", protected["code"]), ("data", protected["data"])):
+            if info and info["changed"]:
+                runtime.record_event(repo, run_id, "protected_paths_changed",
+                                     {"kind": kind, "expected": info["expected"],
+                                      "current": info["hash"], "paths": info["paths"]})
+                raise ToolError(
+                    f"评测代码/数据划分被修改,本轮结论无效:{kind}"
+                    f" expected={info['expected']} current={info['hash']};请恢复后再 end_round")
+        report["evidence"] = round_evidence(repo, env.workspace, plans,
+                                            evaluation.get("contract"),
+                                            evaluation["means"], protected)
+        report["evidenceHash"] = report["evidence"]["evidenceHash"]
+
         if env.config.get("mode") == "validation":
             return _finish_validation(env, round_no, report, evaluation)
 
@@ -399,36 +453,56 @@ def _end_round_tool() -> Tool:
         eligible = [m for m in means
                     if m["n"] >= tier["min_seeds"] and m["meanGain"] is not None]
         best = eligible[0] if eligible else None  # variant_means 已按均值增益降序
-        success = best is not None and best["meanGain"] > 0 \
-            and (tier["threshold"] <= 0 or best["meanGain"] >= tier["threshold"])
+        violations = (evaluation.get("guardrails") or {}).get("violations") or []
+        if best is None:
+            success = False
+        elif tier["threshold"] > 0:
+            # heavy:均值过阈值 + bootstrap 95% CI 下界 > 0 才算统计上可信
+            success = bool(best.get("significant")) and best["meanGain"] >= tier["threshold"]
+        else:
+            success = best["meanGain"] > 0   # light/medium:保持均值语义,快速迭代
+        success = success and not violations
 
         # 冠军:跨轮保留最优的达标变体。判定/报告/通知都以它为准——真机教训:
         # 最后一轮一个次优变体的单 seed 冒尖触发了停止,而它均值比冠军更差。
         champion = rounds[-1].get("champion") if rounds else None
         if best is not None and best["meanGain"] > 0:
             candidate = {"round": round_no, "planId": best["planId"],
-                         "label": best.get("label"), "dataset": best["dataset"],
-                         "n": best["n"], "meanValue": best["meanValue"],
-                         "meanGain": best["meanGain"]}
+                         "variant": best.get("variant"), "label": best.get("label"),
+                         "dataset": best["dataset"], "n": best["n"],
+                         "meanValue": best["meanValue"], "meanGain": best["meanGain"],
+                         "stdGain": best.get("stdGain"),
+                         "ciLow": best.get("ciLow"), "ciHigh": best.get("ciHigh")}
             if not champion or candidate["meanGain"] > (champion.get("meanGain") or 0):
                 champion = candidate
         if champion:
             report["champion"] = champion
 
         if best is not None:
-            verdict = (f"{'有提升' if success else '未提升'}——变体"
-                       f"「{best.get('label') or best['planId']}」[{best['dataset'] or '-'}]"
-                       f" {best['n']} seed 均值增益 {best['meanGain']:+.4g}")
+            ci = "" if best.get("ciLow") is None else \
+                f"(95% CI [{best['ciLow']:+.4f}, {best['ciHigh']:+.4f}])"
+            label = best.get("variant") or best.get("label") or best["planId"]
+            if success:
+                head = "有提升"
+            elif tier["threshold"] > 0 and best["meanGain"] >= tier["threshold"] \
+                    and not best.get("significant"):
+                head = "证据不足"   # 均值过线但 CI 下界 ≤ 0:统计上不可信
+            else:
+                head = "未提升"
+            verdict = (f"{head}——变体「{label}」[{best['dataset'] or '-'}]"
+                       f" {best['n']} seed 均值增益 {best['meanGain']:+.4g}{ci}")
             if champion and champion.get("round") != round_no:
                 verdict += (f";当前冠军:第 {champion['round']} 轮「{champion.get('label')}」"
                             f"[{champion.get('dataset')}] {champion.get('meanGain'):+.4g}")
         elif means:
             top = means[0]
-            verdict = (f"证据不足——最好的变体「{top.get('label') or top['planId']}」只有 "
+            top_label = top.get("variant") or top.get("label") or top["planId"]
+            verdict = (f"证据不足——最好的变体「{top_label}」只有 "
                        f"{top['n']} 个有效 seed(判定需要 ≥{tier['min_seeds']} seed 的均值);"
                        "补齐 seed 或换方向")
         else:
             verdict = "未提升(本轮没有成功产出指标的实验)"
+        verdict += _guardrail_verdict(evaluation)
         report["verdict"] = verdict
         _record_round(env, round_no, report)
 
@@ -680,6 +754,18 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
                 "version_label": version_label,
                 "notes": notes[:2000], "datasets": new_datasets,
                 "history": history[-5:]}
+    # B1.3:契约跨基线晋级保留;新基线采纳后按当前工作区重算保护路径指纹
+    contract = old_snapshot.get("metric_contract")
+    if isinstance(contract, dict) and contract:
+        if (contract.get("eval") or {}).get("code_paths") \
+                or (contract.get("eval") or {}).get("data_paths"):
+            host = open_host(repo, credentials, project["server_id"])
+            try:
+                refresh_contract_hashes(
+                    Workspace(host, project.get("remote_workdir") or ""), contract)
+            finally:
+                host.close()
+        snapshot["metric_contract"] = contract
     repo.update_project(project_id, baseline_passed_at=now,
                         baseline_json=json.dumps(snapshot, ensure_ascii=False))
     _mark_adopted(repo, run_id, result)

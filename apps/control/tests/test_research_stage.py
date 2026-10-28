@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -515,6 +516,205 @@ def test_read_reference_local_and_bounded(api, tmp_path):
     with pytest.raises(UserError, match="越界"):
         tool.handler(env, {"ref": "attnlib", "path": "../../etc/passwd"})
 
+
+
+# ------------------------------------------------------------------ Phase B1
+
+
+def variant_round(state, prefix, jobs_spec):
+    """一轮脚本:一次 run_experiment 提交带 variant/seed 的多个 Job。
+    jobs_spec = [(name, dataset, command, variant, seed)]。"""
+
+    def remember(messages):
+        text = last_tool_text(messages)
+        found = re.findall(r"^- (\S+): (\S+)$", text, re.MULTILINE)
+        assert found, text
+        state.setdefault("jobs", []).extend(jid for _, jid in found)
+        return [use(f"{prefix}w", "wait_jobs", job_ids=[jid for _, jid in found])]
+
+    return [
+        [use(f"{prefix}r", "run_experiment", purpose="变体对照",
+             jobs=[{"name": n, "dataset": d, "command": c, "variant": v, "seed": s}
+                   for n, d, c, v, s in jobs_spec],
+             metrics=[{"name": "val_dice"}])],
+        remember,
+        [use(f"{prefix}e", "end_round", hypothesis="h", changes="c", analysis="a", kept=True)],
+    ]
+
+
+def patch_contract(client, pid, contract):
+    resp = client.patch(f"/api/owner/projects/{pid}/baseline/contract",
+                        json=contract, headers=OWNER_H)
+    assert resp.status_code == 200, resp.text
+    return resp.json()["contract"]
+
+
+def rounds_of(client, pid):
+    return client.get(f"/api/projects/{pid}/research/rounds",
+                      headers=AGENT_H).json()["rounds"]
+
+
+def test_variant_seed_grouping_two_variants(api, tmp_path):
+    """同一 plan 里两个变体 × 各 2 seed:means 分成两组不混合,标签用 variant 名。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="medium", max_rounds=1)
+    state: dict = {}
+    model = ScriptModel(variant_round(state, "a", [
+        ("attn-1", "kvasir", "python train.py --attn --seed 1", "attn", 1),
+        ("attn-2", "kvasir", "python train.py --attn --seed 2", "attn", 2),
+        ("hflip-1", "kvasir", "python train.py --hflip --seed 1", "hflip", 1),
+        ("hflip-2", "kvasir", "python train.py --hflip --seed 2", "hflip", 2)]))
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    for jid, value in zip(state["jobs"], (0.85, 0.83, 0.81, 0.79), strict=True):
+        finish_job(repo, jid, {"val_dice": value})
+    assert step() == "done"                          # 轮数上限收束
+    rounds = rounds_of(client, pid)
+    means = rounds[0]["evaluation"]["means"]
+    assert len(means) == 2 and means[0]["variant"] == "attn"   # 均值增益降序
+    attn = next(m for m in means if m["variant"] == "attn")
+    assert attn["seeds"] == [1, 2] and attn["n"] == 2
+    assert attn["meanGain"] == pytest.approx(0.04) and attn["significant"] is True
+    assert all(r["variant"] in ("attn", "hflip") and r["seed"] in (1, 2)
+               for r in rounds[0]["evaluation"]["rows"])
+    assert "变体「attn」" in rounds[0]["verdict"]
+    journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
+    assert "变体「attn」" in journal and "95% CI" in journal and "✓" in journal
+    assert "- 证据:代码 non-git / dirty 否 / 保护路径 未配置" in journal
+    assert re.search(r"evidence [0-9a-f]{12}", journal)
+
+
+def test_heavy_significance_ci_gates_success(api, tmp_path):
+    """heavy:均值过阈值但 95% CI 下界 ≤ 0 → 证据不足不收束;CI 立住才成功。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="heavy")
+    state: dict = {}
+    seeds = [("s1", "kvasir", "python train.py --attn --seed 1"),
+             ("s2", "kvasir", "python train.py --attn --seed 2"),
+             ("s3", "kvasir", "python train.py --attn --seed 3")]
+    model = ScriptModel([*multi_seed_round(state, "a", seeds),
+                         *multi_seed_round(state, "b", seeds)])
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    for jid, value in zip(state["jobs"], (0.83, 0.79, 0.82), strict=True):
+        finish_job(repo, jid, {"val_dice": value})   # 均值 +0.0133 过 0.01 阈值
+    assert step() == "running"                       # CI 下界 ≤ 0:不成功,翻篇
+    rounds = rounds_of(client, pid)
+    top = rounds[0]["evaluation"]["means"][0]
+    assert top["meanGain"] == pytest.approx((0.83 + 0.79 + 0.82) / 3 - 0.80)
+    assert top["ciLow"] is not None and top["ciLow"] <= 0 and top["significant"] is False
+    assert "证据不足" in rounds[0]["verdict"] and "95% CI" in rounds[0]["verdict"]
+    assert step() == "running" and step() == "waiting_jobs"
+    for jid, value in zip(state["jobs"][3:], (0.84, 0.85, 0.86), strict=True):
+        finish_job(repo, jid, {"val_dice": value})   # gains [0.04,0.05,0.06]:CI 下界 > 0
+    assert step() == "done"
+    result = al.get_run(repo, run_id)["result"]
+    assert result["success"] and result["bestGain"] == pytest.approx(0.05)
+    assert result["champion"]["ciLow"] > 0 and result["champion"]["ciHigh"] <= 0.06
+    assert "stdGain" in result["champion"]
+
+
+def test_guardrail_violation_blocks_heavy_success(api, tmp_path):
+    """契约 guardrail:主指标提升但次指标回退超限 → 违规,heavy 不成功。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    repo.update_project(pid, baseline_passed_at="2026-10-01T00:00:00Z",
+                        baseline_json=json.dumps({"datasets": {"kvasir": {
+                            "metrics": {"val_dice": 0.80, "val_hd95": 0.20},
+                            "command": "python train.py", "dataset_path": ""}}}))
+    contract = patch_contract(client, pid, {
+        "primary": "val_dice", "direction": "maximize",
+        "guardrails": [{"metric": "val_hd95", "direction": "minimize",
+                        "max_regress": 0.01}],
+        "eval": {}})
+    assert contract["guardrails"][0]["max_regress"] == 0.01
+    run_id = start(client, pid, tier="heavy")
+    state: dict = {}
+    # agent 把次指标 val_hd95 声明在第一位:契约固化 primary 后不采信声明顺序
+    model = ScriptModel(variant_round(state, "a", [
+        ("s1", "kvasir", "python train.py --attn --seed 1", "attn", 1),
+        ("s2", "kvasir", "python train.py --attn --seed 2", "attn", 2),
+        ("s3", "kvasir", "python train.py --attn --seed 3", "attn", 3)]))
+    model.replies[0][0]["input"]["metrics"] = [{"name": "val_hd95"}, {"name": "val_dice"}]
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    for jid in state["jobs"]:                        # dice +0.05 但 hd95 回退 +0.02
+        finish_job(repo, jid, {"val_dice": 0.85, "val_hd95": 0.22})
+    assert step() == "running"                       # 违规:不算成功,自动翻篇
+    rounds = rounds_of(client, pid)
+    evaluation = rounds[0]["evaluation"]
+    assert evaluation["contract"]["primary"] == "val_dice"
+    assert all(r["metric"] == "val_dice" for r in evaluation["rows"])
+    assert evaluation["means"][0]["variant"] == "attn"
+    (v,) = evaluation["guardrails"]["violations"]
+    assert v["metric"] == "val_hd95" and v["value"] == 0.22 and v["baseline"] == 0.20
+    assert "guardrail 违规" in rounds[0]["verdict"] and "val_hd95" in rounds[0]["verdict"]
+    assert rounds[0]["verdict"].startswith("未提升")
+
+
+def test_protected_paths_change_rejects_end_round(api, tmp_path):
+    """契约 eval 保护路径:中途改评测代码 → end_round 被拒并留事件;恢复后放行。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    eval_dir = tmp_path / "ws" / "eval"
+    eval_dir.mkdir()
+    (eval_dir / "x.py").write_text("def score():\n    return 1\n", encoding="utf-8")
+    confirm_baseline(repo, pid)
+    contract = patch_contract(client, pid, {
+        "primary": "val_dice", "direction": "maximize", "guardrails": [],
+        "eval": {"code_paths": ["eval/"]}})
+    assert re.fullmatch(r"[0-9a-f]{64}", contract["eval"]["code_hash"])
+    run_id = start(client, pid, tier="medium", max_rounds=1)
+    state: dict = {}
+    model = ScriptModel([
+        *experiment_round(state, "a"),
+        [use("e2", "end_round", hypothesis="h", changes="c", analysis="a", kept=True)],
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    finish_job(repo, state["job"], {"val_dice": 0.85})
+    (eval_dir / "x.py").write_text("def score():\n    return 2\n", encoding="utf-8")
+    assert step() == "running"                       # end_round 被保护路径门拒绝
+    blocks = json.loads(_row(repo, run_id)["messages_json"])[-1]["content"]
+    rejected = next(b for b in blocks if isinstance(b, dict) and b.get("is_error"))
+    assert "评测代码/数据划分被修改" in rejected["content"] and "code" in rejected["content"]
+    conn = repo.db.connect()
+    try:
+        events = [dict(r) for r in conn.execute(
+            "SELECT * FROM agent_run_events WHERE run_id = ? AND kind = 'protected_paths_changed'",
+            (run_id,))]
+    finally:
+        conn.close()
+    payload = json.loads(events[0]["payload"])
+    assert len(events) == 1 and payload["kind"] == "code"
+    assert payload["expected"] == contract["eval"]["code_hash"] and payload["paths"] == ["eval"]
+    assert rounds_of(client, pid) == []              # 被拒的轮不留记录
+
+    (eval_dir / "x.py").write_text("def score():\n    return 1\n", encoding="utf-8")
+    assert step() == "done"                          # 恢复后收束成功
+    rounds = rounds_of(client, pid)
+    report = rounds[0]
+    evidence = report["evidence"]
+    assert {"code", "plans", "jobs", "protected", "contract",
+            "variantMeans", "evidenceHash"} <= set(evidence)
+    assert evidence["protected"]["ok"] is True
+    assert evidence["protected"]["code"]["expected"] == contract["eval"]["code_hash"]
+    assert evidence["contract"]["primary"] == "val_dice"
+    assert evidence["plans"][0]["experimentRef"].endswith(".md")
+    assert evidence["jobs"][0]["metrics"]["val_dice"] == 0.85
+    assert evidence["jobs"][0]["artifacts"][0]["sha256"]
+    assert report["evidenceHash"] == evidence["evidenceHash"]
+    payload = {k: v for k, v in evidence.items() if k != "evidenceHash"}
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    assert digest == evidence["evidenceHash"]       # 同一输入重算稳定
+    journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
+    assert "- 证据:代码 non-git / dirty 否 / 保护路径 ok" in journal
+    assert evidence["evidenceHash"][:12] in journal
 
 KIND_PLACEHOLDER = research_stage.KIND
 

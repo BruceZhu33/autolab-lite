@@ -552,3 +552,27 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   `AgentLoopManager(max_concurrent=8)`。旧库逐列 ALTER 迁移(v22)。
 - 遗留:research 三档 wall-clock 细分未设,当前统一 48h 安全上限(档位配置在
   run config,细分留 Phase B);真机仍需截断探针验证 GLM 端点兼容性。
+
+## D-034 · Phase B1:统计验证器 + 指标契约 + 防篡改证据(2026-10-28)
+
+- 背景:均值判定无方差口径,heavy「均值过线」即可停;主指标由 agent 在
+  `run_experiment.metrics` 里声明且取「第一个命中基线」——agent 可换软指标;
+  次指标回退不受罚;评测代码/数据划分无保护,round 结论无结构化证据。
+- B1.1 variant/seed 显式元数据:`_clean_jobs` 校验(variant ≤80、seed 非 bool、
+  全有或全无、(variant,dataset) seed 去重);`variant_means` 按
+  (variant|planId, dataset) 分组,seeds 非空时 n=distinct seed。
+- B1.2 `bootstrap_ci`(百分位法、Random(seed) 确定);每组带 stdGain/95% CI/
+  significant;heavy 成功 = significant 且均值 ≥ 阈值,light/medium 维持均值语义;
+  verdict/journal/_status_suffix 全部带 CI 口径。
+- B1.3 指标契约:`baseline_json.metric_contract`(primary/direction/guardrails/
+  eval),owner 经 PATCH 固化(校验指标存在、方向合法、max_regress ≥ 0、路径
+  工作区相对),`compare_plan` 优先契约 primary,不回落别的指标;
+  `evaluate_guardrails` 按 (variant,dataset) 组均值判回退,违规则 end_round
+  success=false。无契约行为与旧版完全一致(B1 不强制默认契约)。
+- B1.4 `execution/evidence.py`:`hash_paths` 指纹保护路径;end_round 校验
+  code/data hash,被改则 ToolError 拒绝收束并记 `protected_paths_changed` 事件;
+  report.evidence = {code, plans, jobs, protected, contract, variantMeans,
+  evidenceHash(sha256 sort_keys)},journal 末行带证据摘要。confirm/adopt 保留
+  契约并重算指纹。
+- 遗留:B2 再做 eval 任务套件/CI/平台评测 provenance;guardrail 违规目前不阻断
+  会话只判失败,是否强制停止待真机反馈。

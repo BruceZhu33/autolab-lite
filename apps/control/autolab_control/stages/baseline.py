@@ -14,7 +14,9 @@ from ..agent import knowledge, runtime, tools
 from ..agent.runtime import AgentLoopError, LoopEnv, LoopProfile, Pause, ToolError
 from ..core.db import utc_now
 from ..core.repo import Repo
+from ..execution.evidence import hash_paths
 from ..execution.experiments import job_metrics, project_job
+from ..workspace.fs import open_workspace
 
 KIND = "baseline"
 CONFIRM_KIND = "confirm_baseline"
@@ -60,6 +62,109 @@ def baseline_snapshot(project: dict) -> dict:
         return {}
     return snapshot if isinstance(snapshot, dict) else {}
 
+
+def baseline_contract(project: dict) -> dict | None:
+    """owner 固化的指标契约(基线快照顶层 metric_contract);未配置返回 None,
+    判定链保持旧行为(agent 声明的第一个命中基线的指标为主指标)。"""
+    contract = baseline_snapshot(project).get("metric_contract")
+    return contract if isinstance(contract, dict) and contract else None
+
+
+def default_metric_contract(pool: dict[str, dict]) -> dict:
+    """未配置契约时的默认形态(第一个数据集的第一个指标)。B1 不强制默认契约:
+    只作 GET 端点的预填建议,判定链不使用它。"""
+    for info in pool.values():
+        metrics = list(info.get("metrics") or {})
+        if metrics:
+            return {"primary": metrics[0], "direction": "maximize",
+                    "guardrails": [], "eval": {}}
+    return {"primary": "", "direction": "maximize", "guardrails": [], "eval": {}}
+
+
+def _clean_eval_paths(paths, field: str) -> list[str]:
+    out = []
+    for raw in paths if isinstance(paths, list) else []:
+        rel = str(raw or "").strip().strip("/")
+        if not rel:
+            continue
+        if rel.startswith("/") or ".." in rel.split("/"):
+            raise ToolError(f"eval.{field} 必须是工作区相对路径:{rel}")
+        out.append(rel)
+    return out
+def _clean_contract(payload: dict, pool: dict[str, dict]) -> dict:
+    """核验 owner 提交的契约;非法即 ToolError(映射 409)。"""
+    if not isinstance(payload, dict):
+        raise ToolError("契约必须是对象:{primary, direction, guardrails, eval}")
+    known = {name for info in pool.values() for name in (info.get("metrics") or {})}
+    primary = str(payload.get("primary") or "").strip()
+    if not primary:
+        raise ToolError("primary 不能为空")
+    if primary not in known:
+        raise ToolError(f"primary 指标 {primary} 不在任何数据集的基线指标里")
+    direction = str(payload.get("direction") or "maximize")
+    if direction not in ("maximize", "minimize"):
+        raise ToolError(f"direction 只能是 maximize|minimize:{direction}")
+    guardrails = []
+    for raw in payload.get("guardrails") or []:
+        rule = raw if isinstance(raw, dict) else {}
+        metric = str(rule.get("metric") or "").strip()
+        if metric not in known:
+            raise ToolError(f"guardrail 指标 {metric or '(空)'} 不在基线指标里")
+        rule_direction = str(rule.get("direction") or "maximize")
+        if rule_direction not in ("maximize", "minimize"):
+            raise ToolError(f"guardrail direction 只能是 maximize|minimize:{rule_direction}")
+        regress = rule.get("max_regress", 0.0)
+        if isinstance(regress, bool) or not isinstance(regress, (int, float)) or regress < 0:
+            raise ToolError(f"guardrail {metric} 的 max_regress 必须 ≥ 0")
+        guardrails.append({"metric": metric, "direction": rule_direction,
+                           "max_regress": float(regress)})
+    raw_eval = payload.get("eval") or {}
+    if not isinstance(raw_eval, dict):
+        raise ToolError("eval 必须是对象:{metric_file, code_paths, data_paths}")
+    return {"primary": primary, "direction": direction,
+            "guardrails": guardrails,
+            "eval": {
+                "metric_file": str(raw_eval.get("metric_file") or "metrics.json").strip(),
+                "code_paths": _clean_eval_paths(raw_eval.get("code_paths"), "code_paths"),
+                "data_paths": _clean_eval_paths(raw_eval.get("data_paths"), "data_paths"),
+                "code_hash": "", "data_hash": ""}}
+
+
+def refresh_contract_hashes(workspace, contract: dict) -> dict:
+    """eval 保护路径有配置时重算指纹(owner PATCH / confirm / adopt 共用)。"""
+    eval_cfg = contract.get("eval") or {}
+    if eval_cfg.get("code_paths"):
+        eval_cfg["code_hash"] = hash_paths(workspace, eval_cfg["code_paths"])["hash"]
+    if eval_cfg.get("data_paths"):
+        eval_cfg["data_hash"] = hash_paths(workspace, eval_cfg["data_paths"])["hash"]
+    return contract
+
+
+def get_metric_contract(project: dict) -> dict:
+    """GET 端点载荷:当前契约(未配置 null)+ 逐数据集指标清单 + 预填默认。"""
+    pool = baseline_pool(project)
+    return {"contract": baseline_contract(project),
+            "metrics": {name: list(info.get("metrics") or {})
+                        for name, info in pool.items()},
+            "default": default_metric_contract(pool)}
+
+
+def set_metric_contract(repo: Repo, credentials, project_id: str, payload: dict) -> dict:
+    """owner 固化指标契约:写入基线快照顶层 metric_contract(其余快照字段原样)。"""
+    project = repo.get_project(project_id)
+    if project is None:
+        raise AgentLoopError(f"项目 {project_id} 不存在")
+    pool = baseline_pool(project)
+    if not pool:
+        raise AgentLoopError("还没有确认过的基线,无从绑定指标契约")
+    contract = _clean_contract(payload, pool)
+    if contract["eval"]["code_paths"] or contract["eval"]["data_paths"]:
+        with open_workspace(repo, credentials, project) as ws:
+            refresh_contract_hashes(ws, contract)
+    snapshot = baseline_snapshot(project)
+    snapshot["metric_contract"] = contract
+    repo.update_project(project_id, baseline_json=json.dumps(snapshot, ensure_ascii=False))
+    return get_metric_contract(repo.get_project(project_id))
 
 def baseline_pool(project: dict) -> dict[str, dict]:
     """研究阶段可用的数据集池(只有确认过的才算)。"""
@@ -245,8 +350,11 @@ def start(repo: Repo, project_id: str, *, note: str = "", network: bool = False)
     return runtime.start_run(repo, project_id, KIND, task, {"network": bool(network)})
 
 
-def confirm(repo: Repo, run_id: str) -> dict:
-    """owner 确认基线:复核后写基线快照,项目进入研究阶段。"""
+def confirm(repo: Repo, credentials, run_id: str) -> dict:
+    """owner 确认基线:复核后写基线快照,项目进入研究阶段。
+
+    B1.3:已配置的 metric_contract 原样带进新快照(没有则不写,保持旧行为);
+    eval 保护路径有配置时重算指纹(确认时的代码状态即被保护状态)。"""
     run = runtime.get_run(repo, run_id)
     payload = (run.get("pending") or {}).get("payload") or {}
     if run["kind"] != KIND or payload.get("kind") != CONFIRM_KIND:
@@ -259,7 +367,8 @@ def confirm(repo: Repo, run_id: str) -> dict:
                      for d in proposal["datasets"]]})
     now = utc_now()
     # 追加确认:新提案覆盖同名数据集,已确认的其他数据集原样保留(池只增不减)
-    datasets = {name: info for name, info in baseline_snapshot(project).get("datasets", {}).items()}
+    old_snapshot = baseline_snapshot(project)
+    datasets = {name: info for name, info in old_snapshot.get("datasets", {}).items()}
     datasets.update({d["name"]: {"metrics": d["metrics"], "command": d["command"],
                                  "dataset_path": d["datasetPath"], "job_id": d["jobId"]}
                      for d in proposal["datasets"]})
@@ -267,6 +376,13 @@ def confirm(repo: Repo, run_id: str) -> dict:
         "passed_at": now, "run_id": run_id, "conda_env": proposal["condaEnv"],
         "notes": proposal["notes"], "datasets": datasets,
     }
+    contract = old_snapshot.get("metric_contract")
+    if isinstance(contract, dict) and contract:
+        if (contract.get("eval") or {}).get("code_paths") \
+                or (contract.get("eval") or {}).get("data_paths"):
+            with open_workspace(repo, credentials, project) as ws:
+                refresh_contract_hashes(ws, contract)
+        snapshot["metric_contract"] = contract
     repo.update_project(project["id"], baseline_passed_at=now,
                         baseline_json=json.dumps(snapshot, ensure_ascii=False))
     return runtime.complete_run(repo, run_id, {"confirmed": True, **proposal})

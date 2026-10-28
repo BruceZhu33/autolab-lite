@@ -308,6 +308,11 @@ def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
                      "command": {"type": "string"},
                      "dataset": {"type": "string",
                                  "description": "该 Job 跑的数据集(研究阶段必填,用于对照该数据集基线)"},
+                     "variant": {"type": "string",
+                                 "description": "变体名:同一变体的多个 seed 用同一个 variant;"
+                                 "一个 plan 只放一个 variant(消融请分批提交)"},
+                     "seed": {"type": "integer",
+                              "description": "该 Job 的 seed;同一 (variant, dataset) 下不得重复"},
                  }, ["name", "command"])},
                  "metrics": {"type": "array", "items": _schema({
                      "name": {"type": "string"},

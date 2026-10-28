@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from fastapi.responses import Response
 
 from ...agent import runtime, trace
+from ...core.errors import NotFound
 from ...stages import baseline, research
 from ..app import Ctx
 
@@ -63,7 +64,21 @@ def build(ctx: Ctx) -> APIRouter:
     @router.post("/api/owner/runs/{run_id}/baseline/confirm", dependencies=[ctx.owner])
     def baseline_confirm(run_id: str) -> dict:
         """owner 确认 agent 提交的基线:写基线快照,项目进入研究阶段。"""
-        return {"run": baseline.confirm(repo, run_id)}
+        return {"run": baseline.confirm(repo, ctx.credentials, run_id)}
+
+    @router.get("/api/projects/{project_id}/baseline/contract", dependencies=[ctx.reader])
+    def baseline_contract_get(project_id: str) -> dict:
+        """指标契约(未配置 null)+ 逐数据集基线指标清单 + 预填默认。"""
+        project = repo.get_project(project_id)
+        if project is None:
+            raise NotFound(f"项目 {project_id} 不存在")
+        return baseline.get_metric_contract(project)
+
+    @router.patch("/api/owner/projects/{project_id}/baseline/contract",
+                  dependencies=[ctx.owner])
+    def baseline_contract_set(project_id: str, payload: dict) -> dict:
+        """owner 固化指标契约(primary/direction/guardrails/eval 保护路径)。"""
+        return baseline.set_metric_contract(repo, ctx.credentials, project_id, payload)
 
     @router.get("/api/projects/{project_id}/datasets", dependencies=[ctx.reader])
     def project_datasets(project_id: str) -> dict:

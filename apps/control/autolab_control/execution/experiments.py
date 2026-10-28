@@ -87,7 +87,31 @@ def _clean_jobs(request: ExperimentRequest) -> list[dict]:
             if request.dataset_commands:
                 check_dataset_command_consistency(dataset, command, request.dataset_commands)
             job["dataset"] = dataset  # 对照时按它找该数据集的基线
+        # B1.1:variant/seed 元数据(同一变体多 seed 聚成一组变体均值)
+        variant = str(item.get("variant") or "").strip()
+        if variant:
+            if len(variant) > 80:
+                raise UserError(f"variant 名过长(≤80 字符):{name}")
+            job["variant"] = variant
+        seed = item.get("seed")
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise UserError(f"seed 必须是整数:{name}")
+            job["seed"] = seed
         out.append(job)
+    with_variant = [j for j in out if j.get("variant")]
+    if with_variant and len(with_variant) != len(out):
+        raise UserError("同一批实验里 variant 必须全有或全无")
+    seen_seeds: set[tuple[str, str, int]] = set()
+    for job in out:
+        if job.get("seed") is None:
+            continue
+        key = (job.get("variant") or "", job.get("dataset") or "", job["seed"])
+        if key in seen_seeds:
+            raise UserError("同一变体/数据集下 seed 重复:"
+                            f"{job.get('variant') or '(未命名)'}/"
+                            f"{job.get('dataset') or '(默认)'}/{job['seed']}")
+        seen_seeds.add(key)
     return out
 
 
