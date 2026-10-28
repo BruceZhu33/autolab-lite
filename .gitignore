@@ -24,6 +24,10 @@ dist/
 build/
 *.egg-info/
 
+# agent eval generated reports (keep .gitkeep)
+eval/agent/reports/latest.md
+eval/agent/reports/latest.jsonl
+
 node_modules/
 .next/
 next-env.d.ts

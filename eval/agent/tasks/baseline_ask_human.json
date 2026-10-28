@@ -1,0 +1,33 @@
+{
+  "id": "baseline_ask_human",
+  "kind": "baseline",
+  "title": "Baseline 起步缺数据集:ask_human 暂停等 owner",
+  "fixture": "fixtures/tiny_repo",
+  "note": "",
+  "cassette": [
+    {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "t1",
+          "name": "ask_human",
+          "input": {
+            "question": "需要 tiny 数据集",
+            "kind": "dataset",
+            "name": "tiny",
+            "target_path": "data/tiny",
+            "why": "train.py 读取"
+          }
+        }
+      ]
+    }
+  ],
+  "job_metrics": [],
+  "expect": {
+    "status": "waiting_human",
+    "pending.kind": "dataset",
+    "pending.payload.name": "tiny",
+    "ask_humans": 1
+  },
+  "budget": {"max_steps": 20}
+}

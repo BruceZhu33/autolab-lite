@@ -1,0 +1,48 @@
+{
+  "id": "baseline_happy",
+  "kind": "baseline",
+  "title": "Baseline happy path:run_experiment → wait_jobs → finish",
+  "fixture": "fixtures/tiny_repo",
+  "note": "跑通 tiny 数据集的基线",
+  "cassette": [
+    {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "t1",
+          "name": "run_experiment",
+          "input": {
+            "purpose": "tiny 正式基线",
+            "jobs": [{"name": "train", "dataset": "tiny", "command": "python train.py"}],
+            "metrics": [{"name": "val_dice"}]
+          }
+        }
+      ]
+    },
+    {
+      "content": [
+        {"type": "tool_use", "id": "t2", "name": "wait_jobs", "input": {"job_ids": "{{jobs}}"}}
+      ]
+    },
+    {
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "t3",
+          "name": "finish",
+          "input": {
+            "conda_env": "",
+            "notes": "ok",
+            "datasets": [{"name": "tiny", "job_id": "{{job}}"}]
+          }
+        }
+      ]
+    }
+  ],
+  "job_metrics": [{"val_dice": 0.81}],
+  "expect": {
+    "status": "waiting_human",
+    "pending.kind": "confirm_baseline"
+  },
+  "budget": {"max_steps": 20}
+}

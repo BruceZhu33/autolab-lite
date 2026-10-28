@@ -23,7 +23,7 @@ autolab-client = { workspace = true }
 autolab-runner = { workspace = true }
 
 [tool.pytest.ini_options]
-testpaths = ["packages", "apps", "runner", "tests"]
+testpaths = ["packages", "apps", "runner", "tests", "eval"]
 addopts = "-q --import-mode=importlib"
 
 [tool.ruff]
