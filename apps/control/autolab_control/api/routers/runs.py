@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+import json
 
-from ...agent import runtime
+from fastapi import APIRouter
+from fastapi.responses import Response
+
+from ...agent import runtime, trace
 from ...stages import baseline, research
 from ..app import Ctx
 
@@ -21,6 +24,27 @@ def build(ctx: Ctx) -> APIRouter:
     def events(run_id: str, after: int = 0) -> dict:
         return {"run": runtime.get_run(repo, run_id),
                 "events": runtime.list_events(repo, run_id, after)}
+
+    @router.get("/api/runs/{run_id}/spec", dependencies=[ctx.reader])
+    def run_spec(run_id: str) -> dict:
+        """会话的 AgentSpec 快照;还没有 spec 时返回 null(不 404)。"""
+        run = runtime.get_run(repo, run_id)
+        return {"runId": run_id, "spec": run["spec"], "specHash": run["specHash"]}
+
+    @router.get("/api/runs/{run_id}/trace", dependencies=[ctx.reader])
+    def run_trace(run_id: str) -> dict:
+        """结构化轨迹:llm / tool / verify span,input/output 已从 blob 解析。"""
+        run = runtime.get_run(repo, run_id)
+        return {"run": run, "spec": run["spec"], "specHash": run["specHash"],
+                "spans": trace.list_spans(repo, run_id)}
+
+    @router.get("/api/runs/{run_id}/trace.jsonl", dependencies=[ctx.reader])
+    def run_trace_jsonl(run_id: str) -> Response:
+        runtime.get_run(repo, run_id)  # 只为 404;不存在时抛 NotFound
+        lines = [json.dumps(span, ensure_ascii=False)
+                 for span in trace.list_spans(repo, run_id)]
+        return Response("".join(line + "\n" for line in lines),
+                        media_type="application/x-ndjson")
 
     @router.post("/api/owner/runs/{run_id}/message", dependencies=[ctx.owner])
     def message(run_id: str, payload: dict) -> dict:

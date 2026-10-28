@@ -524,7 +524,9 @@ def build_tools(env: LoopEnv) -> list[Tool]:
 
 PROFILE = LoopProfile(
     kind=KIND, system_prompt=SYSTEM_PROMPT, build_tools=build_tools,
-    system_suffix=_status_suffix, max_steps=2000, max_tokens=40_000_000)
+    system_suffix=_status_suffix, max_steps=2000, max_tokens=40_000_000,
+    wall_clock_seconds=48 * 3600,  # 研究阶段安全上限;light/medium/heavy 三档细分留 Phase B
+    verifier={"id": "research-end-round", "version": 1})
 
 
 # ------------------------------------------------------------------ 对外动作

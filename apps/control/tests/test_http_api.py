@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import io
+import json
 import zipfile
 
 import pytest
+from autolab_control.agent import runtime as agent_runtime
 from autolab_control.api.app import create_api_app
 from autolab_control.core.credentials import CredentialStore
 from fastapi.testclient import TestClient
 
+from .test_agent_loop import ScriptModel, echo_tool
+from .test_agent_loop import profile as loop_profile
 from .test_repo import approve_simple, make_event, make_spec, repo  # noqa: F401
 
 OWNER = "owner-token-xyz"
@@ -240,3 +244,75 @@ def test_create_project_rejects_workdir_outside_runner_roots(api, tmp_path):
         "source": {"kind": "dir", "path": str(tmp_path / "work" / "p")},
     }, headers=OWNER_H)
     assert inside.status_code == 200, inside.text
+
+
+# ------------------------------------------------------- A1/A2 spec 与 trace
+
+
+def _step_run(api, replies):
+    """起一个 kind=test 会话并推进 len(replies) 步(假模型)。"""
+    repo = api["repo"]
+    run_id = agent_runtime.start_run(
+        repo, api["fixture"]["project"]["id"], "test", "做事")["id"]
+    prof = loop_profile(tools=[echo_tool()])
+    model = ScriptModel(replies)
+    for _ in replies:
+        agent_runtime.step(repo, None, run_id, prof, model=model)
+    return run_id
+
+
+def test_run_spec_endpoint_auth_and_shape(api):
+    client = api["client"]
+    use1 = {"type": "tool_use", "id": "t1", "name": "echo", "input": {"v": 1}}
+    run_id = _step_run(api, [[use1]])
+
+    assert client.get(f"/api/runs/{run_id}/spec").status_code == 401  # 无 token
+    body = client.get(f"/api/runs/{run_id}/spec", headers=AGENT_H).json()
+    assert body["runId"] == run_id and body["specHash"]
+    assert body["spec"]["modelId"] == "glm-5.3"  # 未配置 key 时取默认模型
+    assert "api_key" not in json.dumps(body["spec"])
+    assert client.get("/api/runs/arun-none/spec", headers=AGENT_H).status_code == 404
+
+
+def test_run_spec_is_null_before_first_step(api):
+    run_id = agent_runtime.start_run(
+        api["repo"], api["fixture"]["project"]["id"], "test", "做事")["id"]
+    body = api["client"].get(f"/api/runs/{run_id}/spec", headers=AGENT_H).json()
+    assert body["spec"] is None and body["specHash"] == ""
+
+
+def test_run_trace_and_trace_jsonl(api):
+    client = api["client"]
+    use1 = {"type": "tool_use", "id": "t1", "name": "echo", "input": {"v": 1}}
+    finish = {"type": "tool_use", "id": "t2", "name": "finish",
+              "input": {"summary": "ok"}}
+    run_id = _step_run(api, [[use1], [finish]])
+
+    body = client.get(f"/api/runs/{run_id}/trace", headers=AGENT_H).json()
+    assert body["run"]["id"] == run_id and body["specHash"]
+    spans = body["spans"]
+    assert [s["id"] for s in spans] == sorted(s["id"] for s in spans)
+    assert {s["kind"] for s in spans} >= {"llm", "tool", "verify"}
+    assert spans[0]["input"]["system"] == "sys"
+    assert spans[0]["output"]["content"] == [use1]  # blob 已解析为对象
+
+    resp = client.get(f"/api/runs/{run_id}/trace.jsonl", headers=AGENT_H)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    lines = [json.loads(line) for line in resp.text.splitlines() if line]
+    assert len(lines) == len(spans)
+    assert lines[0]["kind"] == "llm" and lines[0]["input"]["messages"]
+
+    assert client.get(f"/api/runs/{run_id}/trace.jsonl").status_code == 401
+    assert client.get("/api/runs/arun-none/trace", headers=AGENT_H).status_code == 404
+    assert client.get("/api/runs/arun-none/trace.jsonl",
+                      headers=AGENT_H).status_code == 404
+
+
+def test_events_endpoint_still_works(api):
+    """旧时间线端点保持原样,不破坏现有 UI。"""
+    use1 = {"type": "tool_use", "id": "t1", "name": "echo", "input": {"v": 1}}
+    run_id = _step_run(api, [[use1]])
+    body = api["client"].get(f"/api/runs/{run_id}/events", headers=AGENT_H).json()
+    kinds = [e["kind"] for e in body["events"]]
+    assert "started" in kinds and "tool_call" in kinds

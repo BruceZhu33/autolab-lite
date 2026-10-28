@@ -60,6 +60,16 @@ def _start_http(repo: Repo, credentials: CredentialStore, port: int) -> bool:
     return True
 
 
+def _max_concurrent_runs() -> int:
+    """AUTOLAB_MAX_CONCURRENT_RUNS:非数字 / <=0 一律回退 8,
+    环境变量拼错不能挡 serve 启动。"""
+    try:
+        value = int(os.environ.get("AUTOLAB_MAX_CONCURRENT_RUNS", "8"))
+    except ValueError:
+        return 8
+    return value if value > 0 else 8
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="autolab-control", description="AutoLab Control")
     parser.add_argument("--version", action="version", version=__version__)
@@ -76,8 +86,10 @@ def main(argv: list[str] | None = None) -> int:
     credentials = CredentialStore(args.credentials)  # 尽早校验 0600 权限
     if args.http_port and not _start_http(repo, credentials, args.http_port):
         return 2
-    agents = AgentLoopManager(repo, credentials, {baseline.KIND: baseline.PROFILE,
-                                                  research.KIND: research.PROFILE})
+    agents = AgentLoopManager(
+        repo, credentials, {baseline.KIND: baseline.PROFILE,
+                            research.KIND: research.PROFILE},
+        max_concurrent=_max_concurrent_runs())
     threading.Thread(target=agents.run_forever, daemon=True, name="agent-loop").start()
 
     stop = threading.Event()

@@ -219,7 +219,9 @@ def build_tools(env: LoopEnv) -> list:
 
 
 PROFILE = LoopProfile(kind=KIND, system_prompt=SYSTEM_PROMPT, build_tools=build_tools,
-                      system_suffix=_facts, max_steps=300, max_tokens=6_000_000)
+                      system_suffix=_facts, max_steps=300, max_tokens=6_000_000,
+                      wall_clock_seconds=6 * 3600,
+                      verifier={"id": "baseline-finish", "version": 1})
 
 
 # ------------------------------------------------------------------ 对外动作

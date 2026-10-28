@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -165,6 +165,11 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     messages_json TEXT NOT NULL DEFAULT '[]',
     pending_json TEXT,
     result_json TEXT,
+    spec_json TEXT NOT NULL DEFAULT '{}',
+    spec_hash TEXT NOT NULL DEFAULT '',
+    error_streak INTEGER NOT NULL DEFAULT 0,
+    active_seconds REAL NOT NULL DEFAULT 0,
+    last_active_at TEXT,
     stop_reason TEXT,
     steps INTEGER NOT NULL DEFAULT 0,
     tokens_in INTEGER NOT NULL DEFAULT 0,
@@ -203,6 +208,35 @@ CREATE TABLE IF NOT EXISTS research_rounds (
 );
 CREATE INDEX IF NOT EXISTS idx_research_rounds ON research_rounds(project_id, created_at);
 
+-- A2 结构化轨迹:span 是给机器回放的,blob 是不截断的原文
+-- (agent_run_events 是给人看的时间线,两者职责不同)。
+CREATE TABLE IF NOT EXISTS agent_blobs (
+    id TEXT PRIMARY KEY,              -- sha256(content)
+    content TEXT NOT NULL,            -- JSON 或文本,不截断
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_spans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    step_no INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('llm','tool','verify','pause','human')),
+    name TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL,             -- ok / error / paused / truncated
+    input_blob TEXT,
+    output_blob TEXT,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER,
+    error_class TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_spans_run ON agent_spans(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_agent_spans_run_step ON agent_spans(run_id, step_no);
 -- 控制台账号(一人一 token):member=只读浏览;写操作仍要求 owner token。
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
@@ -313,6 +347,19 @@ class Database:
             # 卡住原因可见性:磁盘水位/Runner 不可达等把 Job 压回队列时,
             # 原因落在行上(UI 可见),而不是无声等待(真机:盘满任务干等没人知道为何)
             conn.execute("ALTER TABLE jobs ADD COLUMN hold_note TEXT")
+        # CREATE TABLE IF NOT EXISTS 不会给旧表加列:agent_runs 的 spec/长程安全列
+        # (A1 spec 快照、A3 错误连击与 wall-clock)逐列补齐
+        if "agent_runs" in {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}:
+            cols = _columns(conn, "agent_runs")
+            for col, decl in (("spec_json", "TEXT NOT NULL DEFAULT '{}'"),
+                              ("spec_hash", "TEXT NOT NULL DEFAULT ''"),
+                              ("error_streak", "INTEGER NOT NULL DEFAULT 0"),
+                              ("active_seconds", "REAL NOT NULL DEFAULT 0"),
+                              ("last_active_at", "TEXT")):
+                if col not in cols:
+                    conn.execute(
+                        f"ALTER TABLE agent_runs ADD COLUMN {col} {decl}")
         conn.executescript(_SCHEMA)
         conn.execute("INSERT OR IGNORE INTO schema_migrations (version, applied_at)"
                      " VALUES (?, ?)", (SCHEMA_VERSION, utc_now()))

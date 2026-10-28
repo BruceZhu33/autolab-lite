@@ -19,6 +19,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from ..core import notify
@@ -30,11 +31,16 @@ from ..core.repo import TERMINAL_JOB_STATUSES, Repo
 from ..execution.experiments import describe_jobs
 from ..workspace.fs import Workspace
 from ..workspace.host import open_host
-from .model import ModelFn, call_model
+from . import trace
+from .model import ModelFn, call_model, model_settings
+from .spec import build_agent_spec, spec_from_json
+
+KEEP_RECENT = 12  # _compact_view 保留最近 N 个工具结果不截短(spec.contextPolicy)
+TRUNCATED_HINT = ("上一条回复因 max_tokens 被截断。请缩小单次输出"
+                  "(尤其 write_file 内容),或拆成多次工具调用后重试。")
 
 ACTIVE_STATUSES = ("running", "waiting_human", "waiting_jobs")
 TERMINAL_STATUSES = ("done", "failed", "stopped")
-
 
 
 class AgentLoopError(UserError):
@@ -96,6 +102,11 @@ class LoopProfile:
     max_steps: int = 200
     max_tokens: int = 3_000_000
     max_output_tokens: int = 4000
+    # 长程安全(A3):wall-clock 活跃时长上限(0=关闭);连续模型错误上限
+    wall_clock_seconds: int = 0
+    max_consecutive_model_errors: int = 8
+    # 验收器身份(A1):spec 里固化,如 {"id": "baseline-finish", "version": 1}
+    verifier: dict = field(default_factory=lambda: {"id": "default-accept", "version": 1})
     # 每步之前塞给模型的系统提示补充(如:剩余预算);由 profile 自定
     system_suffix: Callable[[LoopEnv], str] | None = None
 
@@ -200,6 +211,8 @@ def _public(row: dict) -> dict:
         "status": row["status"], "stopReason": row["stop_reason"],
         "pending": _loads(row["pending_json"], None),
         "result": _loads(row["result_json"], None),
+        "spec": spec_from_json(row["spec_json"]),
+        "specHash": row["spec_hash"] or "",
         "config": _loads(row["config_json"], {}),
         "steps": row["steps"], "tokensIn": row["tokens_in"],
         "tokensOut": row["tokens_out"],
@@ -333,7 +346,7 @@ def _tool_result(tool_use_id: str, text: str, *, error: bool = False) -> dict:
     return block
 
 
-def _compact_view(messages: list[dict], keep_recent: int = 12) -> list[dict]:
+def _compact_view(messages: list[dict], keep_recent: int = KEEP_RECENT) -> list[dict]:
     """发给模型的视图:较早的工具结果截短(库里保留全文)。长会话不爆上下文,
     关键信息靠 agent 自己写进 journal。"""
     positions = [(i, j) for i, m in enumerate(messages) if m["role"] == "user"
@@ -357,8 +370,83 @@ def _text_of(blocks: list[dict]) -> str:
     return "\n".join(b.get("text", "") for b in blocks
                      if b.get("type") == "text").strip()
 
+# ------------------------------------------------------------------ 长程安全
 
-# ------------------------------------------------------------------ 单步推进
+
+def _parse_ts(raw: str | None) -> float | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _accrue_wall_clock(repo: Repo, row: dict) -> float:
+    """上一步到现在的时长:上一步状态是 running 才计入活跃;等人/等 GPU 不计。
+    每次进入 step 都刷新锚点,返回累计活跃秒数(同时落库)。"""
+    now = datetime.now(timezone.utc).timestamp()
+    active = float(row["active_seconds"] or 0.0)
+    if row["status"] == "running":
+        anchor = _parse_ts(row["last_active_at"])
+        if anchor is not None:
+            active += max(0.0, now - anchor)
+    _update(repo, row["id"], active_seconds=active, last_active_at=utc_now())
+    return active
+
+
+def _reset_active_anchors(repo: Repo) -> None:
+    """控制进程启动时把 running 行的活跃锚点拨回当前时间(active_seconds 不动):
+    重启/宕机期间的停机时长不能被下一次 step 的 wall-clock 计入活跃;
+    正常的长工具执行仍由单步 delta 计入。"""
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            conn.execute("UPDATE agent_runs SET last_active_at = ?"
+                         " WHERE status = 'running'", (utc_now(),))
+    finally:
+        conn.close()
+
+
+def _cancel_active_jobs(repo: Repo, run_id: str) -> list[str]:
+    """会话终结时取消本会话名义批准、未终态的 Job(业务 API,不直改状态)。
+    单个取消失败只记日志:会话终结优先,收尾事故不能挡住状态落库。"""
+    conn = repo.db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT j.id FROM jobs j JOIN plan_revisions p"
+            " ON j.plan_revision_id = p.id WHERE p.approved_by = ?"
+            " AND j.status IN ('QUEUED','DISPATCHING','RUNNING','CANCELLING')",
+            (f"agent-run:{run_id}",)).fetchall()
+    finally:
+        conn.close()
+    job_ids = [r["id"] for r in rows]
+    for job_id in job_ids:
+        try:
+            repo.request_cancel(job_id)
+        except Exception as exc:  # noqa: BLE001 - 收尾路径不再抛
+            print(f"autolab-control: cancel job {job_id} failed"
+                  f" (run {run_id}): {exc}", flush=True)
+    if job_ids:
+        record_event(repo, run_id, "jobs_cancelled", {"jobIds": job_ids})
+    return job_ids
+
+
+def _tool_span_output(output: Any) -> tuple[str, str, Any]:
+    """工具输出 → (span status, error_class, output_obj)。"""
+    if isinstance(output, ToolError):
+        return "error", "tool_error", {"type": "tool_error", "message": str(output)}
+    if isinstance(output, Pause):
+        return "paused", "", {"type": "pause", "kind": output.kind,
+                              "payload": output.payload}
+    if isinstance(output, NewContext):
+        return "ok", "", {"type": "new_context", "seed": output.seed}
+    if isinstance(output, Finish):
+        return "ok", "", {"type": "finish", "payload": output.payload}
+    return "ok", "", str(output)
+
+
+ # ------------------------------------------------------------------ 单步推进
 
 
 def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
@@ -375,6 +463,7 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
     messages: list[dict] = _loads(row["messages_json"], [])
     pending = _loads(row["pending_json"], None)
     status = row["status"]
+    step_no = int(row["steps"]) + 1
 
     # 1) 收件箱:停止优先;owner 的话在等人时就是回答
     notes: list[str] = []
@@ -382,9 +471,13 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
         if item["kind"] == "stop":
             _update(repo, run_id, status="stopped", stop_reason="owner 停止")
             record_event(repo, run_id, "stopped", {"by": "owner"})
+            _cancel_active_jobs(repo, run_id)
             return "stopped"
         notes.append(item.get("text", ""))
         record_event(repo, run_id, "owner_message", {"text": item.get("text", "")})
+
+    # 1.5) wall-clock:上一步后经过的时间按上一步状态归类(活跃 / 等待)
+    active_seconds = _accrue_wall_clock(repo, row)
 
     env = LoopEnv(repo, credentials, row, project)
     try:
@@ -421,37 +514,97 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
             _append_user_blocks(messages, [{"type": "text", "text":
                                 "owner 插话:\n" + "\n\n".join(notes)}])
 
-        # 3) 硬预算
+        # 3) 硬预算(步数 / tokens / wall-clock)
         if row["steps"] >= profile.max_steps:
             return _finish_by_budget(repo, run_id, messages, f"步数上限 {profile.max_steps}")
         if row["tokens_in"] + row["tokens_out"] >= profile.max_tokens:
             return _finish_by_budget(repo, run_id, messages, f"tokens 上限 {profile.max_tokens}")
+        if profile.wall_clock_seconds and active_seconds >= profile.wall_clock_seconds:
+            return _finish_by_budget(
+                repo, run_id, messages,
+                f"wall-clock {profile.wall_clock_seconds}s(活跃 {int(active_seconds)}s)")
 
-        # 4) 调模型
+        # 4) 调模型(spec 快照在首次调用前固化,之后只读)
         tools = profile.build_tools(env)
         tool_map = {t.name: t for t in tools}
         system = profile.system_prompt
         if profile.system_suffix is not None:
             system += "\n\n" + profile.system_suffix(env)
+        if not row["spec_hash"]:
+            snapshot = build_agent_spec(profile, credentials, tools,
+                                        keep_recent=KEEP_RECENT)
+            _update(repo, run_id, spec_json=_dumps(snapshot.to_dict()),
+                    spec_hash=snapshot.spec_hash())
+        view = _compact_view(messages)
+        tool_specs = [t.spec() for t in tools]
+        model_id = model_settings(credentials)["model"]
         call = model or (lambda **kw: call_model(credentials, **kw))
+        llm_in = trace.llm_input(system, view, tool_specs)  # 调用前快照确切视图
+        started_at = utc_now()
         try:
-            response = call(system=system, messages=_compact_view(messages),
-                            tools=[t.spec() for t in tools],
+            response = call(system=system, messages=view, tools=tool_specs,
                             max_tokens=profile.max_output_tokens)
         except Exception as exc:
-            # 模型不可用:保存已拼好的上下文,留在 running 等下一次 tick 重试
+            ended_at = utc_now()
+            streak = int(row["error_streak"] or 0) + 1
+            trace.record_span(repo, run_id, step_no, "llm", model_id, status="error",
+                              input_obj=llm_in,
+                              output_obj={"error": str(exc)[:2000]}, attempt=streak,
+                              error_class=type(exc).__name__,
+                              started_at=started_at, ended_at=ended_at)
+            if streak >= profile.max_consecutive_model_errors:
+                _update(repo, run_id, status="failed",
+                        stop_reason=f"模型连续失败 {streak} 次",
+                        messages_json=_dumps(messages), pending_json=None,
+                        error_streak=streak)
+                record_event(repo, run_id, "failed",
+                             {"error": str(exc)[:500], "streak": streak})
+                _cancel_active_jobs(repo, run_id)
+                return "failed"
+            # 模型不可用:保存已拼好的上下文,留在 running 等下一次 tick 退避重试
             _update(repo, run_id, status="running", messages_json=_dumps(messages),
-                    pending_json=None)
-            record_event(repo, run_id, "model_error", {"error": str(exc)[:500]})
+                    pending_json=None, error_streak=streak)
+            record_event(repo, run_id, "model_error",
+                         {"error": str(exc)[:500], "streak": streak})
             return "running"
         content = [b for b in response.get("content") or []
                    if b.get("type") in ("text", "tool_use")]
         usage = response.get("usage") or {}
         messages.append({"role": "assistant", "content": content})
         text = _text_of(content)
+        truncated = response.get("stop_reason") == "max_tokens"
+        trace.record_span(
+            repo, run_id, step_no, "llm", model_id,
+            status="truncated" if truncated else "ok",
+            input_obj=llm_in, output_obj=response,
+            tokens_in=int(usage.get("input_tokens") or 0),
+            tokens_out=int(usage.get("output_tokens") or 0),
+            started_at=started_at, ended_at=utc_now())
         if text:
             record_event(repo, run_id, "assistant", {"text": text[:6000]})
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
+
+        fields: dict[str, Any] = {
+            "steps": step_no,
+            "tokens_in": row["tokens_in"] + int(usage.get("input_tokens") or 0),
+            "tokens_out": row["tokens_out"] + int(usage.get("output_tokens") or 0),
+            "error_streak": 0,
+        }
+        if truncated:
+            # max_tokens 截断:本步工具一律不执行(半截参数只会引祸),提示 agent
+            # 缩小单次输出后重试;状态保持 running,不等人
+            record_event(repo, run_id, "llm_truncated", {"step": step_no})
+            # assistant 的 tool_use 后必须跟 tool_result(消息约定),否则端点 400:
+            # 对本次 content 里的每个 tool_use 补一个 is_error 的 tool_result,再跟 text 提示
+            blocks = [_tool_result(
+                use["id"], "上一条回复因 max_tokens 被截断,该调用未执行;请缩小输出后重试",
+                error=True) for use in tool_uses]
+            blocks.append({"type": "text", "text": TRUNCATED_HINT})
+            _append_user_blocks(messages, blocks)
+            fields.update(status="running", pending_json=None,
+                          messages_json=_dumps(messages), last_active_at=utc_now())
+            _update(repo, run_id, **fields)
+            return "running"
 
         new_status, new_pending, result, reset = "running", None, None, None
         results: list[dict] = []
@@ -467,18 +620,28 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
             tool = tool_map.get(name)
             if tool is None:
                 results.append(_tool_result(use["id"], f"未知工具 {name}", error=True))
+                trace.record_span(repo, run_id, step_no, "tool", name, status="error",
+                                  error_class="unknown_tool", input_obj=args,
+                                  output_obj={"type": "tool_error",
+                                              "message": f"未知工具 {name}"})
                 continue
             if new_pending is not None or result is not None or reset is not None:
                 results.append(_tool_result(
                     use["id"], "本步已暂停/结束,该调用未执行;恢复后需要请重新调用",
                     error=True))
                 continue
+            tool_started = utc_now()
             try:
                 output = tool.handler(env, args)
             except UserError as exc:  # 工具里的业务错误(含 ToolError)回给 agent
                 output = ToolError(str(exc))
             except Exception as exc:  # 工具自身故障也只是观察,agent 自适应
                 output = ToolError(f"工具执行失败:{exc}")
+            span_status, span_error, span_output = _tool_span_output(output)
+            trace.record_span(repo, run_id, step_no, "tool", name, status=span_status,
+                              error_class=span_error, input_obj=args,
+                              output_obj=span_output, started_at=tool_started,
+                              ended_at=utc_now())
             if isinstance(output, ToolError):
                 results.append(_tool_result(use["id"], str(output), error=True))
                 record_event(repo, run_id, "tool_error", {"name": name,
@@ -494,6 +657,10 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                 record_event(repo, run_id, "new_context", {"seed": reset[:4000]})
             elif isinstance(output, Finish):
                 rejection = profile.on_finish(env, output.payload)
+                trace.record_span(repo, run_id, step_no, "verify", "on_finish",
+                                  input_obj=output.payload,
+                                  output_obj={"rejected": bool(rejection),
+                                              "reason": rejection})
                 if rejection:
                     results.append(_tool_result(use["id"], f"验收未通过:{rejection}",
                                                 error=True))
@@ -506,11 +673,6 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                 record_event(repo, run_id, "tool_result",
                              {"name": name, "output": str(output)[:3000]})
 
-        fields: dict[str, Any] = {
-            "steps": row["steps"] + 1,
-            "tokens_in": row["tokens_in"] + int(usage.get("input_tokens") or 0),
-            "tokens_out": row["tokens_out"] + int(usage.get("output_tokens") or 0),
-        }
         if result is not None:
             _append_user_blocks(messages, results)
             fields.update(status="done", pending_json=None, result_json=_dumps(result))
@@ -527,6 +689,7 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
             _append_user_blocks(messages, results)
             fields.update(status="running", pending_json=None)
         fields["messages_json"] = _dumps(messages)
+        fields["last_active_at"] = utc_now()
         _update(repo, run_id, **fields)
         if new_status == "waiting_human":
             notify.notify_run(repo, row, "waiting_human", detail=str(
@@ -545,6 +708,7 @@ def _finish_by_budget(repo: Repo, run_id: str, messages: list[dict],
             messages_json=_dumps(messages), pending_json=None)
     record_event(repo, run_id, "stopped", {"by": "budget", "reason": reason})
     notify.notify_run(repo, row, "stopped", detail=f"预算耗尽:{reason}")
+    _cancel_active_jobs(repo, run_id)
     return "stopped"
 
 
@@ -556,14 +720,18 @@ class AgentLoopManager:
 
     def __init__(self, repo: Repo, credentials: CredentialStore | None,
                  profiles: dict[str, LoopProfile], *, interval: float = 3.0,
-                 model: ModelFn | None = None):
+                 model: ModelFn | None = None, max_concurrent: int = 8,
+                 model_error_backoff: float = 30.0):
         self.repo = repo
         self.credentials = credentials
         self.profiles = profiles
         self.interval = interval
         self.model = model
+        self.max_concurrent = max(1, int(max_concurrent))
+        self.model_error_backoff = model_error_backoff
         self._busy: set[str] = set()
         self._lock = threading.Lock()
+        _reset_active_anchors(repo)
     
     def active_run_ids(self) -> list[tuple[str, str]]:
         conn = self.repo.db.connect()
@@ -577,14 +745,20 @@ class AgentLoopManager:
         return [(r["id"], r["kind"]) for r in rows]
 
     def tick(self) -> None:
-        for run_id, kind in self.active_run_ids():
-            profile = self.profiles.get(kind)
-            if profile is None:
-                continue
-            with self._lock:
-                if run_id in self._busy:
+        """最多补到 max_concurrent 个在驱动的会话;其余下一轮 tick 再启动。"""
+        started: list[tuple[str, LoopProfile]] = []
+        with self._lock:
+            slots = self.max_concurrent - len(self._busy)
+            for run_id, kind in self.active_run_ids():
+                if slots <= 0:
+                    break
+                profile = self.profiles.get(kind)
+                if profile is None or run_id in self._busy:
                     continue
                 self._busy.add(run_id)
+                started.append((run_id, profile))
+                slots -= 1
+        for run_id, profile in started:
             threading.Thread(target=self._drive, args=(run_id, profile),
                              daemon=True, name=f"agent-run-{run_id}").start()
 
@@ -599,10 +773,9 @@ class AgentLoopManager:
                 row = _row(self.repo, run_id)
                 if row is None or row["status"] != "running":
                     return
-                # model_error 时 step 原地返回 running:退避,别打满端点
-                events = list_events(self.repo, run_id)
-                if events and events[-1]["kind"] == "model_error":
-                    time.sleep(30)
+                # model_error 时 step 原地返回 running:按错误连击退避,别打满端点
+                if row["error_streak"]:
+                    time.sleep(self.model_error_backoff)
         except Exception as exc:  # 运行时自身 bug:终结会话并留因,不明灭
             try:
                 _update(self.repo, run_id, status="failed",
@@ -610,6 +783,7 @@ class AgentLoopManager:
                 record_event(self.repo, run_id, "failed", {"error": str(exc)[:2000]})
                 notify.notify_run(self.repo, _row(self.repo, run_id) or {"id": run_id},
                                   "failed", detail=f"运行时异常:{str(exc)[:300]}")
+                _cancel_active_jobs(self.repo, run_id)
             except Exception:  # 磁盘满/IO 故障时连留痕都写不进:至少别炸线程
                 print(f"autolab-control: driver crash-logging failed (run {run_id}):"
                       f" {exc}", flush=True)

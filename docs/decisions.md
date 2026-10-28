@@ -533,3 +533,22 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   review_refs_json→refs_json、确认快照→baseline_json(原地,退役表保留不读)。
 - 遗留:GLM 真机验证(长工具循环 + 跨暂停续跑)未做,先在真项目上跑通 Baseline
   与轻量研究再合并回 main。
+
+## D-033 · 可评测架构 Phase A:AgentSpec 快照 + 结构化 Trace + 长程安全(2026-10-28)
+
+- 背景:agent 层能力够但无评测面——配置写死在代码里、`agent_run_events` 只给人看,
+  `messages_json` 同时当上下文与审计;运行时缺 wall-clock、错误连击、stop 不取消 Job,
+  过夜 RSI 会把小故障放大成事故。
+- A1 `agent/spec.py`:prompt/tool/model/budget/verifier 在首次模型调用前固化为
+  AgentSpec(spec_hash=sha256(sort_keys JSON)),存 `agent_runs.spec_json/spec_hash`,
+  之后只读;绝不落 api_key。`GET /api/runs/{id}/spec`。
+- A2 `agent/trace.py`:llm/tool/verify 三类 span + 内容寻址 blob(原文不截断,
+  llm 输入超 512KB 降级 contextHash+messagesTail);llm input 必须是当步
+  `_compact_view` 确切视图。`GET /api/runs/{id}/trace[.jsonl]`。
+- A3:`wall_clock_seconds`(running 才计活跃,等人/等 GPU 不计)、
+  `max_consecutive_model_errors=8`、终结路径统一 `_cancel_active_jobs`(走
+  `repo.request_cancel`,不直改 Job 状态)、max_tokens 截断不执行工具、为每个
+  tool_use 补 is_error 的 tool_result 后追加 user 提示、
+  `AgentLoopManager(max_concurrent=8)`。旧库逐列 ALTER 迁移(v22)。
+- 遗留:research 三档 wall-clock 细分未设,当前统一 48h 安全上限(档位配置在
+  run config,细分留 Phase B);真机仍需截断探针验证 GLM 端点兼容性。
