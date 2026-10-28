@@ -15,7 +15,6 @@ from autolab_protocol import (
     ManifestV1,
     MetricSource,
 )
-
 from autolab_runner.config import RunnerConfig
 from autolab_runner.core import RunnerCore
 
