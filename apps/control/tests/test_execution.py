@@ -13,9 +13,16 @@ from autolab_control.execution.comparison import (
     param_insensitivity,
     variant_means,
 )
-from autolab_control.execution.experiments import ExperimentRequest, _clean_jobs, job_log_tail
+from autolab_control.execution.experiments import (
+    ExperimentRequest,
+    _clean_jobs,
+    job_log_tail,
+    submit,
+)
 from autolab_control.execution.metrics import metric_domain_issue, metrics_sanity_issues
 from autolab_control.workspace import refs
+from autolab_control.workspace.fs import Workspace
+from autolab_control.workspace.host import LocalHost
 
 from .test_repo import approve_simple, make_spec, repo  # noqa: F401
 
@@ -180,3 +187,69 @@ def test_evaluate_guardrails():
     assert evaluate_guardrails(rows, {"guardrails": []})["checked"] == 0
     # 失败 Job 不参与判定
     assert evaluate_guardrails([row("bad", 0.9, status="FAILED")], contract)["checked"] == 0
+
+
+# ----------------------------------------------------------------- B2.1 重复实验门
+
+
+def _do_submit(repo_fixture, ws, jobs, approved_by):
+    return submit(repo_fixture["repo"], ws, repo_fixture["project"],
+                  ExperimentRequest(jobs=jobs, metrics=["val_dice"], purpose="p"),
+                  approved_by=approved_by)
+
+
+def _set_job_status(repo_fixture, job_id, status):
+    conn = repo_fixture["repo"].db.connect()
+    try:
+        with repo_fixture["repo"].db.tx(conn):
+            conn.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
+    finally:
+        conn.close()
+
+
+def test_duplicate_submit_rejected_after_success(repo, tmp_path):
+    """同一 agent-run 已成功跑过完全相同的一组 Job → 原样重交被拒。"""
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    jobs = [{"name": "a", "dataset": "kvasir", "command": "python train.py", "seed": 1}]
+    first = _do_submit(repo, ws, jobs, "agent-run:run-1")
+    _set_job_status(repo, first["jobs"][0]["id"], "SUCCEEDED")
+    with pytest.raises(UserError, match="已成功跑过同一组实验"):
+        _do_submit(repo, ws, jobs, "agent-run:run-1")
+
+
+def test_duplicate_submit_allows_new_seed(repo, tmp_path):
+    """换 seed(签名不同)→ 允许;失败 Job 重试也允许。"""
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    jobs = [{"name": "a", "dataset": "kvasir", "command": "python train.py", "seed": 1}]
+    first = _do_submit(repo, ws, jobs, "agent-run:run-1")
+    _set_job_status(repo, first["jobs"][0]["id"], "SUCCEEDED")
+    second = _do_submit(repo, ws, [{"name": "a", "dataset": "kvasir",
+                                    "command": "python train.py", "seed": 2}],
+                        "agent-run:run-1")
+    assert second["planId"] != first["planId"]      # 同命令不同 seed:放行
+
+    # 旧 Job FAILED:成功集合为空,原样重试放行
+    retry = _do_submit(repo, ws, [{"name": "b", "dataset": "kvasir",
+                                   "command": "python eval.py", "seed": 1}],
+                       "agent-run:run-1")
+    _set_job_status(repo, retry["jobs"][0]["id"], "FAILED")
+    again = _do_submit(repo, ws, [{"name": "b", "dataset": "kvasir",
+                                   "command": "python eval.py", "seed": 1}],
+                       "agent-run:run-1")
+    assert again["planId"] != retry["planId"]
+
+    # CANCELLED 同理允许重试
+    _set_job_status(repo, again["jobs"][0]["id"], "CANCELLED")
+    assert _do_submit(repo, ws, [{"name": "b", "dataset": "kvasir",
+                                  "command": "python eval.py", "seed": 1}],
+                      "agent-run:run-1")["planId"] != again["planId"]
+
+
+def test_duplicate_submit_ignores_non_agent_run(repo, tmp_path):
+    """CLI/人工路径(approved_by 非 agent-run:*)不拦,同组 Job 可反复提交。"""
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    jobs = [{"name": "a", "dataset": "kvasir", "command": "python train.py"}]
+    first = _do_submit(repo, ws, jobs, "local_cli")
+    _set_job_status(repo, first["jobs"][0]["id"], "SUCCEEDED")
+    second = _do_submit(repo, ws, jobs, "local_cli")
+    assert second["planId"] != first["planId"]

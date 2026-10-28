@@ -596,8 +596,12 @@ def test_heavy_significance_ci_gates_success(api, tmp_path):
     seeds = [("s1", "kvasir", "python train.py --attn --seed 1"),
              ("s2", "kvasir", "python train.py --attn --seed 2"),
              ("s3", "kvasir", "python train.py --attn --seed 3")]
+    # 第 2 轮必须换 seed:同会话原样重交已被 B2.1 重复实验门拒绝
+    seeds_b = [("s4", "kvasir", "python train.py --attn --seed 4"),
+               ("s5", "kvasir", "python train.py --attn --seed 5"),
+               ("s6", "kvasir", "python train.py --attn --seed 6")]
     model = ScriptModel([*multi_seed_round(state, "a", seeds),
-                         *multi_seed_round(state, "b", seeds)])
+                         *multi_seed_round(state, "b", seeds_b)])
     step = stepper(repo, run_id, model)
     assert step() == "running" and step() == "waiting_jobs"
     for jid, value in zip(state["jobs"], (0.83, 0.79, 0.82), strict=True):
@@ -725,3 +729,88 @@ def _row(repo, run_id):
         return dict(conn.execute("SELECT * FROM agent_runs WHERE id = ?", (run_id,)).fetchone())
     finally:
         conn.close()
+
+
+# ------------------------------------------------------------------ Phase B2.1
+
+
+def _heavy_rounds_script(state, means_per_round):
+    """heavy 连续多轮的脚本:每轮 3 seed、seed 号递增(重复实验门要求换 seed)。
+    means_per_round = [该轮三个 job 的 val_dice]。"""
+    script: list = []
+    for r, _ in enumerate(means_per_round):
+        seeds = [(f"r{r}s{i}", "kvasir", f"python train.py --attn --seed {r * 10 + i}")
+                 for i in (1, 2, 3)]
+        script.extend(multi_seed_round(state, "abcd"[r], seeds))
+    return script
+
+
+def test_heavy_stagnant_rounds_stop_session(api, tmp_path):
+    """heavy 连续 4 轮均值不涨 → stagnant 计满 3 触发 Finish,reason 带无进展口径。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="heavy")
+    state: dict = {}
+    means = [(0.83, 0.79, 0.82)] * 4      # 均值 +0.0133:过阈值但 CI 下界 ≤ 0,轮轮一样
+    step = stepper(repo, run_id, ScriptModel(_heavy_rounds_script(state, means)))
+    for r, vals in enumerate(means):
+        assert step() == "running" and step() == "waiting_jobs"
+        for jid, value in zip(state["jobs"][r * 3:(r + 1) * 3], vals, strict=True):
+            finish_job(repo, jid, {"val_dice": value})
+        assert step() == ("done" if r == 3 else "running")
+    result = al.get_run(repo, run_id)["result"]
+    assert result["success"] is False and result["rounds"] == 4
+    assert "连续 3 轮无新提升" in result["reason"]
+    rounds = rounds_of(client, pid)
+    assert [r.get("stagnantRounds") for r in rounds] == [0, 1, 2, 3]
+    assert "连续 3 轮无新提升" in rounds[3]["verdict"]
+    journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
+    assert "- 连续无提升:3 轮" in journal
+
+
+def test_stagnant_counter_resets_on_progress(api, tmp_path):
+    """第 2 轮原地踏步(stagnant 1),第 3 轮真提升 → 清零并按成功收束,不误停。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="heavy")
+    state: dict = {}
+    means = [(0.83, 0.79, 0.82), (0.83, 0.79, 0.82), (0.84, 0.85, 0.86)]
+    step = stepper(repo, run_id, ScriptModel(_heavy_rounds_script(state, means)))
+    for r, vals in enumerate(means):
+        assert step() == "running" and step() == "waiting_jobs"
+        for jid, value in zip(state["jobs"][r * 3:(r + 1) * 3], vals, strict=True):
+            finish_job(repo, jid, {"val_dice": value})
+        assert step() == ("done" if r == 2 else "running")
+    result = al.get_run(repo, run_id)["result"]
+    assert result["success"] is True and result["rounds"] == 3
+    assert "连续" not in result["reason"]
+    assert [r.get("stagnantRounds") for r in rounds_of(client, pid)] == [0, 1, 0]
+
+
+def test_light_tier_not_auto_stopped_by_stagnation(api, tmp_path):
+    """light(stagnant_rounds=0)同均值不自动停:仍每轮等 owner,只报无进展计数。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="light")
+    state: dict = {}
+    model = ScriptModel([
+        *experiment_round(state, "a", command="python train.py --attn --seed 1"),
+        *experiment_round(state, "b", command="python train.py --attn --seed 2"),
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    finish_job(repo, state["job"], {"val_dice": 0.85})
+    assert step() == "waiting_human"          # 第 1 轮:轻量档等 owner
+    resp = client.post(f"/api/owner/runs/{run_id}/message",
+                       json={"text": "继续,再验证一轮"}, headers=OWNER_H)
+    assert resp.status_code == 200
+    assert step() == "running" and step() == "waiting_jobs"
+    finish_job(repo, state["job"], {"val_dice": 0.85})   # 同均值:+0.05 无新提升
+    assert step() == "waiting_human"          # stagnant 1 但 cap=0:不自动停
+    run = al.get_run(repo, run_id)
+    assert run["status"] == "waiting_human"
+    payload = run["pending"]["payload"]
+    assert payload["roundNo"] == 2 and "连续 1 轮无新提升" in payload["question"]

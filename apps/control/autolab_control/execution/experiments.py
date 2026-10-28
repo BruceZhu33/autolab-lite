@@ -115,6 +115,38 @@ def _clean_jobs(request: ExperimentRequest) -> list[dict]:
     return out
 
 
+def _job_signature(jobs: list[dict]) -> list[tuple]:
+    """排序后的 (dataset, command, variant, seed) 元组集合:重复提交判定用。
+    seed 混有 None/int 时按「无 seed 在前」稳定排序,等值比较不受排序键影响。"""
+    sigs = [(str(j.get("dataset") or "").strip(), str(j.get("command") or "").strip(),
+             str(j.get("variant") or "").strip(),
+             None if j.get("seed") is None else int(j["seed"]))
+            for j in jobs]
+    return sorted(sigs, key=lambda t: (t[0], t[1], t[2], t[3] is not None, t[3] or 0))
+
+
+def check_duplicate_jobs(repo: Repo, approved_by: str, jobs: list[dict]) -> None:
+    """同一 agent-run 已成功跑过完全相同的一组 Job → UserError。
+    签名 = 排序后的 (dataset, command.strip(), variant, seed) 元组集合。
+    只拿 SUCCEEDED 的旧 Job 比较;旧 Job 失败/取消不算重复(允许重试)。
+    approved_by 不是 agent-run:<id> 时直接返回(CLI/人工路径不拦)。"""
+    if not str(approved_by).startswith("agent-run:"):
+        return
+    conn = repo.db.connect()
+    try:
+        plan_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM plan_revisions WHERE approved_by = ?", (approved_by,))]
+    finally:
+        conn.close()
+    signature = _job_signature(jobs)
+    for plan_id in plan_ids:
+        succeeded = [json.loads(j["params_json"]) for j in repo.list_jobs(plan_id=plan_id)
+                     if j["status"] == "SUCCEEDED"]
+        if succeeded and _job_signature(succeeded) == signature:
+            raise UserError("本会话已成功跑过同一组实验(相同 dataset/command/variant/seed);"
+                            "请换 seed、变体或命令,或先分析已有结果,不要原样重复。")
+
+
 # dataset 标注 vs 命令的「身分参数」比对。真机事故:agent 把 BUSI@10% 的实验
 # 标成 BUSI,对照挂到 100% 基线(0.85 vs 0.68),判定链失明三轮才触发停止。
 # 身分参数 = 值/存在性在确认池各数据集命令间有差异的 flag=值对
@@ -199,6 +231,7 @@ def submit(repo: Repo, ws: Workspace, project: dict, request: ExperimentRequest,
            approved_by: str, baseline_ref: str = "baseline") -> dict:
     """提交并自动批准;返回 {planId, experimentId, jobs:[{id, name}]}。"""
     jobs = _clean_jobs(request)
+    check_duplicate_jobs(repo, approved_by, jobs)
     metrics = _clean_metrics(request.metrics)
     metric_file = (request.metric_file or "metrics.json").strip().lstrip("/")
     if ".." in metric_file.split("/"):

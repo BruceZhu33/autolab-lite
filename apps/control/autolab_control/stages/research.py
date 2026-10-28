@@ -43,18 +43,22 @@ JOURNAL_REL = ".autolab/research_journal.md"
 TIERS: dict[str, dict] = {
     # 轻量 = 人机协作:每轮结束停下,owner 看完报告回话才进下一轮
     "light": {"label": "轻量 · 人机协作", "max_rounds": 3, "threshold": 0.0,
-              "gpu_hours": 0.0, "confirm_each_round": True, "min_seeds": 1},
+              "gpu_hours": 0.0, "confirm_each_round": True, "min_seeds": 1,
+              "stagnant_rounds": 0},
     "medium": {"label": "中量", "max_rounds": 5, "threshold": 0.0,
-               "gpu_hours": 0.0, "confirm_each_round": False, "min_seeds": 1},
+               "gpu_hours": 0.0, "confirm_each_round": False, "min_seeds": 1,
+               "stagnant_rounds": 3},
     # 重量 = 过夜:不限轮,只有达到显著阈值才算成功,GPU 小时兜底。
     # 判定按变体均值:单 seed 冒尖不再触发停止(真机教训:hflip TTA 变体均值
     # 更差,却靠一个 seed 的 +0.0175 触发了会话结束)。
     "heavy": {"label": "重量 · 过夜", "max_rounds": 0, "threshold": 0.01,
-              "gpu_hours": 24.0, "confirm_each_round": False, "min_seeds": 3},
+              "gpu_hours": 24.0, "confirm_each_round": False, "min_seeds": 3,
+              "stagnant_rounds": 3},
     # 全量验证 = 把冠军改动在选定数据集上按基线口径多 seed 重跑,一轮收束;
     # 每 dataset 需要的 seed 数在 config.seeds(判定用它,不用这里的 min_seeds)
     "validation": {"label": "全量验证", "max_rounds": 1, "threshold": 0.0,
-                   "gpu_hours": 0.0, "confirm_each_round": False, "min_seeds": 1},
+                   "gpu_hours": 0.0, "confirm_each_round": False, "min_seeds": 1,
+                   "stagnant_rounds": 0},
 }
 
 
@@ -201,6 +205,8 @@ def _round_markdown(round_no: int, report: dict) -> str:
              f"- 分析:{report['analysis']}", f"- 下一步想法:{report.get('nextIdea') or '-'}",
              f"- 保留改动:{'是' if report.get('kept') else '否'}",
              f"- Python 判定:{verdict}", ""]
+    if report.get("stagnantRounds"):
+        lines.insert(-1, f"- 连续无提升:{report['stagnantRounds']} 轮")
     for m in ev.get("means") or []:
         value = "-" if m.get("meanValue") is None else f"{m['meanValue']:.4g}"
         gain = "" if m.get("meanGain") is None else f",增益 {m['meanGain']:+.4g}"
@@ -503,6 +509,20 @@ def _end_round_tool() -> Tool:
         else:
             verdict = "未提升(本轮没有成功产出指标的实验)"
         verdict += _guardrail_verdict(evaluation)
+
+        # B2.1 无进展计数:本轮最优均值相对历史冠军无新提升则累计,有提升清零。
+        # 首轮有产出即视为进展(此前没有可比较的冠军);cap=0 的档位不自动停。
+        prev_best = max((r["champion"]["meanGain"] for r in rounds
+                         if (r.get("champion") or {}).get("meanGain") is not None),
+                        default=None)
+        current_best = best["meanGain"] if best else None
+        progress = current_best is not None and (prev_best is None
+                                                 or current_best > prev_best + 1e-12)
+        stagnant = 0 if progress else ((rounds[-1].get("stagnantRounds", 0) + 1)
+                                       if rounds else 1)
+        report["stagnantRounds"] = stagnant
+        if stagnant:
+            verdict += f";连续 {stagnant} 轮无新提升"
         report["verdict"] = verdict
         _record_round(env, round_no, report)
 
@@ -515,6 +535,12 @@ def _end_round_tool() -> Tool:
             return Finish({**result, "reason": f"已达轮数上限 {tier['max_rounds']}"})
         if tier["gpu_hours"] and gpu_hours_used(repo, run_id) >= tier["gpu_hours"]:
             return Finish({**result, "reason": f"GPU 预算 {tier['gpu_hours']:g} 小时已用完"})
+        cap = int(tier.get("stagnant_rounds") or 0)
+        if cap and stagnant >= cap:
+            # B2.1:来自 B1 实测——heavy 在 fixture 上连跑 12 轮相同实验,
+            # Python 判「证据不足」但 agent 不知道停。软预算到点由 Python 收束。
+            return Finish({**result, "reason": f"连续 {stagnant} 轮无新提升(当前冠军 "
+                                              f"{prev_best if prev_best is not None else '-'});停止"})
         if tier["confirm_each_round"]:
             return Pause("human", {
                 "kind": ROUND_REVIEW_KIND, "roundNo": round_no,

@@ -576,3 +576,20 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   契约并重算指纹。
 - 遗留:B2 再做 eval 任务套件/CI/平台评测 provenance;guardrail 违规目前不阻断
   会话只判失败,是否强制停止待真机反馈。
+
+## D-035 · Phase B2.1:重复实验拒绝 + 无进展停止(2026-10-28)
+
+- 背景:B1 实测 heavy 在 fixture 上连续 12 轮重复提交相同 3-seed 实验,均值
+  +0.0154 但 CI 下界=0,Python 判「证据不足」,agent 却不知道停,烧 GPU 时预算。
+- 重复实验拒绝(硬门):`experiments.check_duplicate_jobs` 在 `submit` 的
+  `_clean_jobs` 之后调用;签名 = 排序后的 (dataset, command.strip(), variant,
+  seed) 元组集合,只与同一 `agent-run:<id>` 名下 **SUCCEEDED** 的旧 Job 组比较,
+  完全相同才拒(失败/取消允许重试;换 seed/变体/命令放行)。CLI/人工路径
+  (approved_by 非 `agent-run:*`)不拦。
+- 无进展停止(软预算):`TIERS.stagnant_rounds`(light 0 / medium 3 / heavy 3 /
+  validation 0)。`end_round` 在 champion 计算后比本轮最优均值 vs 历史冠军均值:
+  无新提升(`> prev + 1e-12` 才算进展)则累计 `stagnantRounds`,有提升清零并
+  随轮次报告持久化;计满 cap 由 Python `Finish` 收束,reason 带连续轮数与当前
+  冠军增益,verdict/研究日志附「连续 N 轮无新提升」。
+- 取舍:重复门只挡「完全相同的一组」,不挡子集重跑(修一个失败 Job 需整组
+  重交);无进展计满时 success=False 结束而非 Pause——过夜无人值守,等人即搁死。
