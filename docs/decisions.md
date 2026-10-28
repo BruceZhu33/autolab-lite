@@ -588,7 +588,8 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   (approved_by 非 `agent-run:*`)不拦。
 - 无进展停止(软预算):`TIERS.stagnant_rounds`(light 0 / medium 3 / heavy 3 /
   validation 0)。`end_round` 在 champion 计算后比本轮最优均值 vs 历史冠军均值:
-  无新提升(`> prev + 1e-12` 才算进展)则累计 `stagnantRounds`,有提升清零并
+  无新提升(进展要求正增益且 `> prev + 1e-12`;零/负增益也计入 stagnant)则
+  累计 `stagnantRounds`,有提升清零并
   随轮次报告持久化;计满 cap 由 Python `Finish` 收束,reason 带连续轮数与当前
   冠军增益,verdict/研究日志附「连续 N 轮无新提升」。
 - 取舍:重复门只挡「完全相同的一组」,不挡子集重跑(修一个失败 Job 需整组

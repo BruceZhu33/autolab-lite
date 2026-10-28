@@ -116,7 +116,8 @@ uv run ruff check .
 - **无进展停止**:`stages/research.py` `TIERS` 增 `stagnant_rounds`
   (light 0 / medium 3 / heavy 3 / validation 0);`end_round` 计算
   `stagnantRounds`(本轮最优均值 vs 历史冠军均值,`> prev + 1e-12` 算进展,
-  首轮有产出即进展;随 report 持久化、verdict 与 `_round_markdown` 附计数),
+  progress 要求正增益;零/负增益也计入 stagnant;随 report 持久化、
+  verdict 与 `_round_markdown` 附计数),
   在轮数/GPU 预算检查之后、confirm/success 之前计满即 `Finish`,
   reason = 「连续 N 轮无新提升(当前冠军 <gain>);停止」。
 - **测试**:`test_execution.py` +3(成功后重交被拒 / 换 seed 与失败、取消重试放行 /

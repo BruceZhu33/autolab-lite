@@ -769,6 +769,30 @@ def test_heavy_stagnant_rounds_stop_session(api, tmp_path):
     assert "- 连续无提升:3 轮" in journal
 
 
+def test_zero_gain_rounds_count_as_stagnant(api, tmp_path):
+    """heavy 连续 3 轮零增益(meanGain=0,历史无冠军)→ 轮轮计入 stagnant,第 3 轮收束。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="heavy")
+    state: dict = {}
+    means = [(0.80, 0.80, 0.80)] * 3      # 均值 0.0:全等于基线,零增益也必须计停滞
+    step = stepper(repo, run_id, ScriptModel(_heavy_rounds_script(state, means)))
+    for r, vals in enumerate(means):
+        assert step() == "running" and step() == "waiting_jobs"
+        for jid, value in zip(state["jobs"][r * 3:(r + 1) * 3], vals, strict=True):
+            finish_job(repo, jid, {"val_dice": value})
+        assert step() == ("done" if r == 2 else "running")
+    result = al.get_run(repo, run_id)["result"]
+    assert result["success"] is False and result["rounds"] == 3
+    assert "连续 3 轮无新提升" in result["reason"]
+    rounds = rounds_of(client, pid)
+    assert [r.get("stagnantRounds") for r in rounds] == [1, 2, 3]
+    assert "连续 3 轮无新提升" in rounds[2]["verdict"]
+    journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
+    assert "- 连续无提升:3 轮" in journal
+
+
 def test_stagnant_counter_resets_on_progress(api, tmp_path):
     """第 2 轮原地踏步(stagnant 1),第 3 轮真提升 → 清零并按成功收束,不误停。"""
     client, repo = api["client"], api["repo"]

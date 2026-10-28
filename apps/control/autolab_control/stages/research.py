@@ -511,13 +511,13 @@ def _end_round_tool() -> Tool:
         verdict += _guardrail_verdict(evaluation)
 
         # B2.1 无进展计数:本轮最优均值相对历史冠军无新提升则累计,有提升清零。
-        # 首轮有产出即视为进展(此前没有可比较的冠军);cap=0 的档位不自动停。
+        # progress 要求正增益;零/负增益也计入 stagnant(此前首轮 0 增益被误判为进展)。
         prev_best = max((r["champion"]["meanGain"] for r in rounds
                          if (r.get("champion") or {}).get("meanGain") is not None),
                         default=None)
         current_best = best["meanGain"] if best else None
-        progress = current_best is not None and (prev_best is None
-                                                 or current_best > prev_best + 1e-12)
+        progress = (current_best is not None and current_best > 0
+                    and (prev_best is None or current_best > prev_best + 1e-12))
         stagnant = 0 if progress else ((rounds[-1].get("stagnantRounds", 0) + 1)
                                        if rounds else 1)
         report["stagnantRounds"] = stagnant
