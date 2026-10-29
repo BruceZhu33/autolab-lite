@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -286,6 +286,21 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at TEXT NOT NULL,
     revoked_at TEXT
 );
+-- C3a 并行研究分支 campaign:每个方向一条 fork 分支记录,选冠军只信 run.result。
+CREATE TABLE IF NOT EXISTS research_campaigns (
+    id TEXT PRIMARY KEY,
+    source_project_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running','done','stopped','failed')),
+    config_json TEXT NOT NULL DEFAULT '{}',
+    branches_json TEXT NOT NULL DEFAULT '[]',
+    winner_project_id TEXT,
+    winner_run_id TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_campaigns_source
+    ON research_campaigns(source_project_id, created_at);
 """
 
 

@@ -714,3 +714,47 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   unavailable 放行;start/validate 开关透传与默认 False。
 - 非目标(C3):并行分支、审阅器跨模型/独立预算/UI 展示、critic 强制用于 baseline、
   真实模型质量校准(需真机采样)。
+
+## D-040 · Phase C3a:并行研究分支 campaign——fork/状态/选冠军/停止(2026-10-29)
+
+- DB v24→v25:新表 `research_campaigns`(status CHECK running/done/stopped/failed;
+  config_json/branches_json/winner_project_id/winner_run_id/result_json)+
+  索引 `idx_campaigns_source(source_project_id, created_at)`。旧库由 `_SCHEMA`
+  executescript 自动补建,无数据迁移;读写直落 `stages/campaign.py`(同 D-038
+  research_cases 约定,不进 core/repo.py)。`branches_json` 条目
+  `{index, idea, projectId, runId, name, fork}`,fork = git 分支名。
+- `projects.fork_workspace(..., *, branch=None)`:显式分支名优先,默认仍是
+  `autolab/fork-<时间戳>`(现有 fork 路由不传,行为不变)。campaign 并行 fork
+  同秒不再撞名;分支名 `autolab/campaign-<id 后 8 位>-<序号>`。
+- `stages/campaign.py`:`start_campaign` 校验(源项目存在/有工作区/有确认基线、
+  ideas strip 后 1–3 且不重复、tier ∈ TIERS、datasets 过滤到 baseline_pool)→
+  先插 running 行 → 逐 idea `_fork_branch`(git rev-parse HEAD 定 commit,非 git
+  拒;worktree fork + prepare_workspace;输出根挂源输出根下
+  `campaign-<id>-<i>`;ensure_within_roots 早失败;建项目
+  `<源名>·分支<i>`(重名追加序号);基线快照**整份**继承——metric_contract/
+  history/conda_env/version_label 原样,fork 元数据 {source_project_id,
+  source_name, campaign_id, idea} 写顶层 fork,notes 前缀留痕;research.start
+  透传 tier/idea/datasets/critic/reviewer/max_rounds/gpu_hours)。任一步失败:
+  campaign 置 failed(result_json.error)、停已启动分支会话、抛 UserError(409)。
+- `campaign_status`:running 且全部分支 run 终态(done/failed/stopped)时收束——
+  `select_winner` 纯函数选冠军:候选 = run done 且 result.success 为 True;
+  排序 bestGain 降序(回落 champion.meanGain,缺失 -inf)→ rounds 升序 →
+  created_at;无候选 winner=None + reason "no branch succeeded"。**只信
+  run.result**(B1/B2.3 Python 验收),终态缺 result/success 不算候选;
+  result_json = {winner, ranking, reason, finishedAt},winner_project_id/run_id
+  落行。停止后的 campaign 不再自动收束。`list_campaigns` 源项目最近 20 条,
+  branches 摘要只带 runId/runStatus;`stop_campaign` 对活跃 run 入队 stop
+  (驱动线程消费),已终态不动,running → stopped。
+- API(api/routers/runs.py):`POST /api/owner/projects/{id}/research/campaigns`
+  (owner;body ideas/tier/datasets/critic/reviewer/max_rounds/gpu_hours)、
+  `GET /api/research/campaigns/{id}` 与 `GET /api/projects/{id}/research/campaigns`
+  (reader)、`POST /api/owner/research/campaigns/{id}/stop`(owner)。
+  404/409 复用统一异常映射;campaign 不存在 NotFound。
+- 测试 `apps/control/tests/test_campaign.py`(13 例):select_winner 纯函数
+  (最高增益/同增益少轮次/champion.meanGain 回落/无成功/failed-stopped-缺 result
+  排除);fork_workspace 显式 branch 同秒两次 + 默认时间戳不变;start_campaign
+  e2e(2 ideas → 2 fork 项目 + 2 会话、快照契约保留、输出根在白名单内、config
+  透传、branches_json 落库);校验与 failed 留痕;status 收束/无冠军;stop(活跃
+  run 入队 → 驱动后 stopped,campaign 不再收束);API 权限/404/409/摘要。
+- 非目标(C3b):冠军代码 merge 回源项目与基线回灌、前端 campaign 页、分支级
+  独立 GPU 预算/调度公平性、AgentSpec RSI 外层。

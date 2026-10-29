@@ -52,17 +52,19 @@ def use_existing_dir(host: Host, workdir: str) -> str:
     return workdir.rstrip("/")
 
 
-def fork_workspace(host: Host, source_workdir: str, new_workdir: str, commit: str) -> str:
+def fork_workspace(host: Host, source_workdir: str, new_workdir: str, commit: str, *,
+                   branch: str | None = None) -> str:
     """研究分叉的工作区侧:git worktree 检出目标基线版本的代码(秒级,零拷贝),
     源工作区里未被 git 跟踪的大目录(数据集/预训练权重)以符号链接共享;
     .autolab(实验记录/研究日志)与 output*(训练产物)不共享,各自独立。
+    branch 显式给定时用它作新分支名(campaign 并行 fork 同秒不撞默认时间戳);
     返回新分支名。"""
     git = f"git -C {q(source_workdir)}"
     if not host.run(f"{git} rev-parse --is-inside-work-tree").ok:
         raise UserError("源项目工作区不是 git 仓库,无法分叉;只有 git 工作区支持分叉")
     if host.run(f"test -e {q(new_workdir)}").ok:
         raise UserError(f"目标目录已存在:{new_workdir}")
-    branch = "autolab/fork-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    branch = branch or ("autolab/fork-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     out = host.run(f"{git} worktree add -b {q(branch)} {q(new_workdir)} {q(commit)}", timeout=120)
     if not out.ok:
         raise UserError(f"git worktree 检出失败:{(out.err or out.out).strip()[:200]}")

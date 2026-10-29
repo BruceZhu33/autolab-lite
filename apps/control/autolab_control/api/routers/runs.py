@@ -9,7 +9,7 @@ from fastapi.responses import Response
 
 from ...agent import runtime, trace
 from ...core.errors import NotFound
-from ...stages import baseline, research
+from ...stages import baseline, campaign, research
 from ..app import Ctx
 
 
@@ -139,5 +139,37 @@ def build(ctx: Ctx) -> APIRouter:
         return {"cases": research.search_cases(
             repo, project_id, query.strip(), (dataset or "").strip() or None,
             max(1, min(limit, 50)))}
+
+    @router.post("/api/owner/projects/{project_id}/research/campaigns",
+                 dependencies=[ctx.owner])
+    def campaign_start(project_id: str, payload: dict) -> dict:
+        """C3a 并行研究分支:每个方向 fork 独立 worktree 项目并启动研究会话,
+        全部终态后按已验收指标(run.result)选冠军。"""
+        def number(key, cast):
+            value = payload.get(key)
+            return None if value in (None, "") else cast(value)
+
+        ideas = [str(i) for i in (payload.get("ideas") or [])]
+        datasets = [str(d) for d in (payload.get("datasets") or []) if str(d).strip()]
+        return {"campaign": campaign.start_campaign(
+            repo, ctx.credentials, project_id, ideas=ideas,
+            tier=str(payload.get("tier") or "heavy"), datasets=datasets or None,
+            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")),
+            max_rounds=number("max_rounds", int),
+            gpu_hours=number("gpu_hours", float))}
+
+    @router.get("/api/research/campaigns/{campaign_id}", dependencies=[ctx.reader])
+    def campaign_get(campaign_id: str) -> dict:
+        return {"campaign": campaign.campaign_status(repo, campaign_id)}
+
+    @router.get("/api/projects/{project_id}/research/campaigns",
+                dependencies=[ctx.reader])
+    def campaign_list(project_id: str) -> dict:
+        return {"campaigns": campaign.list_campaigns(repo, project_id)}
+
+    @router.post("/api/owner/research/campaigns/{campaign_id}/stop",
+                 dependencies=[ctx.owner])
+    def campaign_stop(campaign_id: str) -> dict:
+        return {"campaign": campaign.stop_campaign(repo, campaign_id)}
 
     return router
