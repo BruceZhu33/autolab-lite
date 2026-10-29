@@ -11,9 +11,11 @@ import pytest
 from autolab_control.agent import runtime as al
 from autolab_control.core.db import utc_now
 from autolab_control.core.errors import UserError
+from autolab_control.execution.evidence import hash_paths
 from autolab_control.stages import campaign as campaign_stage
 from autolab_control.stages import research as research_stage
 from autolab_control.workspace import projects as ws_projects
+from autolab_control.workspace.fs import Workspace
 from autolab_control.workspace.host import LocalHost
 
 from .test_baseline_stage import AGENT_H, OWNER_H, ScriptModel, make_project
@@ -241,6 +243,37 @@ def test_start_campaign_forks_branches_and_starts_research(api, tmp_path):
     raw = [{k: b[k] for k in ("index", "idea", "projectId", "runId", "name", "fork")}
            for b in camp["branches"]]
     assert json.loads(campaign_rows(repo, pid)[0]["branches_json"]) == raw
+
+
+def test_fork_branch_recomputes_protected_hashes(api, tmp_path):
+    """fork 后用 fork 工作区重算 metric_contract.eval 指纹:不继承源项目的
+    旧/异根 hash;同内容换绝对根 hash 不变,源快照不被原地改写。"""
+    pid, ws = make_git_project(api, tmp_path)
+    allow_roots(api, tmp_path)
+    repo = api["repo"]
+    (ws / "src").mkdir()
+    (ws / "src" / "model.py").write_text("a=1\n", encoding="utf-8")
+    _git("add", "src", cwd=ws)
+    _git("commit", "-qm", "add src", cwd=ws)
+    snap = json.loads(repo.get_project(pid)["baseline_json"])
+    snap["metric_contract"]["eval"] = {"code_paths": ["src"], "code_hash": "f" * 64,
+                                       "data_paths": ["data"], "data_hash": "e" * 64}
+    repo.update_project(pid, baseline_json=json.dumps(snap, ensure_ascii=False))
+    camp = campaign_stage.start_campaign(repo, api["store"], pid,
+                                         ideas=["注意力改造"], tier="light")
+    assert camp["status"] == "running" and len(camp["branches"]) == 1
+    forked = repo.get_project(camp["branches"][0]["projectId"])
+    stored = json.loads(forked["baseline_json"])["metric_contract"]["eval"]
+    fork_ws = Workspace(LocalHost(), forked["remote_workdir"])
+    src_ws = Workspace(LocalHost(), str(ws))
+    assert stored["code_hash"] == hash_paths(fork_ws, ["src"])["hash"]
+    assert stored["code_hash"] != "f" * 64 and stored["data_hash"] != "e" * 64
+    # 同内容不同绝对根 → 指纹一致(fork 工作区 = 源 HEAD 检出)
+    assert stored["code_hash"] == hash_paths(src_ws, ["src"])["hash"]
+    assert stored["data_hash"] == hash_paths(fork_ws, ["data"])["hash"]
+    # 源快照原样:refresh 不改写共享的 snapshot dict
+    source_eval = json.loads(repo.get_project(pid)["baseline_json"])["metric_contract"]["eval"]
+    assert source_eval["code_hash"] == "f" * 64 and source_eval["data_hash"] == "e" * 64
 
 
 def test_start_campaign_validates_input(api, tmp_path):

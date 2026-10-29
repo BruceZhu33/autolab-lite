@@ -13,6 +13,7 @@ from autolab_control.execution.comparison import (
     param_insensitivity,
     variant_means,
 )
+from autolab_control.execution.evidence import hash_paths
 from autolab_control.execution.experiments import (
     ExperimentRequest,
     _clean_jobs,
@@ -452,3 +453,38 @@ def test_eval_job_manifest_environment(repo, tmp_path):
     assert variables["AUTOLAB_EVAL_INPUT_DIR"] == f"/tmp/out/{train_id}"
     assert variables["AUTOLAB_DATASET"] == "kvasir"
     assert variables["AUTOLAB_SEED"] == "7" and variables["AUTOLAB_VARIANT"] == "attn"
+
+
+# ----------------------------------------------------------------- C3 保护路径指纹
+
+
+def _make_protected_tree(root: Path) -> None:
+    (root / "src" / "sub").mkdir(parents=True)
+    (root / "src" / "model.py").write_text("a=1\n", encoding="utf-8")
+    (root / "src" / "sub" / "b.txt").write_text("b\n", encoding="utf-8")
+    (root / ".git" / "objects").mkdir(parents=True)
+    (root / ".git" / "objects" / "x").write_text("git\n", encoding="utf-8")
+
+
+def test_hash_paths_relative_and_root_independent(tmp_path):
+    """指纹只含相对路径:同内容不同绝对根 → 同 hash;内容变 → hash 变;
+    .git 不计入;空目录无幻影行;缺失路径计入 missing。"""
+    root_a, root_b = tmp_path / "run-a", tmp_path / "run-b"
+    _make_protected_tree(root_a)
+    _make_protected_tree(root_b)
+    ws_a = Workspace(LocalHost(), str(root_a))
+    ws_b = Workspace(LocalHost(), str(root_b))
+    info_a = hash_paths(ws_a, ["src"])
+    info_b = hash_paths(ws_b, ["src"])
+    assert info_a["hash"] == info_b["hash"]
+    assert info_a["files"] == 2 and info_a["paths"] == ["src"] and info_a["missing"] == []
+
+    (root_b / "src" / "model.py").write_text("a=2\n", encoding="utf-8")
+    assert hash_paths(ws_b, ["src"])["hash"] != info_a["hash"]
+
+    (root_a / "src" / "empty").mkdir()
+    empty = hash_paths(ws_a, ["src/empty"])
+    assert empty["files"] == 0 and empty["missing"] == []
+
+    missing = hash_paths(ws_a, ["nope", "src"])
+    assert missing["missing"] == ["nope"] and missing["files"] == 2

@@ -6,6 +6,7 @@ Python 按 run.result(B1/B2.3 的已验收指标)选冠军,不看 journal/agent 
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 
@@ -15,9 +16,10 @@ from ..core.errors import NotFound, UserError
 from ..core.ids import new_id
 from ..core.repo import Repo
 from ..workspace import projects
+from ..workspace.fs import Workspace
 from ..workspace.host import open_host, q
 from . import research
-from .baseline import baseline_pool, baseline_snapshot
+from .baseline import baseline_pool, baseline_snapshot, refresh_contract_hashes
 
 TERMINAL_RUN_STATUSES = frozenset(runtime.TERMINAL_STATUSES)   # done/failed/stopped
 ACTIVE_RUN_STATUSES = frozenset(runtime.ACTIVE_STATUSES)
@@ -182,6 +184,15 @@ def _fork_branch(repo: Repo, credentials, source: dict, campaign_id: str,
             host, source_dir, new_dir, commit,
             branch=f"autolab/campaign-{campaign_id[-8:]}-{index + 1}")
         projects.prepare_workspace(host, new_dir)
+        # 保护路径指纹含相对路径但源快照的 hash 可能是旧值:fork 后用新工作区
+        # 重算,避免继承源项目的旧/异根指纹导致 end_round 的 protected 误报
+        contract = snapshot.get("metric_contract")
+        eval_cfg = (contract or {}).get("eval") if isinstance(contract, dict) else None
+        forked_contract = None
+        if isinstance(eval_cfg, dict) \
+                and (eval_cfg.get("code_paths") or eval_cfg.get("data_paths")):
+            forked_contract = refresh_contract_hashes(
+                Workspace(host, new_dir), copy.deepcopy(contract))
     name = _unique_project_name(repo, f"{source['name']}·分支{index + 1}")
     forked_project = repo.add_project(name=name, server_id=source["server_id"],
                                       workdir=new_dir, output_root=out_root,
@@ -190,6 +201,8 @@ def _fork_branch(repo: Repo, credentials, source: dict, campaign_id: str,
               "fork": {"source_project_id": source["id"], "source_name": source["name"],
                        "campaign_id": campaign_id, "idea": idea},
               "notes": f"并行分支 campaign {campaign_id}: {idea}\n{snapshot.get('notes') or ''}"}
+    if forked_contract is not None:
+        forked["metric_contract"] = forked_contract
     repo.update_project(forked_project["id"],
                         baseline_json=json.dumps(forked, ensure_ascii=False),
                         baseline_passed_at=snapshot.get("passed_at")

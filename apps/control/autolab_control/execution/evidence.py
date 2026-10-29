@@ -20,6 +20,9 @@ _GIT_SHA = re.compile(r"^[0-9a-f]{7,40}$")
 def hash_paths(workspace: Workspace, paths: list[str]) -> dict:
     """保护路径集合指纹:逐路径 find + sha256sum(按路径排序),再对整份清单 sha256。
 
+    指纹只含**相对路径**:sh 已 cd 到工作区根,find 相对路径启动,sha256sum
+    清单里的文件名不含绝对根 → 同内容 fork 到不同目录 hash 相同。
+
     返回 {"hash": hex, "files": n, "paths": [...], "missing": [...]};
     路径不存在/命令失败 → hash 计入该路径 missing(不抛:调用方决定放行与否)。"""
     missing: list[str] = []
@@ -30,11 +33,12 @@ def hash_paths(workspace: Workspace, paths: list[str]) -> dict:
         if not rel:
             continue
         normalized.append(rel)
-        # pipefail:find 失败(路径不存在)不能被管道尾的 xargs 吞掉
+        # pipefail:find 失败(路径不存在)不能被管道尾的 xargs 吞掉;
+        # -r:空目录时 xargs 不空跑 sha256sum(避免幻影行)
         result = workspace.sh(
             "set -o pipefail; "
-            f"find {q(workspace.abs(rel))} -type f -not -path '*/.git/*' -print0"
-            " | sort -z | xargs -0 sha256sum")
+            f"find {q(rel)} -type f -not -path '*/.git/*' -print0"
+            " | sort -z | xargs -0 -r sha256sum")
         if not result.ok:
             missing.append(rel)
             continue
