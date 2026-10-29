@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from autolab_control.core.db import Database
+from autolab_control.core.db import SCHEMA_VERSION, Database
 from autolab_control.core.repo import PlanHashMismatch, Repo
 from autolab_protocol import PlanSpecV1, RunnerEventV1
 
@@ -293,3 +294,34 @@ def test_observation_state_derived(repo):
     instance.ingest_event(make_event(job, "job.succeeded", 2))
     finished = instance.get_job(job["id"])
     assert instance.observation_state(finished, runner_reachable=False) == "CONFIRMED"
+
+
+def test_v23_database_upgrades_with_research_cases(tmp_path):
+    """C1:旧库(schema_migrations 停在 v23,无 research_cases)打开即补建表与
+    索引,并把 v24 记入迁移表——executescript 幂等升级,不需要手工迁移。"""
+    path = tmp_path / "old-v23.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY,"
+        " applied_at TEXT NOT NULL);"
+        "INSERT INTO schema_migrations (version, applied_at)"
+        " VALUES (23, '2026-10-01T00:00:00Z');")
+    conn.commit()
+    conn.close()
+    Database(path).connect().close()
+    conn = sqlite3.connect(path)
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        indexes = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND tbl_name = 'research_cases'")}
+        indexes = {n for n in indexes if not n.startswith("sqlite_autoindex")}
+        versions = [r[0] for r in conn.execute(
+            "SELECT version FROM schema_migrations ORDER BY version")]
+    finally:
+        conn.close()
+    assert "research_cases" in tables
+    assert indexes == {"idx_research_cases_project", "idx_research_cases_fingerprint",
+                       "idx_research_cases_dataset"}
+    assert versions == [23, SCHEMA_VERSION]

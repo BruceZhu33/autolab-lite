@@ -3,7 +3,7 @@
 表分三组:
 - 资源:servers / projects
 - 执行:plan_revisions / jobs / gpu_leases / job_events / artifacts
-- 阶段 agent:agent_runs / agent_run_events / agent_run_inbox / research_rounds
+- 阶段 agent:agent_runs / agent_run_events / agent_run_inbox / research_rounds / research_cases
 
 建表与迁移每个 Database 实例只跑一次(旧实现每次 connect 都重跑)。
 旧库里已退役的表(proposals、iteration_loops、chat_* 等)原样保留、不再读写。
@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -207,6 +207,38 @@ CREATE TABLE IF NOT EXISTS research_rounds (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_research_rounds ON research_rounds(project_id, created_at);
+-- C1 结构化研究记忆:每轮每 (variant,dataset) 一条 case;journal 是渲染视图,这里是事实源。
+CREATE TABLE IF NOT EXISTS research_cases (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    round_no INTEGER NOT NULL,
+    dataset TEXT NOT NULL DEFAULT '',
+    variant TEXT NOT NULL DEFAULT '',
+    hypothesis TEXT NOT NULL,
+    changes TEXT NOT NULL,
+    analysis TEXT NOT NULL,
+    next_idea TEXT NOT NULL DEFAULT '',
+    kept INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL DEFAULT 0,
+    verdict TEXT NOT NULL DEFAULT '',
+    failure_class TEXT NOT NULL DEFAULT '',
+    mean_gain REAL,
+    ci_low REAL,
+    ci_high REAL,
+    significant INTEGER NOT NULL DEFAULT 0,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (run_id, round_no, dataset, variant)
+);
+CREATE INDEX IF NOT EXISTS idx_research_cases_project
+    ON research_cases(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_research_cases_fingerprint
+    ON research_cases(project_id, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_research_cases_dataset
+    ON research_cases(project_id, dataset);
 -- B2.3a 平台评测 Job 关联:训练 Job → 独立评测 Job(评测侧主键,一对一)。
 CREATE TABLE IF NOT EXISTS job_evals (
     eval_job_id TEXT PRIMARY KEY REFERENCES jobs(id),  -- 评测 Job

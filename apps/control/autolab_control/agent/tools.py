@@ -185,6 +185,29 @@ def knowledge_tool() -> Tool:
         handler)
 
 
+def search_cases_tool(search: Callable[..., str]) -> Tool:
+    """C1 本地研究记忆检索:历史 case(假设/改动/判定/失败原因/下一步)。
+    检索 + 渲染由阶段注入(agent 层不依赖 stages);不依赖外部服务,
+    research + validation 工具面都注册(只读可查),与 search_knowledge 互补。"""
+
+    def handler(env: LoopEnv, args: dict) -> str:
+        top_k = max(1, min(int(args.get("top_k") or 5), 10))
+        dataset = str(args.get("dataset") or "").strip() or None
+        return search(env.repo, env.project["id"],
+                      str(args.get("query") or "").strip(), dataset, top_k) \
+            or "没有匹配的历史 case"
+
+    return Tool(
+        "search_cases",
+        "检索本项目的历史研究 case(本地结构化记忆):每轮每个(变体,数据集)的假设、"
+        "改动、判定、失败原因与下一步想法。定方向前、实验失败后、怀疑重复实验时先查:"
+        "上次为什么失败、什么已验证有效。可用 dataset 过滤,关键词可中英文。",
+        _schema({"query": {"type": "string", "description": "关键词,可空"},
+                 "dataset": {"type": "string", "description": "按数据集过滤,可空"},
+                 "top_k": {"type": "integer", "description": "返回条数,默认 5,最大 10"}}),
+        handler)
+
+
 def paper_radar_tool() -> Tool:
     """论文雷达检索(PaperPulse):世界刚发表的论文——arXiv 学科/核心期刊每日新文,
     模型双重评分+中文导读。论文站不可达时不注册(阶段 build_tools 探测)。"""

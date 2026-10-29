@@ -1073,3 +1073,220 @@ def test_wait_jobs_report_includes_train_failures_with_eval_metrics(api, tmp_pat
     rows = {r["jobId"]: r for r in rounds_of(client, pid)[0]["evaluation"]["rows"]}
     assert rows[ok_id]["status"] == "SUCCEEDED" and rows[ok_id]["value"] == 0.82
     assert rows[bad_id]["status"] == "FAILED" and rows[bad_id]["value"] is None
+
+
+# ------------------------------------------------------------------ Phase C1:结构化研究记忆
+
+
+def _cases_of(repo, pid):
+    conn = repo.db.connect()
+    try:
+        return conn.execute("SELECT * FROM research_cases WHERE project_id = ?"
+                            " ORDER BY rowid", (pid,)).fetchall()
+    finally:
+        conn.close()
+
+
+def _record_case_round(repo, pid, run, round_no, hypothesis, changes, dataset,
+                       variant="", *, mean_gain=None, improved=False, n=1,
+                       significant=False, next_idea=""):
+    """直落一条 case(不经 agent 循环):检索/注入/幂等测试的原料。"""
+    env = al.LoopEnv(repo, None, run, repo.get_project(pid))
+    report = {"hypothesis": hypothesis, "changes": changes, "analysis": "看指标",
+              "nextIdea": next_idea, "kept": True, "verdict": "判定文本",
+              "planIds": ["p1"], "evidenceHash": "e" * 64}
+    means = [] if dataset is None else [{
+        "dataset": dataset, "variant": variant or None, "n": n, "meanValue": 0.9,
+        "meanGain": mean_gain, "improved": improved, "significant": significant,
+        "ciLow": 0.01 if significant else None, "ciHigh": 0.02 if significant else None,
+        "seeds": list(range(1, n + 1)), "baseline": 0.8, "planId": "p1"}]
+    return research_stage.record_research_cases(
+        env, round_no, report,
+        {"means": means, "rows": [], "guardrails": {"violations": []}})
+
+
+def test_end_round_records_structured_cases(api, tmp_path):
+    """一轮有 means → 每 (variant,dataset) 一条 case;字段以 Python 判定为准。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="light")
+    state: dict = {}
+    model = ScriptModel([
+        [use("c1r", "run_experiment", purpose="试注意力",
+             jobs=[{"name": "kvasir", "dataset": "kvasir",
+                    "command": "python train.py --attn"}],
+             metrics=[{"name": "val_dice"}])],
+        lambda m: (state.update(job=job_id_from(m))
+                   or [use("c1w", "wait_jobs", job_ids=[state["job"]])]),
+        [use("c1e", "end_round", hypothesis="加注意力提升 dice",
+             changes="model.py 加 attn 模块", analysis="均值 +0.05",
+             next_idea="试 dropout", kept=True)],
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    finish_job(repo, state["job"], {"val_dice": 0.85})   # 基线 0.80 → 增益 +0.05
+    assert step() == "waiting_human"
+    rows = _cases_of(repo, pid)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["run_id"] == run_id and row["round_no"] == 1
+    assert row["dataset"] == "kvasir" and row["variant"] == ""
+    assert row["success"] == 1 and row["mean_gain"] == pytest.approx(0.05)
+    assert row["failure_class"] == "insufficient_evidence"  # 单 seed:提升但证据不足
+    assert row["hypothesis"] == "加注意力提升 dice"
+    assert row["next_idea"] == "试 dropout" and row["kept"] == 1
+    assert row["fingerprint"] == hashlib.sha256(
+        "加注意力提升 dice\nmodel.py 加 attn 模块\nkvasir\n".encode()
+    ).hexdigest()[:32]
+    assert json.loads(row["metrics_json"])["n"] == 1
+    evidence = json.loads(row["evidence_json"])
+    assert evidence["planIds"] and evidence["evalJobIds"] == []
+
+
+def test_record_cases_idempotent_per_round(api, tmp_path):
+    """同一 run/round 重复落库:UNIQUE(run,round,dataset,variant) 不重复插入。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run = al.get_run(repo, start(client, pid, tier="light"))
+    once = _record_case_round(repo, pid, run, 1, "h", "c", "kvasir", variant="attn",
+                              mean_gain=0.05, improved=True, n=3, significant=True)
+    assert len(once) == 1
+    assert _record_case_round(repo, pid, run, 1, "h", "c", "kvasir", variant="attn",
+                              mean_gain=0.05, improved=True, n=3,
+                              significant=True) == []
+    rows = _cases_of(repo, pid)
+    assert len(rows) == 1 and rows[0]["variant"] == "attn" \
+        and rows[0]["failure_class"] == "success"
+
+
+def test_round_without_success_records_no_valid_experiment(api, tmp_path):
+    """Job 全失败 → means 为空:仍落一条 no_valid_experiment 的 case。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="light")
+    state: dict = {}
+    model = ScriptModel([
+        [use("c2r", "run_experiment", purpose="试注意力",
+             jobs=[{"name": "kvasir", "dataset": "kvasir",
+                    "command": "python train.py --attn"}],
+             metrics=[{"name": "val_dice"}])],
+        lambda m: (state.update(job=job_id_from(m))
+                   or [use("c2w", "wait_jobs", job_ids=[state["job"]])]),
+        [use("c2e", "end_round", hypothesis="h", changes="c", analysis="a", kept=False)],
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            conn.execute("UPDATE jobs SET status = 'FAILED', failure_summary = 'oom',"
+                         " finished_at = '2026-10-29T00:00:00Z' WHERE id = ?",
+                         (state["job"],))
+    finally:
+        conn.close()
+    assert step() == "waiting_human"
+    rows = _cases_of(repo, pid)
+    assert len(rows) == 1
+    assert rows[0]["dataset"] == "" and rows[0]["variant"] == ""
+    assert rows[0]["failure_class"] == "no_valid_experiment" \
+        and rows[0]["success"] == 0 and rows[0]["mean_gain"] is None
+
+
+def test_search_cases_filters_ranks_and_dedups(api, tmp_path):
+    """dataset 过滤 + 关键词命中 + 成功/增益加权;同 fingerprint 只留最新。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run = al.get_run(repo, start(client, pid, tier="light"))
+    _record_case_round(repo, pid, run, 1, "注意力机制无效", "model.py", "kvasir",
+                       mean_gain=-0.02, n=3)
+    _record_case_round(repo, pid, run, 2, "数据增强有效", "aug.py", "busi",
+                       mean_gain=0.05, improved=True, n=3, significant=True)
+    _record_case_round(repo, pid, run, 3, "注意力加dropout更好", "model.py", "kvasir",
+                       mean_gain=0.03, improved=True, n=3, significant=True)
+    _record_case_round(repo, pid, run, 4, "注意力机制无效", "model.py", "kvasir",
+                       mean_gain=-0.02, n=3)   # 与第 1 轮同指纹
+    cases = research_stage.search_cases(repo, pid, query="注意力", dataset="kvasir")
+    assert [c["roundNo"] for c in cases] == [3, 4]      # 命中排序 + 第 1 轮被去重
+    assert research_stage.search_cases(repo, pid, dataset="busi")[0]["roundNo"] == 2
+    assert research_stage.search_cases(repo, pid, query="不存在的关键词") == []
+    text = research_stage.format_cases(cases)
+    assert "[case round 3 | kvasir | -] 判定:success 增益 +0.03" in text
+    assert "假设:注意力加dropout更好" in text and "判定:not_improved" in text
+    assert len(text) <= 4000
+
+
+def test_build_task_injects_structured_memory(api, tmp_path):
+    """build_task 追加「结构化研究记忆」;无记忆时占位,有记忆时带出历史假设。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    project = repo.get_project(pid)
+    config = {"tier": "light", "idea": "试注意力"}
+    empty = research_stage.build_task(repo, project, config, run_id=None)
+    assert "## 结构化研究记忆(本地,按相关度)" in empty
+    assert "(暂无结构化记忆)" in empty
+    run = al.get_run(repo, start(client, pid, tier="light"))
+    _record_case_round(repo, pid, run, 1, "混合精度训练更稳", "train.py", "kvasir",
+                       mean_gain=0.04, improved=True, n=3, significant=True,
+                       next_idea="换更大 batch")
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            conn.execute(
+                "INSERT INTO research_rounds (id, run_id, project_id, round_no,"
+                " report_json, created_at) VALUES (?, ?, ?, 1, ?,"
+                " '2026-10-29T00:00:00Z')",
+                ("rround-c1", run["id"], pid, json.dumps(
+                    {"hypothesis": "旧假设", "changes": "c", "analysis": "a",
+                     "evaluation": {"rows": [], "means": [], "warnings": []}})))
+    finally:
+        conn.close()
+    task = research_stage.build_task(repo, project, config, run_id=None)
+    assert "结构化研究记忆" in task and "混合精度训练更稳" in task
+    assert task.index("之前研究会话的日志") < task.index("结构化研究记忆")
+
+
+def test_search_cases_tool_on_both_surfaces(api, tmp_path):
+    """search_cases 工具:research + validation 工具面都有;handler 直读本地表。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = start(client, pid, tier="light")
+    run = al.get_run(repo, run_id)
+    project = repo.get_project(pid)
+    _record_case_round(repo, pid, run, 1, "注意力机制无效", "model.py", "kvasir",
+                       mean_gain=-0.02)
+    env = al.LoopEnv(repo, None, run, project)
+    tool = next(t for t in research_stage.build_tools(env) if t.name == "search_cases")
+    out = tool.handler(env, {"query": "注意力", "dataset": "kvasir", "top_k": 3})
+    assert "注意力机制无效" in out and "[case round 1" in out
+    assert tool.handler(env, {"query": "毫不相关的词"}) == "没有匹配的历史 case"
+    val_run = {**run, "config_json": json.dumps({"mode": "validation"})}
+    val_env = al.LoopEnv(repo, None, val_run, project)
+    assert "search_cases" in [t.name for t in research_stage.build_tools(val_env)]
+
+
+def test_research_cases_api(api, tmp_path):
+    """GET /api/projects/{id}/research/cases:空 200、query/dataset 过滤、404。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    resp = client.get(f"/api/projects/{pid}/research/cases", headers=AGENT_H)
+    assert resp.status_code == 200 and resp.json() == {"cases": []}
+    run = al.get_run(repo, start(client, pid, tier="light"))
+    _record_case_round(repo, pid, run, 1, "混合精度训练更稳", "train.py", "kvasir",
+                       mean_gain=0.04, improved=True, n=3, significant=True)
+    cases = client.get(f"/api/projects/{pid}/research/cases",
+                       params={"query": "混合精度"}, headers=AGENT_H).json()["cases"]
+    assert len(cases) == 1 and cases[0]["dataset"] == "kvasir"
+    assert cases[0]["metrics"]["meanGain"] == pytest.approx(0.04)
+    assert cases[0]["failureClass"] == "success" and cases[0]["success"] is True
+    gone = client.get(f"/api/projects/{pid}/research/cases",
+                      params={"dataset": "busi"}, headers=AGENT_H).json()["cases"]
+    assert gone == []
+    assert client.get("/api/projects/nope/research/cases",
+                      headers=AGENT_H).status_code == 404

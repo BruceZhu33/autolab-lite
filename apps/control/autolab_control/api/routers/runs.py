@@ -128,4 +128,14 @@ def build(ctx: Ctx) -> APIRouter:
         return {"rounds": research.list_rounds(repo, project_id, run_id),
                 "tiers": research.TIERS}
 
+    @router.get("/api/projects/{project_id}/research/cases", dependencies=[ctx.reader])
+    def research_cases(project_id: str, query: str = "", dataset: str | None = None,
+                       limit: int = 20) -> dict:
+        """结构化研究记忆(C1):按相关度返回历史 case;关键词 + 数据集过滤。"""
+        if repo.get_project(project_id) is None:
+            raise NotFound(f"项目 {project_id} 不存在")
+        return {"cases": research.search_cases(
+            repo, project_id, query.strip(), (dataset or "").strip() or None,
+            max(1, min(limit, 50)))}
+
     return router

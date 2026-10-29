@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -259,6 +261,183 @@ def journal_text(rounds: list[dict], limit: int = 12) -> str:
     return "\n".join(_round_markdown(r["roundNo"], r) for r in rounds[-limit:])
 
 
+# ------------------------------------------------------------------ 结构化研究记忆(C1)
+
+
+def _case_fingerprint(hypothesis: str, changes: str, dataset: str,
+                      variant: str) -> str:
+    """同一(假设,改动,数据集,变体)跨轮同指纹:检索去重、避免重复实验的门。"""
+    return hashlib.sha256(
+        f"{hypothesis}\n{changes}\n{dataset}\n{variant}".encode()).hexdigest()[:32]
+
+
+def _case_failure_class(evaluation: dict, m: dict) -> str:
+    """失败原因归类,按可行动性排序(先命中先归):违规 > 证据不足 > 没提升 >
+    评测失败 > 成功 > 无证据。success 与它独立:单 seed 合法提升也是 success。"""
+    dataset = m.get("dataset") or ""
+    violations = (evaluation.get("guardrails") or {}).get("violations") or []
+    if any((v.get("dataset") or "") == dataset for v in violations):
+        return "guardrail"
+    if not m.get("significant") and m.get("n", 0) < 3:
+        return "insufficient_evidence"
+    if m.get("meanGain") is not None and m["meanGain"] <= 0:
+        return "not_improved"
+    if any(r.get("status") in ("FAILED", "EVAL_MISSING")
+           for r in evaluation.get("rows") or []
+           if (r.get("dataset") or "") == dataset):
+        return "eval_failed"
+    if m.get("improved"):
+        return "success"
+    return "no_evidence"
+
+
+def record_research_cases(env: LoopEnv, round_no: int, report: dict,
+                          evaluation: dict) -> list[str]:
+    """把本轮 evaluation.means 落成 per-(variant,dataset) case,返回新插入的 id。
+    means 为空时记一条 no_valid_experiment(空 dataset/variant)。幂等:
+    UNIQUE(run_id, round_no, dataset, variant) + INSERT OR IGNORE。"""
+    common = {"project_id": env.project["id"], "run_id": env.run["id"],
+              "round_no": round_no, "created_at": utc_now(),
+              "hypothesis": report.get("hypothesis") or "",
+              "changes": report.get("changes") or "",
+              "analysis": report.get("analysis") or "",
+              "next_idea": report.get("nextIdea") or "",
+              "kept": int(bool(report.get("kept"))),
+              "verdict": report.get("verdict") or "",
+              "evidence_json": json.dumps(
+                  {"evidenceHash": report.get("evidenceHash"),
+                   "planIds": report.get("planIds")}, ensure_ascii=False)}
+    def mean_row(m: dict) -> dict:
+        dataset, variant = m.get("dataset") or "", m.get("variant") or ""
+        return {
+            "dataset": dataset, "variant": variant,
+            "success": int(bool(m.get("improved"))),
+            "significant": int(bool(m.get("significant"))),
+            "failure_class": _case_failure_class(evaluation, m),
+            "mean_gain": m.get("meanGain"), "ci_low": m.get("ciLow"),
+            "ci_high": m.get("ciHigh"),
+            "metrics_json": json.dumps(
+                {"meanValue": m.get("meanValue"), "meanGain": m.get("meanGain"),
+                 "ciLow": m.get("ciLow"), "ciHigh": m.get("ciHigh"), "n": m.get("n"),
+                 "seeds": m.get("seeds"), "baseline": m.get("baseline")},
+                ensure_ascii=False),
+            "evidence_json": json.dumps(
+                {"evidenceHash": report.get("evidenceHash"),
+                 "evalJobIds": [r["evalJobId"] for r in evaluation.get("rows") or []
+                                if r.get("evalJobId")
+                                and (r.get("dataset") or "") == dataset
+                                and (r.get("variant") or "") == variant],
+                 "planIds": report.get("planIds")}, ensure_ascii=False),
+            "fingerprint": _case_fingerprint(common["hypothesis"], common["changes"],
+                                             dataset, variant),
+            **{k: v for k, v in common.items() if k != "evidence_json"}}
+
+    rows = [mean_row(m) for m in evaluation.get("means") or []]
+    if not rows:  # 本轮没有任何成功产出指标的实验:也留一条可检索的 case
+        rows = [{"dataset": "", "variant": "", "success": 0, "significant": 0,
+                 "failure_class": "no_valid_experiment", "mean_gain": None,
+                 "ci_low": None, "ci_high": None, "metrics_json": "{}",
+                 "fingerprint": _case_fingerprint(common["hypothesis"],
+                                                  common["changes"], "", ""),
+                 **common}]
+    conn = env.repo.db.connect()
+    try:
+        with env.repo.db.tx(conn):
+            inserted = []
+            for row in rows:
+                case_id = new_id("rcase")
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO research_cases (id, project_id, run_id,"
+                    " round_no, dataset, variant, hypothesis, changes, analysis,"
+                    " next_idea, kept, success, verdict, failure_class, mean_gain,"
+                    " ci_low, ci_high, significant, metrics_json, evidence_json,"
+                    " fingerprint, created_at)"
+                    " VALUES (:id, :project_id, :run_id, :round_no, :dataset, :variant,"
+                    " :hypothesis, :changes, :analysis, :next_idea, :kept, :success,"
+                    " :verdict, :failure_class, :mean_gain, :ci_low, :ci_high,"
+                    " :significant, :metrics_json, :evidence_json, :fingerprint,"
+                    " :created_at)", {"id": case_id, **row})
+                if cur.rowcount:
+                    inserted.append(case_id)
+        return inserted
+    finally:
+        conn.close()
+
+
+def _case_dict(r) -> dict:
+    return {"id": r["id"], "runId": r["run_id"], "roundNo": r["round_no"],
+            "dataset": r["dataset"], "variant": r["variant"],
+            "hypothesis": r["hypothesis"], "changes": r["changes"],
+            "analysis": r["analysis"], "nextIdea": r["next_idea"],
+            "kept": bool(r["kept"]), "success": bool(r["success"]),
+            "verdict": r["verdict"], "failureClass": r["failure_class"],
+            "meanGain": r["mean_gain"], "ciLow": r["ci_low"], "ciHigh": r["ci_high"],
+            "significant": bool(r["significant"]), "fingerprint": r["fingerprint"],
+            "createdAt": r["created_at"],
+            "metrics": json.loads(r["metrics_json"] or "{}"),
+            "evidence": json.loads(r["evidence_json"] or "{}")}
+
+
+def _query_tokens(query: str) -> list[str]:
+    """小写后按非字母数字/CJK 切分;命中用子串匹配,单个字符太噪丢弃。"""
+    return [t for t in re.split(r"[^0-9a-z\u4e00-\u9fff]+", query.lower())
+            if len(t) >= 2]
+
+
+def search_cases(repo: Repo, project_id: str, query: str = "",
+                 dataset: str | None = None, limit: int = 5) -> list[dict]:
+    """本地 case 检索:dataset 过滤 → 最近 200 条 → 关键词重叠 + 成功/收益/新近
+    排序 → 同 fingerprint 只留最新。跨项目/向量检索是 C1 非目标。"""
+    sql, args = "SELECT * FROM research_cases WHERE project_id = ?", [project_id]
+    if dataset:
+        sql += " AND dataset = ?"
+        args.append(dataset)
+    conn = repo.db.connect()
+    try:
+        rows = conn.execute(sql + " ORDER BY created_at DESC, rowid DESC LIMIT 200",
+                            args).fetchall()
+    finally:
+        conn.close()
+    tokens = _query_tokens(query)
+    seen_fp: set[str] = set()
+    scored: list[tuple[float, dict]] = []
+    for i, r in enumerate(rows):
+        case = _case_dict(r)
+        if case["fingerprint"] in seen_fp:
+            continue
+        seen_fp.add(case["fingerprint"])
+        text = " ".join([case["hypothesis"], case["changes"], case["analysis"],
+                         case["nextIdea"], case["dataset"], case["variant"],
+                         case["verdict"], case["failureClass"]]).lower()
+        hits = sum(1 for t in tokens if t in text)
+        if tokens and not hits:
+            continue
+        score = hits * 2 + int(case["success"]) \
+            + int((case["meanGain"] or 0) > 0) + (len(rows) - i) * 1e-4
+        scored.append((score, case))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [case for _, case in scored[:max(1, limit)]]
+
+
+def format_cases(cases: list[dict], *, max_chars: int = 4000) -> str:
+    lines = []
+    for c in cases:
+        gain = "-" if c.get("meanGain") is None else f"{c['meanGain']:+.4g}"
+        verdict = "success" if c.get("success") else (c.get("failureClass") or "no_evidence")
+        lines.append(f"- [case round {c.get('roundNo')} | {c.get('dataset') or '-'}"
+                     f" | {c.get('variant') or '-'}] 判定:{verdict} 增益 {gain}"
+                     f" / 假设:{c.get('hypothesis') or '-'}"
+                     f" / 分析:{c.get('analysis') or '-'}"
+                     f" / 下一步:{c.get('nextIdea') or '-'}")
+    return "\n".join(lines)[:max_chars]
+
+
+def _case_answer(repo: Repo, project_id: str, query: str, dataset: str | None,
+                 top_k: int) -> str:
+    """search_cases 工具的出口:检索 + 渲染;空结果由工具层提示「没有匹配」。"""
+    return format_cases(search_cases(repo, project_id, query, dataset, top_k))
+
+
 # ------------------------------------------------------------------ 任务与状态
 
 def _tier(env_or_config) -> dict:
@@ -331,6 +510,15 @@ def build_task(repo: Repo, project: dict, config: dict, *, run_id: str | None) -
     previous = [r for r in list_rounds(repo, project["id"]) if r["runId"] != run_id]
     if previous:
         lines += ["## 之前研究会话的日志(避免重复)", journal_text(previous, limit=6), ""]
+    # C1 结构化研究记忆:下一会话开始前自动注入最相关的历史 case(本地,可靠兜底)。
+    try:
+        seed_query = f"{config.get('idea') or project['name']} {' '.join(pool)}".strip()
+        lines += ["## 结构化研究记忆(本地,按相关度)",
+                  format_cases(search_cases(repo, project["id"], seed_query, limit=5))
+                  or "(暂无结构化记忆)", ""]
+    except Exception as exc:  # noqa: BLE001 - 记忆检索失败不阻塞会话启动
+        print(f"autolab-control: 研究记忆注入失败:{exc}", flush=True)
+        lines += ["## 结构化研究记忆(本地,按相关度)", "(暂无结构化记忆)", ""]
     if run_id:
         current = list_rounds(repo, project["id"], run_id)
         if current:
@@ -627,6 +815,10 @@ def _record_round(env: LoopEnv, round_no: int, report: dict) -> None:
     old = ws.read_bytes(JOURNAL_REL).decode("utf-8") if ws.exists(JOURNAL_REL) \
         else "# 研究日志\n\n"
     ws.write_bytes(JOURNAL_REL, (old + _round_markdown(round_no, report)).encode("utf-8"))
+    try:
+        record_research_cases(env, round_no, report, report.get("evaluation") or {})
+    except Exception as exc:  # noqa: BLE001 - 记忆失败不毁研究结论
+        print(f"autolab-control: 研究记忆落库失败(round {round_no}):{exc}", flush=True)
 
 
 def build_tools(env: LoopEnv) -> list[Tool]:
@@ -640,14 +832,15 @@ def build_tools(env: LoopEnv) -> list[Tool]:
                                     for name, info in baseline_pool(e.project).items()},
         before_submit=_check_gpu_budget,
         eval_contract=lambda e: baseline_contract(e.project))
+    cases_tool = tools.search_cases_tool(_case_answer)
     if env.config.get("mode") == "validation":
         # 验证会话只读 + 只跑:改代码/shell 都不给,保证验证的是来源会话结束时的代码
         return [*tools.workspace_tools(writable=False), *knowledge_tools, *paper_tools,
-                *experiment, tools.read_paper_tool(), tools.read_reference_tool(),
-                tools.ask_human_tool(), _end_round_tool()]
+                *experiment, cases_tool, tools.read_paper_tool(),
+                tools.read_reference_tool(), tools.ask_human_tool(), _end_round_tool()]
     return [*tools.workspace_tools(), tools.shell_tool(), *knowledge_tools, *paper_tools,
-            *experiment, tools.read_paper_tool(), tools.read_reference_tool(),
-            tools.ask_human_tool(), _end_round_tool()]
+            *experiment, cases_tool, tools.read_paper_tool(),
+            tools.read_reference_tool(), tools.ask_human_tool(), _end_round_tool()]
 
 
 def _describe_session_jobs(env: LoopEnv, job_ids: list[str]):

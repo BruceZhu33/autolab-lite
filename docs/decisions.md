@@ -648,3 +648,38 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   平台评测 Job:查询从 `approved_by='agent-run:<run_id>'` 扩为
   `IN ('agent-run:<run_id>', 'platform-eval:<run_id>')`,`jobs_cancelled`
   事件记录实际取消的全部 Job,评测 Job 不再滞留占 GPU 租约。
+
+
+## D-038 · Phase C1:结构化研究记忆 research_cases(2026-10-29)
+
+- DB v23→v24:新表 `research_cases`(UNIQUE(run_id, round_no, dataset, variant))+
+  三个索引(project+created_at / project+fingerprint / project+dataset)。旧库由
+  `_SCHEMA` executescript 自动补建,无数据迁移;journal(.md 渲染)保持不变,
+  DB case 是事实源。读写不进 `core/repo.py`,直接放 `stages/research.py`。
+- 记录:`_record_round` 写完 journal 后调 `record_research_cases`,把
+  `evaluation.means` 逐条落成 per-(variant,dataset) case;`INSERT OR IGNORE`
+  幂等(同 run/round 重复收束不重复插入)。异常只打日志不阻塞 end_round——
+  记忆失败不毁研究结论。
+- 字段口径:`success = m.improved`(单列 `significant`;light 单 seed 合法提升
+  也是 success,不因证据不足误判失败);`failure_class` 按可行动性排序先命中先归:
+  guardrail > insufficient_evidence(not significant 且 n<3)> not_improved
+  (meanGain≤0)> eval_failed(该 dataset 有 FAILED/EVAL_MISSING 行)> success >
+  no_evidence 兜底;means 为空时落一条 `no_valid_experiment`(空 dataset/variant)。
+  `fingerprint = sha256(hypothesis\changes\dataset\variant)[:32]`,metrics/evidence
+  各自 JSON(meanValue/meanGain/CI/n/seeds/baseline;evidenceHash/evalJobIds/planIds)。
+- 检索 `search_cases`:SQL 按 project(+dataset)取最近 200 条(created_at DESC,
+  rowid DESC 保证同毫秒也新者在前),Python 侧打分——关键词(小写、非字母数字/CJK
+  切分、≥2 字符、子串匹配,CJK 覆盖中文)×2 + success +1 + meanGain>0 +1 + 新近
+  微权重(×1e-4);同 fingerprint 只留最新;空 query 只按 dataset/时间。无向量、
+  无跨项目(C1 非目标)。`format_cases` 渲染单行 case(判定/增益/假设/分析/下一步),
+  上限 4000 字符。
+- 注入:`build_task` 在「之前研究会话的日志」后追加「## 结构化研究记忆(本地,按
+  相关度)」,query = idea(无则项目名)+ 可用数据集名,limit 5;检索失败/空写
+  「(暂无结构化记忆)」,不阻塞会话启动。
+- 工具:`tools.search_cases_tool(search)`——agent 层不 import stages(分层守卫
+  test_architecture),检索+渲染函数由 research 阶段注入(`_case_answer`);
+  注册进 research 与 validation 两个工具面(validation 只读可查),空结果返回
+  「没有匹配的历史 case」。本地表直读,外部 `search_knowledge` 不可达时的可靠兜底。
+- API:`GET /api/projects/{id}/research/cases`(reader;query/dataset/limit 1..50,
+  默认 20;项目不存在 404)。前端展示是 C1 非目标。
+- 非目标(C2/C3):critic/reviewer、并行分支、跨项目全局记忆/向量检索。
