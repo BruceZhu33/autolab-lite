@@ -2,7 +2,8 @@
 
 owner 给 1–3 个方向,每个方向 fork 一个独立 git worktree 项目并启动研究会话;
 Python 按 run.result(B1/B2.3 的已验收指标)选冠军,不看 journal/agent 自述。
-C3b promote:owner 确认后冠军分支代码 merge 回源项目 + 冠军基线采纳为新基线。
+C3b promote:owner 确认后冠军分支代码 merge 回源项目 + 冠军已验证均值
+(result.champion)采纳为新基线。
 """
 
 from __future__ import annotations
@@ -323,11 +324,52 @@ def _metrics_summary(datasets: dict) -> str:
     return ";".join(parts)
 
 
+def _is_metric_number(value) -> bool:
+    """指标可参与运算:int/float 且不是 bool(JSON 里 bool 不是数值)。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _champion_primary(winner_snapshot: dict, source_snapshot: dict, repo: Repo,
+                      winner_project_id: str, winner_run_id: str,
+                      dataset: str) -> str:
+    """主指标:winner 契约 primary → source 契约 primary →
+    最后一轮 evaluation.rows 里该数据集行的 metric。"""
+    for snapshot in (winner_snapshot, source_snapshot):
+        name = str((snapshot.get("metric_contract") or {}).get("primary") or "").strip()
+        if name:
+            return name
+    rounds = research.list_rounds(repo, winner_project_id, winner_run_id)
+    rows = ((rounds[-1].get("evaluation") or {}).get("rows") or []) if rounds else []
+    for row in rows:
+        if str(row.get("dataset") or "").strip() == dataset and row.get("metric"):
+            return str(row["metric"])
+    return ""
+
+
+def _abort_merge(host, git: str) -> str | None:
+    """merge 失败/卡死后尽力还原工作区;返回 None = 已还原或无需还原,
+    否则返回需要手动处理的原因。全程不抛(还原阶段异常也算手动处理原因)。"""
+    try:
+        if not host.run(f"{git} rev-parse -q --verify MERGE_HEAD").ok:
+            return None
+    except Exception as exc:  # noqa: BLE001 - 探测失败同样要人工介入
+        return str(exc).strip()[:300] or "探测 MERGE_HEAD 失败"
+    try:
+        abort = host.run(f"{git} merge --abort")
+    except Exception as exc:  # noqa: BLE001
+        return str(exc).strip()[:300] or "git merge --abort 失败"
+    if not abort.ok:
+        return ((abort.err or abort.out) or "").strip()[:300] or "git merge --abort 失败"
+    return None
+
+
 def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                      confirm: bool = False) -> dict:
-    """owner 确认:冠军分支代码 merge 回源项目 + 采纳冠军 baseline 为源项目
+    """owner 确认:冠军分支代码 merge 回源项目 + 采纳冠军已验证均值为源项目
     新基线。必须 campaign.status=='done' 且有 winner、winner run success=True;
-    源工作区 tracked clean;冲突/失败 abort 还原;重复回灌拒绝。"""
+    采纳值只信 winner run result.champion(dataset/meanValue),缺失即 409,
+    绝不回灌冠军分支的旧基线快照;源工作区 tracked clean;
+    冲突/失败 abort 还原;重复回灌拒绝。"""
     if not confirm:
         raise UserError("promote 需要 owner 明确确认(confirm=true)")
     row = _campaign_row(repo, campaign_id)
@@ -358,6 +400,19 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
     source_snapshot = baseline_snapshot(source)
     winner_snapshot = baseline_snapshot(winner_project)
 
+    # ---- 冠军已验证均值:回灌只信 result.champion,不采信冠军分支的旧基线快照。
+    #      放在 merge 之前:均值不可采纳时直接 409,源工作区一个字节都不动。
+    champion = (winner_run.get("result") or {}).get("champion")
+    champion_dataset = str((champion or {}).get("dataset") or "").strip()
+    champion_mean = (champion or {}).get("meanValue")
+    if not isinstance(champion, dict) or not champion_dataset \
+            or not _is_metric_number(champion_mean):
+        raise UserError("冠军会话没有可采纳的逐数据集均值,不能回灌")
+    primary = _champion_primary(winner_snapshot, source_snapshot, repo,
+                                winner_project_id, winner_run_id, champion_dataset)
+    if not primary:
+        raise UserError("无法确定主指标,冠军均值不能回灌")
+
     # ---- 代码 merge:源工作区 tracked clean 才动手;失败 abort 还原
     with open_host(repo, credentials, source["server_id"]) as host:
         git = f"git -C {q(source_dir)}"
@@ -370,16 +425,26 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
         if not host.run(f"{git} rev-parse --verify --quiet {q(winner_branch)}").ok:
             raise UserError(f"冠军分支 {winner_branch} 不存在,无法回灌")
         message = f"campaign {campaign_id}: promote {branch.get('name') or winner_branch}"
-        merge = host.run(f"{git} merge --no-ff -m {q(message)} {q(winner_branch)}",
-                         timeout=300)
+        try:
+            merge = host.run(f"{git} merge --no-ff -m {q(message)} {q(winner_branch)}",
+                             timeout=300)
+        except Exception as exc:  # noqa: BLE001 - 超时/传输异常:先尝试还原再抛
+            manual = _abort_merge(host, git)
+            if manual is not None:
+                raise UserError(f"合并失败且自动还原失败,源工作区需要手动处理:"
+                                f"{str(exc).strip()[:300]};{manual}") from exc
+            raise
         if not merge.ok:  # 冲突/失败:还原到 merge 前状态,源 HEAD/工作区不变
-            if host.run(f"{git} rev-parse -q --verify MERGE_HEAD").ok:
-                host.run(f"{git} merge --abort")
             stderr = ((merge.err or merge.out) or "").strip()[:300]
+            manual = _abort_merge(host, git)
+            if manual is not None:
+                raise UserError(f"合并失败且自动还原失败,源工作区需要手动处理:"
+                                f"{stderr};{manual}")
             raise UserError(f"冠军代码合并失败(源工作区已还原):{stderr}")
         code_commit = host.run(f"{git} rev-parse HEAD").out.strip()
 
-        # ---- 基线采纳:冠军快照为主体,旧源快照整条进 history,去掉 fork
+        # ---- 基线采纳:冠军快照为主体,该数据集主指标换成冠军已验证均值,
+        #      旧源快照整条进 history,去掉 fork
         now = utc_now()
         history = list(source_snapshot.get("history") or [])
         history.append({"passed_at": source_snapshot.get("passed_at"),
@@ -387,17 +452,51 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                         "version_label": source_snapshot.get("version_label"),
                         "notes": source_snapshot.get("notes"),
                         "datasets": source_snapshot.get("datasets") or {}})
+        datasets = copy.deepcopy(winner_snapshot.get("datasets") or {})
+        entry = datasets.get(champion_dataset)
+        if not isinstance(entry, dict):
+            entry = {}
+            datasets[champion_dataset] = entry
+        metrics = entry.get("metrics")
+        if not isinstance(metrics, dict):
+            metrics = {}
+            entry["metrics"] = metrics
+        metrics[primary] = champion_mean
+        # command/job_id:champion.planId 对应 plan 的该数据集训练 Job 实际值
+        # (取不到——plan 缺失/不属于冠军项目/该数据集无成功 Job——保留原值)
+        champion_plan = repo.get_plan(str(champion.get("planId") or ""))
+        if champion_plan is not None \
+                and champion_plan.get("project_id") == winner_project_id:
+            for job in repo.list_jobs(plan_id=champion_plan["id"]):
+                if job["status"] != "SUCCEEDED":
+                    continue
+                params = json.loads(job["params_json"] or "{}")
+                if str(params.get("dataset") or "") != champion_dataset:
+                    continue
+                command = str(params.get("command") or "").strip()
+                if command:
+                    entry["command"] = command
+                if job.get("id"):
+                    entry["job_id"] = job["id"]
+                break
         notes = (f"{(winner_snapshot.get('notes') or '').strip()}"
                  f"\n采纳自 campaign {campaign_id} 分支 {winner_branch}"
                  f"(代码 {code_commit})")
         snapshot = {**winner_snapshot,
                     "passed_at": now, "run_id": winner_run_id,
                     "notes": notes[:2000], "history": history[-5:],
+                    "datasets": datasets,
                     "promoted_from": {"campaign_id": campaign_id,
                                       "winner_project_id": winner_project_id,
                                       "winner_run_id": winner_run_id,
                                       "winner_branch": winner_branch,
-                                      "code_commit": code_commit}}
+                                      "code_commit": code_commit,
+                                      "champion": {"dataset": champion_dataset,
+                                                   "metric": primary,
+                                                   "meanValue": champion_mean,
+                                                   "n": champion.get("n"),
+                                                   "ciLow": champion.get("ciLow"),
+                                                   "ciHigh": champion.get("ciHigh")}}}
         snapshot.pop("fork", None)   # 源项目不再是分叉视角
         repo.update_project(source["id"], baseline_passed_at=now,
                             baseline_json=json.dumps(snapshot, ensure_ascii=False))

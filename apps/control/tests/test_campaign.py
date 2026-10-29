@@ -12,6 +12,7 @@ import pytest
 from autolab_control.agent import runtime as al
 from autolab_control.core.db import utc_now
 from autolab_control.core.errors import UserError
+from autolab_control.core.ids import new_id
 from autolab_control.execution.evidence import hash_paths
 from autolab_control.stages import campaign as campaign_stage
 from autolab_control.stages import research as research_stage
@@ -499,9 +500,44 @@ def head_at(cwd):
                   capture_output=True, text=True, check=True).stdout.strip()
 
 
-def promote_fixture(api, tmp_path, *, source_edit=None, name="bl"):
+DEFAULT_CHAMPION = {"round": 2, "dataset": "kvasir", "n": 3, "meanValue": 0.9,
+                    "meanGain": 0.1, "ciLow": 0.05, "ciHigh": 0.15}
+CHAMPION_COMMAND = "python train.py --model attn"
+
+
+def _insert_champion_plan(repo, project_id: str, *, dataset="kvasir",
+                          status="SUCCEEDED") -> tuple[str, str]:
+    """冠军 planId 的落库实体:APPROVED plan + 该数据集一个训练 Job(带实际
+    command)。回灌写回 entry["command"]/entry["job_id"] 的溯源原料。"""
+    plan_id, job_id = new_id("plan"), new_id("job")
+    now = utc_now()
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            conn.execute(
+                "INSERT INTO plan_revisions (id, project_id, revision_no, status,"
+                " spec_json, spec_hash, experiment_ref, experiment_hash, approved_by,"
+                " created_at) VALUES (?, ?, 1, 'APPROVED', '{}', 'h', 'EXP-9', 'h2',"
+                " 'agent-run:x', ?)", (plan_id, project_id, now))
+            conn.execute(
+                "INSERT INTO jobs (id, plan_revision_id, ordinal, params_json,"
+                " status, queued_at, updated_at) VALUES (?, ?, 1, ?, ?, ?, ?)",
+                (job_id, plan_id,
+                 json.dumps({"name": "kvasir-attn", "dataset": dataset,
+                             "command": CHAMPION_COMMAND, "variant": "attn",
+                             "seed": 1}, ensure_ascii=False),
+                 status, now, now))
+    finally:
+        conn.close()
+    return plan_id, job_id
+
+
+def promote_fixture(api, tmp_path, *, source_edit=None, name="bl",
+                    champion=DEFAULT_CHAMPION):
     """收敛出可回灌的 campaign:2 分支,winner 分支 worktree 提交了代码改动,
-    冠军项目基线已更新(val_dice=0.9,保留 metric_contract)。"""
+    winner run result.champion 带已验证均值(kvasir val_dice=0.9,plan/job 可溯源);
+    冠军项目的基线快照保持分叉继承的旧值 0.8——回灌必须取 champion.meanValue,
+    不允许把冠军分支旧基线当新基线。champion=None/改字段可造坏数据用例。"""
     pid, ws = make_git_project(api, tmp_path, name=name)
     allow_roots(api, tmp_path)
     repo = api["repo"]
@@ -513,21 +549,21 @@ def promote_fixture(api, tmp_path, *, source_edit=None, name="bl"):
     (fork_ws / "train.py").write_text("print('winner-v2')\n", encoding="utf-8")
     _git("add", "train.py", cwd=fork_ws)
     _git("commit", "-qm", "winner change", cwd=fork_ws)
+    plan_id, champion_job_id = _insert_champion_plan(repo, winner["projectId"])
     finish_run(repo, loser["runId"], status="failed")
-    finish_run(repo, winner["runId"],
-               result={"success": True, "bestGain": 0.2, "rounds": 2})
+    result = {"success": True, "bestGain": 0.2, "rounds": 2}
+    if champion is not None:
+        result["champion"] = {**champion, "planId": plan_id}
+    finish_run(repo, winner["runId"], result=result)
     final = campaign_stage.campaign_status(repo, camp["id"])
     assert final["status"] == "done" and final["winner"]["runId"] == winner["runId"]
-    snap = json.loads(repo.get_project(winner["projectId"])["baseline_json"])
-    snap["datasets"]["kvasir"]["metrics"]["val_dice"] = 0.9
-    repo.update_project(winner["projectId"],
-                        baseline_json=json.dumps(snap, ensure_ascii=False))
     if source_edit is not None:  # 源侧同文件同行的提交(冲突用例)
         (ws / "train.py").write_text(source_edit, encoding="utf-8")
         _git("add", "train.py", cwd=ws)
         _git("commit", "-qm", "source change", cwd=ws)
     return {"pid": pid, "ws": ws, "repo": repo, "camp": camp,
-            "winner": winner, "loser": loser}
+            "winner": winner, "loser": loser,
+            "plan_id": plan_id, "champion_job_id": champion_job_id}
 
 
 def test_promote_requires_done_campaign_and_winner(api, tmp_path):
@@ -565,17 +601,25 @@ def test_promote_merges_code_and_adopts_baseline(api, tmp_path):
     after = head_at(ws)
     assert (ws / "train.py").read_text(encoding="utf-8") == "print('winner-v2')\n"
     assert after != before
-    # 源基线 = 冠军快照:指标 0.9、契约原样、fork 去掉、旧基线进 history
+    # 源基线主指标 = 冠军已验证均值 0.9,不是冠军分支分叉继承的旧基线 0.8;
+    # 契约原样、fork 去掉、旧源基线整条进 history
     snap = json.loads(repo.get_project(pid)["baseline_json"])
     assert snap["datasets"]["kvasir"]["metrics"]["val_dice"] == pytest.approx(0.9)
     assert snap["metric_contract"]["primary"] == "val_dice"
     assert snap["run_id"] == fx["winner"]["runId"]
     assert "fork" not in snap
-    assert snap["promoted_from"] == {"campaign_id": camp["id"],
-                                     "winner_project_id": fx["winner"]["projectId"],
-                                     "winner_run_id": fx["winner"]["runId"],
-                                     "winner_branch": fx["winner"]["fork"],
-                                     "code_commit": after}
+    # command/job_id 来自 champion.planId 对应 plan 的该数据集训练 Job
+    assert snap["datasets"]["kvasir"]["command"] == CHAMPION_COMMAND
+    assert snap["datasets"]["kvasir"]["job_id"] == fx["champion_job_id"]
+    assert snap["promoted_from"]["campaign_id"] == camp["id"]
+    assert snap["promoted_from"]["winner_project_id"] == fx["winner"]["projectId"]
+    assert snap["promoted_from"]["winner_run_id"] == fx["winner"]["runId"]
+    assert snap["promoted_from"]["winner_branch"] == fx["winner"]["fork"]
+    assert snap["promoted_from"]["code_commit"] == after
+    assert snap["promoted_from"]["champion"] == {"dataset": "kvasir",
+                                                 "metric": "val_dice",
+                                                 "meanValue": 0.9, "n": 3,
+                                                 "ciLow": 0.05, "ciHigh": 0.15}
     assert snap["history"][-1]["datasets"]["kvasir"]["metrics"]["val_dice"] \
         == pytest.approx(0.8)
     assert repo.get_project(pid)["baseline_passed_at"] == snap["passed_at"]
@@ -588,10 +632,45 @@ def test_promote_merges_code_and_adopts_baseline(api, tmp_path):
     assert promotion["winnerBranch"] == fx["winner"]["fork"]
     assert promotion["baselineRunId"] == "arun-src"
     assert campaign_rows(repo, pid)[0]["status"] == "done"
-    # 源 journal 落回灌一笔
+    # 源 journal 落回灌一笔,摘要显示采纳后的新值
     journal = (ws / ".autolab" / "research_journal.md").read_text(encoding="utf-8")
     assert "Campaign 冠军回灌" in journal and camp["id"] in journal
     assert "val_dice=0.9" in journal
+
+
+def test_promote_rejects_bad_champion_mean(api, tmp_path):
+    """result.champion 缺失 / meanValue 非数值 / dataset 缺失:409,
+    源 baseline 快照与 HEAD 原样不动(绝不静默采纳旧基线)。"""
+    # champion 整个缺失
+    fx = promote_fixture(api, tmp_path, champion=None)
+    repo, store, ws = fx["repo"], api["store"], fx["ws"]
+    before_snap = repo.get_project(fx["pid"])["baseline_json"]
+    before_head = head_at(ws)
+    with pytest.raises(UserError, match="没有可采纳的逐数据集均值"):
+        campaign_stage.promote_campaign(repo, store, fx["camp"]["id"], confirm=True)
+    assert head_at(ws) == before_head
+    assert (ws / "train.py").read_text(encoding="utf-8") == "print('v1')\n"
+    assert repo.get_project(fx["pid"])["baseline_json"] == before_snap
+    # meanValue 非数值(字符串;bool 也算非数值口径)
+    for i, bad in enumerate(({"dataset": "kvasir", "meanValue": "0.9"},
+                             {"dataset": "kvasir", "meanValue": True}), start=2):
+        fx = promote_fixture(api, tmp_path / f"p{i}", name=f"p{i}", champion=bad)
+        allow_roots(api, tmp_path)  # fixture 收窄了白名单根,放宽回测试根
+        before_snap = fx["repo"].get_project(fx["pid"])["baseline_json"]
+        before_head = head_at(fx["ws"])
+        with pytest.raises(UserError, match="没有可采纳的逐数据集均值"):
+            campaign_stage.promote_campaign(fx["repo"], api["store"],
+                                            fx["camp"]["id"], confirm=True)
+        assert head_at(fx["ws"]) == before_head
+        assert fx["repo"].get_project(fx["pid"])["baseline_json"] == before_snap
+    # champion 有均值但没标 dataset:同样不可采纳
+    fx = promote_fixture(api, tmp_path / "p9", name="p9",
+                         champion={"meanValue": 0.9, "n": 3})
+    before_snap = fx["repo"].get_project(fx["pid"])["baseline_json"]
+    with pytest.raises(UserError, match="没有可采纳的逐数据集均值"):
+        campaign_stage.promote_campaign(fx["repo"], api["store"],
+                                        fx["camp"]["id"], confirm=True)
+    assert fx["repo"].get_project(fx["pid"])["baseline_json"] == before_snap
 
 
 def test_promote_rejects_dirty_source(api, tmp_path):
