@@ -101,7 +101,8 @@ def build(ctx: Ctx) -> APIRouter:
             network=bool(payload.get("network")), max_rounds=number("max_rounds", int),
             gpu_hours=number("gpu_hours", float), datasets=datasets or None,
             kb_assist=bool(payload.get("kb_assist")),
-            kb_spaces=[str(s) for s in (payload.get("kb_spaces") or []) if str(s).strip()] or None)}
+            kb_spaces=[str(s) for s in (payload.get("kb_spaces") or []) if str(s).strip()] or None,
+            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")))}
 
     @router.post("/api/owner/projects/{project_id}/research/validate",
                  dependencies=[ctx.owner])
@@ -114,7 +115,8 @@ def build(ctx: Ctx) -> APIRouter:
             datasets=[str(d) for d in (payload.get("datasets") or []) if str(d).strip()] or None,
             seeds=int(payload.get("seeds") or 3),
             source_run_id=str(payload.get("source_run_id") or "").strip() or None,
-            gpu_hours=float(gpu_hours) if gpu_hours not in (None, "") else None)}
+            gpu_hours=float(gpu_hours) if gpu_hours not in (None, "") else None,
+            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")))}
 
     @router.post("/api/owner/projects/{project_id}/research/adopt",
                  dependencies=[ctx.owner])

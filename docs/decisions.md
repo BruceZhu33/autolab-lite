@@ -683,3 +683,34 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
 - API:`GET /api/projects/{id}/research/cases`(reader;query/dataset/limit 1..50,
   默认 20;项目不存在 404)。前端展示是 C1 非目标。
 - 非目标(C2/C3):critic/reviewer、并行分支、跨项目全局记忆/向量检索。
+
+
+## D-039 · Phase C2:独立 LLM 审阅——pre-flight critic + post-round reviewer(2026-10-29)
+
+- 新增 `agent/critic.py`(不 import stages,分层守卫不变):`_ask_json` 一次无工具
+  `call_model`,拼接 text 块、剥 ```json fence、取首 `{` 到尾 `}` 再 `json.loads`,
+  附响应 usage;任何异常(无 key/端点失败/解析失败)返回 `{"error", "unavailable"}`。
+  `critique_experiment`(输入 purpose/jobs/metrics/baseline pool/contract/最近 5 条
+  本地 case)输出 approve|revise|reject;`review_round`(输入 report/evaluation/
+  evidence/contract)输出 valid|suspect + low|medium|high。两者 fail-open:
+  基础设施失败或 verdict/severity 非法 → approve/valid + unavailable,绝不因审阅器
+  故障阻塞研究循环。reasons/suggestions 最多 5 条。
+- 接入点一(pre-flight):`experiment_tools(..., critic=Callable[[LoopEnv,
+  ExperimentRequest], dict|None])`——`before_submit`(GPU 预算)之后、`experiments.submit`
+  之前调 critic,`record_event(run_id, "critic", decision)`;revise/reject 抛 ToolError
+  (理由+建议回给 agent),不建 plan;approve/unavailable 放行。开关只在 research 启动
+  config,agent 不能经 run_experiment 参数自行关闭。
+- 接入点二(post-round):`_end_round_tool` 在 evidence 组装后、`_finish_validation`/
+  成功判定/`_record_round` 之前,`env.config["reviewer"]` 时调 `critic.review_round`,
+  `record_event(run_id, "reviewer", decision)`;suspect+medium/high 抛 ToolError 且该轮
+  不落库(research_rounds/journal/cases 都不写);low 只记录;unavailable 放行。
+- 开关 opt-in:`research.start` / `start_validation` / `POST /research/start` /
+  `POST /research/validate` 均接受 `critic` / `reviewer` bool(默认 False)写入 config;
+  旧会话/旧测试零额外模型调用。critic 输入组装(`_critic_review`:baseline pool 指标+
+  命令、契约、search_cases 最近 5 条)在 stages/research.py,agent 层保持无 stages 依赖。
+- 测试 `apps/control/tests/test_critic.py`(9 例,全部 fake 模型):_ask_json 裸/fenced
+  JSON 与两类失败;verdict/severity 透传与非法 fail-open;revise 拦提交不建 plan、
+  approve 正常建 plan;suspect/high 拒收束不落库、重新 end_round 后落库;low 记录不拦;
+  unavailable 放行;start/validate 开关透传与默认 False。
+- 非目标(C3):并行分支、审阅器跨模型/独立预算/UI 展示、critic 强制用于 baseline、
+  真实模型质量校准(需真机采样)。

@@ -16,7 +16,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..agent import knowledge, runtime, tools
+from ..agent import critic, knowledge, runtime, tools
 from ..agent.runtime import (
     AgentLoopError,
     Finish,
@@ -665,6 +665,19 @@ def _end_round_tool() -> Tool:
                                             evaluation.get("contract"),
                                             evaluation["means"], protected)
         report["evidenceHash"] = report["evidence"]["evidenceHash"]
+        # C2 post-round reviewer:证据组装后、落库/成功判定前独立审一轮;
+        # suspect+medium/high 拒绝收束(该轮不落库),low 只记录,故障放行。
+        if env.config.get("reviewer"):
+            decision = critic.review_round(
+                env.credentials, report=report, evaluation=evaluation,
+                evidence=report["evidence"], contract=evaluation.get("contract"))
+            runtime.record_event(repo, run_id, "reviewer", decision)
+            if decision.get("verdict") == "suspect" \
+                    and decision.get("severity") in ("medium", "high"):
+                reasons = ";".join(str(r) for r in decision.get("reasons") or [])
+                raise ToolError(
+                    f"Reviewer 判定本轮证据可疑({decision.get('severity')}):"
+                    f"{reasons or '(无理由)'};请修正/补充证据后重新 end_round")
 
         if env.config.get("mode") == "validation":
             return _finish_validation(env, round_no, report, evaluation)
@@ -821,6 +834,23 @@ def _record_round(env: LoopEnv, round_no: int, report: dict) -> None:
         print(f"autolab-control: 研究记忆落库失败(round {round_no}):{exc}", flush=True)
 
 
+def _critic_review(env: LoopEnv, request) -> dict | None:
+    """C2 pre-flight critic 的输入组装:研究阶段注入,agent 层不 import stages。
+    组装+调用全程包死:任何异常(契约/池/case 检索故障)都 fail-open 放行,
+    不把普通 tool_error 抛给主循环;原因落进 critic 事件可追溯。"""
+    try:
+        return critic.critique_experiment(
+            env.credentials, purpose=request.purpose, jobs=request.jobs,
+            metrics=request.metrics, contract=baseline_contract(env.project),
+            pool={name: {"metrics": info.get("metrics") or {},
+                         "command": info.get("command") or ""}
+                  for name, info in baseline_pool(env.project).items()},
+            cases=search_cases(env.repo, env.project["id"], limit=5))
+    except Exception as exc:  # noqa: BLE001 - pre-flight 严格 fail-open
+        return {"verdict": "approve",
+                "reasons": [f"critic 输入组装失败:{exc}"], "unavailable": True}
+
+
 def build_tools(env: LoopEnv) -> list[Tool]:
     knowledge_tools = [tools.knowledge_tool()] if knowledge.configured() else []
     from ..agent import paper_radar
@@ -831,7 +861,8 @@ def build_tools(env: LoopEnv) -> list[Tool]:
         dataset_commands=lambda e: {name: (info.get("command") or "")
                                     for name, info in baseline_pool(e.project).items()},
         before_submit=_check_gpu_budget,
-        eval_contract=lambda e: baseline_contract(e.project))
+        eval_contract=lambda e: baseline_contract(e.project),
+        critic=_critic_review if env.config.get("critic") else None)
     cases_tool = tools.search_cases_tool(_case_answer)
     if env.config.get("mode") == "validation":
         # 验证会话只读 + 只跑:改代码/shell 都不给,保证验证的是来源会话结束时的代码
@@ -866,7 +897,8 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
           reference: str = "", network: bool = False,
           max_rounds: int | None = None, gpu_hours: float | None = None,
           datasets: list[str] | None = None, kb_assist: bool = False,
-          kb_spaces: list[str] | None = None) -> dict:
+          kb_spaces: list[str] | None = None,
+          critic: bool = False, reviewer: bool = False) -> dict:
     project = repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
@@ -889,7 +921,8 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
               "overrides": overrides,
               "datasets": [d for d in (datasets or []) if d in baseline_pool(project)] or None,
               "kb_assist": bool(kb_assist),
-              "kb_spaces": [s for s in (kb_spaces or []) if s] or None}
+              "kb_spaces": [s for s in (kb_spaces or []) if s] or None,
+              "critic": bool(critic), "reviewer": bool(reviewer)}
     return runtime.start_run(repo, project_id, KIND,
                              build_task(repo, project, config, run_id=None), config)
 
@@ -1040,7 +1073,8 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
 
 def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None = None,
                      seeds: int = 3, source_run_id: str | None = None,
-                     gpu_hours: float | None = None) -> dict:
+                     gpu_hours: float | None = None,
+                     critic: bool = False, reviewer: bool = False) -> dict:
     """把来源研究会话的冠军改动做成一次全量验证会话:不改代码,在选定数据集上
     按基线口径多 seed 重跑,一轮收束出逐数据集均值结论。owner 点按钮即授权。"""
     project = repo.get_project(project_id)
@@ -1074,6 +1108,7 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
                            "n": champion.get("n"), "meanGain": champion.get("meanGain"),
                            "hypothesis": str(carrier.get("hypothesis") or "")[:2000],
                            "changes": str(carrier.get("changes") or "")[:2000]},
-              "kb_assist": False, "kb_spaces": None}
+              "kb_assist": False, "kb_spaces": None,
+              "critic": bool(critic), "reviewer": bool(reviewer)}
     return runtime.start_run(repo, project_id, KIND,
                              build_task(repo, project, config, run_id=None), config)

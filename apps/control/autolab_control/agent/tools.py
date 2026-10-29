@@ -13,7 +13,7 @@ from collections.abc import Callable
 from ..execution import experiments
 from ..workspace import papers, refs
 from ..workspace.host import q
-from .runtime import Finish, LoopEnv, Pause, Tool, ToolError
+from .runtime import Finish, LoopEnv, Pause, Tool, ToolError, record_event
 
 _OBJ = "object"
 
@@ -318,10 +318,15 @@ def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
                      allowed_datasets: Callable[[LoopEnv], set[str] | None] | None = None,
                      dataset_commands: Callable[[LoopEnv], dict[str, str] | None] | None = None,
                      before_submit: Callable[[LoopEnv], None] | None = None,
-                     eval_contract: Callable[[LoopEnv], dict | None] | None = None) -> list[Tool]:
+                     eval_contract: Callable[[LoopEnv], dict | None] | None = None,
+                     critic: Callable[[LoopEnv, experiments.ExperimentRequest],
+                                      dict | None] | None = None) -> list[Tool]:
     """baseline_ref / allowed_datasets / dataset_commands / eval_contract 按会话惰性求值;
     before_submit 抛 ToolError 可拦截提交(如 GPU 预算用完)。eval_contract 供
-    wait_jobs 在训练 Job 结束后自动提交平台评测 Job(B2.3a,baseline 阶段不传)。"""
+    wait_jobs 在训练 Job 结束后自动提交平台评测 Job(B2.3a,baseline 阶段不传)。
+    critic(C2 pre-flight):提交前审实验设计,verdict=revise/reject 抛 ToolError
+    拦下并留 "critic" 事件;返回 None(未启用)跳过。开关只在 research 启动配置,
+    agent 不能经 run_experiment 参数自行开关。"""
 
     def run_experiment(env: LoopEnv, args: dict) -> str:
         if before_submit is not None:
@@ -338,6 +343,14 @@ def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
             gpus_per_job=args.get("gpus_per_job") or 1,
             allowed_datasets=allowed_datasets(env) if allowed_datasets else None,
             dataset_commands=dataset_commands(env) if dataset_commands else None)
+        if critic is not None:
+            decision = critic(env, request)
+            if decision is not None:
+                record_event(env.repo, env.run["id"], "critic", decision)
+                if decision.get("verdict") in ("revise", "reject"):
+                    reasons = ";".join(str(r) for r in decision.get("reasons") or [])
+                    tips = ";".join(str(s) for s in decision.get("suggestions") or [])
+                    raise ToolError(f"Critic 要求修改/拒绝:{reasons or '(无理由)'};建议:{tips}")
         result = experiments.submit(
             env.repo, env.workspace, env.project, request,
             approved_by=f"agent-run:{env.run['id']}",
@@ -345,6 +358,7 @@ def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
         listing = "\n".join(f"- {j['name']}: {j['id']}" for j in result["jobs"])
         return (f"已提交 {result['experimentId']}(plan {result['planId']}),Job 已排队:\n"
                 f"{listing}\n用 wait_jobs 等结果。")
+
 
     def wait_jobs(env: LoopEnv, args: dict):
         job_ids = [str(j) for j in args.get("job_ids") or []]
