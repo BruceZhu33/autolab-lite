@@ -758,3 +758,46 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   run 入队 → 驱动后 stopped,campaign 不再收束);API 权限/404/409/摘要。
 - 非目标(C3b):冠军代码 merge 回源项目与基线回灌、前端 campaign 页、分支级
   独立 GPU 预算/调度公平性、AgentSpec RSI 外层。
+
+## D-041 · Phase C3b:Campaign 冠军回灌 promote + 失败分支留痕(2026-10-29)
+
+- `stages/campaign.py` `promote_campaign(repo, credentials, campaign_id, *,
+  confirm=False)`:owner 确认门(confirm=False → UserError 409);前置校验
+  依序为 campaign 存在(NotFound 404)→ result.promotion 已存在则
+  「该 campaign 已回灌过」(幂等,防重复 merge/基线覆盖)→ status=='done' 且
+  winner_project_id/run_id 落行 → winner run 重读必须 done 且 result.success
+  is True(只信 run.result,与选冠军同口径)→ 源/冠军项目在且有 workdir。
+- 代码 merge:源工作区必须 `git status --porcelain --untracked-files=no` 为空
+  (未跟踪 `.autolab`/数据不拦,tracked 脏 → 409);冠军分支名取 branch["fork"],
+  `git rev-parse --verify` 确认存在后 `git merge --no-ff -m "campaign <id>:
+  promote <name>"`;失败时若 MERGE_HEAD 存在(冲突态)`git merge --abort` 还原,
+  UserError「冠军代码合并失败(源工作区已还原)」,源 HEAD/工作区不变;
+  成功/Already up-to-date 记录 `rev-parse HEAD` 为 code_commit。不自动删冠军/
+  其他分支 worktree(owner 可继续查看)。
+- 基线采纳:新源快照 = {**冠军快照, passed_at=now, run_id=winner_run_id,
+  notes=冠军 notes+采纳溯源[:2000], history=旧源 history+旧源快照整条[-5:],
+  promoted_from={campaign_id, winner_project_id, winner_run_id, winner_branch,
+  code_commit}},`pop("fork")`(源项目不再是分叉视角);metric_contract 原样
+  来自冠军快照(fork 时已按分支工作区重算,不再改写)。源项目
+  `.autolab/research_journal.md` 追加「Campaign 冠军回灌」一笔(open_host+
+  Workspace;写失败仅 log.warning,不阻塞 promote)。
+- 落库:campaign result_json 增 promotion={at, sourceProjectId, sourceCommit,
+  winnerProjectId, winnerRunId, winnerBranch, baselineRunId(冠军快照 run_id)}
+  + promotedAt,status 保持 done;返回 campaign_status(含 promotion)。
+- `start_campaign` 失败路径留痕:except 里把已 fork 分支写 branches_json(每条
+  加 `"aborted": True`),result_json={error, startedBranches};仍停已启动 run;
+  **不删 worktree/项目**(owner 可查可清);campaign failed 不再收束。
+- API:`POST /api/owner/research/campaigns/{campaign_id}/promote`(owner;
+  body confirm bool)。agent 403、缺 confirm 409、不存在 404、非 done/无冠军/
+  脏源/冲突/重复回灌 409。
+- 测试 `test_campaign.py` 新增 6 例(promote_fixture 复用收敛好的 done+
+  winner campaign):前置校验(confirm/running/done 无 winner/winner run
+  success=False);merge+采纳 e2e(源 train.py 吸收冠军改动、HEAD 前进、基线
+  val_dice=0.9、history 含旧基线 0.8、promoted_from/promotion/journal 断言);
+  脏源拒绝+未跟踪 .autolab 不拦;冲突 abort 还原(HEAD 不变、无 MERGE_HEAD/
+  UU);幂等二次 409;API auth(agent 403/缺 confirm 409/404/owner 200)。
+  `test_start_campaign_failure_marks_failed` 扩:第二分支 research.start 失败
+  → branches_json 含已启动分支+aborted=True、result.startedBranches、
+  worktree/项目保留、run 驱动后 stopped。
+- 非目标(后续):前端 campaign/promote 页、自动清理失败分支 worktree/项目、
+  分支级 GPU 公平分配、AgentSpec RSI 外层。

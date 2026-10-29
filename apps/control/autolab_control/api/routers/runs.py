@@ -172,4 +172,13 @@ def build(ctx: Ctx) -> APIRouter:
     def campaign_stop(campaign_id: str) -> dict:
         return {"campaign": campaign.stop_campaign(repo, campaign_id)}
 
+    @router.post("/api/owner/research/campaigns/{campaign_id}/promote",
+                 dependencies=[ctx.owner])
+    def campaign_promote(campaign_id: str, payload: dict) -> dict:
+        """C3b 冠军回灌:冠军分支代码 merge 回源项目 + 冠军基线采纳为新基线。
+        必须 confirm=true;非 done/无冠军/脏工作区/冲突/重复回灌 → 409。"""
+        return {"campaign": campaign.promote_campaign(
+            repo, ctx.credentials, campaign_id,
+            confirm=bool(payload.get("confirm")))}
+
     return router

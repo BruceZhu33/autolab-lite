@@ -1,5 +1,6 @@
-"""Campaign 阶段(C3a):并行 fork + 研究会话、只信 run.result 的冠军选择、
-状态收束、停止、API 权限与校验;fork_workspace 显式分支名。"""
+"""Campaign 阶段(C3a/C3b):并行 fork + 研究会话、只信 run.result 的冠军选择、
+状态收束、停止、失败分支留痕、冠军回灌(promote)与 API 权限/校验;
+fork_workspace 显式分支名。"""
 
 from __future__ import annotations
 
@@ -28,11 +29,11 @@ def _git(*args, cwd):
     sp.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
 
 
-def make_git_project(api, tmp_path):
+def make_git_project(api, tmp_path, name="bl"):
     """git 工作区 + 带契约(metric_contract/history/conda_env/version_label)的
-    确认基线;campaign 分叉的原料。"""
+    确认基线;campaign 分叉的原料。name 可换(同测试建第二个 git 项目用)。"""
     ws = tmp_path / "ws"
-    ws.mkdir()
+    ws.mkdir(parents=True, exist_ok=True)
     _git("init", "-q", cwd=ws)
     _git("config", "user.email", "t@t", cwd=ws)
     _git("config", "user.name", "t", cwd=ws)
@@ -42,7 +43,7 @@ def make_git_project(api, tmp_path):
     _git("add", "train.py", cwd=ws)
     _git("commit", "-qm", "baseline", cwd=ws)
     resp = api["client"].post("/api/owner/projects", json={
-        "name": "bl", "server_id": api["fixture"]["server"]["id"], "workdir": str(ws),
+        "name": name, "server_id": api["fixture"]["server"]["id"], "workdir": str(ws),
         "source": {"kind": "dir", "path": str(ws)}}, headers=OWNER_H)
     assert resp.status_code == 200, resp.text
     pid = resp.json()["project"]["id"]
@@ -301,9 +302,10 @@ def test_start_campaign_validates_input(api, tmp_path):
         campaign_stage.start_campaign(repo, store, "proj-nope", ideas=["a"])
 
 
-def test_start_campaign_failure_marks_failed(api, tmp_path):
-    """非 git 源项目:campaign 行留痕 failed,不抛裸异常。"""
-    pid = make_project(api, tmp_path)  # 普通目录,不是 git 仓库
+def test_start_campaign_failure_marks_failed(api, tmp_path, monkeypatch):
+    """失败留痕:campaign 行 failed;已 fork 的分支写进 branches_json 标
+    aborted=True、result 记 error+startedBranches,worktree/项目不删。"""
+    pid = make_project(api, tmp_path)  # 普通目录,不是 git 仓库:0 分支启动即失败
     api["repo"].update_project(pid, baseline_passed_at="2026-10-28T00:00:00Z",
                                baseline_json=json.dumps({"datasets": {
                                    "kvasir": {"metrics": {"val_dice": 0.8}}}}))
@@ -313,6 +315,40 @@ def test_start_campaign_failure_marks_failed(api, tmp_path):
     rows = campaign_rows(api["repo"], pid)
     assert len(rows) == 1 and rows[0]["status"] == "failed"
     assert "git" in json.loads(rows[0]["result_json"])["error"]
+    assert json.loads(rows[0]["branches_json"]) == []  # 没有任何分支被启动
+
+    # git 源、第一分支完整启动、第二分支启动会话失败:留痕 + 保留现场
+    pid2, ws = make_git_project(api, tmp_path / "git", name="git")
+    allow_roots(api, tmp_path / "git")
+    repo = api["repo"]
+    real_start = research_stage.start
+    calls = {"n": 0}
+
+    def flaky_start(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise UserError("会话队列满了")
+        return real_start(*args, **kwargs)
+
+    monkeypatch.setattr(research_stage, "start", flaky_start)
+    with pytest.raises(UserError, match="campaign 启动失败"):
+        campaign_stage.start_campaign(repo, api["store"], pid2,
+                                      ideas=["a", "b"], tier="light")
+    row = campaign_rows(repo, pid2)[0]
+    assert row["status"] == "failed"
+    branches = json.loads(row["branches_json"])
+    assert len(branches) == 1 and branches[0]["aborted"] is True
+    assert branches[0]["fork"].startswith("autolab/") and branches[0]["runId"]
+    result = json.loads(row["result_json"])
+    assert "会话队列满" in result["error"]
+    assert [b["runId"] for b in result["startedBranches"]] == [branches[0]["runId"]]
+    # 不删 worktree/项目:分支工作区与项目行仍在(owner 可查可清)
+    assert Path(repo.get_project(branches[0]["projectId"])["remote_workdir"]) \
+        .exists()
+    assert repo.get_project(branches[0]["projectId"])["name"].endswith("分支1")
+    # 已启动 run 已入队 stop:驱动一步后 stopped
+    assert al.step(repo, None, branches[0]["runId"], research_stage.PROFILE,
+                   model=ScriptModel([])) == "stopped"
 
 
 def test_start_campaign_outside_roots_fails_before_fork(api, tmp_path):
@@ -454,3 +490,170 @@ def test_campaign_api_lifecycle_and_auth(api, tmp_path):
     assert resp.status_code == 200
     assert resp.json()["campaign"]["status"] == "stopped"
     assert campaign_rows(repo, pid)[0]["status"] == "stopped"
+
+
+# ------------------------------------------------------------------ promote(C3b 冠军回灌)
+
+def head_at(cwd):
+    return sp.run(["git", "-C", str(cwd), "rev-parse", "HEAD"],
+                  capture_output=True, text=True, check=True).stdout.strip()
+
+
+def promote_fixture(api, tmp_path, *, source_edit=None, name="bl"):
+    """收敛出可回灌的 campaign:2 分支,winner 分支 worktree 提交了代码改动,
+    冠军项目基线已更新(val_dice=0.9,保留 metric_contract)。"""
+    pid, ws = make_git_project(api, tmp_path, name=name)
+    allow_roots(api, tmp_path)
+    repo = api["repo"]
+    camp = campaign_stage.start_campaign(repo, api["store"], pid,
+                                         ideas=["注意力改造", "数据增强"], tier="light")
+    assert camp["status"] == "running" and len(camp["branches"]) == 2
+    winner, loser = camp["branches"]
+    fork_ws = Path(repo.get_project(winner["projectId"])["remote_workdir"])
+    (fork_ws / "train.py").write_text("print('winner-v2')\n", encoding="utf-8")
+    _git("add", "train.py", cwd=fork_ws)
+    _git("commit", "-qm", "winner change", cwd=fork_ws)
+    finish_run(repo, loser["runId"], status="failed")
+    finish_run(repo, winner["runId"],
+               result={"success": True, "bestGain": 0.2, "rounds": 2})
+    final = campaign_stage.campaign_status(repo, camp["id"])
+    assert final["status"] == "done" and final["winner"]["runId"] == winner["runId"]
+    snap = json.loads(repo.get_project(winner["projectId"])["baseline_json"])
+    snap["datasets"]["kvasir"]["metrics"]["val_dice"] = 0.9
+    repo.update_project(winner["projectId"],
+                        baseline_json=json.dumps(snap, ensure_ascii=False))
+    if source_edit is not None:  # 源侧同文件同行的提交(冲突用例)
+        (ws / "train.py").write_text(source_edit, encoding="utf-8")
+        _git("add", "train.py", cwd=ws)
+        _git("commit", "-qm", "source change", cwd=ws)
+    return {"pid": pid, "ws": ws, "repo": repo, "camp": camp,
+            "winner": winner, "loser": loser}
+
+
+def test_promote_requires_done_campaign_and_winner(api, tmp_path):
+    """confirm 门 + done/winner/winner run success 校验,全部 409。"""
+    repo, store = api["repo"], api["store"]
+    # running:分支未全终态
+    pid, _ = make_git_project(api, tmp_path)
+    allow_roots(api, tmp_path)
+    running = campaign_stage.start_campaign(repo, store, pid,
+                                            ideas=["a"], tier="light")
+    with pytest.raises(UserError, match="confirm"):
+        campaign_stage.promote_campaign(repo, store, running["id"])  # 缺 confirm
+    with pytest.raises(UserError, match="未完成"):
+        campaign_stage.promote_campaign(repo, store, running["id"], confirm=True)
+    finish_run(repo, running["branches"][0]["runId"], status="failed")
+    done_no_winner = campaign_stage.campaign_status(repo, running["id"])
+    assert done_no_winner["status"] == "done" and done_no_winner["winner"] is None
+    with pytest.raises(UserError, match="没有冠军"):
+        campaign_stage.promote_campaign(repo, store, running["id"], confirm=True)
+    # done + winner,但 winner run 的 result.success 不是 True(直改 DB 复现)
+    fx = promote_fixture(api, tmp_path / "p2", name="p2")
+    finish_run(fx["repo"], fx["winner"]["runId"],
+               result={"success": False, "bestGain": 0.2})
+    with pytest.raises(UserError, match="已验收成功"):
+        campaign_stage.promote_campaign(fx["repo"], api["store"], fx["camp"]["id"],
+                                        confirm=True)
+
+
+def test_promote_merges_code_and_adopts_baseline(api, tmp_path):
+    fx = promote_fixture(api, tmp_path)
+    pid, ws, repo, camp = fx["pid"], fx["ws"], fx["repo"], fx["camp"]
+    before = head_at(ws)
+    out = campaign_stage.promote_campaign(repo, api["store"], camp["id"], confirm=True)
+    # 源代码吸收冠军改动,HEAD 前进(--no-ff 必有 merge commit)
+    after = head_at(ws)
+    assert (ws / "train.py").read_text(encoding="utf-8") == "print('winner-v2')\n"
+    assert after != before
+    # 源基线 = 冠军快照:指标 0.9、契约原样、fork 去掉、旧基线进 history
+    snap = json.loads(repo.get_project(pid)["baseline_json"])
+    assert snap["datasets"]["kvasir"]["metrics"]["val_dice"] == pytest.approx(0.9)
+    assert snap["metric_contract"]["primary"] == "val_dice"
+    assert snap["run_id"] == fx["winner"]["runId"]
+    assert "fork" not in snap
+    assert snap["promoted_from"] == {"campaign_id": camp["id"],
+                                     "winner_project_id": fx["winner"]["projectId"],
+                                     "winner_run_id": fx["winner"]["runId"],
+                                     "winner_branch": fx["winner"]["fork"],
+                                     "code_commit": after}
+    assert snap["history"][-1]["datasets"]["kvasir"]["metrics"]["val_dice"] \
+        == pytest.approx(0.8)
+    assert repo.get_project(pid)["baseline_passed_at"] == snap["passed_at"]
+    # campaign result.promotion 落库,status 保持 done
+    assert out["status"] == "done"
+    promotion = out["result"]["promotion"]
+    assert promotion["sourceProjectId"] == pid and promotion["sourceCommit"] == after
+    assert promotion["winnerProjectId"] == fx["winner"]["projectId"]
+    assert promotion["winnerRunId"] == fx["winner"]["runId"]
+    assert promotion["winnerBranch"] == fx["winner"]["fork"]
+    assert promotion["baselineRunId"] == "arun-src"
+    assert campaign_rows(repo, pid)[0]["status"] == "done"
+    # 源 journal 落回灌一笔
+    journal = (ws / ".autolab" / "research_journal.md").read_text(encoding="utf-8")
+    assert "Campaign 冠军回灌" in journal and camp["id"] in journal
+    assert "val_dice=0.9" in journal
+
+
+def test_promote_rejects_dirty_source(api, tmp_path):
+    fx = promote_fixture(api, tmp_path)
+    ws, repo = fx["ws"], fx["repo"]
+    before = head_at(ws)
+    (ws / "train.py").write_text("print('dirty')\n", encoding="utf-8")
+    with pytest.raises(UserError, match="未提交"):
+        campaign_stage.promote_campaign(repo, api["store"], fx["camp"]["id"],
+                                        confirm=True)
+    assert head_at(ws) == before
+    assert (ws / "train.py").read_text(encoding="utf-8") == "print('dirty')\n"
+    # 未跟踪 .autolab 不拦:清掉 tracked 改动后带未跟踪文件照常回灌
+    _git("checkout", "--", "train.py", cwd=ws)
+    (ws / ".autolab").mkdir(exist_ok=True)
+    (ws / ".autolab" / "foo").write_text("x", encoding="utf-8")
+    out = campaign_stage.promote_campaign(repo, api["store"], fx["camp"]["id"],
+                                          confirm=True)
+    assert out["result"]["promotion"]
+
+
+def test_promote_merge_conflict_aborts_clean(api, tmp_path):
+    fx = promote_fixture(api, tmp_path, source_edit="print('source-v2')\n")
+    ws, repo = fx["ws"], fx["repo"]
+    before = head_at(ws)
+    with pytest.raises(UserError, match="合并失败"):
+        campaign_stage.promote_campaign(repo, api["store"], fx["camp"]["id"],
+                                        confirm=True)
+    # abort 还原:HEAD 不变、无 merge 进行中、源改动原样
+    assert head_at(ws) == before
+    merge_head = sp.run(["git", "-C", str(ws), "rev-parse", "-q", "--verify",
+                         "MERGE_HEAD"], capture_output=True)
+    assert merge_head.returncode != 0
+    status = sp.run(["git", "-C", str(ws), "status", "--porcelain"],
+                    capture_output=True, text=True).stdout
+    assert "UU" not in status
+    assert (ws / "train.py").read_text(encoding="utf-8") == "print('source-v2')\n"
+    # 还原后 campaign 未回灌:状态里没有 promotion
+    assert campaign_stage.campaign_status(repo, fx["camp"]["id"])["result"] \
+        .get("promotion") is None
+
+
+def test_promote_idempotent(api, tmp_path):
+    fx = promote_fixture(api, tmp_path)
+    repo, store = fx["repo"], api["store"]
+    campaign_stage.promote_campaign(repo, store, fx["camp"]["id"], confirm=True)
+    with pytest.raises(UserError, match="已回灌过"):
+        campaign_stage.promote_campaign(repo, store, fx["camp"]["id"], confirm=True)
+
+
+def test_promote_api_auth(api, tmp_path):
+    fx = promote_fixture(api, tmp_path)
+    client = api["client"]
+    url = f"/api/owner/research/campaigns/{fx['camp']['id']}/promote"
+    assert client.post(url, json={"confirm": True},
+                       headers=AGENT_H).status_code == 403
+    assert client.post(url, json={}, headers=OWNER_H).status_code == 409
+    assert client.post("/api/owner/research/campaigns/camp-nope/promote",
+                       json={"confirm": True}, headers=OWNER_H).status_code == 404
+    resp = client.post(url, json={"confirm": True}, headers=OWNER_H)
+    assert resp.status_code == 200, resp.text
+    campaign = resp.json()["campaign"]
+    assert campaign["status"] == "done"
+    assert campaign["result"]["promotion"]["winnerBranch"] == fx["winner"]["fork"]
+    assert (fx["ws"] / "train.py").read_text(encoding="utf-8") == "print('winner-v2')\n"

@@ -1,13 +1,15 @@
-"""Campaign 阶段(C3a):并行研究分支的创建/状态/选冠军/停止。
+"""Campaign 阶段(C3a/C3b):并行研究分支的创建/状态/选冠军/停止/冠军回灌。
 
 owner 给 1–3 个方向,每个方向 fork 一个独立 git worktree 项目并启动研究会话;
 Python 按 run.result(B1/B2.3 的已验收指标)选冠军,不看 journal/agent 自述。
+C3b promote:owner 确认后冠军分支代码 merge 回源项目 + 冠军基线采纳为新基线。
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 
 from ..agent import runtime
@@ -20,6 +22,8 @@ from ..workspace.fs import Workspace
 from ..workspace.host import open_host, q
 from . import research
 from .baseline import baseline_pool, baseline_snapshot, refresh_contract_hashes
+
+log = logging.getLogger(__name__)
 
 TERMINAL_RUN_STATUSES = frozenset(runtime.TERMINAL_STATUSES)   # done/failed/stopped
 ACTIVE_RUN_STATUSES = frozenset(runtime.ACTIVE_STATUSES)
@@ -230,7 +234,8 @@ def start_campaign(repo: Repo, credentials, source_project_id: str, *,
                    max_rounds: int | None = None,
                    gpu_hours: float | None = None) -> dict:
     """并行开 1–3 个研究分支。任一步失败:campaign 置 failed、停掉已启动的
-    分支会话、抛 UserError(API 409)。成功返回 campaign_status。"""
+    分支会话并把已 fork 分支写进 branches_json(每条标 aborted,worktree/项目
+    不删,owner 可查可清)、抛 UserError(API 409)。成功返回 campaign_status。"""
     source = repo.get_project(source_project_id)
     if source is None:
         raise NotFound(f"项目 {source_project_id} 不存在")
@@ -279,9 +284,13 @@ def start_campaign(repo: Repo, credentials, source_project_id: str, *,
     except Exception as exc:
         for branch in started:
             _stop_branch_run(repo, branch["runId"])
-        _update_campaign(repo, campaign_id, status="failed",
-                         result_json=json.dumps({"error": str(exc)},
-                                                ensure_ascii=False))
+        _update_campaign(
+            repo, campaign_id, status="failed",
+            branches_json=json.dumps([{**b, "aborted": True} for b in started],
+                                     ensure_ascii=False),
+            result_json=json.dumps(
+                {"error": str(exc), "startedBranches": started},
+                ensure_ascii=False))
         raise UserError(f"campaign 启动失败:{exc}") from exc
     _update_campaign(repo, campaign_id,
                      branches_json=json.dumps(started, ensure_ascii=False))
@@ -299,4 +308,122 @@ def stop_campaign(repo: Repo, campaign_id: str) -> dict:
             _stop_branch_run(repo, branch["runId"])
     if row["status"] == "running":
         _update_campaign(repo, campaign_id, status="stopped")
+    return campaign_status(repo, campaign_id)
+
+
+# ------------------------------------------------------------------ 冠军回灌(C3b)
+
+def _metrics_summary(datasets: dict) -> str:
+    """采纳基线的逐数据集指标摘要(journal 一行):kvasir:val_dice=0.9。"""
+    parts = []
+    for name, info in (datasets or {}).items():
+        metrics = ",".join(f"{key}={value}" for key, value
+                           in sorted((info.get("metrics") or {}).items()))
+        parts.append(f"{name}:{metrics}" if metrics else str(name))
+    return ";".join(parts)
+
+
+def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
+                     confirm: bool = False) -> dict:
+    """owner 确认:冠军分支代码 merge 回源项目 + 采纳冠军 baseline 为源项目
+    新基线。必须 campaign.status=='done' 且有 winner、winner run success=True;
+    源工作区 tracked clean;冲突/失败 abort 还原;重复回灌拒绝。"""
+    if not confirm:
+        raise UserError("promote 需要 owner 明确确认(confirm=true)")
+    row = _campaign_row(repo, campaign_id)
+    result = json.loads(row["result_json"] or "null") or {}
+    if result.get("promotion"):
+        raise UserError("该 campaign 已回灌过")
+    if row["status"] != "done":
+        raise UserError(f"campaign 未完成(status={row['status']}),不能回灌")
+    winner_project_id, winner_run_id = row["winner_project_id"], row["winner_run_id"]
+    if not winner_project_id or not winner_run_id:
+        raise UserError("campaign 没有冠军分支,无从回灌")
+    branch = next((b for b in json.loads(row["branches_json"] or "[]")
+                   if b.get("runId") == winner_run_id), None)
+    if branch is None or not branch.get("fork"):
+        raise UserError("冠军分支记录缺失(无 fork 分支名),无从回灌")
+    winner_run = runtime.get_run(repo, winner_run_id)
+    if winner_run["status"] != "done" \
+            or (winner_run.get("result") or {}).get("success") is not True:
+        raise UserError("冠军会话不是已验收成功状态,不能回灌")
+    source = repo.get_project(row["source_project_id"])
+    winner_project = repo.get_project(winner_project_id)
+    if source is None or winner_project is None:
+        raise UserError("源项目或冠军项目不存在,不能回灌")
+    source_dir = (source.get("remote_workdir") or "").rstrip("/")
+    if not source_dir or not (winner_project.get("remote_workdir") or "").strip():
+        raise UserError("源项目或冠军项目没有工作区,不能回灌")
+    winner_branch = str(branch["fork"])
+    source_snapshot = baseline_snapshot(source)
+    winner_snapshot = baseline_snapshot(winner_project)
+
+    # ---- 代码 merge:源工作区 tracked clean 才动手;失败 abort 还原
+    with open_host(repo, credentials, source["server_id"]) as host:
+        git = f"git -C {q(source_dir)}"
+        if not host.run(f"{git} rev-parse --is-inside-work-tree").ok:
+            raise UserError("源工作区不是 git 仓库,无法回灌")
+        status = host.run(f"{git} status --porcelain --untracked-files=no")
+        if not status.ok or (status.out or "").strip():
+            dirty = ";".join((status.out or "").strip().splitlines()[:5])
+            raise UserError(f"源工作区有未提交的 tracked 改动,拒绝回灌:{dirty}")
+        if not host.run(f"{git} rev-parse --verify --quiet {q(winner_branch)}").ok:
+            raise UserError(f"冠军分支 {winner_branch} 不存在,无法回灌")
+        message = f"campaign {campaign_id}: promote {branch.get('name') or winner_branch}"
+        merge = host.run(f"{git} merge --no-ff -m {q(message)} {q(winner_branch)}",
+                         timeout=300)
+        if not merge.ok:  # 冲突/失败:还原到 merge 前状态,源 HEAD/工作区不变
+            if host.run(f"{git} rev-parse -q --verify MERGE_HEAD").ok:
+                host.run(f"{git} merge --abort")
+            stderr = ((merge.err or merge.out) or "").strip()[:300]
+            raise UserError(f"冠军代码合并失败(源工作区已还原):{stderr}")
+        code_commit = host.run(f"{git} rev-parse HEAD").out.strip()
+
+        # ---- 基线采纳:冠军快照为主体,旧源快照整条进 history,去掉 fork
+        now = utc_now()
+        history = list(source_snapshot.get("history") or [])
+        history.append({"passed_at": source_snapshot.get("passed_at"),
+                        "run_id": source_snapshot.get("run_id"),
+                        "version_label": source_snapshot.get("version_label"),
+                        "notes": source_snapshot.get("notes"),
+                        "datasets": source_snapshot.get("datasets") or {}})
+        notes = (f"{(winner_snapshot.get('notes') or '').strip()}"
+                 f"\n采纳自 campaign {campaign_id} 分支 {winner_branch}"
+                 f"(代码 {code_commit})")
+        snapshot = {**winner_snapshot,
+                    "passed_at": now, "run_id": winner_run_id,
+                    "notes": notes[:2000], "history": history[-5:],
+                    "promoted_from": {"campaign_id": campaign_id,
+                                      "winner_project_id": winner_project_id,
+                                      "winner_run_id": winner_run_id,
+                                      "winner_branch": winner_branch,
+                                      "code_commit": code_commit}}
+        snapshot.pop("fork", None)   # 源项目不再是分叉视角
+        repo.update_project(source["id"], baseline_passed_at=now,
+                            baseline_json=json.dumps(snapshot, ensure_ascii=False))
+
+        # ---- 源项目 journal 落一笔;失败只打日志,不阻塞 promote
+        try:
+            journal = Workspace(host, source_dir)
+            old = journal.read_bytes(research.JOURNAL_REL) \
+                .decode("utf-8") if journal.exists(research.JOURNAL_REL) \
+                else "# 研究日志\n\n"
+            entry = (f"\n## Campaign 冠军回灌({now[:10]})\n\n"
+                     f"- campaign {campaign_id} / 分支 {winner_branch} /"
+                     f" run {winner_run_id} / 代码 {code_commit}\n"
+                     f"- 采纳基线:{_metrics_summary(snapshot.get('datasets'))}\n")
+            journal.write_bytes(research.JOURNAL_REL,
+                                (old + entry).encode("utf-8"))
+        except Exception as exc:
+            log.warning("campaign %s 回灌日志写入失败:%s", campaign_id, exc)
+
+    result = {**result, "promotedAt": now,
+              "promotion": {"at": now, "sourceProjectId": source["id"],
+                            "sourceCommit": code_commit,
+                            "winnerProjectId": winner_project_id,
+                            "winnerRunId": winner_run_id,
+                            "winnerBranch": winner_branch,
+                            "baselineRunId": winner_snapshot.get("run_id")}}
+    _update_campaign(repo, campaign_id, result_json=json.dumps(result,
+                                                               ensure_ascii=False))
     return campaign_status(repo, campaign_id)
