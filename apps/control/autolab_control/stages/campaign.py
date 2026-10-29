@@ -424,6 +424,22 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
             raise UserError(f"源工作区有未提交的 tracked 改动,拒绝回灌:{dirty}")
         if not host.run(f"{git} rev-parse --verify --quiet {q(winner_branch)}").ok:
             raise UserError(f"冠军分支 {winner_branch} 不存在,无法回灌")
+        # ---- untracked 碰撞预检:源工作区未跟踪(非忽略)文件若被冠军分支跟踪,
+        #      merge 会被 git 以「未跟踪文件将被覆盖」拒绝;提前 409 点名文件,
+        #      不自动删除/移动 owner 文件。
+        untracked = (host.run(f"{git} ls-files --others --exclude-standard").out
+                     or "").splitlines()
+        untracked = [p.strip() for p in untracked if p.strip()]
+        if untracked:
+            tracked = (host.run(
+                f"{git} ls-tree -r --name-only {q(winner_branch)}").out
+                or "").splitlines()
+            tracked_set = {p.strip() for p in tracked if p.strip()}
+            collisions = sorted(p for p in untracked if p in tracked_set)
+            if collisions:
+                listed = ";".join(collisions[:10])
+                raise UserError(f"源工作区有未跟踪文件会被冠军分支覆盖:{listed};"
+                                "请先移动/删除后重试")
         message = f"campaign {campaign_id}: promote {branch.get('name') or winner_branch}"
         try:
             merge = host.run(f"{git} merge --no-ff -m {q(message)} {q(winner_branch)}",

@@ -692,6 +692,32 @@ def test_promote_rejects_dirty_source(api, tmp_path):
     assert out["result"]["promotion"]
 
 
+def test_promote_rejects_untracked_collision_with_winner_branch(api, tmp_path):
+    """源工作区未跟踪 metrics.json 与冠军分支 tracked 同名文件碰撞:
+    409 点名「未跟踪文件」+路径,源 HEAD/baseline 原样,owner 文件不被动;
+    移走后 promote 成功并吸收冠军改动。"""
+    fx = promote_fixture(api, tmp_path)
+    ws, repo = fx["ws"], fx["repo"]
+    before_head, before_snap = head_at(ws), repo.get_project(fx["pid"])["baseline_json"]
+    (ws / "metrics.json").write_text('{"local": true}\n', encoding="utf-8")
+    fork_ws = Path(repo.get_project(fx["winner"]["projectId"])["remote_workdir"])
+    (fork_ws / "metrics.json").write_text('{"winner": true}\n', encoding="utf-8")
+    _git("add", "metrics.json", cwd=fork_ws)
+    _git("commit", "-qm", "track metrics", cwd=fork_ws)
+    with pytest.raises(UserError, match="未跟踪文件.*metrics\\.json"):
+        campaign_stage.promote_campaign(repo, api["store"], fx["camp"]["id"],
+                                        confirm=True)
+    assert head_at(ws) == before_head
+    assert repo.get_project(fx["pid"])["baseline_json"] == before_snap
+    assert (ws / "metrics.json").read_text(encoding="utf-8") == '{"local": true}\n'
+    # owner 移走文件后重试:promote 成功,冠军版 metrics.json 随 merge 进入源
+    (ws / "metrics.json").rename(ws / "metrics.json.bak")
+    out = campaign_stage.promote_campaign(repo, api["store"], fx["camp"]["id"],
+                                          confirm=True)
+    assert out["result"]["promotion"]
+    assert (ws / "metrics.json").read_text(encoding="utf-8") == '{"winner": true}\n'
+
+
 def test_promote_merge_conflict_aborts_clean(api, tmp_path):
     fx = promote_fixture(api, tmp_path, source_edit="print('source-v2')\n")
     ws, repo = fx["ws"], fx["repo"]
