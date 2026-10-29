@@ -911,6 +911,59 @@ def test_platform_eval_job_feeds_judgment(api, tmp_path):
     assert evidence["jobs"][0]["metrics"]["val_dice"] == 0.99   # 训练自报仍留训练行
 
 
+def test_gpu_hours_used_counts_eval_jobs(api, tmp_path):
+    """B2.3b:GPU 用量 = 训练 + 平台评测 Job(1h + 0.5h ≈ 1.5);评测计划
+    approved_by=platform-eval:<run>,只进用量统计,不进 end_round 的训练计划列表。"""
+    from datetime import datetime, timedelta, timezone
+
+    from autolab_control.execution.experiments import (
+        ExperimentRequest,
+        submit,
+        submit_eval_jobs,
+    )
+    from autolab_control.stages.research import _run_plans, gpu_hours_used
+    from autolab_control.workspace.fs import Workspace
+    from autolab_control.workspace.host import LocalHost
+
+    repo = api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    run_id = research_stage.start(repo, pid, tier="heavy", idea="预算含评测")["id"]
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    contract = {"primary": "val_dice", "direction": "maximize", "guardrails": [],
+                "eval": {"command": "python eval.py"}}
+
+    def stamp(job_id, started, finished):
+        def fmt(dt):
+            return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+        conn = repo.db.connect()
+        try:
+            with repo.db.tx(conn):
+                conn.execute(
+                    "UPDATE jobs SET status = 'SUCCEEDED', started_at = ?,"
+                    " finished_at = ? WHERE id = ?",
+                    (fmt(started), fmt(finished), job_id))
+        finally:
+            conn.close()
+
+    now = datetime.now(timezone.utc)
+    train = submit(repo, ws, repo.get_project(pid), ExperimentRequest(
+        jobs=[{"name": "t", "dataset": "kvasir",
+               "command": "python train.py", "seed": 1}],
+        metrics=["val_dice"], purpose="p"), approved_by=f"agent-run:{run_id}")
+    train_id = train["jobs"][0]["id"]
+    stamp(train_id, now - timedelta(hours=1), now)
+    (eval_id,) = submit_eval_jobs(repo, ws, repo.get_project(pid),
+                                  [train_id], contract, run_id=run_id)
+    stamp(eval_id, now - timedelta(minutes=30), now)
+
+    assert gpu_hours_used(repo, run_id) == pytest.approx(1.5)
+    assert [p["id"] for p in _run_plans(repo, run_id, None)] == [train["planId"]]
+    assert repo.get_plan(repo.get_job(eval_id)["plan_revision_id"])[
+        "approved_by"] == f"platform-eval:{run_id}"
+
+
 def test_end_round_rejected_when_eval_job_missing(api, tmp_path):
     """评测 Job 缺失 → end_round 被 ToolError 拒绝;wait_jobs 自动补上再收束。"""
     client, repo = api["client"], api["repo"]

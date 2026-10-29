@@ -312,6 +312,45 @@ def test_stop_cancels_active_agent_jobs(repo, monkeypatch):
     assert events[-1]["payload"] == {"jobIds": ["j1"]}
 
 
+def test_stop_cancels_platform_eval_jobs_too(repo, monkeypatch):
+    """B2.3b 回归:owner stop / 异常终止时,平台评测 Job(platform-eval:<run>)
+    与训练 Job 一并取消,不再滞留 QUEUED/RUNNING 占 GPU 租约。"""
+    run_id = start(repo)
+    now = utc_now()
+    conn = repo["repo"].db.connect()
+    try:
+        with repo["repo"].db.tx(conn):
+            conn.execute(
+                "INSERT INTO plan_revisions (id, project_id, revision_no, status,"
+                " spec_json, spec_hash, experiment_ref, experiment_hash, approved_by,"
+                " created_at) VALUES ('p1', ?, 1, 'APPROVED', '{}', 'h', 'EXP-9',"
+                " 'h2', ?, ?)",
+                (repo["project"]["id"], f"agent-run:{run_id}", now))
+            conn.execute(
+                "INSERT INTO jobs (id, plan_revision_id, ordinal, status, queued_at,"
+                " updated_at) VALUES ('j1', 'p1', 1, 'RUNNING', ?, ?)", (now, now))
+            conn.execute(
+                "INSERT INTO plan_revisions (id, project_id, revision_no, status,"
+                " spec_json, spec_hash, experiment_ref, experiment_hash, approved_by,"
+                " created_at) VALUES ('p2', ?, 2, 'APPROVED', '{}', 'h', 'EXP-9',"
+                " 'h2', ?, ?)",
+                (repo["project"]["id"], f"platform-eval:{run_id}", now))
+            conn.execute(
+                "INSERT INTO jobs (id, plan_revision_id, ordinal, status, queued_at,"
+                " updated_at) VALUES ('je1', 'p2', 1, 'QUEUED', ?, ?)", (now, now))
+    finally:
+        conn.close()
+    cancelled = []
+    monkeypatch.setattr(repo["repo"], "request_cancel",
+                        lambda job_id: cancelled.append(job_id) or {"id": job_id})
+    al.stop_run(repo["repo"], run_id)
+    assert run_step(repo, run_id, profile(), ScriptModel([])) == "stopped"
+    assert sorted(cancelled) == ["j1", "je1"]
+    events = al.list_events(repo["repo"], run_id)
+    assert "jobs_cancelled" in [e["kind"] for e in events]
+    assert sorted(events[-1]["payload"]["jobIds"]) == ["j1", "je1"]
+
+
 def test_max_tokens_truncation_skips_tool_calls(repo):
     class ReplyModel:
         """按序吐回复;回复 dict 可带 stop_reason 等额外字段。"""

@@ -410,14 +410,16 @@ def _reset_active_anchors(repo: Repo) -> None:
 
 def _cancel_active_jobs(repo: Repo, run_id: str) -> list[str]:
     """会话终结时取消本会话名义批准、未终态的 Job(业务 API,不直改状态)。
-    单个取消失败只记日志:会话终结优先,收尾事故不能挡住状态落库。"""
+    训练 Job(agent-run:<run_id>)与平台评测 Job(platform-eval:<run_id>)一并取消:
+    异常终止时评测 Job 也会滞留并占 GPU 租约。单个取消失败只记日志:会话终结
+    优先,收尾事故不能挡住状态落库。"""
     conn = repo.db.connect()
     try:
         rows = conn.execute(
             "SELECT j.id FROM jobs j JOIN plan_revisions p"
-            " ON j.plan_revision_id = p.id WHERE p.approved_by = ?"
+            " ON j.plan_revision_id = p.id WHERE p.approved_by IN (?, ?)"
             " AND j.status IN ('QUEUED','DISPATCHING','RUNNING','CANCELLING')",
-            (f"agent-run:{run_id}",)).fetchall()
+            (f"agent-run:{run_id}", f"platform-eval:{run_id}")).fetchall()
     finally:
         conn.close()
     job_ids = [r["id"] for r in rows]

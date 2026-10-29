@@ -473,6 +473,19 @@ def test_metric_contract_eval_command_validation(api, tmp_path):
     assert eval_cfg["metric_file"] == "eval_metrics.json"
     assert eval_cfg["timeout_minutes"] == 45 and eval_cfg["gpus_per_job"] == 2
 
+    # B2.3b:eval.conda_env strip 后回写;缺省为空串
+    resp = client.patch(url, json={"primary": "val_dice",
+                                   "eval": {"command": "python eval.py",
+                                            "conda_env": " lab "}},
+                        headers=OWNER_H)
+    assert resp.status_code == 200
+    assert resp.json()["contract"]["eval"]["conda_env"] == "lab"
+    resp = client.patch(url, json={"primary": "val_dice",
+                                   "eval": {"command": "python eval.py"}},
+                        headers=OWNER_H)
+    assert resp.status_code == 200
+    assert resp.json()["contract"]["eval"]["conda_env"] == ""
+
     # command 为空 = 不启用平台评测(默认值落盘,允许只配保护路径)
     resp = client.patch(url, json={"primary": "val_dice",
                                    "eval": {"code_paths": ["eval/"]}}, headers=OWNER_H)

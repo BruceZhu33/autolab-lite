@@ -329,6 +329,40 @@ def test_submit_eval_jobs_creates_links_and_skips_failures(repo, tmp_path):
                             [t_ok1], no_eval, run_id="run-1") == []
 
 
+def test_eval_job_conda_env_prefix(repo, tmp_path):
+    """B2.3b:契约 eval.conda_env → 评测 Job 的 manifest argv 带
+    conda activate 前缀;空 conda_env 不加前缀。"""
+    from autolab_control.execution.manifest import build_manifest
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    contract = {"primary": "val_dice", "direction": "maximize", "guardrails": [],
+                "eval": {"command": "python eval.py", "conda_env": "lab"}}
+    train_id = _do_submit(repo, ws, [{"name": "a", "dataset": "kvasir",
+                                      "command": "python train.py", "seed": 1}],
+                          "agent-run:run-11")["jobs"][0]["id"]
+    _set_job_status(repo, train_id, "SUCCEEDED")
+
+    (eval_id,) = submit_eval_jobs(repo["repo"], ws, repo["project"],
+                                  [train_id], contract, run_id="run-11")
+    acquired = repo["repo"].try_acquire_next_job()   # 评测 Job 是唯一 QUEUED
+    assert acquired is not None and acquired.job["id"] == eval_id
+    argv = build_manifest(acquired, repo["repo"].get_project(
+        repo["project"]["id"])).execution.argv
+    assert argv[:2] == ["bash", "-c"]
+    assert argv[2].endswith("conda activate lab && python eval.py")
+
+    # 空 conda_env:无激活前缀,命令原样
+    plain = {**contract, "eval": {"command": "python eval.py"}}
+    train2 = _do_submit(repo, ws, [{"name": "b", "dataset": "kvasir",
+                                    "command": "python train.py", "seed": 2}],
+                        "agent-run:run-11")["jobs"][0]["id"]
+    _set_job_status(repo, train2, "SUCCEEDED")
+    (eval2,) = submit_eval_jobs(repo["repo"], ws, repo["project"],
+                                [train2], plain, run_id="run-11")
+    spec = json.loads(repo["repo"].get_plan(
+        repo["repo"].get_job(eval2)["plan_revision_id"])["spec_json"])
+    assert spec["command_template"][2] == "{{command}}"
+
+
 def test_compare_plan_prefers_eval_job_metrics(repo, tmp_path):
     """训练自报 0.99、评测 0.80 → row value=0.80 + evalJobId;无评测 →
     EVAL_MISSING;无契约 → 旧逻辑(训练指标)。"""

@@ -71,12 +71,14 @@ def offline_tools():
 
 
 def _run_job_ids(repo: Repo, run_id: str) -> list[str]:
-    """本 run 通过 run_experiment 提交的 Job(approved_by=agent-run:<id>),按序。"""
+    """本 run 提交的 Job:训练(agent-run:<id>)与平台评测(platform-eval:<id>,
+    B2.3b),按批准顺序——训练 Job 先、其评测 Job 后。"""
     conn = repo.db.connect()
     try:
         rows = conn.execute(
-            "SELECT id FROM plan_revisions WHERE approved_by = ? ORDER BY approved_at",
-            (f"agent-run:{run_id}",)).fetchall()
+            "SELECT id FROM plan_revisions WHERE approved_by IN (?, ?)"
+            " ORDER BY approved_at, id",
+            (f"agent-run:{run_id}", f"platform-eval:{run_id}")).fetchall()
     finally:
         conn.close()
     ids: list[str] = []
@@ -250,11 +252,14 @@ def run_task(task: dict, *, root: Path | None = None) -> dict:
 
 
 def _get_path(obj: object, path: str) -> object:
-    """点路径只穿 dict;取不到返回 _MISSING(list 用 *_contains 断言)。"""
+    """点路径穿 dict 与 list(数字下标);取不到返回 _MISSING。"""
     cur = obj
     for part in path.split("."):
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
+        elif isinstance(cur, list) and part.isdigit():
+            idx = int(part)
+            cur = cur[idx] if 0 <= idx < len(cur) else _MISSING
         else:
             return _MISSING
     return cur

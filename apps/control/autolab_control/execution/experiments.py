@@ -332,6 +332,7 @@ def submit_eval_jobs(repo: Repo, ws: Workspace, project: dict, train_job_ids: li
                     "eval_input_dir": f"{output_root}/{train_job_id}", "role": "eval"})
         request = ExperimentRequest(
             jobs=[job], metrics=metric_names, purpose=f"平台评测 {train_job_id}",
+            conda_env=str(eval_cfg.get("conda_env") or ""),
             metric_file=str(eval_cfg.get("metric_file") or "metrics.json"),
             timeout_minutes=int(eval_cfg.get("timeout_minutes") or 30),
             gpus_per_job=int(eval_cfg.get("gpus_per_job") or 1),

@@ -123,6 +123,8 @@ def _clean_contract(payload: dict, pool: dict[str, dict]) -> dict:
         raise ToolError("eval 必须是对象:{command, metric_file, code_paths, data_paths}")
     # B2.3a:command 非空才启用平台独立评测 Job;为空允许只配 code_paths 做保护。
     command = str(raw_eval.get("command") or "").strip()
+    # B2.3b:评测 Job 运行用的 conda 环境(空串允许 = 不激活)。
+    conda_env = str(raw_eval.get("conda_env") or "").strip()
     metric_file = str(raw_eval.get("metric_file") or "metrics.json").strip()
     timeout_minutes = raw_eval.get("timeout_minutes", 30)
     gpus_per_job = raw_eval.get("gpus_per_job", 1)
@@ -139,6 +141,7 @@ def _clean_contract(payload: dict, pool: dict[str, dict]) -> dict:
             "guardrails": guardrails,
             "eval": {
                 "command": command,
+                "conda_env": conda_env,
                 "metric_file": metric_file,
                 "timeout_minutes": timeout_minutes,
                 "gpus_per_job": gpus_per_job,

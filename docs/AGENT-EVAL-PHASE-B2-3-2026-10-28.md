@@ -259,3 +259,25 @@ uv run ruff check .
 - eval Job 的 provenance 签名/UI 展示；
 - adopt/evidence 之外的前端；
 - 真实数据集评测脚本（平台只执行 owner 配置的命令）。
+
+---
+
+## 10. B2.3b 实施状态(2026-10-29,已完成)
+
+三项收尾 + harness 对抗任务全部落地,Python 3.10+、无新增依赖、前端零改动:
+
+1. **评测 conda 环境**:契约 `eval.conda_env` 可选(空串允许);`_clean_contract`
+   strip 保留,`submit_eval_jobs` 透传给 `ExperimentRequest.conda_env`,评测 Job
+   复用 `submit` 的 conda activate 前缀。测试:PATCH 回写(`test_baseline_stage`)
+   + manifest argv 含 `conda activate <env>` / 空串无前缀(`test_execution.py:
+   test_eval_job_conda_env_prefix`)。
+2. **评测 GPU 时长计入预算**:`research._run_plans` 增加 `include_eval`,
+   `gpu_hours_used` 同时统计 `agent-run:*` 与 `platform-eval:*` 的 plan;
+   `_end_round_tool`/adopt 的训练计划列表不变。测试:`test_research_stage.py:
+   test_gpu_hours_used_counts_eval_jobs`(训练 1h + 评测 0.5h ≈ 1.5,评测 plan
+   不进训练计划列表);end_round 的预算门走同一 `gpu_hours_used`。
+3. **harness 平台评测链 + 对抗任务**:`_run_job_ids` 双来源按 approved_at 排序
+   (训练先、评测后),`_get_path` 支持 list 数字下标;新任务
+   `research_platform_eval.json`(训练自报 0.99 ×3,评测 0.85/0.86/0.87)断言
+   行 value=0.85、evalJobId、evidence.evalJobs.0.metrics.val_dice=0.85——
+   训练假指标被忽略。harness 任务 5→6,`6/6 PASS`。

@@ -114,13 +114,23 @@ def list_rounds(repo: Repo, project_id: str, run_id: str | None = None) -> list[
              "createdAt": r["created_at"], **json.loads(r["report_json"])} for r in rows]
 
 
-def _run_plans(repo: Repo, run_id: str, since: str | None) -> list[dict]:
+def _run_plans(repo: Repo, run_id: str, since: str | None, *,
+               include_eval: bool = False) -> list[dict]:
+    """本会话经 run_experiment 批准的训练计划(approved_by=agent-run:<id>)。
+
+    include_eval=True 时并入平台评测计划(platform-eval:<id>);那只该用于
+    用量统计,不要进 end_round/adopt 的训练计划列表——否则 evaluate_plans
+    会把评测 Job 当训练 Job 再判一次。"""
+    sources = [f"agent-run:{run_id}"]
+    if include_eval:
+        sources.append(f"platform-eval:{run_id}")
+    marks = ",".join("?" * len(sources))
     conn = repo.db.connect()
     try:
         rows = conn.execute(
-            "SELECT id FROM plan_revisions WHERE approved_by = ?"
-            " AND (? IS NULL OR approved_at > ?) ORDER BY approved_at",
-            (f"agent-run:{run_id}", since, since)).fetchall()
+            "SELECT id FROM plan_revisions WHERE approved_by IN (" + marks + ")"
+            " AND (? IS NULL OR approved_at > ?) ORDER BY approved_at, id",
+            (*sources, since, since)).fetchall()
     finally:
         conn.close()
     return [repo.get_plan(r["id"]) for r in rows]
@@ -136,10 +146,12 @@ def _parse_ts(raw: str | None) -> float | None:
 
 
 def gpu_hours_used(repo: Repo, run_id: str) -> float:
-    """本会话所有 Job 的实际占卡时长(运行中的按到现在计)× 每 Job GPU 数。"""
+    """本会话所有 Job 的实际占卡时长(运行中的按到现在计)× 每 Job GPU 数。
+
+    B2.3b:平台评测 Job(platform-eval:<run_id>)与训练 Job 一并计入预算。"""
     now = datetime.now(timezone.utc).timestamp()
     seconds = 0.0
-    for plan in _run_plans(repo, run_id, None):
+    for plan in _run_plans(repo, run_id, None, include_eval=True):
         try:
             gpus = json.loads(plan["spec_json"])["resources"]["gpu_count"]
         except (ValueError, KeyError, TypeError):

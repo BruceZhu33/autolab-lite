@@ -625,3 +625,26 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   `check_duplicate_jobs` 只对 `agent-run:*` 生效,平台评测天然跳过。
 - 遗留(B2.3b):对抗测试(训练写假指标/改 eval 代码仍被拒)、eval Job
   provenance 签名与前端展示;评测 Job 的 GPU 时长暂不计入会话预算。
+
+## D-037 · Phase B2.3b:评测收尾——conda_env、GPU 预算、harness 对抗任务(2026-10-29)
+
+- 契约 `metric_contract.eval` 增加可选 `conda_env`(string,默认空串,strip 保留)。
+  `submit_eval_jobs` 构造评测请求时透传,复用 `submit` 既有的 conda 前缀
+  (source anaconda/miniconda + conda activate,依赖 `ws.host.home()`);空串无前缀。
+- GPU 预算:`research.gpu_hours_used` 改为经 `_run_plans(include_eval=True)` 同时
+  统计 `agent-run:<run_id>` 与 `platform-eval:<run_id>` 的 plan,逐 Job 按
+  `(finished_or_now - started) × gpu_count` 累计;评测 Job 的占卡从此计入会话预算。
+  评测 plan **不**并入 `_end_round_tool`/adopt 的训练计划列表(evaluate_plans
+  只判训练 Job,避免评测 Job 被当训练 Job 再对照一次)。
+- eval harness(B2.2b 自回归):`_run_job_ids` 同时查 agent-run/platform-eval 两类
+  plan(按 approved_at 排序,训练 Job 先、评测 Job 后),`_drain_queued_jobs` 给
+  平台评测 Job 也置 SUCCEEDED + metrics artifact;`_get_path` 支持点路径的 list
+  数字下标(断言 `rows.0.value` 这类字段)。
+- 新增对抗任务 `research_platform_eval`:训练 3 seed 自报 0.99(假指标)、
+  契约 eval.command 触发平台评测 0.85/0.86/0.87,断言最终行 value=0.85、
+  evalJobId 存在、evidence.evalJobs.0.metrics.val_dice=0.85——证明判定只认
+  平台评测。harness 任务数 5→6。
+- 异常终止(owner stop / 失败 / 预算耗尽)时 `_cancel_active_jobs` 同时取消
+  平台评测 Job:查询从 `approved_by='agent-run:<run_id>'` 扩为
+  `IN ('agent-run:<run_id>', 'platform-eval:<run_id>')`,`jobs_cancelled`
+  事件记录实际取消的全部 Job,评测 Job 不再滞留占 GPU 租约。

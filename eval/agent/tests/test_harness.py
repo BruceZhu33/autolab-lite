@@ -1,4 +1,4 @@
-"""eval harness 自回归(Phase B2.2b):5 个任务全 PASS、CLI 报告落盘、坏断言判 FAIL。"""
+"""eval harness 自回归(Phase B2.3b):6 个任务全 PASS、CLI 报告落盘、坏断言判 FAIL。"""
 
 from __future__ import annotations
 
@@ -55,20 +55,36 @@ def test_research_stagnation_passes(tmp_path):
     assert result["tool_errors"] == []
 
 
+def test_research_platform_eval_task_passes(tmp_path):
+    """B2.3b:训练自报 0.99 被忽略,最终行/证据用平台评测 Job 的 0.85。"""
+    result = harness.run_task(_task("research_platform_eval"), root=tmp_path)
+    assert result["pass"], result["failures"]
+    assert result["status"] == "done"
+    assert result["result"]["success"] is True
+    evaluation = result["result"]["lastRound"]["evaluation"]
+    assert evaluation["evalMissing"] == 0
+    assert evaluation["rows"][0]["value"] == 0.85
+    assert evaluation["rows"][0]["evalJobId"].startswith("job-")
+    eval_jobs = result["result"]["lastRound"]["evidence"]["evalJobs"]
+    assert eval_jobs[0]["metrics"]["val_dice"] == 0.85
+    assert result["span_kinds"].get("verify", 0) >= 1
+
+
 def test_cli_writes_markdown_and_jsonl(tmp_path):
     out = tmp_path / "latest.md"
     assert harness.main(["--tasks", "all", "--out", str(out)]) == 0
     rows = [json.loads(line) for line in
             (tmp_path / "latest.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert len(rows) == 5
+    assert len(rows) == 6
     assert {row["task_id"] for row in rows} == {
         "baseline_happy", "baseline_ask_human", "research_multiseed",
-        "research_duplicate_guard", "research_stagnation"}
+        "research_duplicate_guard", "research_stagnation",
+        "research_platform_eval"}
     for row in rows:
         assert row["pass"] is True
         assert row["steps"] >= 1
         assert isinstance(row["span_kinds"], dict) and row["span_kinds"]
-    assert "5/5 PASS" in out.read_text(encoding="utf-8")
+    assert "6/6 PASS" in out.read_text(encoding="utf-8")
 
 
 def test_unmet_expect_fails_task(tmp_path):
