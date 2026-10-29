@@ -89,6 +89,7 @@ def round_evidence(repo: Repo, workspace: Workspace, plans: list[dict],
                            "experimentRef": spec.get("experiment_ref"),
                            "codeAnchor": spec.get("code_anchor")})
     job_items = []
+    eval_items = []
     for plan in plans:
         for job in repo.list_jobs(plan_id=plan["id"]):
             job_items.append({
@@ -97,7 +98,17 @@ def round_evidence(repo: Repo, workspace: Workspace, plans: list[dict],
                 "metrics": job_metrics(repo, job["id"]),
                 "artifacts": [{"path": a.get("remote_path"), "sha256": a.get("sha256")}
                               for a in repo.job_artifacts(job["id"])]})
+            # B2.3a:训练 Job 的平台评测 Job 单列(evidenceHash 覆盖)
+            eval_job = repo.eval_job_for(job["id"])
+            if eval_job is None:
+                continue
+            eval_items.append({
+                "id": eval_job["id"], "trainJobId": job["id"], "status": eval_job["status"],
+                "metrics": job_metrics(repo, eval_job["id"]),
+                "artifacts": [{"path": a.get("remote_path"), "sha256": a.get("sha256")}
+                              for a in repo.job_artifacts(eval_job["id"])]})
     evidence = {"code": _code_state(workspace), "plans": plan_items, "jobs": job_items,
+                "evalJobs": eval_items,
                 "protected": protected, "contract": contract, "variantMeans": means}
     digest = hashlib.sha256(
         json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()

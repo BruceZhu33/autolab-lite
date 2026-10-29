@@ -120,11 +120,28 @@ def _clean_contract(payload: dict, pool: dict[str, dict]) -> dict:
                            "max_regress": float(regress)})
     raw_eval = payload.get("eval") or {}
     if not isinstance(raw_eval, dict):
-        raise ToolError("eval 必须是对象:{metric_file, code_paths, data_paths}")
+        raise ToolError("eval 必须是对象:{command, metric_file, code_paths, data_paths}")
+    # B2.3a:command 非空才启用平台独立评测 Job;为空允许只配 code_paths 做保护。
+    command = str(raw_eval.get("command") or "").strip()
+    metric_file = str(raw_eval.get("metric_file") or "metrics.json").strip()
+    timeout_minutes = raw_eval.get("timeout_minutes", 30)
+    gpus_per_job = raw_eval.get("gpus_per_job", 1)
+    if command:
+        if metric_file.startswith("/") or ".." in metric_file.split("/"):
+            raise ToolError(f"eval.metric_file 必须是输出目录内的相对路径:{metric_file}")
+        if isinstance(timeout_minutes, bool) or not isinstance(timeout_minutes, int) \
+                or not 1 <= timeout_minutes <= 1440:
+            raise ToolError("eval.timeout_minutes 必须是 1..1440 的整数(分钟)")
+        if isinstance(gpus_per_job, bool) or not isinstance(gpus_per_job, int) \
+                or not 1 <= gpus_per_job <= 8:
+            raise ToolError("eval.gpus_per_job 必须是 1..8 的整数")
     return {"primary": primary, "direction": direction,
             "guardrails": guardrails,
             "eval": {
-                "metric_file": str(raw_eval.get("metric_file") or "metrics.json").strip(),
+                "command": command,
+                "metric_file": metric_file,
+                "timeout_minutes": timeout_minutes,
+                "gpus_per_job": gpus_per_job,
                 "code_paths": _clean_eval_paths(raw_eval.get("code_paths"), "code_paths"),
                 "data_paths": _clean_eval_paths(raw_eval.get("data_paths"), "data_paths"),
                 "code_hash": "", "data_hash": ""}}

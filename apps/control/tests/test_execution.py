@@ -16,8 +16,10 @@ from autolab_control.execution.comparison import (
 from autolab_control.execution.experiments import (
     ExperimentRequest,
     _clean_jobs,
+    effective_metrics,
     job_log_tail,
     submit,
+    submit_eval_jobs,
 )
 from autolab_control.execution.metrics import metric_domain_issue, metrics_sanity_issues
 from autolab_control.workspace import refs
@@ -253,3 +255,166 @@ def test_duplicate_submit_ignores_non_agent_run(repo, tmp_path):
     _set_job_status(repo, first["jobs"][0]["id"], "SUCCEEDED")
     second = _do_submit(repo, ws, jobs, "local_cli")
     assert second["planId"] != first["planId"]
+
+
+# ----------------------------------------------------------------- B2.3a 平台评测
+
+
+_EVAL_CONTRACT = {"primary": "val_dice", "direction": "maximize",
+                  "guardrails": [{"metric": "val_hd95", "direction": "minimize",
+                                  "max_regress": 0.01}],
+                  "eval": {"command": "python eval.py --dir $AUTOLAB_EVAL_INPUT_DIR",
+                           "metric_file": "metrics.json", "timeout_minutes": 30,
+                           "gpus_per_job": 1}}
+
+
+def _metrics_artifact(repo_fixture, job_id, metrics):
+    from autolab_control.core.db import utc_now
+    conn = repo_fixture["repo"].db.connect()
+    try:
+        with repo_fixture["repo"].db.tx(conn):
+            conn.execute(
+                "INSERT INTO artifacts (id, job_id, kind, location_kind, remote_path,"
+                " sha256, size_bytes, metadata_json, created_at)"
+                " VALUES (?, ?, 'metrics', 'remote', ?, ?, 10, ?, ?)",
+                (f"art-{job_id}", job_id, f"/tmp/out/{job_id}/metrics.json", "0" * 64,
+                 json.dumps({"metric_values": metrics}), utc_now()))
+    finally:
+        conn.close()
+
+
+def _succeeded_with_metrics(repo_fixture, job_id, metrics):
+    _set_job_status(repo_fixture, job_id, "SUCCEEDED")
+    _metrics_artifact(repo_fixture, job_id, metrics)
+
+
+def test_submit_eval_jobs_creates_links_and_skips_failures(repo, tmp_path):
+    """2 个成功训练 Job → 各 1 个评测 Job 并登记 job_evals;已存在不重复;
+    FAILED 训练 Job 不建;契约无 command → []。"""
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    result = submit(repo["repo"], ws, repo["project"], ExperimentRequest(
+        jobs=[{"name": "a", "dataset": "kvasir", "command": "python train.py", "seed": 1},
+              {"name": "b", "dataset": "kvasir", "command": "python train.py", "seed": 2},
+              {"name": "c", "dataset": "kvasir", "command": "python train.py", "seed": 3}],
+        metrics=["val_dice"], purpose="p"), approved_by="agent-run:run-1")
+    t_ok1, t_ok2, t_bad = [j["id"] for j in result["jobs"]]
+    for jid in (t_ok1, t_ok2):
+        _set_job_status(repo, jid, "SUCCEEDED")
+    _set_job_status(repo, t_bad, "FAILED")
+
+    ids = submit_eval_jobs(repo["repo"], ws, repo["project"],
+                           [t_ok1, t_ok2, t_bad], _EVAL_CONTRACT, run_id="run-1")
+    assert len(ids) == 2 and len(set(ids)) == 2
+    for train_id, eval_id in zip((t_ok1, t_ok2), ids, strict=True):
+        assert repo["repo"].eval_job_for(train_id)["id"] == eval_id
+        params = json.loads(repo["repo"].get_job(eval_id)["params_json"])
+        assert params["eval_of_job_id"] == train_id
+        assert params["eval_input_dir"] == f"/tmp/out/{train_id}"
+        assert params["role"] == "eval"
+        assert params["command"] == _EVAL_CONTRACT["eval"]["command"]
+        plan = repo["repo"].get_plan(repo["repo"].get_job(eval_id)["plan_revision_id"])
+        assert plan["approved_by"] == "platform-eval:run-1"
+        spec = json.loads(plan["spec_json"])
+        assert [m["name"] for m in spec["metrics"]] == ["val_dice", "val_hd95"]
+    assert repo["repo"].eval_job_for(t_bad) is None
+
+    # 已存在的评测 Job 不重复提交
+    again = submit_eval_jobs(repo["repo"], ws, repo["project"],
+                             [t_ok1, t_ok2], _EVAL_CONTRACT, run_id="run-1")
+    assert again == ids
+    assert len(repo["repo"].eval_jobs_for_run("run-1")) == 2
+    # 契约未启用 → []
+    no_eval = {**_EVAL_CONTRACT, "eval": {}}
+    assert submit_eval_jobs(repo["repo"], ws, repo["project"],
+                            [t_ok1], no_eval, run_id="run-1") == []
+
+
+def test_compare_plan_prefers_eval_job_metrics(repo, tmp_path):
+    """训练自报 0.99、评测 0.80 → row value=0.80 + evalJobId;无评测 →
+    EVAL_MISSING;无契约 → 旧逻辑(训练指标)。"""
+    from autolab_control.execution.comparison import compare_plan
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    result = _do_submit(repo, ws, [{"name": "a", "dataset": "kvasir",
+                                    "command": "python train.py", "seed": 1}],
+                        "agent-run:run-1")
+    train_id = result["jobs"][0]["id"]
+    _succeeded_with_metrics(repo, train_id, {"val_dice": 0.99})
+    pool = {"kvasir": {"metrics": {"val_dice": 0.80, "val_hd95": 0.20}}}
+    plan = repo["repo"].get_plan(result["planId"])
+
+    # 契约启用但评测 Job 还没建 → EVAL_MISSING
+    comparison = compare_plan(repo["repo"], plan, pool, _EVAL_CONTRACT)
+    (row,) = comparison["rows"]
+    assert row["status"] == "EVAL_MISSING" and row["value"] is None \
+        and row["gain"] is None and row["improved"] is False and row["evalJobId"] is None
+    assert comparison["evalMissing"] == 1
+
+    (eval_id,) = submit_eval_jobs(repo["repo"], ws, repo["project"],
+                                  [train_id], _EVAL_CONTRACT, run_id="run-1")
+    _succeeded_with_metrics(repo, eval_id, {"val_dice": 0.80, "val_hd95": 0.21})
+    comparison = compare_plan(repo["repo"], plan, pool, _EVAL_CONTRACT)
+    (row,) = comparison["rows"]
+    assert row["status"] == "SUCCEEDED" and row["value"] == 0.80 \
+        and row["gain"] == pytest.approx(0.0) and row["evalJobId"] == eval_id
+    assert row["allMetrics"]["val_hd95"] == 0.21 and comparison["evalMissing"] == 0
+
+    # 无契约:旧逻辑,直接用训练 Job 指标
+    comparison = compare_plan(repo["repo"], plan, pool, None)
+    (row,) = comparison["rows"]
+    assert row["value"] == 0.99 and row["evalJobId"] is None
+    assert "evalMissing" not in comparison
+
+    # 评测失败:行状态 FAILED(evalJobId 仍可排查);variant_means 只收 SUCCEEDED,
+    # 不产生成功。value 保留评测已提取值供诊断(与旧训练行口径一致)
+    _set_job_status(repo, eval_id, "FAILED")
+    comparison = compare_plan(repo["repo"], plan, pool, _EVAL_CONTRACT)
+    (row,) = comparison["rows"]
+    assert row["status"] == "FAILED" and row["evalJobId"] == eval_id
+    assert variant_means(comparison["rows"]) == []
+
+
+def test_effective_metrics_prefers_eval_job(repo, tmp_path):
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    result = _do_submit(repo, ws, [{"name": "a", "dataset": "kvasir",
+                                    "command": "python train.py", "seed": 1}],
+                        "agent-run:run-1")
+    train = repo["repo"].get_job(result["jobs"][0]["id"])
+    _succeeded_with_metrics(repo, train["id"], {"val_dice": 0.99})
+    assert effective_metrics(repo["repo"], train) == {"val_dice": 0.99}  # 无评测:旧行为
+    (eval_id,) = submit_eval_jobs(repo["repo"], ws, repo["project"],
+                                  [train["id"]], _EVAL_CONTRACT, run_id="run-1")
+    _succeeded_with_metrics(repo, eval_id, {"val_dice": 0.80})
+    assert effective_metrics(repo["repo"], train) == {"val_dice": 0.80}
+
+
+def test_eval_job_manifest_environment(repo, tmp_path):
+    """评测 Job 的 manifest:ROLE=eval + EVAL_INPUT_DIR/DATASET/SEED/VARIANT;
+    训练 Job:ROLE=train,无 EVAL_INPUT_DIR。"""
+    from autolab_control.execution.manifest import build_manifest
+    ws = Workspace(LocalHost(), str(tmp_path / "ws"))
+    result = _do_submit(repo, ws, [{"name": "a", "dataset": "kvasir",
+                                    "command": "python train.py", "seed": 7,
+                                    "variant": "attn"}],
+                        "agent-run:run-1")
+    train_id = result["jobs"][0]["id"]
+
+    acquired = repo["repo"].try_acquire_next_job()   # 训练 Job:QUEUED → DISPATCHING
+    assert acquired is not None and acquired.job["id"] == train_id
+    train_vars = build_manifest(
+        acquired, repo["repo"].get_project(repo["project"]["id"])
+    ).execution.environment.variables
+    assert train_vars["AUTOLAB_JOB_ROLE"] == "train"
+    assert "AUTOLAB_EVAL_INPUT_DIR" not in train_vars
+
+    _set_job_status(repo, train_id, "SUCCEEDED")
+    (eval_id,) = submit_eval_jobs(repo["repo"], ws, repo["project"],
+                                  [train_id], _EVAL_CONTRACT, run_id="run-1")
+    acquired = repo["repo"].try_acquire_next_job()   # 评测 Job 是唯一 QUEUED
+    assert acquired is not None and acquired.job["id"] == eval_id
+    variables = build_manifest(
+        acquired, repo["repo"].get_project(repo["project"]["id"])
+    ).execution.environment.variables
+    assert variables["AUTOLAB_JOB_ROLE"] == "eval"
+    assert variables["AUTOLAB_EVAL_INPUT_DIR"] == f"/tmp/out/{train_id}"
+    assert variables["AUTOLAB_DATASET"] == "kvasir"
+    assert variables["AUTOLAB_SEED"] == "7" and variables["AUTOLAB_VARIANT"] == "attn"

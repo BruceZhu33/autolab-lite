@@ -440,3 +440,44 @@ def test_confirm_preserves_metric_contract(api, tmp_path):
     assert snapshot["metric_contract"] == contract
     assert set(snapshot["datasets"]) == {"kvasir", "polyp"}
     assert snapshot["metric_contract"]["eval"]["code_hash"] == first_hash
+
+
+def test_metric_contract_eval_command_validation(api, tmp_path):
+    """B2.3a:eval.command 启用平台评测;metric_file/timeout/gpus 非法 → 409。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    _confirm_plain(repo, pid, {"val_dice": 0.8})
+    url = f"/api/owner/projects/{pid}/baseline/contract"
+    for bad, fragment in [
+        ({"eval": {"command": "python eval.py", "metric_file": "../secrets.json"}},
+         "相对路径"),
+        ({"eval": {"command": "python eval.py", "metric_file": "/abs/metrics.json"}},
+         "相对路径"),
+        ({"eval": {"command": "python eval.py", "timeout_minutes": 0}}, "1..1440"),
+        ({"eval": {"command": "python eval.py", "timeout_minutes": 1441}}, "1..1440"),
+        ({"eval": {"command": "python eval.py", "gpus_per_job": 0}}, "1..8"),
+        ({"eval": {"command": "python eval.py", "gpus_per_job": 9}}, "1..8"),
+        ({"eval": {"command": "python eval.py", "timeout_minutes": True}}, "1..1440"),
+    ]:
+        resp = client.patch(url, json={"primary": "val_dice", **bad}, headers=OWNER_H)
+        assert resp.status_code == 409 and fragment in resp.json()["detail"], bad
+
+    resp = client.patch(url, json={"primary": "val_dice", "direction": "maximize",
+                                   "eval": {"command": "python eval.py --dir $AUTOLAB_EVAL_INPUT_DIR",
+                                            "metric_file": "eval_metrics.json",
+                                            "timeout_minutes": 45, "gpus_per_job": 2}},
+                        headers=OWNER_H)
+    assert resp.status_code == 200, resp.text
+    eval_cfg = resp.json()["contract"]["eval"]
+    assert eval_cfg["command"].startswith("python eval.py")
+    assert eval_cfg["metric_file"] == "eval_metrics.json"
+    assert eval_cfg["timeout_minutes"] == 45 and eval_cfg["gpus_per_job"] == 2
+
+    # command 为空 = 不启用平台评测(默认值落盘,允许只配保护路径)
+    resp = client.patch(url, json={"primary": "val_dice",
+                                   "eval": {"code_paths": ["eval/"]}}, headers=OWNER_H)
+    assert resp.status_code == 200
+    eval_cfg = resp.json()["contract"]["eval"]
+    assert eval_cfg["command"] == "" and eval_cfg["timeout_minutes"] == 30 \
+        and eval_cfg["gpus_per_job"] == 1
+    assert re.fullmatch(r"[0-9a-f]{64}", eval_cfg["code_hash"])

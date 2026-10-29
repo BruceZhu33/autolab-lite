@@ -30,7 +30,7 @@ from ..core.ids import new_id
 from ..core.repo import TERMINAL_JOB_STATUSES, Repo
 from ..execution.comparison import compare_plan, evaluate_guardrails, variant_means
 from ..execution.evidence import protected_state, round_evidence
-from ..execution.experiments import job_metrics
+from ..execution.experiments import effective_metrics
 from ..workspace import refs
 from ..workspace.fs import Workspace
 from ..workspace.host import open_host
@@ -169,13 +169,14 @@ def evaluate_plans(repo: Repo, project: dict, plans: list[dict]) -> dict:
     没配置时保持旧的「第一个命中基线的声明指标」行为。"""
     pool = baseline_pool(project)
     contract = baseline_contract(project)
-    rows, warnings, labels = [], [], {}
+    rows, warnings, labels, eval_missing = [], [], {}, 0
     for plan in plans:
         comparison = compare_plan(repo, plan, pool, contract)
+        eval_missing += int(comparison.get("evalMissing") or 0)
         labels[plan["id"]] = str(plan.get("summary") or plan["id"])[:80]
         rows += [{k: r[k] for k in ("planId", "jobId", "name", "dataset", "variant", "seed",
                                     "status", "metric", "value", "baseline", "gain", "improved",
-                                    "allMetrics", "baselineMetrics")}
+                                    "allMetrics", "baselineMetrics", "evalJobId")}
                  for r in comparison["rows"]]
         if comparison["warning"]:
             warnings.append(comparison["warning"])
@@ -184,7 +185,7 @@ def evaluate_plans(repo: Repo, project: dict, plans: list[dict]) -> dict:
         m["label"] = labels.get(m["planId"], str(m["planId"]))
     gains = [r["gain"] for r in rows if r["gain"] is not None and r["status"] == "SUCCEEDED"]
     return {"rows": rows, "means": means, "labels": labels,
-            "contract": contract,
+            "contract": contract, "evalMissing": eval_missing,
             "guardrails": evaluate_guardrails(rows, contract),
             "bestGain": max(gains) if gains else None,
             "bestMean": means[0]["meanGain"] if means and means[0]["meanGain"] is not None else None,
@@ -426,6 +427,20 @@ def _end_round_tool() -> Tool:
                    if j["status"] not in TERMINAL_JOB_STATUSES]
         if pending:
             raise ToolError(f"还有 Job 没结束:{', '.join(pending)};先 wait_jobs 或 cancel_jobs")
+        # B2.3a 平台评测门:契约启用 eval.command 时,成功的训练 Job 必须有
+        # 已终态的评测 Job 才能收束(评测失败允许收束,但 rows 不会产生成功)。
+        eval_command = str((((baseline_contract(project) or {}).get("eval")) or {})
+                           .get("command") or "").strip()
+        if eval_command:
+            for p in plans:
+                for j in repo.list_jobs(plan_id=p["id"]):
+                    if j["status"] != "SUCCEEDED":
+                        continue
+                    eval_job = repo.eval_job_for(j["id"])
+                    if eval_job is None:
+                        raise ToolError(f"平台评测 Job 尚未创建:先 wait_jobs 等训练结束后自动评测({j['id']})")
+                    if eval_job["status"] not in TERMINAL_JOB_STATUSES:
+                        raise ToolError(f"平台评测还在跑:先 wait_jobs({j['id']} 的评测 {eval_job['id']})")
         evaluation = evaluate_plans(repo, project, plans)
         report = {"hypothesis": str(args.get("hypothesis") or "").strip(),
                   "changes": str(args.get("changes") or "").strip(),
@@ -611,7 +626,8 @@ def build_tools(env: LoopEnv) -> list[Tool]:
         allowed_datasets=lambda e: set(baseline_pool(e.project)),
         dataset_commands=lambda e: {name: (info.get("command") or "")
                                     for name, info in baseline_pool(e.project).items()},
-        before_submit=_check_gpu_budget)
+        before_submit=_check_gpu_budget,
+        eval_contract=lambda e: baseline_contract(e.project))
     if env.config.get("mode") == "validation":
         # 验证会话只读 + 只跑:改代码/shell 都不给,保证验证的是来源会话结束时的代码
         return [*tools.workspace_tools(writable=False), *knowledge_tools, *paper_tools,
@@ -622,9 +638,19 @@ def build_tools(env: LoopEnv) -> list[Tool]:
             tools.ask_human_tool(), _end_round_tool()]
 
 
+def _describe_session_jobs(env: LoopEnv, job_ids: list[str]):
+    """B2.3a:waiting_jobs 恢复路径的结果出口,与 wait_jobs 工具同一逻辑:
+    训练 Job 终态后按契约自动提交平台评测 Job,改等评测;返回文本或新 Pause。"""
+    return tools.jobs_wait_outcome(env, job_ids,
+                                   eval_contract=baseline_contract(env.project),
+                                   baseline_ref=_baseline_exp_ref(env.repo, env.project))
+
+
 PROFILE = LoopProfile(
     kind=KIND, system_prompt=SYSTEM_PROMPT, build_tools=build_tools,
     system_suffix=_status_suffix, max_steps=2000, max_tokens=40_000_000,
+    # B2.3a:waiting_jobs 恢复时训练 Job 终态 → 自动提交平台评测 Job 并改等评测
+    describe_jobs=_describe_session_jobs,
     wall_clock_seconds=48 * 3600,  # 研究阶段安全上限;light/medium/heavy 三档细分留 Phase B
     verifier={"id": "research-end-round", "version": 1})
 
@@ -735,7 +761,7 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
             dataset = str((json.loads(job["params_json"] or "{}")).get("dataset") or "")
             if job["status"] != "SUCCEEDED" or dataset not in old_snapshot["datasets"]:
                 continue
-            for key, value in (job_metrics(repo, job["id"]) or {}).items():
+            for key, value in (effective_metrics(repo, job) or {}).items():
                 if isinstance(value, (int, float)):
                     measured.setdefault(dataset, {}).setdefault(key, []).append(float(value))
             jobs_of.setdefault(dataset, []).append(job["id"])

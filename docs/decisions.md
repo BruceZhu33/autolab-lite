@@ -594,3 +594,34 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   冠军增益,verdict/研究日志附「连续 N 轮无新提升」。
 - 取舍:重复门只挡「完全相同的一组」,不挡子集重跑(修一个失败 Job 需整组
   重交);无进展计满时 success=False 结束而非 Pause——过夜无人值守,等人即搁死。
+
+## D-036 · Phase B2.3a:平台独立评测 Job + 指标 provenance(2026-10-29)
+
+- 背景:B1 的指标仍由 agent 的训练命令写 `metrics.json`,训练进程既能当运动员
+  又能当裁判;保护路径只防改评测代码,不防训练命令直接编数。
+- DB(SCHEMA_VERSION 22→23):新表 `job_evals(eval_job_id PK, train_job_id,
+  run_id, created_at)` + train/run 两索引;`executescript` 建表,无需 ALTER。
+  Repo 新增 `link_eval_job / eval_job_for / eval_jobs_for_run`。
+- 契约:`metric_contract.eval` 增加 `command/metric_file/timeout_minutes/
+  gpus_per_job`;command 非空才启用平台评测(为空允许只配保护路径);启用时
+  metric_file 必须输出目录内相对路径、timeout ∈ [1,1440]、gpus ∈ [1,8]。
+- 评测 Job:训练 Job 成功后由平台按 owner 固化的 `eval.command` 提交独立 Job
+  (`submit_eval_jobs`,approved_by=`platform-eval:<run_id>`,一个训练 Job 至多
+  一个评测 Job,`job_evals` 关联);命令不渲染模板,通过 manifest 环境变量
+  `AUTOLAB_EVAL_INPUT_DIR / AUTOLAB_DATASET / AUTOLAB_SEED / AUTOLAB_VARIANT /
+  AUTOLAB_JOB_ROLE(train|eval)` 取输入。`run_experiment` 的 job schema 不暴露
+  eval 字段,工具侧再把入参收敛到公开字段(agent 不能指定评测命令)。
+- `wait_jobs` 自动评测:训练 Job 全终态且契约启用 → 平台提交评测并改等评测
+  (`Pause` 延伸等待链;`waiting_jobs` 恢复路径经 profile.describe_jobs 共用
+  同一出口);返回汇总同时带评测指标与训练失败信息。输入是评测 Job 时直接
+  汇总(附同会话失败训练 Job)。
+- 判定只认评测:`compare_plan` 在契约启用时逐训练 Job 取评测 Job 的状态/指标
+  (行加 `evalJobId`);评测缺失 → `EVAL_MISSING`(value/gain=None,
+  返回加 `evalMissing`);训练失败行保留训练状态。`end_round` 硬门:成功训练
+  Job 缺评测或评测未终态 → ToolError;评测失败允许收束但不判成功。
+  `adopt`/`effective_metrics` 优先评测 Job 指标。`round_evidence` 增加
+  `evalJobs`(id/trainJobId/status/metrics/artifacts),evidenceHash 覆盖。
+- 兼容:无 eval.command 的项目全程旧行为(训练 Job 指标、原 wait/end_round);
+  `check_duplicate_jobs` 只对 `agent-run:*` 生效,平台评测天然跳过。
+- 遗留(B2.3b):对抗测试(训练写假指标/改 eval 代码仍被拒)、eval Job
+  provenance 签名与前端展示;评测 Job 的 GPU 时长暂不计入会话预算。

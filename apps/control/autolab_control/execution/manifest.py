@@ -60,11 +60,7 @@ def build_manifest(acquired: AcquiredJob, project: dict[str, Any]) -> ManifestV1
             argv=argv,
             environment=ManifestEnvironment(
                 prepend_path=environment.prepend_path,
-                variables={
-                    "AUTOLAB_JOB_ID": job["id"],
-                    "AUTOLAB_DISPATCH_ID": job["dispatch_id"],
-                    "AUTOLAB_OUTPUT_DIR": output_root,
-                },
+                variables=_execution_variables(job, params, output_root),
             ),
             gpu_indices=acquired.gpu_indices,
             timeout_seconds=spec.timeout_seconds,
@@ -78,6 +74,27 @@ def build_manifest(acquired: AcquiredJob, project: dict[str, Any]) -> ManifestV1
         # byte-identical manifest (same payload_hash) for the same dispatch_id
         created_at=_stable_created_at(job),
     )
+
+
+def _execution_variables(job: dict[str, Any], params: dict[str, Any],
+                         output_root: str) -> dict[str, str]:
+    """派发环境变量。B2.3a 起评测 Job 通过环境变量拿输入目录/数据集/seed/
+    变体(AUTOLAB_JOB_ROLE=train|eval),评测命令不做二次模板渲染。"""
+    variables = {
+        "AUTOLAB_JOB_ID": job["id"],
+        "AUTOLAB_DISPATCH_ID": job["dispatch_id"],
+        "AUTOLAB_OUTPUT_DIR": output_root,
+        "AUTOLAB_JOB_ROLE": str(params.get("role") or "train").strip() or "train",
+    }
+    if str(params.get("eval_input_dir") or "").strip():
+        variables["AUTOLAB_EVAL_INPUT_DIR"] = str(params["eval_input_dir"])
+    if str(params.get("dataset") or "").strip():
+        variables["AUTOLAB_DATASET"] = str(params["dataset"])
+    if isinstance(params.get("seed"), int) and not isinstance(params["seed"], bool):
+        variables["AUTOLAB_SEED"] = str(params["seed"])
+    if str(params.get("variant") or "").strip():
+        variables["AUTOLAB_VARIANT"] = str(params["variant"])
+    return variables
 
 
 def _stable_created_at(job: dict[str, Any]) -> datetime:

@@ -501,8 +501,16 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                     _update(repo, run_id, pending_json=_dumps(
                         {**pending, "notes": pending.get("notes", []) + notes}))
                 return status
-            text = (profile.describe_jobs(env, job_ids) if profile.describe_jobs
-                    else describe_jobs(repo, credentials, project, job_ids))
+            described = (profile.describe_jobs(env, job_ids) if profile.describe_jobs
+                         else describe_jobs(repo, credentials, project, job_ids))
+            if isinstance(described, Pause):
+                # B2.3a:等待链延伸(训练 Job 终态后自动提交的平台评测 Job 还没完)
+                pending = {**pending, "payload": described.payload}
+                if notes:  # 等待期间 owner 说的话留到恢复时一起给
+                    pending["notes"] = list(pending.get("notes", [])) + notes
+                _update(repo, run_id, pending_json=_dumps(pending))
+                return "waiting_jobs"
+            text = described
             notes = pending.get("notes", []) + notes
             _append_user_blocks(messages, pending.get("results", []) + [
                 _tool_result(pending["tool_use_id"], text)])

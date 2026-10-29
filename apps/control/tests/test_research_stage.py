@@ -838,3 +838,185 @@ def test_light_tier_not_auto_stopped_by_stagnation(api, tmp_path):
     assert run["status"] == "waiting_human"
     payload = run["pending"]["payload"]
     assert payload["roundNo"] == 2 and "连续 1 轮无新提升" in payload["question"]
+
+
+# ------------------------------------------------------------------ Phase B2.3a
+
+
+def _patch_eval_contract(client, pid, command="python eval.py --dir $AUTOLAB_EVAL_INPUT_DIR"):
+    contract = patch_contract(client, pid, {
+        "primary": "val_dice", "direction": "maximize", "guardrails": [],
+        "eval": {"command": command, "metric_file": "metrics.json",
+                 "timeout_minutes": 30, "gpus_per_job": 1}})
+    assert contract["eval"]["command"] == command
+    return contract
+
+
+def _job_id_of_run(repo, run_id) -> str:
+    """从会话消息里取 run_experiment 提交的 Job id(等待中时消息尾是 assistant
+    tool_use,要往前找最后一条带 tool_result 的 user 消息)。"""
+    for msg in reversed(json.loads(_row(repo, run_id)["messages_json"])):
+        if msg.get("role") != "user":
+            continue
+        blocks = [b for b in msg["content"]
+                  if isinstance(b, dict) and b.get("type") == "tool_result"]
+        if blocks:
+            return job_id_from([msg])
+    raise AssertionError("会话里还没有工具结果")
+
+
+def test_platform_eval_job_feeds_judgment(api, tmp_path):
+    """端到端:训练成功自报 0.99(不可信)→ wait_jobs 自动提交评测 Job 并改等;
+    评测 0.85 → end_round 判定/证据用 0.85,训练写的 0.99 只留在训练 Job 行。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)                       # val_dice 基线 0.80
+    _patch_eval_contract(client, pid)
+    run_id = start(client, pid, tier="medium", max_rounds=1)
+    model = ScriptModel([
+        [use("r", "run_experiment", purpose="试注意力",
+             jobs=[{"name": "kvasir", "dataset": "kvasir",
+                    "command": "python train.py --attn"}],
+             metrics=[{"name": "val_dice"}])],
+        lambda m: [use("w", "wait_jobs", job_ids=[job_id_from(m)])],
+        [use("e", "end_round", hypothesis="h", changes="c", analysis="a", kept=True)],
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running"
+    assert step() == "waiting_jobs"                   # 等训练 Job
+    train_id = _job_id_of_run(repo, run_id)
+    finish_job(repo, train_id, {"val_dice": 0.99})    # 训练命令自报 0.99
+    assert step() == "waiting_jobs"                   # 恢复:自动提交评测,等待链延伸
+    eval_job = repo.eval_job_for(train_id)
+    assert eval_job is not None
+    assert json.loads(eval_job["params_json"])["command"].startswith("python eval.py")
+    finish_job(repo, eval_job["id"], {"val_dice": 0.85})
+    assert step() == "done"                           # 评测终态 → 汇总 → end_round 收束
+
+    run = al.get_run(repo, run_id)
+    assert run["result"]["success"] is True
+    rounds = rounds_of(client, pid)
+    row = rounds[0]["evaluation"]["rows"][0]
+    assert row["jobId"] == train_id and row["evalJobId"] == eval_job["id"]
+    assert row["status"] == "SUCCEEDED" and row["value"] == 0.85
+    assert row["gain"] == pytest.approx(0.05)
+    assert rounds[0]["evaluation"]["means"][0]["meanGain"] == pytest.approx(0.05)
+    assert rounds[0]["evaluation"]["evalMissing"] == 0
+    assert rounds[0]["verdict"].startswith("有提升")
+    evidence = rounds[0]["evidence"]
+    (eval_entry,) = evidence["evalJobs"]
+    assert eval_entry["id"] == eval_job["id"] and eval_entry["trainJobId"] == train_id
+    assert eval_entry["status"] == "SUCCEEDED"
+    assert eval_entry["metrics"]["val_dice"] == 0.85
+    assert evidence["jobs"][0]["metrics"]["val_dice"] == 0.99   # 训练自报仍留训练行
+
+
+def test_end_round_rejected_when_eval_job_missing(api, tmp_path):
+    """评测 Job 缺失 → end_round 被 ToolError 拒绝;wait_jobs 自动补上再收束。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    _patch_eval_contract(client, pid)
+    run_id = start(client, pid, tier="medium", max_rounds=1)
+    state: dict = {}
+    model = ScriptModel([
+        [use("r", "run_experiment", purpose="试注意力",
+             jobs=[{"name": "kvasir", "dataset": "kvasir",
+                    "command": "python train.py --attn"}],
+             metrics=[{"name": "val_dice"}])],
+        [use("e0", "end_round", hypothesis="h", changes="c", analysis="a", kept=True)],
+        lambda m: [use("w", "wait_jobs", job_ids=[state["job"]])],
+        [use("e", "end_round", hypothesis="h", changes="c", analysis="a", kept=True)],
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running"                        # 提交实验
+    state["job"] = _job_id_of_run(repo, run_id)
+    finish_job(repo, state["job"], {"val_dice": 0.99})
+    assert step() == "running"                        # 训练终态但没等评测 → end_round 被拒
+    blocks = json.loads(_row(repo, run_id)["messages_json"])[-1]["content"]
+    rejected = next(b for b in blocks if isinstance(b, dict) and b.get("is_error"))
+    assert "平台评测 Job 尚未创建" in rejected["content"]
+    assert rounds_of(client, pid) == []               # 被拒的轮不留记录
+    assert step() == "waiting_jobs"                   # wait_jobs:自动提交评测并改等
+    eval_job = repo.eval_job_for(state["job"])
+    assert eval_job is not None
+    finish_job(repo, eval_job["id"], {"val_dice": 0.85})
+    assert step() == "done"
+    assert rounds_of(client, pid)[0]["evaluation"]["rows"][0]["value"] == 0.85
+
+
+def test_failed_eval_job_blocks_success(api, tmp_path):
+    """评测 Job 失败:允许收束,但行状态 FAILED、本轮不成功。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    _patch_eval_contract(client, pid)
+    run_id = start(client, pid, tier="medium", max_rounds=1)
+    model = ScriptModel([
+        [use("r", "run_experiment", purpose="试注意力",
+             jobs=[{"name": "kvasir", "dataset": "kvasir",
+                    "command": "python train.py --attn"}],
+             metrics=[{"name": "val_dice"}])],
+        lambda m: [use("w", "wait_jobs", job_ids=[job_id_from(m)])],
+        [use("e", "end_round", hypothesis="h", changes="c", analysis="a", kept=True)],
+    ])
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    train_id = _job_id_of_run(repo, run_id)
+    finish_job(repo, train_id, {"val_dice": 0.99})
+    assert step() == "waiting_jobs"                   # 评测 Job 已提交
+    eval_job = repo.eval_job_for(train_id)
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            conn.execute("UPDATE jobs SET status = 'FAILED', failure_summary = 'eval boom',"
+                         " finished_at = '2026-10-29T00:00:00Z' WHERE id = ?",
+                         (eval_job["id"],))
+    finally:
+        conn.close()
+    assert step() == "done"                           # 评测失败:收束但不判成功
+    run = al.get_run(repo, run_id)
+    assert run["result"]["success"] is False
+    rounds = rounds_of(client, pid)
+    row = rounds[0]["evaluation"]["rows"][0]
+    assert row["status"] == "FAILED" and row["value"] is None \
+        and row["evalJobId"] == eval_job["id"]
+    assert rounds[0]["evaluation"]["means"] == []
+    assert rounds[0]["verdict"].startswith("未提升")
+
+
+def test_wait_jobs_report_includes_train_failures_with_eval_metrics(api, tmp_path):
+    """部分训练失败:wait_jobs 结果同时带评测指标与训练失败信息,不只看评测。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    confirm_baseline(repo, pid)
+    _patch_eval_contract(client, pid)
+    run_id = start(client, pid, tier="medium", max_rounds=1)
+    state: dict = {}
+    model = ScriptModel(multi_seed_round(state, "a", [
+        ("ok", "kvasir", "python train.py --attn --seed 1"),
+        ("bad", "kvasir", "python train.py --attn --seed 2")]))
+    step = stepper(repo, run_id, model)
+    assert step() == "running" and step() == "waiting_jobs"
+    ok_id, bad_id = state["jobs"]
+    finish_job(repo, ok_id, {"val_dice": 0.99})
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            conn.execute("UPDATE jobs SET status = 'FAILED', failure_summary = 'oom',"
+                         " finished_at = '2026-10-29T00:00:00Z' WHERE id = ?", (bad_id,))
+    finally:
+        conn.close()
+    assert step() == "waiting_jobs"                   # 只为成功的训练 Job 建评测
+    eval_job = repo.eval_job_for(ok_id)
+    assert eval_job is not None and repo.eval_job_for(bad_id) is None
+    finish_job(repo, eval_job["id"], {"val_dice": 0.82})
+    assert step() == "done"                           # 汇总 → end_round 收束
+    # 恢复时回给 agent 的汇总:评测指标 + 训练失败(不只看评测)
+    summary = "\n".join(str(b.get("content")) for b in model.seen[-1][-1]["content"]
+                        if b.get("type") == "tool_result")
+    assert eval_job["id"] in summary and "0.82" in summary
+    assert bad_id in summary and "[FAILED]" in summary
+    rows = {r["jobId"]: r for r in rounds_of(client, pid)[0]["evaluation"]["rows"]}
+    assert rows[ok_id]["status"] == "SUCCEEDED" and rows[ok_id]["value"] == 0.82
+    assert rows[bad_id]["status"] == "FAILED" and rows[bad_id]["value"] is None

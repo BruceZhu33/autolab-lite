@@ -44,7 +44,10 @@ def compare_plan(repo: Repo, plan: dict, pool: dict[str, dict],
     """pool = {数据集: {metrics: {...}}}(基线确认快照)。
 
     contract(B1.3)固化 primary/direction:配了就不再信 agent 声明的指标顺序;
-    Job 指标里没有 primary 时 value/gain 为 None,不回落到别的指标。"""
+    Job 指标里没有 primary 时 value/gain 为 None,不回落到别的指标。
+    B2.3a:契约启用 eval.command 时,成功的训练 Job 以其平台评测 Job 的
+    状态/指标为准;评测 Job 缺失 → 行状态 EVAL_MISSING(本轮不算数),
+    训练失败 → 行保留训练失败状态(评测也不会有)。"""
     spec = PlanSpecV1.model_validate(json.loads(plan["spec_json"]))
     declared = [(m.name, m.direction) for m in spec.metrics]
     primary = str((contract or {}).get("primary") or "").strip()
@@ -57,26 +60,47 @@ def compare_plan(repo: Repo, plan: dict, pool: dict[str, dict],
             ((name, d) for name, d in declared
              if any(name in (info.get("metrics") or {}) for info in pool.values())),
             declared[0])
+    eval_cfg = (contract or {}).get("eval") or {}
+    eval_enabled = bool(str(eval_cfg.get("command") or "").strip())
     rows = []
+    eval_missing = 0
     for job in sorted(repo.list_jobs(plan_id=plan["id"]), key=lambda j: j["ordinal"]):
         params = json.loads(job["params_json"] or "{}")
         dataset = params.get("dataset")
         baseline_metrics = ((pool.get(dataset) or {}).get("metrics") or {}) if dataset else {}
         baseline = baseline_metrics.get(primary)
-        all_metrics = job_metrics(repo, job["id"])
+        status, all_metrics, eval_job_id = job["status"], {}, None
+        if eval_enabled:
+            if job["status"] != "SUCCEEDED":
+                status = job["status"]          # 训练失败:指标不可信,不算数
+            else:
+                eval_job = repo.eval_job_for(job["id"])
+                if eval_job is None:
+                    eval_missing += 1
+                    status = "EVAL_MISSING"
+                else:
+                    status = eval_job["status"]  # 以评测 Job 的状态/指标为准
+                    all_metrics = job_metrics(repo, eval_job["id"])
+                    eval_job_id = eval_job["id"]
+        else:
+            all_metrics = job_metrics(repo, job["id"])
         value = all_metrics.get(primary)
         gain = None
         if _numeric(value) and _numeric(baseline):
             gain = (value - baseline) if direction == "maximize" else (baseline - value)
         rows.append({"planId": plan["id"], "jobId": job["id"], "name": params.get("name"),
                      "dataset": dataset, "variant": params.get("variant"),
-                     "seed": params.get("seed"), "params": params, "status": job["status"],
+                     "seed": params.get("seed"), "params": params, "status": status,
                      "metric": primary, "value": value, "baseline": baseline, "gain": gain,
                      "improved": gain is not None and gain > 0,
                      # guardrail 判定要全指标与该数据集整套基线,不只有 primary
-                     "allMetrics": all_metrics, "baselineMetrics": baseline_metrics})
-    return {"metric": primary, "direction": direction, "rows": rows,
-            "warning": param_insensitivity(rows)}
+                     "allMetrics": all_metrics, "baselineMetrics": baseline_metrics,
+                     "evalJobId": eval_job_id})
+    result = {"metric": primary, "direction": direction, "rows": rows,
+              "warning": param_insensitivity(rows)}
+    if eval_enabled:
+        result["evalMissing"] = eval_missing
+    return result
 
 
 def variant_means(rows: list[dict]) -> list[dict]:

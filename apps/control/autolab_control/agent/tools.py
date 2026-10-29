@@ -250,18 +250,64 @@ def finish_tool(description: str, properties: dict, required: list[str],
 
 # ------------------------------------------------------------------ 实验
 
+def jobs_wait_outcome(env: LoopEnv, job_ids: list[str], *,
+                      eval_contract: dict | None = None,
+                      baseline_ref: str = "baseline"):
+    """wait_jobs 工具与 waiting_jobs 恢复路径共用的结果出口(B2.3a)。
+
+    Job 未全终态 → Pause 继续等;全终态且契约启用了平台评测 → 为成功的训练
+    Job 自动提交评测 Job 并改等评测(Pause 会延伸等待链);评测终态后汇总
+    「评测指标 + 训练失败信息」。输入本身是评测 Job 时直接汇总。"""
+    from ..core.repo import TERMINAL_JOB_STATUSES
+
+    jobs = [env.repo.get_job(j) for j in job_ids]
+    if any(j is not None and j["status"] not in TERMINAL_JOB_STATUSES for j in jobs):
+        return Pause("jobs", {"job_ids": job_ids})
+    if any(j is not None and json.loads(j["params_json"] or "{}").get("eval_of_job_id")
+           for j in jobs):
+        described = list(job_ids)
+        # 同会话里失败/超时/取消的训练 Job 一并汇报:不能只看评测侧
+        conn = env.repo.db.connect()
+        try:
+            failed_rows = conn.execute(
+                "SELECT j.id FROM jobs j JOIN plan_revisions p ON p.id = j.plan_revision_id"
+                " WHERE p.approved_by = ? AND j.status IN ('FAILED', 'TIMED_OUT', 'CANCELLED')"
+                " ORDER BY j.queued_at", (f"agent-run:{env.run['id']}",)).fetchall()
+        finally:
+            conn.close()
+        described += [r["id"] for r in failed_rows if r["id"] not in set(described)]
+        return experiments.describe_jobs(env.repo, env.credentials, env.project, described)
+    eval_cfg = (eval_contract or {}).get("eval") or {}
+    if str(eval_cfg.get("command") or "").strip():
+        eval_ids = experiments.submit_eval_jobs(
+            env.repo, env.workspace, env.project, job_ids, eval_contract,
+            run_id=env.run["id"], baseline_ref=baseline_ref)
+        if eval_ids:
+            if not experiments.all_terminal(env.repo, eval_ids):
+                return Pause("jobs", {"job_ids": eval_ids, "parents": job_ids})
+            failed = [j["id"] for j in jobs if j is not None and j["status"] != "SUCCEEDED"]
+            return experiments.describe_jobs(env.repo, env.credentials, env.project,
+                                             [*eval_ids, *failed])
+    return experiments.describe_jobs(env.repo, env.credentials, env.project, job_ids)
+
+
 def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
                      allowed_datasets: Callable[[LoopEnv], set[str] | None] | None = None,
                      dataset_commands: Callable[[LoopEnv], dict[str, str] | None] | None = None,
-                     before_submit: Callable[[LoopEnv], None] | None = None) -> list[Tool]:
-    """baseline_ref / allowed_datasets / dataset_commands 按会话惰性求值;
-    before_submit 抛 ToolError 可拦截提交(如 GPU 预算用完)。"""
+                     before_submit: Callable[[LoopEnv], None] | None = None,
+                     eval_contract: Callable[[LoopEnv], dict | None] | None = None) -> list[Tool]:
+    """baseline_ref / allowed_datasets / dataset_commands / eval_contract 按会话惰性求值;
+    before_submit 抛 ToolError 可拦截提交(如 GPU 预算用完)。eval_contract 供
+    wait_jobs 在训练 Job 结束后自动提交平台评测 Job(B2.3a,baseline 阶段不传)。"""
 
     def run_experiment(env: LoopEnv, args: dict) -> str:
         if before_submit is not None:
             before_submit(env)
+        public = ("name", "command", "dataset", "variant", "seed")
+        jobs = [{k: v for k, v in (job or {}).items() if k in public}
+                for job in (args.get("jobs") or [])]
         request = experiments.ExperimentRequest(
-            jobs=args.get("jobs") or [], metrics=args.get("metrics") or [],
+            jobs=jobs, metrics=args.get("metrics") or [],
             purpose=(args.get("purpose") or "").strip() or "实验",
             conda_env=args.get("conda_env") or "",
             metric_file=args.get("metric_file") or "metrics.json",
@@ -283,9 +329,10 @@ def experiment_tools(*, baseline_ref: Callable[[LoopEnv], str] | None = None,
             raise ToolError("job_ids 不能为空")
         for job_id in job_ids:
             experiments.project_job(env.repo, env.project, job_id)
-        if experiments.all_terminal(env.repo, job_ids):
-            return experiments.describe_jobs(env.repo, env.credentials, env.project, job_ids)
-        return Pause("jobs", {"job_ids": job_ids})
+        return jobs_wait_outcome(
+            env, job_ids,
+            eval_contract=eval_contract(env) if eval_contract else None,
+            baseline_ref=baseline_ref(env) if baseline_ref else "baseline")
 
     def cancel_jobs(env: LoopEnv, args: dict) -> str:
         cancelled = []

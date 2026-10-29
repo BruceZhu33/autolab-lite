@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -207,6 +207,15 @@ CREATE TABLE IF NOT EXISTS research_rounds (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_research_rounds ON research_rounds(project_id, created_at);
+-- B2.3a 平台评测 Job 关联:训练 Job → 独立评测 Job(评测侧主键,一对一)。
+CREATE TABLE IF NOT EXISTS job_evals (
+    eval_job_id TEXT PRIMARY KEY REFERENCES jobs(id),  -- 评测 Job
+    train_job_id TEXT NOT NULL REFERENCES jobs(id),    -- 被评测的训练 Job
+    run_id TEXT NOT NULL,                              -- 触发评测的 agent run
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_evals_train ON job_evals(train_job_id);
+CREATE INDEX IF NOT EXISTS idx_job_evals_run ON job_evals(run_id);
 
 -- A2 结构化轨迹:span 是给机器回放的,blob 是不截断的原文
 -- (agent_run_events 是给人看的时间线,两者职责不同)。

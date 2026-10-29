@@ -98,6 +98,10 @@ def _clean_jobs(request: ExperimentRequest) -> list[dict]:
             if isinstance(seed, bool) or not isinstance(seed, int):
                 raise UserError(f"seed 必须是整数:{name}")
             job["seed"] = seed
+        # B2.3a 平台评测 Job 的内部字段(仅平台 submit_eval_jobs 构造,不进 agent schema)
+        for key in ("eval_of_job_id", "eval_input_dir", "role"):
+            if item.get(key) is not None:
+                job[key] = item[key]
         out.append(job)
     with_variant = [j for j in out if j.get("variant")]
     if with_variant and len(with_variant) != len(out):
@@ -291,6 +295,60 @@ def project_job(repo: Repo, project: dict, job_id: str) -> dict:
         raise UserError(f"Job {job_id} 不存在或不属于本项目")
     return job
 
+
+def submit_eval_jobs(repo: Repo, ws: Workspace, project: dict, train_job_ids: list[str],
+                     contract: dict | None, *, run_id: str,
+                     baseline_ref: str = "baseline") -> list[str]:
+    """B2.3a:为 SUCCEEDED 且尚无评测 Job 的训练 Job 提交独立平台评测 Job。
+
+    评测命令来自 owner 固化的 contract.eval.command(agent 不可指定);每个训练
+    Job 一个评测 Job,approved_by=platform-eval:<run_id>,登记进 job_evals。
+    返回该批训练 Job 对应的全部评测 Job id(含已存在的)。契约未启用返回 []。"""
+    eval_cfg = (contract or {}).get("eval") or {}
+    command = str(eval_cfg.get("command") or "").strip()
+    if not command:
+        return []
+    primary = str((contract or {}).get("primary") or "").strip()
+    guardrail_metrics = [str(g.get("metric") or "").strip()
+                         for g in ((contract or {}).get("guardrails") or [])
+                         if isinstance(g, dict) and str(g.get("metric") or "").strip()]
+    metric_names = [name for name in dict.fromkeys([primary, *guardrail_metrics]) if name]
+    output_root = (project.get("output_root") or "").rstrip("/")
+    eval_ids: list[str] = []
+    for train_job_id in train_job_ids:
+        train = repo.get_job(train_job_id)
+        if train is None or train["status"] != "SUCCEEDED":
+            continue
+        existing = repo.eval_job_for(train_job_id)
+        if existing is not None:
+            eval_ids.append(existing["id"])
+            continue
+        params = json.loads(train["params_json"] or "{}")
+        job = {"name": f"eval-{train_job_id[-12:]}", "command": command}
+        for key in ("dataset", "variant", "seed"):
+            if params.get(key) is not None:
+                job[key] = params[key]
+        job.update({"eval_of_job_id": train_job_id,
+                    "eval_input_dir": f"{output_root}/{train_job_id}", "role": "eval"})
+        request = ExperimentRequest(
+            jobs=[job], metrics=metric_names, purpose=f"平台评测 {train_job_id}",
+            metric_file=str(eval_cfg.get("metric_file") or "metrics.json"),
+            timeout_minutes=int(eval_cfg.get("timeout_minutes") or 30),
+            gpus_per_job=int(eval_cfg.get("gpus_per_job") or 1),
+        )
+        result = submit(repo, ws, project, request,
+                        approved_by=f"platform-eval:{run_id}", baseline_ref=baseline_ref)
+        eval_job_id = result["jobs"][0]["id"]
+        repo.link_eval_job(eval_job_id, train_job_id, run_id)
+        eval_ids.append(eval_job_id)
+    return eval_ids
+
+
+def effective_metrics(repo: Repo, job: dict) -> dict:
+    """B2.3a:有平台评测 Job 用评测 Job 的指标(训练命令自报的不算数),
+    否则回落训练 Job 自己的指标(无契约旧行为)。"""
+    eval_job = repo.eval_job_for(job["id"])
+    return job_metrics(repo, eval_job["id"]) if eval_job else job_metrics(repo, job["id"])
 
 def all_terminal(repo: Repo, job_ids: list[str]) -> bool:
     return all((j := repo.get_job(i)) is None or j["status"] in TERMINAL_JOB_STATUSES

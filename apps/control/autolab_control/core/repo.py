@@ -698,6 +698,46 @@ class Repo:
         finally:
             conn.close()
 
+    # -------------------------------------------------- job_evals (B2.3a)
+
+    def link_eval_job(self, eval_job_id: str, train_job_id: str, run_id: str) -> None:
+        """登记训练 Job 与其平台评测 Job 的关联(同一评测 Job 重复登记幂等)。"""
+        conn = self.db.connect()
+        try:
+            with self.db.tx(conn):
+                conn.execute(
+                    "INSERT OR REPLACE INTO job_evals (eval_job_id, train_job_id, run_id,"
+                    " created_at) VALUES (?, ?, ?, ?)",
+                    (eval_job_id, train_job_id, run_id, utc_now()),
+                )
+        finally:
+            conn.close()
+
+    def eval_job_for(self, train_job_id: str) -> dict[str, Any] | None:
+        """该训练 Job 的评测 Job(jobs 行);没有返回 None。"""
+        conn = self.db.connect()
+        try:
+            row = conn.execute(
+                "SELECT j.* FROM job_evals e JOIN jobs j ON j.id = e.eval_job_id"
+                " WHERE e.train_job_id = ? ORDER BY e.created_at LIMIT 1",
+                (train_job_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def eval_jobs_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        """该 agent run 触发的全部评测 Job(jobs 行)。"""
+        conn = self.db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT j.* FROM job_evals e JOIN jobs j ON j.id = e.eval_job_id"
+                " WHERE e.run_id = ? ORDER BY e.created_at", (run_id,),
+            )
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     def active_leases(self) -> list[dict[str, Any]]:
         conn = self.db.connect()
         try:
