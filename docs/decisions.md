@@ -801,3 +801,61 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   worktree/项目保留、run 驱动后 stopped。
 - 非目标(后续):前端 campaign/promote 页、自动清理失败分支 worktree/项目、
   分支级 GPU 公平分配、AgentSpec RSI 外层。
+
+## D-042 · Phase C4a:AgentSpec 注册表 + runtime overlay + 沙箱评测 + owner 激活(2026-10-30)
+
+- DB v25→v26:新表 `agent_specs`(id/kind CHECK baseline·research/label/parent_id/
+  status CHECK candidate·active·retired·rejected/config_json/时间戳)+ 部分唯一索引
+  `idx_agent_specs_active ON (kind) WHERE status='active'`(每 kind 至多一个 active,
+  SQLite 兜底)+ `idx_agent_specs_kind(kind, created_at)`。旧库 executescript 自动
+  补建,无数据迁移、无默认 active——没有 active 时 runtime 行为与 C4a 前完全一致。
+- overlay 契约(config_json,stages/agent_specs.py `clean_overlay_config` 校验,
+  非法 UserError→API 409):`prompt_append`(str,strip 后 ≤4000,空允许)、
+  `tool_exclude`(list[str] 去重保序;不得含 finish/end_round/ask_human 协议必需;
+  未知工具名允许)、`max_steps` 1..5000、`max_tokens` 1..1e8、`max_output_tokens`
+  512..16384、`wall_clock_seconds` 0..604800、`keep_recent` 1..100;bool 一律拒绝、
+  未知键拒绝;空键不落库。
+- agent/spec.py:`overlay_hash`(sha256 sort_keys JSON,注册表/快照/eval 报告同一
+  公式)+ `apply_profile_overlay(profile, overlay)`(dataclasses.replace,原件不动):
+  prompt_append 以 `\n\n## 变体指令\n` 追加 system_prompt 末尾(suffix 仍排其后)、
+  build_tools 包装按 name 过滤保序、max_*/wall_clock/keep_recent 覆盖、verifier
+  不动。`AgentSpec` 增 `agentSpecId`/`agentSpecHash`(无 overlay 为空,不记录完整
+  prompt 文本),`contextPolicy.keep_recent` 改取 `profile.keep_recent`;
+  `build_agent_spec(..., *, overlay=None)`(overlay = {"id","label","config"})。
+- runtime:`LoopProfile` 增 `keep_recent: int = 12`;`step()` 每次从 run config 的
+  `agent_spec` 键应用 overlay(在预算/build_tools/模型之前)——config 是启动快照,
+  运行中不受 DB active 变化影响;`_compact_view(messages, profile.keep_recent)`
+  不再用常量;spec 快照带 overlay id/hash(首次成功 step 固化,与 A1 同口径)。
+- 注册表(stages/agent_specs.py,agent 层不 import stages 不变):create(校验+清洗
+  落库,candidate)/list/get/activate(单事务:同 kind 其他 active→retired;rejected
+  拒绝)/retire(active→retired;candidate→rejected;终态不可再动)/active_spec/
+  overlay_for_run(显式 id 须存在、kind 匹配、candidate/active,否则 UserError;
+  否则回落 active;返回 {"id","label","config"})。parent_id 仅记录(rollback =
+  activate parent)。行读写直落 stages(同 D-038/D-040 约定)。
+- 启动接线:`baseline.start` / `research.start` / `research.start_validation` /
+  `campaign.start_campaign` 均接受 `agent_spec_id=None` 透传(research.start 解析
+  overlay 写 config["agent_spec"],None 不写);不传且无 active = 旧行为。API
+  四个启动端点(baseline/start、research/start、research/validate、research/
+  campaigns)body 增 `agent_spec_id` 透传。
+- API(api/routers/agent_specs.py,注册进 create_api_app):`POST /api/owner/
+  agent-specs`(owner,body {kind,label,config,parent_id?}→candidate)、
+  `GET /api/agent-specs?kind=` 与 `GET /api/agent-specs/{id}`(reader)、
+  `POST /api/owner/agent-specs/{id}/activate|retire`(owner)。agent token 写 403、
+  非法 config 409、不存在 404(统一异常映射)。
+- 沙箱评测 eval/agent/run.py:`--spec-file PATH`(JSON = overlay config,不含 id;
+  `load_spec_file` 复用注册表校验,坏文件/坏 config stderr + exit 2,不跑任务);
+  `run_task(task, *, root, overlay, spec)` 驱动前 `apply_profile_overlay`(cassette/
+  断言同一套,不调真实模型);报告 Markdown 头与 JSONL 行增 `spec`
+  {file,hash,keys},hash 与注册表同公式,owner 看报告后再 activate。
+- 测试 `apps/control/tests/test_agent_specs.py`(24 例):overlay 校验全键×越界×
+  bool×必需工具×超长×未知键;注册表 create/list/get/唯一 active/kind 隔离/retire
+  状态机/rejected 不可激活/retired 可复活/parent 保留/overlay_for_run 全分支/
+  部分唯一索引 IntegrityError;runtime(research 走 active 注入、baseline 走显式
+  candidate canary:prompt_append 进 system、tool_exclude 生效且保序、max_steps
+  覆盖到 stopReason、keep_recent 进 contextPolicy、spec 快照 agentSpecId/Hash、
+  不记录 prompt 文本;无 active 旧行为 + spec 快照空 id);start 接线(不存在/
+  错 kind 409);API 权限/404/409/透传;harness(--spec-file baseline_happy 仍 PASS、
+  报告含 spec、坏 overlay exit 2);DB v25→v26 迁移。`test_agent_trace.py` 的
+  `build_agent_spec` 调用点随签名更新(keep_recent 改由 profile 默认提供)。
+- 非目标(C4b):live 模型评测、canary 自动晋级/回滚、AgentSpec 变异提议、前端
+  spec 页、模型覆盖(model id 不在 overlay 内)。

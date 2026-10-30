@@ -36,6 +36,7 @@ from ..execution.experiments import effective_metrics
 from ..workspace import refs
 from ..workspace.fs import Workspace
 from ..workspace.host import open_host
+from . import agent_specs
 from .baseline import baseline_contract, baseline_pool, baseline_snapshot, refresh_contract_hashes
 
 KIND = "research"
@@ -898,7 +899,8 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
           max_rounds: int | None = None, gpu_hours: float | None = None,
           datasets: list[str] | None = None, kb_assist: bool = False,
           kb_spaces: list[str] | None = None,
-          critic: bool = False, reviewer: bool = False) -> dict:
+          critic: bool = False, reviewer: bool = False,
+          agent_spec_id: str | None = None) -> dict:
     project = repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
@@ -923,6 +925,9 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
               "kb_assist": bool(kb_assist),
               "kb_spaces": [s for s in (kb_spaces or []) if s] or None,
               "critic": bool(critic), "reviewer": bool(reviewer)}
+    overlay = agent_specs.overlay_for_run(repo, KIND, agent_spec_id)
+    if overlay is not None:  # C4a:无 active 且未显式指定时行为与原来一致
+        config["agent_spec"] = overlay
     return runtime.start_run(repo, project_id, KIND,
                              build_task(repo, project, config, run_id=None), config)
 
@@ -1074,7 +1079,8 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
 def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None = None,
                      seeds: int = 3, source_run_id: str | None = None,
                      gpu_hours: float | None = None,
-                     critic: bool = False, reviewer: bool = False) -> dict:
+                     critic: bool = False, reviewer: bool = False,
+                     agent_spec_id: str | None = None) -> dict:
     """把来源研究会话的冠军改动做成一次全量验证会话:不改代码,在选定数据集上
     按基线口径多 seed 重跑,一轮收束出逐数据集均值结论。owner 点按钮即授权。"""
     project = repo.get_project(project_id)
@@ -1110,5 +1116,8 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
                            "changes": str(carrier.get("changes") or "")[:2000]},
               "kb_assist": False, "kb_spaces": None,
               "critic": bool(critic), "reviewer": bool(reviewer)}
+    overlay = agent_specs.overlay_for_run(repo, KIND, agent_spec_id)
+    if overlay is not None:  # C4a:无 active 且未显式指定时行为与原来一致
+        config["agent_spec"] = overlay
     return runtime.start_run(repo, project_id, KIND,
                              build_task(repo, project, config, run_id=None), config)

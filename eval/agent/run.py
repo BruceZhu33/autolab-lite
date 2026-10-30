@@ -29,8 +29,11 @@ if str(REPO_ROOT) not in sys.path:  # 支持 `python eval/agent/run.py` 直跑
     sys.path.insert(0, str(REPO_ROOT))
 
 from autolab_control.agent import runtime, trace  # noqa: E402
+from autolab_control.agent.spec import apply_profile_overlay, overlay_hash  # noqa: E402
 from autolab_control.core.db import Database, utc_now  # noqa: E402
+from autolab_control.core.errors import UserError  # noqa: E402
 from autolab_control.core.repo import Repo  # noqa: E402
+from autolab_control.stages import agent_specs  # noqa: E402
 from autolab_control.stages import baseline as baseline_stage  # noqa: E402
 from autolab_control.stages import research as research_stage  # noqa: E402
 
@@ -65,6 +68,21 @@ def offline_tools():
         yield
     finally:
         paper_radar.available, knowledge.configured, notify.webhook_url = saved
+
+
+def load_spec_file(path: Path) -> dict:
+    """--spec-file:JSON 内容为 overlay config(不含 id)。校验复用注册表
+    (stages/agent_specs);坏文件/坏 config 打到 stderr 并 sys.exit(2)。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"--spec-file 读取失败:{path}({exc})", file=sys.stderr)
+        sys.exit(2)
+    try:
+        return agent_specs.clean_overlay_config(raw)
+    except UserError as exc:
+        print(f"--spec-file 非法:{exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 # ------------------------------------------------------------------ Job 落库
@@ -150,8 +168,14 @@ def _pending_view(pending: dict | None) -> dict | None:
     return view
 
 
-def run_task(task: dict, *, root: Path | None = None) -> dict:
-    """回放一个任务,返回结果对象(expect 断言在它之上求值,见 evaluate_expect)。"""
+def run_task(task: dict, *, root: Path | None = None, overlay: dict | None = None,
+             spec: dict | None = None) -> dict:
+    """回放一个任务,返回结果对象(expect 断言在它之上求值,见 evaluate_expect)。
+
+    overlay(C4a --spec-file):候选 AgentSpec 的 overlay config,驱动前先
+    apply_profile_overlay;cassette/断言同一套,不调真实模型。spec 是报告
+    元数据 {file,hash,keys},随结果落 JSONL/Markdown。
+    """
     started = time.monotonic()
     base = (Path(root) / task["id"]) if root is not None \
         else Path(tempfile.mkdtemp(prefix="autolab-eval-"))
@@ -189,6 +213,8 @@ def run_task(task: dict, *, root: Path | None = None) -> dict:
                                        datasets=task.get("datasets") or None, network=False)
         else:
             raise ValueError(f"未知任务 kind:{task['kind']}")
+        if overlay:
+            profile = apply_profile_overlay(profile, overlay)
         run_id = run["id"]
 
         context = {"run_id": run_id, "project_id": pid}
@@ -238,6 +264,7 @@ def run_task(task: dict, *, root: Path | None = None) -> dict:
         "duration_ms": int((time.monotonic() - started) * 1000),
         "workdir": str(base),
         "harness_error": harness_error,
+        "spec": spec,
     }
     result["failures"] = evaluate_expect(result, task.get("expect") or {})
     if harness_error:
@@ -319,7 +346,13 @@ def write_report(results: list[dict], out: Path) -> tuple[Path, Path]:
         "# Agent Eval Report(B2.2a replay)",
         "",
         f"- 生成时间:{datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-        f"- 结果:{passed}/{len(results)} PASS",
+         f"- 结果:{passed}/{len(results)} PASS",
+    ]
+    spec = next((r["spec"] for r in results if r.get("spec")), None)
+    if spec:  # C4a:--spec-file 时记录评测的候选 overlay(文件/指纹/键)
+        lines.append(f"- spec:`{spec['file']}`(hash `{spec['hash']}`;"
+                     f"keys {', '.join(spec['keys']) or '-'})")
+    lines += [
         "",
         "| task | kind | 结果 | steps | tokens(in/out) | tool errors | 耗时(ms) | 失败断言 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -349,7 +382,7 @@ def write_report(results: list[dict], out: Path) -> tuple[Path, Path]:
             row = {key: r.get(key) for key in (
                 "task_id", "kind", "pass", "status", "steps", "tokens_in", "tokens_out",
                 "span_kinds", "tool_calls", "tool_errors", "ask_humans", "duration_ms",
-                "failures", "harness_error", "workdir")}
+                "spec", "failures", "harness_error", "workdir")}
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     return out, jsonl
 
@@ -361,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tasks", default="all", help='"all" 或逗号分隔的任务 id')
     parser.add_argument("--out", default=str(DEFAULT_REPORT),
                         help="Markdown 报告路径(同时写同名 .jsonl)")
+    parser.add_argument("--spec-file", default=None,
+                        help="overlay config JSON 文件(C4a:评测候选 AgentSpec)")
     parser.add_argument("--mode", default="replay", choices=["replay"],
                         help="本轮只有 replay")
     args = parser.parse_args(argv)
@@ -380,7 +415,13 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         selected = wanted
 
-    results = [run_task(json.loads(tasks[name].read_text(encoding="utf-8")))
+    overlay, spec = None, None
+    if args.spec_file:  # C4a:候选 overlay 校验失败直接退出 2,不跑任务
+        overlay = load_spec_file(Path(args.spec_file))
+        spec = {"file": str(args.spec_file), "hash": overlay_hash(overlay),
+                "keys": sorted(overlay)}
+    results = [run_task(json.loads(tasks[name].read_text(encoding="utf-8")),
+                        overlay=overlay, spec=spec)
                for name in selected]
     md, jsonl = write_report(results, Path(args.out))
     for r in results:

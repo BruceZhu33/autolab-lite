@@ -174,8 +174,7 @@ def test_spec_contents_from_credentials(repo, monkeypatch):
 
     # spec_hash = sha256(sort_keys JSON),与重建结果一致
     prof = profile(tools=[echo_tool()])
-    rebuilt = agent_spec.build_agent_spec(prof, None, prof.build_tools(None),
-                                          keep_recent=al.KEEP_RECENT)
+    rebuilt = agent_spec.build_agent_spec(prof, None, prof.build_tools(None))
     assert rebuilt.to_dict() == spec
     assert hashlib.sha256(json.dumps(spec, sort_keys=True, ensure_ascii=False)
                           .encode()).hexdigest() == \

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import subprocess
@@ -32,6 +33,8 @@ class AgentSpec:
     context_policy: dict         # compact / reset / keep_recent
     verifier: dict               # 例如 {"id": "baseline-finish", "version": 1}
     code_rev: str                # control 代码版本;取不到时用包版本
+    agent_spec_id: str = ""       # 变体注册表 id(C4a);无 overlay 为空
+    agent_spec_hash: str = ""     # overlay_hash(config);无 overlay 为空
 
     def to_dict(self) -> dict:
         return {
@@ -46,6 +49,8 @@ class AgentSpec:
             "contextPolicy": self.context_policy,
             "verifier": self.verifier,
             "codeRev": self.code_rev,
+            "agentSpecId": self.agent_spec_id,
+            "agentSpecHash": self.agent_spec_hash,
         }
 
     def spec_hash(self) -> str:
@@ -73,13 +78,52 @@ def _code_rev() -> str:
     except Exception:  # noqa: BLE001
         return "unknown"
 
+def overlay_hash(config: dict) -> str:
+    """overlay config 的内容指纹:sha256(sort_keys JSON)。注册表(C4a)、
+    spec 快照与 eval 报告用同一公式,owner 可直接对账。"""
+    canonical = json.dumps(config, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def apply_profile_overlay(profile: LoopProfile, overlay: dict) -> LoopProfile:
+    """把 AgentSpec overlay 应用到 profile,返回新实例(不改原件)。
+
+    prompt_append 追加到 system prompt 末尾;tool_exclude 包装 build_tools
+    按 name 过滤(保留顺序);max_* / wall_clock_seconds / keep_recent 直接覆盖。
+    verifier 不动:验收口径不属于变体自由度。契约校验在 stages 层(owner API),
+    这里只做应用,容忍任何键。
+    """
+    updates: dict = {}
+    append = str(overlay.get("prompt_append") or "").strip()
+    if append:
+        updates["system_prompt"] = profile.system_prompt + "\n\n## 变体指令\n" + append
+    excluded = [str(t) for t in overlay.get("tool_exclude") or []]
+    if excluded:
+        drop = frozenset(excluded)
+        inner = profile.build_tools
+
+        def build_tools(env):
+            return [t for t in inner(env) if t.name not in drop]
+
+        updates["build_tools"] = build_tools
+    for key in ("max_steps", "max_tokens", "max_output_tokens",
+                "wall_clock_seconds", "keep_recent"):
+        if key in overlay:
+            updates[key] = overlay[key]
+    return dataclasses.replace(profile, **updates)
+
 
 def build_agent_spec(profile: LoopProfile, credentials: Any,
-                     tools: list[Tool], *, keep_recent: int = 12) -> AgentSpec:
-    """从 profile + 当步实际构建的工具 + 模型设置生成 spec(确定性)。"""
+                     tools: list[Tool], *, overlay: dict | None = None) -> AgentSpec:
+    """从 profile + 当步实际构建的工具 + 模型设置生成 spec(确定性)。
+
+    overlay = {"id","label","config"}(stages 注册表的运行时形态)或 None:
+    只记录 id 与 config 的内容 hash,不记录完整 prompt_append 文本。
+    """
     settings = model_settings(credentials)  # 只取 model / base_url;key 绝不落库
     prompt_hash = hashlib.sha256(
         profile.system_prompt.encode("utf-8")).hexdigest()
+    overlay_cfg = (overlay or {}).get("config") or {}
     return AgentSpec(
         spec_id=f"{profile.kind}:{settings['model']}:{prompt_hash[:8]}",
         kind=profile.kind,
@@ -94,9 +138,12 @@ def build_agent_spec(profile: LoopProfile, credentials: Any,
             "max_output_tokens": profile.max_output_tokens,
             "wall_clock_seconds": profile.wall_clock_seconds,
         },
-        context_policy={"compact": True, "reset": True, "keep_recent": keep_recent},
+        context_policy={"compact": True, "reset": True,
+                        "keep_recent": profile.keep_recent},
         verifier=dict(profile.verifier),
         code_rev=_code_rev(),
+        agent_spec_id=str((overlay or {}).get("id") or ""),
+        agent_spec_hash=overlay_hash(overlay_cfg) if overlay_cfg else "",
     )
 
 

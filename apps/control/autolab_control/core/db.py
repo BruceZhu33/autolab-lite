@@ -4,6 +4,7 @@
 - 资源:servers / projects
 - 执行:plan_revisions / jobs / gpu_leases / job_events / artifacts
 - 阶段 agent:agent_runs / agent_run_events / agent_run_inbox / research_rounds / research_cases
+  / agent_specs / research_campaigns
 
 建表与迁移每个 Database 实例只跑一次(旧实现每次 connect 都重跑)。
 旧库里已退役的表(proposals、iteration_loops、chat_* 等)原样保留、不再读写。
@@ -20,7 +21,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -301,6 +302,23 @@ CREATE TABLE IF NOT EXISTS research_campaigns (
 );
 CREATE INDEX IF NOT EXISTS idx_campaigns_source
     ON research_campaigns(source_project_id, created_at);
+
+-- C4a AgentSpec 注册表:agent 自身配置的版本化对象(candidate/active/retired/
+-- rejected);每 kind 至多一个 active(部分唯一索引兜底),无默认 active。
+CREATE TABLE IF NOT EXISTS agent_specs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('baseline','research')),
+    label TEXT NOT NULL,
+    parent_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('candidate','active','retired','rejected')),
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_specs_active
+    ON agent_specs(kind) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_agent_specs_kind
+    ON agent_specs(kind, created_at);
 """
 
 

@@ -165,9 +165,10 @@ def _unique_project_name(repo: Repo, base: str) -> str:
 
 
 def _fork_branch(repo: Repo, credentials, source: dict, campaign_id: str,
-                 index: int, idea: str, snapshot: dict, *,
-                 tier: str, datasets: list[str] | None, critic: bool, reviewer: bool,
-                 max_rounds: int | None, gpu_hours: float | None) -> dict:
+                  index: int, idea: str, snapshot: dict, *,
+                  tier: str, datasets: list[str] | None, critic: bool, reviewer: bool,
+                 max_rounds: int | None, gpu_hours: float | None,
+                 agent_spec_id: str | None = None) -> dict:
     """fork 一个方向:worktree 检出源 HEAD → 建项目(整份继承基线快照,保留
     metric_contract)→ 启动研究会话。返回 branches_json 的一个条目。"""
     source_dir = source["remote_workdir"].rstrip("/")
@@ -214,7 +215,8 @@ def _fork_branch(repo: Repo, credentials, source: dict, campaign_id: str,
                         or source.get("baseline_passed_at"))
     run = research.start(repo, forked_project["id"], tier=tier, idea=idea,
                          datasets=datasets, critic=critic, reviewer=reviewer,
-                         max_rounds=max_rounds, gpu_hours=gpu_hours)
+                         max_rounds=max_rounds, gpu_hours=gpu_hours,
+                         agent_spec_id=agent_spec_id)
     return {"index": index, "idea": idea, "projectId": forked_project["id"],
             "runId": run["id"], "name": name, "fork": fork}
 
@@ -233,7 +235,8 @@ def start_campaign(repo: Repo, credentials, source_project_id: str, *,
                    datasets: list[str] | None = None,
                    critic: bool = False, reviewer: bool = False,
                    max_rounds: int | None = None,
-                   gpu_hours: float | None = None) -> dict:
+                   gpu_hours: float | None = None,
+                   agent_spec_id: str | None = None) -> dict:
     """并行开 1–3 个研究分支。任一步失败:campaign 置 failed、停掉已启动的
     分支会话并把已 fork 分支写进 branches_json(每条标 aborted,worktree/项目
     不删,owner 可查可清)、抛 UserError(API 409)。成功返回 campaign_status。"""
@@ -281,7 +284,8 @@ def start_campaign(repo: Repo, credentials, source_project_id: str, *,
             started.append(_fork_branch(
                 repo, credentials, source, campaign_id, index, idea, snapshot,
                 tier=tier, datasets=dataset_pool, critic=critic, reviewer=reviewer,
-                max_rounds=max_rounds, gpu_hours=gpu_hours))
+                max_rounds=max_rounds, gpu_hours=gpu_hours,
+                agent_spec_id=agent_spec_id))
     except Exception as exc:
         for branch in started:
             _stop_branch_run(repo, branch["runId"])

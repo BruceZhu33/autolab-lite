@@ -17,6 +17,7 @@ from ..core.repo import Repo
 from ..execution.evidence import hash_paths
 from ..execution.experiments import job_metrics, project_job
 from ..workspace.fs import open_workspace
+from . import agent_specs
 
 KIND = "baseline"
 CONFIRM_KIND = "confirm_baseline"
@@ -351,7 +352,8 @@ PROFILE = LoopProfile(kind=KIND, system_prompt=SYSTEM_PROMPT, build_tools=build_
 
 # ------------------------------------------------------------------ 对外动作
 
-def start(repo: Repo, project_id: str, *, note: str = "", network: bool = False) -> dict:
+def start(repo: Repo, project_id: str, *, note: str = "", network: bool = False,
+          agent_spec_id: str | None = None) -> dict:
     project = repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
@@ -367,7 +369,11 @@ def start(repo: Repo, project_id: str, *, note: str = "", network: bool = False)
                  + "\n本次只需为**新增**的数据集补跑基线;finish 时把新增的列出来即可。")
     if note.strip():
         task += f"\n\nowner 补充说明:\n{note.strip()}"
-    return runtime.start_run(repo, project_id, KIND, task, {"network": bool(network)})
+    config = {"network": bool(network)}
+    overlay = agent_specs.overlay_for_run(repo, KIND, agent_spec_id)
+    if overlay is not None:  # C4a:无 active 且未显式指定时行为与原来一致
+        config["agent_spec"] = overlay
+    return runtime.start_run(repo, project_id, KIND, task, config)
 
 
 def confirm(repo: Repo, credentials, run_id: str) -> dict:

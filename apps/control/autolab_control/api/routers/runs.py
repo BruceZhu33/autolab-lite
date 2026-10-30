@@ -58,8 +58,10 @@ def build(ctx: Ctx) -> APIRouter:
 
     @router.post("/api/owner/projects/{project_id}/baseline/start", dependencies=[ctx.owner])
     def baseline_start(project_id: str, payload: dict) -> dict:
-        return {"run": baseline.start(repo, project_id, note=str(payload.get("note") or ""),
-                                      network=bool(payload.get("network")))}
+        return {"run": baseline.start(
+            repo, project_id, note=str(payload.get("note") or ""),
+            network=bool(payload.get("network")),
+            agent_spec_id=str(payload.get("agent_spec_id") or "").strip() or None)}
 
     @router.post("/api/owner/runs/{run_id}/baseline/confirm", dependencies=[ctx.owner])
     def baseline_confirm(run_id: str) -> dict:
@@ -102,7 +104,8 @@ def build(ctx: Ctx) -> APIRouter:
             gpu_hours=number("gpu_hours", float), datasets=datasets or None,
             kb_assist=bool(payload.get("kb_assist")),
             kb_spaces=[str(s) for s in (payload.get("kb_spaces") or []) if str(s).strip()] or None,
-            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")))}
+            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")),
+            agent_spec_id=str(payload.get("agent_spec_id") or "").strip() or None)}
 
     @router.post("/api/owner/projects/{project_id}/research/validate",
                  dependencies=[ctx.owner])
@@ -116,7 +119,8 @@ def build(ctx: Ctx) -> APIRouter:
             seeds=int(payload.get("seeds") or 3),
             source_run_id=str(payload.get("source_run_id") or "").strip() or None,
             gpu_hours=float(gpu_hours) if gpu_hours not in (None, "") else None,
-            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")))}
+            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")),
+            agent_spec_id=str(payload.get("agent_spec_id") or "").strip() or None)}
 
     @router.post("/api/owner/projects/{project_id}/research/adopt",
                  dependencies=[ctx.owner])
@@ -156,7 +160,8 @@ def build(ctx: Ctx) -> APIRouter:
             tier=str(payload.get("tier") or "heavy"), datasets=datasets or None,
             critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")),
             max_rounds=number("max_rounds", int),
-            gpu_hours=number("gpu_hours", float))}
+            gpu_hours=number("gpu_hours", float),
+            agent_spec_id=str(payload.get("agent_spec_id") or "").strip() or None)}
 
     @router.get("/api/research/campaigns/{campaign_id}", dependencies=[ctx.reader])
     def campaign_get(campaign_id: str) -> dict:

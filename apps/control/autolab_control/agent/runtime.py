@@ -33,7 +33,7 @@ from ..workspace.fs import Workspace
 from ..workspace.host import open_host
 from . import trace
 from .model import ModelFn, call_model, model_settings
-from .spec import build_agent_spec, spec_from_json
+from .spec import apply_profile_overlay, build_agent_spec, spec_from_json
 
 KEEP_RECENT = 12  # _compact_view 保留最近 N 个工具结果不截短(spec.contextPolicy)
 TRUNCATED_HINT = ("上一条回复因 max_tokens 被截断。请缩小单次输出"
@@ -107,6 +107,8 @@ class LoopProfile:
     max_consecutive_model_errors: int = 8
     # 验收器身份(A1):spec 里固化,如 {"id": "baseline-finish", "version": 1}
     verifier: dict = field(default_factory=lambda: {"id": "default-accept", "version": 1})
+    # C4a 上下文窗口:_compact_view 保留最近 N 个工具结果不截短(AgentSpec 可覆盖)
+    keep_recent: int = 12
     # 每步之前塞给模型的系统提示补充(如:剩余预算);由 profile 自定
     system_suffix: Callable[[LoopEnv], str] | None = None
 
@@ -467,6 +469,13 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
     status = row["status"]
     step_no = int(row["steps"]) + 1
 
+    # C4a:每次 step 从 run config 应用 AgentSpec overlay。config 是启动时的
+    # 快照,运行中不受 DB 里 active spec 变化影响;无 overlay 行为与原来一致
+    overlay = _loads(row["config_json"], {}).get("agent_spec") or {}
+    overlay_cfg = overlay.get("config") or {}
+    if overlay_cfg:
+        profile = apply_profile_overlay(profile, overlay_cfg)
+
     # 1) 收件箱:停止优先;owner 的话在等人时就是回答
     notes: list[str] = []
     for item in _drain_inbox(repo, run_id):
@@ -542,10 +551,10 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
             system += "\n\n" + profile.system_suffix(env)
         if not row["spec_hash"]:
             snapshot = build_agent_spec(profile, credentials, tools,
-                                        keep_recent=KEEP_RECENT)
+                                        overlay=overlay or None)
             _update(repo, run_id, spec_json=_dumps(snapshot.to_dict()),
                     spec_hash=snapshot.spec_hash())
-        view = _compact_view(messages)
+        view = _compact_view(messages, profile.keep_recent)
         tool_specs = [t.spec() for t in tools]
         model_id = model_settings(credentials)["model"]
         call = model or (lambda **kw: call_model(credentials, **kw))
