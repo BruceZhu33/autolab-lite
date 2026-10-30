@@ -12,12 +12,18 @@ import copy
 import re
 from typing import Any
 
+from autolab_control.agent.model import call_model
+
 # 整串占位(值可以是 list,整串替换保留原类型,如 job_ids: "{{jobs}}")
 _FULL_PLACEHOLDER = re.compile(r"^\{\{(?P<name>[A-Za-z0-9_]+)\}\}$")
 
 
 class CassetteError(Exception):
     """cassette 耗尽或条目非法:harness 以此把任务判 FAIL,绝不重试。"""
+
+
+class LiveModelError(Exception):
+    """live 模型调用/成本超过 harness 硬上限;任务判 FAIL,不再继续。"""
 
 
 def substitute(value: Any, context: dict) -> Any:
@@ -70,3 +76,54 @@ class CassetteModel:
         self.calls += 1
         return {"content": substitute(copy.deepcopy(content), self._context),
                 "usage": dict(self._usage)}
+
+
+class LiveModel:
+    """真实模型:包装 control 的 call_model,累计调用数与 token,超限即抛。
+
+    runtime.step 以关键字参数 system / messages / tools / max_tokens 调用;
+    model 非空时覆盖凭据里的模型(与 AgentSpec overlay 的 model 一致)。
+    调用次数在发起前计数(含失败重试),token 按响应 usage 累计。
+    """
+
+    def __init__(self, credentials, *, model: str | None = None,
+                 max_calls: int = 12, max_tokens: int = 200000):
+        self.credentials = credentials
+        self.model = (model or "").strip()
+        self.max_calls = max(1, int(max_calls))
+        self.max_tokens = max(1, int(max_tokens))
+        self.calls = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.limit_error = ""
+
+    @property
+    def tokens_total(self) -> int:
+        return self.tokens_in + self.tokens_out
+
+    @property
+    def exhausted(self) -> bool:
+        return self.calls >= self.max_calls or self.tokens_total >= self.max_tokens
+
+    def __call__(self, *, system: str, messages: list[dict],
+                 tools: list[dict], max_tokens: int) -> dict:
+        if self.calls >= self.max_calls:
+            self.limit_error = (f"模型调用上限 {self.max_calls} 次已用完"
+                                f"(calls={self.calls})")
+            raise LiveModelError(self.limit_error)
+        if self.tokens_total >= self.max_tokens:
+            self.limit_error = (f"token 上限 {self.max_tokens} 已用完"
+                                f"(tokens={self.tokens_total})")
+            raise LiveModelError(self.limit_error)
+        self.calls += 1
+        response = call_model(self.credentials, system=system, messages=messages,
+                              tools=tools, max_tokens=max_tokens,
+                              model=self.model or None)
+        usage = response.get("usage") or {}
+        self.tokens_in += int(usage.get("input_tokens") or 0)
+        self.tokens_out += int(usage.get("output_tokens") or 0)
+        if self.tokens_total > self.max_tokens:
+            self.limit_error = (f"token 上限 {self.max_tokens} 超限"
+                                f"(tokens={self.tokens_total})")
+            raise LiveModelError(self.limit_error)
+        return response

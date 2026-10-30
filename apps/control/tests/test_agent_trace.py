@@ -153,8 +153,9 @@ def test_existing_spec_is_never_overwritten(repo):
 
 def test_spec_contents_from_credentials(repo, monkeypatch):
     monkeypatch.setattr(agent_spec, "model_settings",
-                        lambda creds: {"api_key": "sk-secret", "base_url": "http://m:1",
-                                       "model": "glm-test"})
+                        lambda creds, model=None: {
+                            "api_key": "sk-secret", "base_url": "http://m:1",
+                            "model": model or "glm-test"})
     run_id = start(repo)
     model = ScriptModel([[use("t1", "echo", v=1)]])
     assert run_step(repo, run_id, profile(tools=[echo_tool()]), model) == "running"

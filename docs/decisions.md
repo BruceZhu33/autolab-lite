@@ -859,3 +859,63 @@ failures.md 同步记录。三层纵深(入口治本/起草期静态检查/门�
   `build_agent_spec` 调用点随签名更新(keep_recent 改由 profile 默认提供)。
 - 非目标(C4b):live 模型评测、canary 自动晋级/回滚、AgentSpec 变异提议、前端
   spec 页、模型覆盖(model id 不在 overlay 内)。
+
+## D-043 · Phase C4b:模型覆盖 + live 评测 + canary 质量门 + 变异提议 + spec 页(2026-10-30)
+
+- DB v26→v27:新表 `agent_canaries`(id/spec_id/kind/mode CHECK cassette·live/
+  status CHECK running·done·failed/tasks_json/result_json/error/时间戳)+
+  `idx_agent_canaries_spec(spec_id, created_at)`;`agent_specs` 增
+  `provenance_json TEXT NOT NULL DEFAULT '{}'`。provenance 不升版本:已有 v25/v26/
+  v27 库在 `_migrate` 用 `PRAGMA table_info` 幂等补列,v25 无表时由 executescript
+  按新 schema 建。旧库自动迁移,无数据丢失。
+- overlay 契约新增 `model`(str,strip 后 1..80,`^[A-Za-z0-9][A-Za-z0-9._:/-]*$`;
+  空串不落键)。`model_settings(credentials, model=)` / `call_model(..., model=)`
+  只覆盖 payload model,api_key/base_url 仍来自凭据;`LoopProfile.model_override`、
+  `apply_profile_overlay`、`build_agent_spec` 全链路生效,spec 快照 modelId 记录
+  实际模型。verifier 仍不可被 overlay 改。
+- live 评测(eval/agent/run.py):`--mode live` 读 `eval/agent/live_tasks/`,必须
+  `--credentials`(0600;缺 key exit 2),`--model`/`--max-model-calls`(默认12)/
+  `--max-tokens`(默认200k)硬上限;`LiveModel` 包 call_model,累计 calls/tokens,
+  超限抛 LiveModelError 并把任务判 FAIL。Job 指标不再消费 cassette 队列,而由
+  `metric_profile` 按 Job 的 (dataset,variant,seed) 确定性模拟(baseline+gain+
+  seed%7 抖动;无 profile 回落 0.81,不静默 0)。任务:baseline_smoke(真实模型
+  run_experiment→wait_jobs→finish,等 confirm_baseline)、research_smoke(light
+  档跑一轮,end_round 后等 round_review)。报告/JSONL 增 mode/model/model_calls/
+  tokens_total。live 不进 CI。
+- canary(stages/canaries.py + eval/agent/canary_worker.py):只允许 candidate;
+  同 spec 已有 running → 409;任务集合为该 kind 的 replay/live 任务(显式 tasks
+  必须是子集);写 running 后默认用独立子进程(`python -m eval.agent.canary_worker`,
+  cwd=仓库根,stdout/stderr 落 `.local-state/canaries/<id>.log`)执行——隔离
+  `offline_tools` 的全局 monkeypatch。worker 在临时 DB/目录跑 candidate 与
+  当前 active(无 active 用 {})同任务对照,绝不写生产项目/Job;结果落 result_json。
+  `recommend` 纯函数:有回归/通过数下降 → reject;compare=False 只按候选自身
+  全通过 promote 否则 hold(不跑基线,省额度);live 候选 token > 基线 ×2 →
+  hold;否则全通过 promote / 未全通过 hold。只建议,绝不自动 activate。
+  `start_canary(spawn=False)` 供测试同步执行;真实子进程已端到端验证。
+- 变异提议(stages/agent_specs.propose_mutation):owner 对任意 spec 发起;显式
+  canary 必须存在、属于该 spec 且 done;未给则取该 spec 最近一条 done canary,
+  没有也可生成通用提示。prompt 含当前 config、recommendation/reasons/regressions、
+  候选失败 task/failures/toolErrors、allowed keys/bounds;call_model(tools=[],
+  max_tokens=2000),只输出 `{"config":...,"rationale":...}`;解析/校验/空 config
+  一律 UserError(API 409,附模型输出摘要),不 fail-open。创建 candidate,
+  parent_id=父 spec,provenance 记录 source/rationale/model/canaryId(显式或
+  自动选中的 done canary)/createdAt;绝不自动激活。
+- API:`POST /api/owner/agent-specs/{id}/canary`(body mode/tasks/compare;live
+  用服务端凭据路径)、`GET /api/agent-canaries?spec_id=`、`GET /api/agent-canaries/
+  {id}`(reader)、`POST /api/owner/agent-specs/{id}/mutate`(body canary_id?);
+  agent token 写 403、不存在 404、非法/重复 running/模型失败 409。
+- 前端 `apps/web/app/specs/page.tsx` + `lib/api/specs.ts` + 侧栏「Agent 规格」:
+  kind 筛选、新建候选(label/kind/prompt_append/tool_exclude/max_steps/
+  keep_recent/model)、状态/摘要/parent/provenance、activate/retire/cassette
+  canary/live canary(二次确认消耗真实额度)/变异、canary 历史(recommendation/
+  reasons/候选与基线逐任务 pass/status/steps/tokens/tool_errors,运行中 3s 刷新)。
+  不新增依赖。
+- 测试:新增 test_agent_canary.py(模型覆盖、recommend 三分支/compare=False/
+  live token hold、同步 cassette canary、重复 running/spawn 失败、API 权限/404/
+  409、DB v26→v27)、test_agent_mutation.py(provenance 清洗/坏数据、无 canary/
+  自动最近 done/显式 canary 归属与 done、失败任务进 prompt、坏 JSON/非 dict/
+  空 config/未知键/越界、API、v26/v27 补列)、eval live harness 测试(目录隔离、
+  FakeModel 收束、metric_profile 确定性、LiveModel 上限、CLI exit 2、报告字段)。
+  全量 429+ 用例通过,ruff 全绿,`next build` 通过(`/specs` 5.36 kB)。
+- 非目标(后续):canary 断点续跑/崩溃后 stale 自动收尾;多模型 A/B 的统计
+  显著性;变异提议的自动 canary 排队;前端 canary 详情页/趋势图。

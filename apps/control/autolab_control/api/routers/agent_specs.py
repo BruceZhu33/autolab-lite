@@ -39,4 +39,15 @@ def build(ctx: Ctx) -> APIRouter:
         """退役(owner):active→retired;candidate→rejected。"""
         return {"spec": agent_specs.retire_spec(repo, spec_id)}
 
+    @router.post("/api/owner/agent-specs/{spec_id}/mutate", dependencies=[ctx.owner])
+    def mutate(spec_id: str, payload: dict | None = None) -> dict:
+        """变异提议(owner,同步单次模型调用):body {canary_id?} → 新 candidate。
+
+        只写 candidate,不自动激活;不存在 404,模型/校验失败 409。
+        """
+        body = payload or {}
+        canary_id = str(body.get("canary_id") or "").strip() or None
+        return {"spec": agent_specs.propose_mutation(
+            repo, ctx.credentials, spec_id, canary_id=canary_id)}
+
     return router

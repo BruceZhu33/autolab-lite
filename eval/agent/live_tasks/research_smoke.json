@@ -1,0 +1,30 @@
+{
+  "id": "research_smoke",
+  "kind": "research",
+  "title": "Live research smoke:light 档真实模型跑一轮研究并等 owner 审阅",
+  "fixture": "fixtures/tiny_repo",
+  "tier": "light",
+  "idea": "把学习率从 0.01 降到 0.005,用 3 个 seed 在 kvasir 上验证 val_dice。",
+  "datasets": ["kvasir"],
+  "baseline": {
+    "datasets": {
+      "kvasir": {"metrics": {"val_dice": 0.8}, "command": "python train.py"}
+    }
+  },
+  "contract": {"primary": "val_dice", "direction": "maximize",
+               "guardrails": [], "eval": {}},
+  "metric_profile": {
+    "baseline": {"kvasir": 0.8},
+    "variant_gains": {"kvasir": {"base": 0.0, "lr_low": 0.05}},
+    "seed_spread": 0.002
+  },
+  "expect": {
+    "tier": "light",
+    "status": "waiting_human",
+    "pending.kind": "round_review",
+    "tool_calls_contains": "run_experiment",
+    "steps_lte": 20,
+    "tool_errors": []
+  },
+  "budget": {"max_steps": 20}
+}
