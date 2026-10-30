@@ -29,7 +29,9 @@ if str(REPO_ROOT) not in sys.path:  # 支持 `python eval/agent/run.py` 直跑
     sys.path.insert(0, str(REPO_ROOT))
 
 from autolab_control.agent import runtime, trace  # noqa: E402
+from autolab_control.agent.model import model_settings  # noqa: E402
 from autolab_control.agent.spec import apply_profile_overlay, overlay_hash  # noqa: E402
+from autolab_control.core.credentials import CredentialStore  # noqa: E402
 from autolab_control.core.db import Database, utc_now  # noqa: E402
 from autolab_control.core.errors import UserError  # noqa: E402
 from autolab_control.core.repo import Repo  # noqa: E402
@@ -37,11 +39,13 @@ from autolab_control.stages import agent_specs  # noqa: E402
 from autolab_control.stages import baseline as baseline_stage  # noqa: E402
 from autolab_control.stages import research as research_stage  # noqa: E402
 
-from eval.agent.model import CassetteModel  # noqa: E402
+from eval.agent.model import CassetteModel, LiveModel  # noqa: E402
 
 TASKS_DIR = AGENT_DIR / "tasks"
+LIVE_TASKS_DIR = AGENT_DIR / "live_tasks"
 DEFAULT_REPORT = AGENT_DIR / "reports" / "latest.md"
 DEFAULT_MAX_STEPS = 30
+DEFAULT_METRIC_BASELINE = 0.81
 STOP_STATUSES = ("done", "failed", "stopped", "waiting_human")
 _MISSING = object()
 
@@ -124,16 +128,54 @@ def _finish_job(repo: Repo, job_id: str, metrics: dict) -> None:
         conn.close()
 
 
-def _drain_queued_jobs(repo: Repo, run_id: str, metrics_queue: list[dict]) -> None:
-    """把本 run 仍 QUEUED 的 Job 依次消费 metrics_queue 置为 SUCCEEDED。"""
+def _drain_queued_jobs(repo: Repo, run_id: str, metrics_queue: list[dict],
+                       metric_fn=None) -> None:
+    """把本 run 仍 QUEUED 的 Job 依次消费 metrics_queue 置为 SUCCEEDED。
+
+    live 模式给 metric_fn:按 Job 参数(dataset/variant/seed)确定性生成指标,
+    不再依赖预录 job_metrics。"""
     for job_id in _run_job_ids(repo, run_id):
         job = repo.get_job(job_id)
         if job is None or job["status"] != "QUEUED":
             continue
-        if not metrics_queue:
-            raise JobMetricsExhausted(
-                f"job_metrics 队列已耗尽,Job {job_id} 仍是 QUEUED")
-        _finish_job(repo, job_id, metrics_queue.pop(0))
+        if metric_fn is not None:
+            metrics = metric_fn(job)
+        else:
+            if not metrics_queue:
+                raise JobMetricsExhausted(
+                    f"job_metrics 队列已耗尽,Job {job_id} 仍是 QUEUED")
+            metrics = metrics_queue.pop(0)
+        _finish_job(repo, job_id, metrics)
+
+
+def _simulated_metrics(task: dict, job: dict) -> dict:
+    """live 任务的确定性 Job 指标:baseline + variant_gain + seed_jitter。
+
+    metric_profile 缺省时回落到 0.81(不静默写 0);seed 抖动按 seed % 7
+    对称展开,同一 seed 每次结果一致,不做随机。"""
+    try:
+        params = json.loads(job.get("params_json") or "{}")
+    except (TypeError, ValueError):
+        params = {}
+    dataset = str(params.get("dataset") or "")
+    variant = str(params.get("variant") or "base")
+    profile = task.get("metric_profile") or {}
+    baselines = profile.get("baseline") or {}
+    baseline = baselines.get(dataset)
+    if baseline is None:
+        baseline = baselines.get("") if "" in baselines else DEFAULT_METRIC_BASELINE
+    gains = (profile.get("variant_gains") or {}).get(dataset) or {}
+    gain = float(gains.get(variant) or 0.0)
+    jitter = 0.0
+    seed = params.get("seed")
+    if seed is not None:
+        try:
+            seed_int = int(seed)
+        except (TypeError, ValueError):
+            seed_int = 0
+        jitter = ((seed_int % 7) - 3) * float(profile.get("seed_spread") or 0.0)
+    metric = str((task.get("contract") or {}).get("primary") or "val_dice")
+    return {metric: float(baseline) + gain + jitter}
 
 
 def _refresh_job_context(repo: Repo, run_id: str, context: dict) -> None:
@@ -169,14 +211,19 @@ def _pending_view(pending: dict | None) -> dict | None:
 
 
 def run_task(task: dict, *, root: Path | None = None, overlay: dict | None = None,
-             spec: dict | None = None) -> dict:
-    """回放一个任务,返回结果对象(expect 断言在它之上求值,见 evaluate_expect)。
+             spec: dict | None = None, credentials=None, model=None) -> dict:
+    """跑一个任务,返回结果对象(expect 断言在它之上求值,见 evaluate_expect)。
 
     overlay(C4a --spec-file):候选 AgentSpec 的 overlay config,驱动前先
-    apply_profile_overlay;cassette/断言同一套,不调真实模型。spec 是报告
-    元数据 {file,hash,keys},随结果落 JSONL/Markdown。
+    apply_profile_overlay;cassette/断言同一套。
+
+    model 为 None = replay:用 CassetteModel 回放,Job 指标消费 job_metrics。
+    model 给了 = live:用它调真实模型(通常 LiveModel),Job 指标由
+    metric_profile 确定性模拟。credentials 仅 live 需要。
+    spec 是报告元数据 {file,hash,keys},随结果落 JSONL/Markdown。
     """
     started = time.monotonic()
+    live = model is not None
     base = (Path(root) / task["id"]) if root is not None \
         else Path(tempfile.mkdtemp(prefix="autolab-eval-"))
     work, out = base / "work", base / "out"
@@ -215,21 +262,41 @@ def run_task(task: dict, *, root: Path | None = None, overlay: dict | None = Non
             raise ValueError(f"未知任务 kind:{task['kind']}")
         if overlay:
             profile = apply_profile_overlay(profile, overlay)
+        if isinstance(model, LiveModel):
+            if model.model:  # --model / canary 显式模型优先,快照与实际调用一致
+                profile = apply_profile_overlay(profile, {"model": model.model})
+            else:
+                model.model = str((overlay or {}).get("model") or "").strip()
         run_id = run["id"]
 
         context = {"run_id": run_id, "project_id": pid}
-        model = CassetteModel(task.get("cassette") or [], context)
+        if model is None:
+            model = CassetteModel(task.get("cassette") or [], context)
         metrics_queue = list(task.get("job_metrics") or [])
+        metric_fn = (lambda job: _simulated_metrics(task, job)) if live else None
         max_steps = int((task.get("budget") or {}).get("max_steps") or DEFAULT_MAX_STEPS)
         for _ in range(max_steps):
             if model.exhausted:
-                harness_error = f"cassette 耗尽(状态 {statuses[-1] if statuses else '?'})"
+                if live:
+                    harness_error = (
+                        getattr(model, "limit_error", "")
+                        or f"live 模型调用上限 {getattr(model, 'max_calls', '?')}"
+                           f" 或 token 上限 {getattr(model, 'max_tokens', '?')} 已用完"
+                           f"(calls={getattr(model, 'calls', 0)},"
+                           f" tokens={getattr(model, 'tokens_total', 0)})")
+                else:
+                    harness_error = (f"cassette 耗尽"
+                                     f"(状态 {statuses[-1] if statuses else '?'})")
                 break
-            status = runtime.step(repo, None, run_id, profile, model=model)
+            status = runtime.step(repo, credentials, run_id, profile, model=model)
             statuses.append(status)
+            limit_error = getattr(model, "limit_error", "")
+            if limit_error:  # LiveModel 超限:任务直接判 FAIL,不再重试
+                harness_error = str(limit_error)
+                break
             _refresh_job_context(repo, run_id, context)
             try:
-                _drain_queued_jobs(repo, run_id, metrics_queue)
+                _drain_queued_jobs(repo, run_id, metrics_queue, metric_fn=metric_fn)
             except JobMetricsExhausted as exc:
                 harness_error = str(exc)
                 break
@@ -246,9 +313,25 @@ def run_task(task: dict, *, root: Path | None = None, overlay: dict | None = Non
         tool_errors = [f'{e["payload"].get("name")}: {e["payload"].get("error")}'
                        for e in events if e["kind"] == "tool_error"]
 
+    if live:
+        model_label = str(getattr(model, "model", "") or "")
+        if not model_label:
+            try:
+                model_label = model_settings(credentials)["model"]
+            except Exception:  # noqa: BLE001 - 仅展示用
+                model_label = ""
+        model_label = model_label or "injected"
+    else:
+        model_label = "cassette"
+    tokens_total = int(run_row["tokensIn"]) + int(run_row["tokensOut"])
     result = {
         "task_id": task["id"],
         "kind": task.get("kind"),
+        "tier": task.get("tier"),
+        "mode": "live" if live else "replay",
+        "model": model_label,
+        "model_calls": int(getattr(model, "calls", 0) or 0),
+        "tokens_total": tokens_total,
         "status": run_row["status"],
         "statuses": statuses,
         "run": run_row,
@@ -326,10 +409,13 @@ def evaluate_expect(result: dict, expect: dict) -> list[dict]:
 # ------------------------------------------------------------------ 报告与 CLI
 
 
-def load_tasks() -> dict[str, Path]:
-    """{任务 id: 任务文件};文件名 stem 必须与 JSON 里的 id 一致。"""
+def load_tasks(live: bool = False) -> dict[str, Path]:
+    """{任务 id: 任务文件};文件名 stem 必须与 JSON 里的 id 一致。
+
+    live=True 只读 eval/agent/live_tasks(真实模型任务);默认 replay 任务。"""
+    directory = LIVE_TASKS_DIR if live else TASKS_DIR
     tasks: dict[str, Path] = {}
-    for path in sorted(TASKS_DIR.glob("*.json")):
+    for path in sorted(directory.glob("*.json")):
         task = json.loads(path.read_text(encoding="utf-8"))
         if task.get("id") != path.stem:
             raise ValueError(f"任务文件 {path.name} 的 id 字段({task.get('id')})与文件名不一致")
@@ -337,16 +423,28 @@ def load_tasks() -> dict[str, Path]:
     return tasks
 
 
+def load_live_tasks() -> dict[str, Path]:
+    return load_tasks(live=True)
+
+
 def write_report(results: list[dict], out: Path) -> tuple[Path, Path]:
     """写 Markdown 表 + 同名 .jsonl(每任务一行);返回两个路径。"""
     out.parent.mkdir(parents=True, exist_ok=True)
     jsonl = out.with_suffix(".jsonl")
     passed = sum(1 for r in results if r["pass"])
+    mode = results[0].get("mode", "replay") if results else "replay"
+    model = results[0].get("model", "") if results else ""
+    total_calls = sum(int(r.get("model_calls") or 0) for r in results)
+    total_tokens = sum(int(r.get("tokens_total") or 0) for r in results)
     lines = [
-        "# Agent Eval Report(B2.2a replay)",
+        f"# Agent Eval Report({mode})",
         "",
         f"- 生成时间:{datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-         f"- 结果:{passed}/{len(results)} PASS",
+        f"- mode:`{mode}`",
+        f"- model:`{model or '-'}`",
+        f"- 模型调用:{total_calls}",
+        f"- tokens:{total_tokens}",
+        f"- 结果:{passed}/{len(results)} PASS",
     ]
     spec = next((r["spec"] for r in results if r.get("spec")), None)
     if spec:  # C4a:--spec-file 时记录评测的候选 overlay(文件/指纹/键)
@@ -380,7 +478,8 @@ def write_report(results: list[dict], out: Path) -> tuple[Path, Path]:
     with jsonl.open("w", encoding="utf-8") as fh:
         for r in results:
             row = {key: r.get(key) for key in (
-                "task_id", "kind", "pass", "status", "steps", "tokens_in", "tokens_out",
+                "task_id", "kind", "tier", "mode", "model", "model_calls",
+                "tokens_total", "pass", "status", "steps", "tokens_in", "tokens_out",
                 "span_kinds", "tool_calls", "tool_errors", "ask_humans", "duration_ms",
                 "spec", "failures", "harness_error", "workdir")}
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -390,19 +489,30 @@ def write_report(results: list[dict], out: Path) -> tuple[Path, Path]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="eval.agent.run",
-        description="离线 agent eval harness(B2.2a;唯一模式 replay,不调真实模型)")
-    parser.add_argument("--tasks", default="all", help='"all" 或逗号分隔的任务 id')
+        description="agent eval harness:B2.2a replay(默认,不调真实模型)"
+                    "/ C4b live(真实 GLM,显式 --credentials)")
+    parser.add_argument("--tasks", default="all",
+                        help='"all" 或逗号分隔的任务 id(replay 查 tasks/,live 查 live_tasks/)')
     parser.add_argument("--out", default=str(DEFAULT_REPORT),
                         help="Markdown 报告路径(同时写同名 .jsonl)")
     parser.add_argument("--spec-file", default=None,
                         help="overlay config JSON 文件(C4a:评测候选 AgentSpec)")
-    parser.add_argument("--mode", default="replay", choices=["replay"],
-                        help="本轮只有 replay")
+    parser.add_argument("--mode", default="replay", choices=["replay", "live"],
+                        help="replay(默认)/ live(真实模型)")
+    parser.add_argument("--credentials", default=None,
+                        help="凭据文件(live 必填;必须 0600)")
+    parser.add_argument("--model", default=None,
+                        help="临时覆盖模型 id(不写 AgentSpec)")
+    parser.add_argument("--max-model-calls", type=int, default=12,
+                        help="每个任务模型调用上限(live,默认 12)")
+    parser.add_argument("--max-tokens", type=int, default=200000,
+                        help="每个任务输入+输出 token 上限(live,默认 200000)")
     args = parser.parse_args(argv)
 
-    tasks = load_tasks()
+    live = args.mode == "live"
+    tasks = load_tasks(live=live)
     if not tasks:
-        print(f"没有任务:{TASKS_DIR}", file=sys.stderr)
+        print(f"没有任务:{LIVE_TASKS_DIR if live else TASKS_DIR}", file=sys.stderr)
         return 2
     if args.tasks.strip() == "all":
         selected = sorted(tasks)
@@ -420,9 +530,44 @@ def main(argv: list[str] | None = None) -> int:
         overlay = load_spec_file(Path(args.spec_file))
         spec = {"file": str(args.spec_file), "hash": overlay_hash(overlay),
                 "keys": sorted(overlay)}
-    results = [run_task(json.loads(tasks[name].read_text(encoding="utf-8")),
-                        overlay=overlay, spec=spec)
-               for name in selected]
+
+    credentials = None
+    model_override = None
+    if live:
+        if not args.credentials:
+            print("--mode live 需要 --credentials PATH", file=sys.stderr)
+            return 2
+        if args.max_model_calls < 1 or args.max_tokens < 1:
+            print("--max-model-calls / --max-tokens 必须为正整数", file=sys.stderr)
+            return 2
+        cred_path = Path(args.credentials).expanduser()
+        if not cred_path.exists():
+            print(f"credentials 文件不存在:{cred_path}", file=sys.stderr)
+            return 2
+        try:
+            credentials = CredentialStore(cred_path)
+        except Exception as exc:  # noqa: BLE001 - 坏凭据(权限/JSON)一律退出 2
+            print(f"credentials 不可用:{exc}", file=sys.stderr)
+            return 2
+        model_override = ((args.model or "").strip()
+                          or str((overlay or {}).get("model") or "").strip() or None)
+        if not model_settings(credentials, model=model_override)["api_key"]:
+            print("credentials 里没有模型 API Key(model:api-key);"
+                  "先在 Settings 页配置", file=sys.stderr)
+            return 2
+
+    results = []
+    for name in selected:
+        task = json.loads(tasks[name].read_text(encoding="utf-8"))
+        if live:
+            live_model = LiveModel(credentials, model=model_override,
+                                   max_calls=args.max_model_calls,
+                                   max_tokens=args.max_tokens)
+            result = run_task(task, overlay=overlay, spec=spec,
+                              credentials=credentials, model=live_model)
+        else:
+            result = run_task(task, overlay=overlay, spec=spec)
+        results.append(result)
     md, jsonl = write_report(results, Path(args.out))
     for r in results:
         mark = "PASS" if r["pass"] else "FAIL"

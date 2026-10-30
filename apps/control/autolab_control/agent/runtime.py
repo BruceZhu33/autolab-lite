@@ -109,6 +109,8 @@ class LoopProfile:
     verifier: dict = field(default_factory=lambda: {"id": "default-accept", "version": 1})
     # C4a 上下文窗口:_compact_view 保留最近 N 个工具结果不截短(AgentSpec 可覆盖)
     keep_recent: int = 12
+    # C4b 模型覆盖:AgentSpec overlay / eval --model 指定的模型;空 = 用凭据默认
+    model_override: str = ""
     # 每步之前塞给模型的系统提示补充(如:剩余预算);由 profile 自定
     system_suffix: Callable[[LoopEnv], str] | None = None
 
@@ -556,8 +558,9 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                     spec_hash=snapshot.spec_hash())
         view = _compact_view(messages, profile.keep_recent)
         tool_specs = [t.spec() for t in tools]
-        model_id = model_settings(credentials)["model"]
-        call = model or (lambda **kw: call_model(credentials, **kw))
+        model_override = profile.model_override or None
+        model_id = model_settings(credentials, model=model_override)["model"]
+        call = model or (lambda **kw: call_model(credentials, model=model_override, **kw))
         llm_in = trace.llm_input(system, view, tool_specs)  # 调用前快照确切视图
         started_at = utc_now()
         try:

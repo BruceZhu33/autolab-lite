@@ -4,7 +4,7 @@
 - 资源:servers / projects
 - 执行:plan_revisions / jobs / gpu_leases / job_events / artifacts
 - 阶段 agent:agent_runs / agent_run_events / agent_run_inbox / research_rounds / research_cases
-  / agent_specs / research_campaigns
+  / agent_specs / agent_canaries / research_campaigns
 
 建表与迁移每个 Database 实例只跑一次(旧实现每次 connect 都重跑)。
 旧库里已退役的表(proposals、iteration_loops、chat_* 等)原样保留、不再读写。
@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -312,6 +312,9 @@ CREATE TABLE IF NOT EXISTS agent_specs (
     parent_id TEXT,
     status TEXT NOT NULL CHECK (status IN ('candidate','active','retired','rejected')),
     config_json TEXT NOT NULL DEFAULT '{}',
+    -- C4b-2 变异来源(只允许 source/rationale/model/canaryId/createdAt);
+    -- 旧 v25/v26/v27 库由 _migrate 补列。不升 SCHEMA_VERSION:兼容补列。
+    provenance_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -319,6 +322,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_specs_active
     ON agent_specs(kind) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_agent_specs_kind
     ON agent_specs(kind, created_at);
+
+-- C4b canary:对 candidate 跑「候选 vs 当前 active」同任务对照,只产出建议,
+-- 绝不自动 activate。result_json 含 recommendation/reasons/逐任务明细。
+CREATE TABLE IF NOT EXISTS agent_canaries (
+    id TEXT PRIMARY KEY,
+    spec_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('cassette','live')),
+    status TEXT NOT NULL CHECK (status IN ('running','done','failed')),
+    tasks_json TEXT NOT NULL DEFAULT '[]',
+    result_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_canaries_spec
+    ON agent_canaries(spec_id, created_at);
 """
 
 
@@ -434,6 +454,13 @@ class Database:
                 if col not in cols:
                     conn.execute(
                         f"ALTER TABLE agent_runs ADD COLUMN {col} {decl}")
+        if "agent_specs" in {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")} \
+                and "provenance_json" not in _columns(conn, "agent_specs"):
+            # C4b-2 变异来源:不升 SCHEMA_VERSION(v27),已有表原地补列;
+            # v25 没有 agent_specs 时下面的 executescript 会按新 schema 建表。
+            conn.execute("ALTER TABLE agent_specs ADD COLUMN"
+                         " provenance_json TEXT NOT NULL DEFAULT '{}'")
         conn.executescript(_SCHEMA)
         conn.execute("INSERT OR IGNORE INTO schema_migrations (version, applied_at)"
                      " VALUES (?, ?)", (SCHEMA_VERSION, utc_now()))

@@ -1,0 +1,21 @@
+{
+  "id": "baseline_smoke",
+  "kind": "baseline",
+  "title": "Live baseline smoke:真实模型跑 tiny 基线并交 owner 确认",
+  "fixture": "fixtures/tiny_repo",
+  "note": "用 data/tiny/sample.txt 跑通 tiny 数据集基线",
+  "datasets": ["tiny"],
+  "metric_profile": {
+    "baseline": {"tiny": 0.81},
+    "variant_gains": {"tiny": {"base": 0.0}},
+    "seed_spread": 0.002
+  },
+  "expect": {
+    "status": "waiting_human",
+    "pending.kind": "confirm_baseline",
+    "tool_calls_contains": "run_experiment",
+    "steps_lte": 20,
+    "tool_errors": []
+  },
+  "budget": {"max_steps": 20}
+}

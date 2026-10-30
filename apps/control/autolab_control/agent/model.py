@@ -29,8 +29,13 @@ class ModelError(UserError):
     """模型不可用(key 缺失/失效、端点故障)。"""
 
 
-def model_settings(credentials: CredentialStore | None) -> dict:
-    """{api_key, base_url, model};找不到 key 时 api_key 为空。"""
+def model_settings(credentials: CredentialStore | None, *,
+                   model: str | None = None) -> dict:
+    """{api_key, base_url, model};找不到 key 时 api_key 为空。
+
+    model 给了就覆盖凭据里的模型(AgentSpec overlay / --model);key 与
+    base_url 仍来自凭据,不因覆盖改变。"""
+    override = model.strip() if isinstance(model, str) and model.strip() else None
     for ref in (MODEL_KEY_REF, _LEGACY_KEY_REF):
         try:
             entry = credentials.get_entry(ref) if credentials else {}
@@ -39,8 +44,9 @@ def model_settings(credentials: CredentialStore | None) -> dict:
         if entry.get("api_key"):
             return {"api_key": entry["api_key"],
                     "base_url": entry.get("base_url") or DEFAULT_BASE_URL,
-                    "model": entry.get("model") or DEFAULT_MODEL}
-    return {"api_key": "", "base_url": DEFAULT_BASE_URL, "model": DEFAULT_MODEL}
+                    "model": override or entry.get("model") or DEFAULT_MODEL}
+    return {"api_key": "", "base_url": DEFAULT_BASE_URL,
+            "model": override or DEFAULT_MODEL}
 
 
 def save_model_settings(credentials: CredentialStore, *, api_key: str,
@@ -60,9 +66,11 @@ def public_settings(credentials: CredentialStore | None) -> dict:
 
 
 def call_model(credentials: CredentialStore | None, *, system: str, messages: list[dict],
-               tools: list[dict], max_tokens: int) -> dict:
-    """一次 tool_use 调用;空回复 / 网络抖动 / 5xx / 429 退避重试 4 次。"""
-    settings = model_settings(credentials)
+               tools: list[dict], max_tokens: int, model: str | None = None) -> dict:
+    """一次 tool_use 调用;空回复 / 网络抖动 / 5xx / 429 退避重试 4 次。
+
+    model 覆盖 payload 里的模型(api_key / base_url 不变)。"""
+    settings = model_settings(credentials, model=model)
     if not settings["api_key"]:
         raise ModelError("还没有配置模型 API Key:在 Settings 页填写")
     payload = {"model": settings["model"], "max_tokens": max_tokens, "system": system,

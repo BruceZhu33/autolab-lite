@@ -6,7 +6,8 @@ import { useTheme } from "next-themes";
 import { useQuery } from "@tanstack/react-query";
 import {
   BarChart3, BookOpen, ChevronDown, FlaskConical, FolderKanban, FolderPlus,
-  GitBranch, Gpu, Lightbulb, ListChecks, Moon, Newspaper, Settings, Sun, User,
+  GitBranch, Gpu, Lightbulb, ListChecks, Moon, Newspaper, Settings,
+  SlidersHorizontal, Sun, User,
 } from "lucide-react";
 
 import { whoami } from "@/lib/api";
@@ -35,6 +36,7 @@ const TOOLS = [
   { label: "论文雷达", icon: Newspaper, href: "/papers", key: "papers" },
   { label: "知识对话", icon: BookOpen, href: "/kb", key: "kb" },
   { label: "空间与文档", icon: FolderPlus, href: "/spaces", key: "spaces" },
+  { label: "Agent 规格", icon: SlidersHorizontal, href: "/specs", key: "specs" },
   { label: "GPU 服务器", icon: Gpu, href: "/gpus", key: "gpus" },
 ];
 

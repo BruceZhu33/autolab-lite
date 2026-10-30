@@ -89,7 +89,8 @@ def apply_profile_overlay(profile: LoopProfile, overlay: dict) -> LoopProfile:
     """把 AgentSpec overlay 应用到 profile,返回新实例(不改原件)。
 
     prompt_append 追加到 system prompt 末尾;tool_exclude 包装 build_tools
-    按 name 过滤(保留顺序);max_* / wall_clock_seconds / keep_recent 直接覆盖。
+    按 name 过滤(保留顺序);model → model_override;max_* /
+    wall_clock_seconds / keep_recent 直接覆盖。
     verifier 不动:验收口径不属于变体自由度。契约校验在 stages 层(owner API),
     这里只做应用,容忍任何键。
     """
@@ -97,6 +98,9 @@ def apply_profile_overlay(profile: LoopProfile, overlay: dict) -> LoopProfile:
     append = str(overlay.get("prompt_append") or "").strip()
     if append:
         updates["system_prompt"] = profile.system_prompt + "\n\n## 变体指令\n" + append
+    model = str(overlay.get("model") or "").strip()
+    if model:
+        updates["model_override"] = model
     excluded = [str(t) for t in overlay.get("tool_exclude") or []]
     if excluded:
         drop = frozenset(excluded)
@@ -120,7 +124,8 @@ def build_agent_spec(profile: LoopProfile, credentials: Any,
     overlay = {"id","label","config"}(stages 注册表的运行时形态)或 None:
     只记录 id 与 config 的内容 hash,不记录完整 prompt_append 文本。
     """
-    settings = model_settings(credentials)  # 只取 model / base_url;key 绝不落库
+    settings = model_settings(
+        credentials, model=profile.model_override or None)  # 只取 model / base_url;key 绝不落库
     prompt_hash = hashlib.sha256(
         profile.system_prompt.encode("utf-8")).hexdigest()
     overlay_cfg = (overlay or {}).get("config") or {}
