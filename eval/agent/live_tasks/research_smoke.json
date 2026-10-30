@@ -24,7 +24,7 @@
     "pending.kind": "round_review",
     "tool_calls_contains": "run_experiment",
     "steps_lte": 20,
-    "tool_errors": []
+    "tool_errors_count_lte": 1
   },
   "budget": {"max_steps": 20}
 }

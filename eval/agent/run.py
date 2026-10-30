@@ -384,17 +384,28 @@ def _contains(actual: object, expected: str) -> bool:
 
 
 def evaluate_expect(result: dict, expect: dict) -> list[dict]:
-    """按点路径断言;后缀决定算子:_contains 包含、_gte/_lte 数值比较、其余 ==。"""
+    """按点路径断言;后缀决定算子:_contains 包含、_gte/_lte 数值比较、
+    _count_gte/_count_lte 列表/字符串长度比较、其余 ==。
+
+    live 任务用 count_lte 允许少量可恢复的工具错误(真实模型会试错),
+    replay 任务仍可用精确 tool_errors == [] 卡死回归。
+    """
     failures = []
     for key, expected in expect.items():
         op, path = "==", key
-        for suffix in ("contains", "gte", "lte"):
+        # 长后缀先匹配,否则 count_lte 会被 lte 截走。
+        for suffix in ("contains", "count_gte", "count_lte", "gte", "lte"):
             if key.endswith("_" + suffix):
                 op, path = suffix, key[: -(len(suffix) + 1)]
                 break
         actual = _get_path(result, path)
         if op == "contains":
             ok = _contains(actual, str(expected))
+        elif op in ("count_gte", "count_lte"):
+            ok = (isinstance(actual, (list, str)) and isinstance(expected, int)
+                  and not isinstance(expected, bool)
+                  and ((len(actual) >= expected) if op == "count_gte"
+                       else (len(actual) <= expected)))
         elif op in ("gte", "lte"):
             ok = (isinstance(actual, (int, float)) and not isinstance(actual, bool)
                   and (actual >= expected if op == "gte" else actual <= expected))

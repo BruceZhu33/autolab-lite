@@ -145,6 +145,17 @@ def test_live_report_contains_mode_model_tokens(tmp_path):
     assert row["model_calls"] == 3 and row["tokens_total"] == 450
 
 
+def test_evaluate_expect_count_ops_for_recoverable_tool_errors():
+    result = {"tool_errors": ["run_experiment: Job 名重复"], "empty": []}
+    assert harness.evaluate_expect(result, {"tool_errors_count_lte": 1}) == []
+    assert harness.evaluate_expect(result, {"empty_count_gte": 0}) == []
+    failures = harness.evaluate_expect(
+        result, {"tool_errors_count_lte": 0, "empty_count_gte": 1})
+    assert {f["op"] for f in failures} == {"count_lte", "count_gte"}
+    # 长后缀不能被 lte/gte 截走:路径必须是 tool_errors,不是 tool_errors_count
+    assert failures[0]["path"] == "tool_errors"
+
+
 # ------------------------------------------------------------------ metric_profile
 
 
