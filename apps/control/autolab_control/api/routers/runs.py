@@ -21,6 +21,11 @@ def build(ctx: Ctx) -> APIRouter:
     def latest(project_id: str, kind: str) -> dict:
         return {"run": runtime.latest_run(repo, project_id, kind)}
 
+    @router.get("/api/projects/{project_id}/runs/{kind}", dependencies=[ctx.reader])
+    def project_runs(project_id: str, kind: str, limit: int = 20) -> dict:
+        """项目某阶段的历史会话列表(新在前),供控制台回放与切换。"""
+        return {"runs": runtime.list_runs(repo, project_id, kind, limit)}
+
     @router.get("/api/runs/{run_id}/events", dependencies=[ctx.reader])
     def events(run_id: str, after: int = 0) -> dict:
         return {"run": runtime.get_run(repo, run_id),

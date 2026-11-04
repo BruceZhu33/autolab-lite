@@ -9,7 +9,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   AlertTriangle, Bot, CheckCircle2, FileUp, FolderOpen, Hourglass, Loader2,
-  MessageSquare, Square, Terminal,
+  MessageSquare, ShieldCheck, Square, Terminal,
 } from "lucide-react";
 import {
   confirmBaseline, fetchRunEvents, isActive, linkAsset, sendRunMessage, stopRun, uploadAsset,
@@ -74,6 +74,56 @@ function EventRow({ event }: { event: RunEvent }) {
           <AlertTriangle className="mr-1 inline size-3 align-[-2px]" />核验未通过:{String(p.reason ?? "")}
         </p>
       );
+    case "critic": {
+      const verdict = String(p.verdict ?? "approve");
+      const reasons = Array.isArray(p.reasons) ? p.reasons.map(String) : [];
+      const suggestions = Array.isArray(p.suggestions) ? p.suggestions.map(String) : [];
+      const tone = verdict === "approve"
+        ? "border-info/30 bg-info/5 text-info"
+        : verdict === "revise"
+        ? "border-warning/40 bg-warning/5 text-warning"
+        : "border-destructive/40 bg-destructive/5 text-destructive";
+      return (
+        <div className={`ml-4 rounded-xl border-[0.5px] px-2.5 py-1.5 text-micro ${tone}`}>
+          <p className="font-semibold">
+            <ShieldCheck className="mr-1 inline size-3 align-[-2px]" />
+            实验前审阅 (Critic): {verdict}
+          </p>
+          {reasons.length > 0 ? <p className="mt-0.5 text-foreground/80">原因:{reasons.join("; ")}</p> : null}
+          {suggestions.length > 0 ? <p className="mt-0.5 text-muted-foreground">建议:{suggestions.join("; ")}</p> : null}
+        </div>
+      );
+    }
+    case "reviewer": {
+      const verdict = String(p.verdict ?? "valid");
+      const severity = String(p.severity ?? "low");
+      const reasons = Array.isArray(p.reasons) ? p.reasons.map(String) : [];
+      const tone = verdict === "valid"
+        ? "border-success/30 bg-success/5 text-success"
+        : severity === "low"
+        ? "border-warning/40 bg-warning/5 text-warning"
+        : "border-destructive/40 bg-destructive/5 text-destructive";
+      return (
+        <div className={`ml-4 rounded-xl border-[0.5px] px-2.5 py-1.5 text-micro ${tone}`}>
+          <p className="font-semibold">
+            <ShieldCheck className="mr-1 inline size-3 align-[-2px]" />
+            轮末证据审阅 (Reviewer): {verdict}{verdict === "suspect" ? ` (${severity})` : ""}
+          </p>
+          {reasons.length > 0 ? <p className="mt-0.5 text-foreground/80">{reasons.join("; ")}</p> : null}
+        </div>
+      );
+    }
+    case "protected_paths_changed":
+      return (
+        <p className="text-micro text-destructive">
+          <AlertTriangle className="mr-1 inline size-3 align-[-2px]" />
+          受保护路径被修改 ({String(p.kind ?? "")}): 本轮收束被拒绝
+        </p>
+      );
+    case "llm_truncated":
+      return <p className="text-micro text-warning">— 回复达到 max_tokens 截断上限,已提示 Agent 拆分重试 —</p>;
+    case "jobs_cancelled":
+      return <p className="text-micro text-muted-foreground">— 已取消未完成实验 Job —</p>;
     case "model_error":
       return <p className="text-micro text-destructive">— 模型调用失败,稍后自动重试:{brief(p.error)} —</p>;
     case "new_context":
@@ -302,14 +352,35 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
 
   return (
     <div className="space-y-3 rounded-2xl border-[0.5px] border-surface-border bg-card p-3.5 shadow-[var(--surface-shadow)]">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Bot className="size-4 text-brand" />
         <span className="text-caption font-semibold">Agent 会话</span>
         {current.config?.mode === "validation" ? (
           <span className="rounded-full bg-info/10 px-2 py-0.5 text-micro font-medium text-info">全量验证</span>
+        ) : current.config?.tier ? (
+          <span className="rounded-full bg-muted/60 px-2 py-0.5 text-micro text-muted-foreground">
+            {String(current.config.tier)}
+          </span>
         ) : null}
         <span className={`rounded-full px-2 py-0.5 text-micro font-medium ${status.cls}`}>{status.label}</span>
         {current.status === "running" ? <Loader2 className="size-3.5 animate-spin text-brand" /> : null}
+        {current.config?.critic ? (
+          <span className="rounded-full bg-info/10 px-1.5 py-0.5 text-micro text-info" title="已开启实验前审阅 Critic">
+            Critic
+          </span>
+        ) : null}
+        {current.config?.reviewer ? (
+          <span className="rounded-full bg-info/10 px-1.5 py-0.5 text-micro text-info" title="已开启轮末审阅 Reviewer">
+            Reviewer
+          </span>
+        ) : null}
+        {current.spec?.modelId ? (
+          <code className="rounded bg-muted/50 px-1.5 py-0.5 font-mono text-micro text-muted-foreground"
+                title={current.specHash ? `Spec Hash: ${current.specHash}` : undefined}>
+            {current.spec.modelId}
+            {current.spec.agentSpecId ? ` · ${String(current.spec.agentSpecId).slice(-8)}` : ""}
+          </code>
+        ) : null}
         <span className="ml-auto font-mono text-micro tabular-nums text-muted-foreground">
           {current.steps} 步 · {Math.round((current.tokensIn + current.tokensOut) / 1000)}k tokens
         </span>

@@ -42,6 +42,15 @@ export type Run = {
   stopReason: string | null;
   pending: RunPending | null;
   result: Record<string, unknown> | null;
+  spec?: {
+    specId?: string;
+    modelId?: string;
+    agentSpecId?: string;
+    agentSpecHash?: string;
+    codeRev?: string;
+    [key: string]: unknown;
+  } | null;
+  specHash?: string;
   config: Record<string, unknown>;
   steps: number;
   tokensIn: number;
@@ -74,15 +83,18 @@ export type ResearchTier = "light" | "medium" | "heavy";
 
 /** 变体 = 一次 run_experiment 在同一数据集上的多 seed;(planId, dataset) 聚合均值 */
 export type VariantMean = {
-  planId: string | null; dataset: string | null; label?: string;
+  planId: string | null; dataset: string | null; variant?: string | null; label?: string;
   n: number; meanValue: number; baseline?: number | null;
-  meanGain: number | null; improved: boolean;
+  meanGain: number | null; stdGain?: number | null;
+  ciLow?: number | null; ciHigh?: number | null; significant?: boolean;
+  improved: boolean;
   metric: string | null; jobIds: string[];
 };
 
 export type RoundChampion = {
-  round: number; planId: string; label?: string | null; dataset?: string | null;
+  round: number; planId: string; variant?: string | null; label?: string | null; dataset?: string | null;
   n: number; meanValue?: number; meanGain: number;
+  ciLow?: number | null; ciHigh?: number | null;
 };
 
 export type ResearchRound = {
@@ -98,6 +110,7 @@ export type ResearchRound = {
   verdict?: string;
   validation?: boolean;
   champion?: RoundChampion;
+  evidenceHash?: string;
   evaluation: {
     anyImproved: boolean;
     bestGain: number | null;
@@ -105,7 +118,8 @@ export type ResearchRound = {
     succeeded: number;
     warnings: string[];
     rows: Array<{
-      jobId: string; name: string | null; dataset: string | null; status: string;
+      jobId: string; name: string | null; dataset: string | null; variant?: string | null;
+      seed?: number | null; evalJobId?: string | null; status: string;
       metric: string | null; value: number | null; baseline: number | null;
       gain: number | null; improved: boolean;
     }>;
@@ -121,6 +135,8 @@ export const isActive = (run: Run | null | undefined) =>
 
 export const fetchLatestRun = (projectId: string, kind: RunKind) =>
   get<{ run: Run | null }>(`/api/projects/${projectId}/runs/${kind}/latest`);
+export const fetchProjectRuns = (projectId: string, kind: RunKind, limit = 20) =>
+  get<{ runs: Run[] }>(`/api/projects/${projectId}/runs/${kind}?limit=${limit}`);
 export const fetchRunEvents = (runId: string, after = 0) =>
   get<{ run: Run; events: RunEvent[] }>(`/api/runs/${runId}/events?after=${after}`);
 
@@ -129,19 +145,23 @@ export const sendRunMessage = (runId: string, text: string) =>
   post<{ runId: string }>(`/api/owner/runs/${runId}/message`, { text });
 export const stopRun = (runId: string) => post<{ runId: string }>(`/api/owner/runs/${runId}/stop`);
 
-export const startBaseline = (projectId: string, input: { note?: string; network?: boolean }) =>
-  post<{ run: Run }>(`/api/owner/projects/${projectId}/baseline/start`, input);
+export const startBaseline = (projectId: string, input: {
+  note?: string; network?: boolean; agent_spec_id?: string;
+}) => post<{ run: Run }>(`/api/owner/projects/${projectId}/baseline/start`, input);
 export const confirmBaseline = (runId: string) =>
   post<{ run: Run }>(`/api/owner/runs/${runId}/baseline/confirm`);
 
 export const startResearch = (projectId: string, input: {
-  tier: ResearchTier; idea?: string; reference?: string; network?: boolean; gpu_hours?: number;
+  tier: ResearchTier; idea?: string; reference?: string; network?: boolean;
+  max_rounds?: number; gpu_hours?: number;
   datasets?: string[]; kb_assist?: boolean; kb_spaces?: string[];
+  critic?: boolean; reviewer?: boolean; agent_spec_id?: string;
 }) => post<{ run: Run }>(`/api/owner/projects/${projectId}/research/start`, input);
 
 /** 全量验证:把最近一次成功研究会话的冠军改动在选定数据集上按基线口径多 seed 重跑。 */
 export const startValidation = (projectId: string, input: {
   datasets?: string[]; seeds?: number; source_run_id?: string; gpu_hours?: number;
+  critic?: boolean; reviewer?: boolean; agent_spec_id?: string;
 }) => post<{ run: Run }>(`/api/owner/projects/${projectId}/research/validate`, input);
 
 /** 采纳全量验证会话的实测为新基线(owner 决策;未通过也可拍板,留痕)。 */
@@ -152,3 +172,95 @@ export const adoptValidation = (projectId: string, runId: string) =>
 export const fetchResearchRounds = (projectId: string, runId?: string) =>
   get<{ rounds: ResearchRound[] }>(
     `/api/projects/${projectId}/research/rounds${runId ? `?run_id=${runId}` : ""}`);
+
+// ------------------------------------------------------------------ 并行研究分支 Campaign (Phase C3)
+
+export type CampaignStatus = "running" | "done" | "stopped" | "failed";
+
+export type CampaignBranch = {
+  index?: number;
+  idea?: string;
+  projectId?: string;
+  runId: string;
+  name?: string;
+  fork?: string;
+  aborted?: boolean;
+  runStatus: RunStatus | null;
+  result?: {
+    success?: boolean;
+    bestGain?: number | null;
+    rounds?: number;
+    champion?: RoundChampion | null;
+    [key: string]: unknown;
+  } | null;
+  bestGain?: number | null;
+};
+
+export type CampaignWinner = {
+  index?: number;
+  idea?: string;
+  projectId: string;
+  runId: string;
+  name?: string;
+  runStatus?: RunStatus | null;
+  success: boolean;
+  gain: number | null;
+  rounds?: number | null;
+  createdAt?: string;
+};
+
+export type CampaignPromotion = {
+  at: string;
+  sourceProjectId: string;
+  sourceCommit: string;
+  winnerProjectId: string;
+  winnerRunId: string;
+  winnerBranch: string;
+  baselineRunId?: string | null;
+};
+
+export type ResearchCampaign = {
+  id: string;
+  sourceProjectId: string;
+  status: CampaignStatus;
+  config: {
+    ideas?: string[];
+    tier?: ResearchTier;
+    datasets?: string[] | null;
+    critic?: boolean;
+    reviewer?: boolean;
+    max_rounds?: number | null;
+    gpu_hours?: number | null;
+  };
+  branches: CampaignBranch[];
+  winner: CampaignWinner | null;
+  result: {
+    winner?: CampaignWinner | null;
+    ranking?: CampaignWinner[];
+    reason?: string;
+    finishedAt?: string;
+    error?: string;
+    promotedAt?: string;
+    promotion?: CampaignPromotion;
+  } | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export const startCampaign = (projectId: string, input: {
+  ideas: string[]; tier?: ResearchTier; datasets?: string[];
+  critic?: boolean; reviewer?: boolean; max_rounds?: number; gpu_hours?: number;
+  agent_spec_id?: string;
+}) => post<{ campaign: ResearchCampaign }>(`/api/owner/projects/${projectId}/research/campaigns`, input);
+
+export const fetchProjectCampaigns = (projectId: string) =>
+  get<{ campaigns: ResearchCampaign[] }>(`/api/projects/${projectId}/research/campaigns`);
+
+export const fetchCampaign = (campaignId: string) =>
+  get<{ campaign: ResearchCampaign }>(`/api/research/campaigns/${campaignId}`);
+
+export const stopCampaign = (campaignId: string) =>
+  post<{ campaign: ResearchCampaign }>(`/api/owner/research/campaigns/${campaignId}/stop`);
+
+export const promoteCampaign = (campaignId: string) =>
+  post<{ campaign: ResearchCampaign }>(`/api/owner/research/campaigns/${campaignId}/promote`, { confirm: true });

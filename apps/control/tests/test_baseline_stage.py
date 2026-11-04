@@ -494,3 +494,33 @@ def test_metric_contract_eval_command_validation(api, tmp_path):
     assert eval_cfg["command"] == "" and eval_cfg["timeout_minutes"] == 30 \
         and eval_cfg["gpus_per_job"] == 1
     assert re.fullmatch(r"[0-9a-f]{64}", eval_cfg["code_hash"])
+
+
+def test_project_runs_list_endpoint(api, tmp_path):
+    """历史会话回放列表:按创建时间/rowid 逆序返回同项目同阶段的会话。"""
+    client, repo = api["client"], api["repo"]
+    pid = make_project(api, tmp_path)
+    _confirm_plain(repo, pid, {"val_dice": 0.8})
+
+    r1 = client.post(f"/api/owner/projects/{pid}/research/start",
+                     json={"tier": "light", "idea": "第一轮探索"}, headers=OWNER_H)
+    assert r1.status_code == 200
+    first_id = r1.json()["run"]["id"]
+    client.post(f"/api/owner/runs/{first_id}/stop", headers=OWNER_H)
+    assert al.step(repo, None, first_id, baseline_stage.PROFILE,
+                   model=ScriptModel([])) == "stopped"
+
+    r2 = client.post(f"/api/owner/projects/{pid}/research/start",
+                     json={"tier": "medium", "idea": "第二轮探索",
+                           "critic": True, "reviewer": True}, headers=OWNER_H)
+    assert r2.status_code == 200
+    second_id = r2.json()["run"]["id"]
+
+    listed = client.get(f"/api/projects/{pid}/runs/research?limit=10",
+                        headers=AGENT_H)
+    assert listed.status_code == 200
+    runs = listed.json()["runs"]
+    assert [r["id"] for r in runs] == [second_id, first_id]
+    assert runs[0]["config"]["critic"] is True and runs[0]["config"]["reviewer"] is True
+    assert client.get(f"/api/projects/{pid}/runs/baseline",
+                      headers=AGENT_H).json()["runs"] == []

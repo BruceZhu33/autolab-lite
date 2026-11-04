@@ -15,7 +15,9 @@ import {
 
 const FIELD = "w-full rounded-md border-[0.5px] border-surface-border bg-background px-2 text-caption";
 
-export function ValidateLaunch({ project, label }: { project: Project; label?: string }) {
+export function ValidateLaunch({ project, sourceRunId, label }: {
+  project: Project; sourceRunId?: string; label?: string;
+}) {
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const [seeds, setSeeds] = useState("3");
@@ -37,9 +39,11 @@ export function ValidateLaunch({ project, label }: { project: Project; label?: s
       await startValidation(project.id, {
         datasets: picked.length ? picked : undefined,
         seeds: Number(seeds) || 3,
+        source_run_id: sourceRunId,
       });
       setOpen(false);
       void queryClient.invalidateQueries({ queryKey: ["run-latest", project.id] });
+      void queryClient.invalidateQueries({ queryKey: ["project-runs", project.id] });
     } catch (err) {
       toast.error(`启动验证失败:${(err as Error).message}`);
     } finally {

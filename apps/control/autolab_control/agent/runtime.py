@@ -278,6 +278,24 @@ def latest_run(repo: Repo, project_id: str, kind: str) -> dict | None:
     return _public(dict(row)) if row is not None else None
 
 
+def list_runs(repo: Repo, project_id: str, kind: str | None = None,
+              limit: int = 20) -> list[dict]:
+    """项目的最近会话列表(新在前);不返回 messages_json,含 spec/result/config。"""
+    sql = "SELECT * FROM agent_runs WHERE project_id = ?"
+    args: list[Any] = [project_id]
+    if kind:
+        sql += " AND kind = ?"
+        args.append(kind)
+    sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 50)))
+    conn = repo.db.connect()
+    try:
+        rows = conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+    return [_public(dict(row)) for row in rows]
+
+
 def list_events(repo: Repo, run_id: str, after: int = 0) -> list[dict]:
     conn = repo.db.connect()
     try:

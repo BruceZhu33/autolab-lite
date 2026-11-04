@@ -2,12 +2,17 @@
 
 /** 研究 = 一个 Agent 会话:论文/参考库 + 你的想法 → 自由迭代;是否提升由 Python 对照基线判定。 */
 
+import { useState } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
-import { BadgeCheck, FlaskConical, Lightbulb } from "lucide-react";
-import { fetchLatestRun, fetchProjectDatasets, fetchResearchRounds, isActive, type Project } from "@/lib/api";
+import { BadgeCheck, FlaskConical, History, Lightbulb } from "lucide-react";
+import {
+  fetchLatestRun, fetchProjectDatasets, fetchProjectRuns, fetchResearchRounds,
+  isActive, type Project, type Run,
+} from "@/lib/api";
 import { RunPanel } from "@/components/agent-run/panel";
 import { ProjectTabs, useProjectSelection } from "@/components/project-picker";
+import { CampaignPanel } from "@/components/research/campaign-panel";
 import { ResearchJournal } from "@/components/research/journal";
 import { ResearchStartForm } from "@/components/research/start-form";
 import { AdoptButton } from "@/components/research/adopt-button";
@@ -15,6 +20,32 @@ import { ValidateLaunch } from "@/components/research/validate-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "~/vendor/ui/components/ui/button";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-header";
+
+const STATUS_SHORT: Record<string, string> = {
+  running: "工作中",
+  waiting_human: "等你回复",
+  waiting_jobs: "等 GPU",
+  done: "完成",
+  failed: "失败",
+  stopped: "已停止",
+};
+
+function formatRunOption(run: Run, idx: number, total: number): string {
+  const mode = run.config?.mode === "validation"
+    ? "全量验证"
+    : String(run.config?.tier ?? "research");
+  const st = STATUS_SHORT[run.status] ?? run.status;
+  const res = (run.result ?? null) as {
+    bestGain?: number | null;
+    champion?: { meanGain?: number | null; label?: string | null };
+  } | null;
+  const gain = res?.champion?.meanGain ?? res?.bestGain ?? null;
+  const gainStr = typeof gain === "number" && !Number.isNaN(gain)
+    ? ` · ${gain >= 0 ? "+" : ""}${gain.toFixed(4)}`
+    : "";
+  const time = run.createdAt ? `${run.createdAt.slice(5, 10)} ${run.createdAt.slice(11, 16)}` : "";
+  return `#${total - idx}${idx === 0 ? "(最新)" : ""} · ${mode} · ${st}${gainStr} · ${run.steps}步 (${time})`;
+}
 
 function BaselineCard({ project }: { project: Project }) {
   const { data } = useQuery({
@@ -57,19 +88,35 @@ function BaselineCard({ project }: { project: Project }) {
 }
 
 function ResearchSection({ project }: { project: Project }) {
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [allRoundsMode, setAllRoundsMode] = useState(false);
+
   const { data } = useQuery({
     queryKey: ["run-latest", project.id, "research"],
     queryFn: () => fetchLatestRun(project.id, "research"),
     refetchInterval: 4000,
   });
-  const run = data?.run ?? null;
+  const latestRun = data?.run ?? null;
+
+  const runsQuery = useQuery({
+    queryKey: ["project-runs", project.id, "research"],
+    queryFn: () => fetchProjectRuns(project.id, "research", 20),
+    refetchInterval: isActive(latestRun) ? 5000 : false,
+  });
+  const runs = runsQuery.data?.runs ?? (latestRun ? [latestRun] : []);
+
+  const run = (selectedRunId ? runs.find((r) => r.id === selectedRunId) : null) ?? latestRun;
+  const viewingHistorical = !!run && !!latestRun && run.id !== latestRun.id;
+
   const { data: rounds } = useQuery({
-    queryKey: ["research-rounds", project.id, run?.id ?? ""],
-    queryFn: () => fetchResearchRounds(project.id, run!.id),
-    enabled: !!run,
+    queryKey: ["research-rounds", project.id, allRoundsMode ? "all" : (run?.id ?? "")],
+    queryFn: () => fetchResearchRounds(project.id, allRoundsMode ? undefined : run!.id),
+    enabled: !!run || allRoundsMode,
     refetchInterval: isActive(run) ? 5000 : false,
   });
-  const result = (run?.result ?? null) as { success?: boolean; adopted?: boolean; adoptedAt?: string;
+
+  const result = (run?.result ?? null) as {
+    success?: boolean; adopted?: boolean; adoptedAt?: string;
     champion?: {
       round: number; label?: string | null; dataset?: string | null;
       n: number; meanGain: number;
@@ -77,12 +124,47 @@ function ResearchSection({ project }: { project: Project }) {
     validation?: { datasets?: string[] };
   } | null;
   const validated = run?.config?.mode === "validation";
-  const canValidate = !!run && !isActive(run) && !validated && !!result?.success;
-  const canAdopt = !!run && !isActive(run) && validated && !result?.adopted;
+  const canValidate = !!run && !isActive(latestRun) && !validated && !!result?.success;
+  const canAdopt = !!run && !isActive(latestRun) && validated && !result?.adopted;
+
   return (
     <div className="space-y-3">
       <BaselineCard project={project} />
-      {!isActive(run) ? <ResearchStartForm project={project} /> : null}
+      {!isActive(latestRun) ? <ResearchStartForm project={project} /> : null}
+      <CampaignPanel project={project} />
+
+      {runs.length > 1 ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border-[0.5px] border-surface-border bg-card px-3 py-2">
+          <History className="size-3.5 text-muted-foreground" />
+          <span className="text-micro font-medium text-muted-foreground">研究会话回放:</span>
+          <select
+            value={run?.id ?? ""}
+            onChange={(e) => setSelectedRunId(e.target.value || null)}
+            className="h-7 min-w-0 flex-1 rounded-md border-[0.5px] border-surface-border bg-background px-2 font-mono text-micro sm:max-w-md"
+          >
+            {runs.map((r, idx) => (
+              <option key={r.id} value={r.id}>
+                {formatRunOption(r, idx, runs.length)}
+              </option>
+            ))}
+          </select>
+          {viewingHistorical ? (
+            <>
+              <span className="rounded-full bg-warning/15 px-2 py-0.5 text-micro font-medium text-warning">
+                正在回看历史会话
+              </span>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => setSelectedRunId(null)}
+              >
+                回到最新会话
+              </Button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
       {run ? <RunPanel key={run.id} project={project} run={run} /> : null}
       {canAdopt ? (
         <div className={`space-y-2 rounded-xl border-[0.5px] p-3 ${
@@ -127,10 +209,37 @@ function ResearchSection({ project }: { project: Project }) {
             ) : null}
             。是否在全部数据集上验证该方案?
           </p>
-          <ValidateLaunch project={project} />
+          <ValidateLaunch project={project} sourceRunId={run.id} />
         </div>
       ) : null}
-      <ResearchJournal rounds={rounds?.rounds ?? []} projectTitle={project.name} />
+      <ResearchJournal
+        rounds={rounds?.rounds ?? []}
+        projectTitle={project.name}
+        headerExtra={
+          runs.length > 1 ? (
+            <div className="inline-flex rounded-md border-[0.5px] border-surface-border bg-muted/40 p-0.5 text-micro">
+              <button
+                type="button"
+                onClick={() => setAllRoundsMode(false)}
+                className={`rounded px-2 py-0.5 transition-colors ${
+                  !allRoundsMode ? "bg-background font-medium text-foreground shadow-xs" : "text-muted-foreground"
+                }`}
+              >
+                当前会话轮次
+              </button>
+              <button
+                type="button"
+                onClick={() => setAllRoundsMode(true)}
+                className={`rounded px-2 py-0.5 transition-colors ${
+                  allRoundsMode ? "bg-background font-medium text-foreground shadow-xs" : "text-muted-foreground"
+                }`}
+              >
+                项目全部历史轮次
+              </button>
+            </div>
+          ) : undefined
+        }
+      />
     </div>
   );
 }

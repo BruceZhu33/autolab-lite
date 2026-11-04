@@ -21,6 +21,12 @@ function RoundItem({ round, projectTitle }: { round: ResearchRound; projectTitle
           {ev.anyImproved ? "有提升" : "未提升"}
           {ev.bestGain != null ? ` ${ev.bestGain >= 0 ? "+" : ""}${ev.bestGain.toFixed(4)}` : ""}
         </span>
+        {round.evidenceHash ? (
+          <code className="ml-1.5 rounded bg-muted/50 px-1 font-mono text-micro text-muted-foreground"
+                title={`证据哈希: ${round.evidenceHash}`}>
+            #{round.evidenceHash.slice(0, 8)}
+          </code>
+        ) : null}
         <span className="ml-2 text-muted-foreground">{round.hypothesis}</span>
       </summary>
       <div className="mt-1 space-y-1 text-caption">
@@ -61,11 +67,11 @@ function RoundItem({ round, projectTitle }: { round: ResearchRound; projectTitle
                 <td className="pr-2">数据集</td>
                 <td className="pr-2">seed</td>
                 <td className="pr-2">均值(基线)</td>
-                <td>增益</td>
+                <td>增益 / 95% CI</td>
               </tr>
               {ev.means.map((m) => (
-                <tr key={`${m.planId}-${m.dataset}`}>
-                  <td className="pr-2">{m.label ?? m.planId}</td>
+                <tr key={`${m.planId}-${m.variant ?? ""}-${m.dataset}`}>
+                  <td className="pr-2">{m.variant ?? m.label ?? m.planId}</td>
                   <td className="pr-2 text-muted-foreground">{m.dataset ?? "-"}</td>
                   <td className="pr-2">{m.n}</td>
                   <td className="font-mono tabular-nums">
@@ -73,6 +79,11 @@ function RoundItem({ round, projectTitle }: { round: ResearchRound; projectTitle
                   </td>
                   <td className={`font-mono tabular-nums ${m.improved ? "text-success" : "text-muted-foreground"}`}>
                     {sgn(m.meanGain)}
+                    {m.ciLow != null && m.ciHigh != null ? (
+                      <span className="ml-1 text-muted-foreground">
+                        [{sgn(m.ciLow)}, {sgn(m.ciHigh)}]
+                      </span>
+                    ) : null}
                   </td>
                 </tr>
               ))}
@@ -99,14 +110,21 @@ function RoundItem({ round, projectTitle }: { round: ResearchRound; projectTitle
   );
 }
 
-export function ResearchJournal({ rounds, projectTitle }: {
-  rounds: ResearchRound[]; projectTitle: string;
+export function ResearchJournal({ rounds, projectTitle, headerExtra }: {
+  rounds: ResearchRound[]; projectTitle: string; headerExtra?: React.ReactNode;
 }) {
-  if (!rounds.length) return null;
+  if (!rounds.length && !headerExtra) return null;
   return (
     <div className="space-y-1.5 rounded-xl border-[0.5px] border-surface-border bg-card p-3">
-      <p className="text-caption font-semibold">研究日志</p>
-      {rounds.map((r) => <RoundItem key={r.id} round={r} projectTitle={projectTitle} />)}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-caption font-semibold">研究日志</p>
+        {headerExtra}
+      </div>
+      {rounds.length ? (
+        rounds.map((r) => <RoundItem key={r.id} round={r} projectTitle={projectTitle} />)
+      ) : (
+        <p className="text-micro text-muted-foreground">当前所选会话暂无已收束轮次。</p>
+      )}
     </div>
   );
 }
