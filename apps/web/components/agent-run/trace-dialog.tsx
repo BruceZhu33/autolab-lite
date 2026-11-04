@@ -11,7 +11,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity, ChevronDown, ChevronRight, Download, Loader2,
 } from "lucide-react";
-import { fetchRunTrace, type TraceSpan } from "@/lib/api";
+import { fetchRunEvents, fetchRunTrace, type RunEvent, type TraceSpan } from "@/lib/api";
 import { Button } from "~/vendor/ui/components/ui/button";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
@@ -45,6 +45,113 @@ function formatJson(value: unknown): string {
   }
 }
 
+function deriveSpansFromEvents(events: RunEvent[]): TraceSpan[] {
+  const out: TraceSpan[] = [];
+  let stepNo = 0;
+  let pendingTool: {
+    seq: number;
+    stepNo: number;
+    name: string;
+    input: unknown;
+    at: string;
+  } | null = null;
+
+  for (const ev of events) {
+    const p = ev.payload ?? {};
+    if (ev.kind === "assistant") {
+      stepNo += 1;
+      out.push({
+        id: ev.seq,
+        stepNo,
+        kind: "llm",
+        name: "assistant_reply",
+        attempt: 1,
+        status: "ok",
+        tokensIn: 0,
+        tokensOut: 0,
+        durationMs: null,
+        errorClass: "",
+        input: { eventSeq: ev.seq },
+        output: { text: p.text ?? "" },
+        startedAt: ev.at,
+        endedAt: ev.at,
+        createdAt: ev.at,
+      });
+    } else if (ev.kind === "tool_call") {
+      stepNo += 1;
+      pendingTool = {
+        seq: ev.seq,
+        stepNo,
+        name: String(p.name ?? "tool"),
+        input: p.input ?? {},
+        at: ev.at,
+      };
+    } else if ((ev.kind === "tool_result" || ev.kind === "tool_error") && pendingTool) {
+      const startMs = Date.parse(pendingTool.at);
+      const endMs = Date.parse(ev.at);
+      const durationMs = !Number.isNaN(startMs) && !Number.isNaN(endMs)
+        ? Math.max(0, endMs - startMs)
+        : null;
+      out.push({
+        id: pendingTool.seq,
+        stepNo: pendingTool.stepNo,
+        kind: "tool",
+        name: pendingTool.name,
+        attempt: 1,
+        status: ev.kind === "tool_error" ? "error" : "ok",
+        tokensIn: 0,
+        tokensOut: 0,
+        durationMs,
+        errorClass: ev.kind === "tool_error" ? "ToolError" : "",
+        input: pendingTool.input,
+        output: p.output ?? p.error ?? p,
+        startedAt: pendingTool.at,
+        endedAt: ev.at,
+        createdAt: ev.at,
+      });
+      pendingTool = null;
+    } else if (ev.kind === "finish_rejected") {
+      out.push({
+        id: ev.seq,
+        stepNo: Math.max(1, stepNo),
+        kind: "verify",
+        name: "verifier",
+        attempt: 1,
+        status: "rejected",
+        tokensIn: 0,
+        tokensOut: 0,
+        durationMs: 0,
+        errorClass: "",
+        input: null,
+        output: { reason: p.reason ?? "" },
+        startedAt: ev.at,
+        endedAt: ev.at,
+        createdAt: ev.at,
+      });
+    }
+  }
+  if (pendingTool) {
+    out.push({
+      id: pendingTool.seq,
+      stepNo: pendingTool.stepNo,
+      kind: "tool",
+      name: pendingTool.name,
+      attempt: 1,
+      status: "ok",
+      tokensIn: 0,
+      tokensOut: 0,
+      durationMs: null,
+      errorClass: "",
+      input: pendingTool.input,
+      output: "(等待返回或已暂停)",
+      startedAt: pendingTool.at,
+      endedAt: pendingTool.at,
+      createdAt: pendingTool.at,
+    });
+  }
+  return out;
+}
+
 export function RunTraceDialog({ runId }: { runId: string }) {
   const [open, setOpen] = useState(false);
   const [kindFilter, setKindFilter] = useState<string>("all");
@@ -56,7 +163,19 @@ export function RunTraceDialog({ runId }: { runId: string }) {
     enabled: open,
   });
 
-  const spans = data?.spans ?? [];
+  const needEventFallback = open && !isLoading && (data?.spans?.length ?? 0) === 0;
+  const { data: eventsData } = useQuery({
+    queryKey: ["run-trace-events-fallback", runId],
+    queryFn: () => fetchRunEvents(runId, 0),
+    enabled: needEventFallback,
+  });
+
+  const derivedMode = (data?.spans?.length ?? 0) === 0 && (eventsData?.events?.length ?? 0) > 0;
+  const spans = useMemo(() => {
+    if (data?.spans?.length) return data.spans;
+    if (eventsData?.events?.length) return deriveSpansFromEvents(eventsData.events);
+    return [];
+  }, [data?.spans, eventsData?.events]);
   const filtered = useMemo(() => {
     if (kindFilter === "all") return spans;
     if (kindFilter === "abnormal") return spans.filter((s) => s.status !== "ok");
@@ -111,6 +230,11 @@ export function RunTraceDialog({ runId }: { runId: string }) {
                 <code className="rounded bg-muted/40 px-1.5 py-0.5 font-mono text-micro text-muted-foreground">
                   spec #{data.specHash.slice(0, 8)}
                 </code>
+              ) : null}
+              {derivedMode ? (
+                <span className="rounded-full bg-muted/60 px-2 py-0.5 text-micro font-normal text-muted-foreground">
+                  由历史事件流派生 (A2 前会话)
+                </span>
               ) : null}
             </DialogTitle>
           </DialogHeader>

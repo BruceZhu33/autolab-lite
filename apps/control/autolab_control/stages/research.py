@@ -292,13 +292,11 @@ def _case_failure_class(evaluation: dict, m: dict) -> str:
     return "no_evidence"
 
 
-def record_research_cases(env: LoopEnv, round_no: int, report: dict,
-                          evaluation: dict) -> list[str]:
-    """把本轮 evaluation.means 落成 per-(variant,dataset) case,返回新插入的 id。
-    means 为空时记一条 no_valid_experiment(空 dataset/variant)。幂等:
-    UNIQUE(run_id, round_no, dataset, variant) + INSERT OR IGNORE。"""
-    common = {"project_id": env.project["id"], "run_id": env.run["id"],
-              "round_no": round_no, "created_at": utc_now(),
+def _insert_cases_for_round(repo: Repo, project_id: str, run_id: str,
+                            round_no: int, created_at: str,
+                            report: dict, evaluation: dict) -> list[str]:
+    common = {"project_id": project_id, "run_id": run_id,
+              "round_no": round_no, "created_at": created_at,
               "hypothesis": report.get("hypothesis") or "",
               "changes": report.get("changes") or "",
               "analysis": report.get("analysis") or "",
@@ -308,6 +306,7 @@ def record_research_cases(env: LoopEnv, round_no: int, report: dict,
               "evidence_json": json.dumps(
                   {"evidenceHash": report.get("evidenceHash"),
                    "planIds": report.get("planIds")}, ensure_ascii=False)}
+
     def mean_row(m: dict) -> dict:
         dataset, variant = m.get("dataset") or "", m.get("variant") or ""
         return {
@@ -333,7 +332,16 @@ def record_research_cases(env: LoopEnv, round_no: int, report: dict,
                                              dataset, variant),
             **{k: v for k, v in common.items() if k != "evidence_json"}}
 
-    rows = [mean_row(m) for m in evaluation.get("means") or []]
+    means = evaluation.get("means")
+    if not means and evaluation.get("rows"):
+        # 兼容均值口径(B2.1)上线前的旧历史轮次:从逐 Job rows 派生变体均值
+        means = variant_means([
+            {"planId": r.get("planId") or r.get("name") or run_id,
+             "variant": r.get("variant") or r.get("name") or "",
+             **r}
+            for r in evaluation.get("rows") or []
+        ])
+    rows = [mean_row(m) for m in means or []]
     if not rows:  # 本轮没有任何成功产出指标的实验:也留一条可检索的 case
         rows = [{"dataset": "", "variant": "", "success": 0, "significant": 0,
                  "failure_class": "no_valid_experiment", "mean_gain": None,
@@ -341,9 +349,9 @@ def record_research_cases(env: LoopEnv, round_no: int, report: dict,
                  "fingerprint": _case_fingerprint(common["hypothesis"],
                                                   common["changes"], "", ""),
                  **common}]
-    conn = env.repo.db.connect()
+    conn = repo.db.connect()
     try:
-        with env.repo.db.tx(conn):
+        with repo.db.tx(conn):
             inserted = []
             for row in rows:
                 case_id = new_id("rcase")
@@ -363,6 +371,43 @@ def record_research_cases(env: LoopEnv, round_no: int, report: dict,
         return inserted
     finally:
         conn.close()
+
+
+def record_research_cases(env: LoopEnv, round_no: int, report: dict,
+                          evaluation: dict) -> list[str]:
+    """把本轮 evaluation.means 落成 per-(variant,dataset) case,返回新插入的 id。
+    means 为空时记一条 no_valid_experiment(空 dataset/variant)。幂等:
+    UNIQUE(run_id, round_no, dataset, variant) + INSERT OR IGNORE。"""
+    return _insert_cases_for_round(
+        env.repo, env.project["id"], env.run["id"], round_no,
+        utc_now(), report, evaluation)
+
+
+def _backfill_cases_from_rounds(repo: Repo, project_id: str) -> None:
+    """将 C1 上线前已存在于 research_rounds 的历史轮次按幂等规则补写入 research_cases。"""
+    conn = repo.db.connect()
+    try:
+        missing = conn.execute(
+            "SELECT rr.run_id, rr.round_no, rr.created_at, rr.report_json"
+            " FROM research_rounds rr"
+            " WHERE rr.project_id = ?"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM research_cases rc"
+            "   WHERE rc.run_id = rr.run_id AND rc.round_no = rr.round_no"
+            " )"
+            " ORDER BY rr.created_at, rr.round_no",
+            (project_id,)).fetchall()
+    finally:
+        conn.close()
+    for r in missing:
+        try:
+            report = json.loads(r["report_json"] or "{}")
+        except ValueError:
+            continue
+        evaluation = report.get("evaluation") or {}
+        _insert_cases_for_round(
+            repo, project_id, r["run_id"], int(r["round_no"]),
+            r["created_at"] or utc_now(), report, evaluation)
 
 
 def _case_dict(r) -> dict:
@@ -389,6 +434,7 @@ def search_cases(repo: Repo, project_id: str, query: str = "",
                  dataset: str | None = None, limit: int = 5) -> list[dict]:
     """本地 case 检索:dataset 过滤 → 最近 200 条 → 关键词重叠 + 成功/收益/新近
     排序 → 同 fingerprint 只留最新。跨项目/向量检索是 C1 非目标。"""
+    _backfill_cases_from_rounds(repo, project_id)
     sql, args = "SELECT * FROM research_cases WHERE project_id = ?", [project_id]
     if dataset:
         sql += " AND dataset = ?"
