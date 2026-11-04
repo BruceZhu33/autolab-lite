@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..agent.model import model_settings
@@ -22,6 +24,7 @@ from ..core.repo import Repo
 from . import agent_specs
 
 MODES = ("cassette", "live")
+STALE_RUNNING_SECONDS = 3600
 # stages/canaries.py → stages → autolab_control → control → apps → 仓库根
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -75,6 +78,53 @@ def _update(repo: Repo, canary_id: str, **fields) -> None:
         conn.close()
 
 
+def _pid_alive(pid: object) -> bool:
+    """检查子进程 PID 是否仍存活(EPERM 说明进程存在但无权发信号)。"""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _age_seconds(iso_ts: str | None) -> float:
+    if not iso_ts:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+    except ValueError:
+        return 0.0
+
+
+def _reconcile_row(repo: Repo, row: dict) -> dict:
+    """自动收敛僵尸 running canary:
+    - 若记录了 worker pid 且进程已不存在 → 置 failed;
+    - 若未记录 pid(旧记录或无 pid)且超过 STALE_RUNNING_SECONDS → 置 failed。
+    防止 worker 意外退出或服务重启后永久卡在 running 阻塞再次发起。"""
+    if row.get("status") != "running":
+        return row
+    meta = _loads(row.get("result_json"), {})
+    pid = meta.get("pid") if isinstance(meta, dict) else None
+    if isinstance(pid, int) and not isinstance(pid, bool):
+        if not _pid_alive(pid):
+            err = f"canary worker 进程 (pid={pid}) 已退出,未完成归档"
+            _update(repo, row["id"], status="failed", error=err)
+            return _row(repo, row["id"]) or {**row, "status": "failed", "error": err}
+        return row
+    if _age_seconds(row.get("updated_at") or row.get("created_at")) > STALE_RUNNING_SECONDS:
+        err = f"canary 运行超时 (>{STALE_RUNNING_SECONDS}s) 或工作进程失联"
+        _update(repo, row["id"], status="failed", error=err)
+        return _row(repo, row["id"]) or {**row, "status": "failed", "error": err}
+    return row
+
+
 def _public(row: dict) -> dict:
     result = _loads(row["result_json"], None)
     recommendation = (result or {}).get("recommendation") if isinstance(result, dict) else None
@@ -94,7 +144,7 @@ def get_canary(repo: Repo, canary_id: str) -> dict:
     row = _row(repo, canary_id)
     if row is None:
         raise NotFound(f"canary {canary_id} 不存在")
-    return _public(row)
+    return _public(_reconcile_row(repo, row))
 
 
 def list_canaries(repo: Repo, spec_id: str | None = None, limit: int = 20) -> list[dict]:
@@ -110,7 +160,7 @@ def list_canaries(repo: Repo, spec_id: str | None = None, limit: int = 20) -> li
         rows = conn.execute(sql, (*args, max(1, int(limit)))).fetchall()
     finally:
         conn.close()
-    return [_public(r) for r in rows]
+    return [_public(_reconcile_row(repo, dict(r))) for r in rows]
 
 
 # ------------------------------------------------------------------ 任务清单
@@ -183,13 +233,15 @@ def start_canary(repo: Repo, spec_id: str, *, mode: str = "cassette",
 
     conn = repo.db.connect()
     try:
-        running = conn.execute(
-            "SELECT id FROM agent_canaries WHERE spec_id = ? AND status = 'running'"
-            " LIMIT 1", (spec_id,)).fetchone()
+        running_rows = conn.execute(
+            "SELECT * FROM agent_canaries WHERE spec_id = ? AND status = 'running'",
+            (spec_id,)).fetchall()
     finally:
         conn.close()
-    if running is not None:
-        raise UserError(f"AgentSpec {spec_id} 已有进行中的 canary {running['id']}")
+    for r in running_rows:
+        reconciled = _reconcile_row(repo, dict(r))
+        if reconciled.get("status") == "running":
+            raise UserError(f"AgentSpec {spec_id} 已有进行中的 canary {reconciled['id']}")
 
     canary_id, now = new_id("acanary"), utc_now()
     # compare 不是独立列:用 result_json 暂存运行参数,run_canary 完成时覆盖。
@@ -209,7 +261,11 @@ def start_canary(repo: Repo, spec_id: str, *, mode: str = "cassette",
 
     if spawn:
         try:
-            _spawn_worker(repo, canary_id, credentials_path)
+            proc = _spawn_worker(repo, canary_id, credentials_path)
+            pid = getattr(proc, "pid", None)
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                _update(repo, canary_id, result_json=json.dumps(
+                    {"compare": bool(compare), "pid": pid}, ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001 - 启动失败必须落 failed 并报 409
             _update(repo, canary_id, status="failed",
                     error=f"worker 启动失败:{str(exc)[:2000]}")

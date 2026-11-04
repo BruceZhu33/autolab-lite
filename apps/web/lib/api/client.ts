@@ -81,3 +81,4 @@ export async function request<T>(path: string, init?: { method?: string; body?: 
 
 export const get = <T>(path: string) => request<T>(path);
 export const post = <T>(path: string, body: Body = {}) => request<T>(path, { body });
+export const patch = <T>(path: string, body: Body = {}) => request<T>(path, { method: "PATCH", body });

@@ -1,6 +1,6 @@
 "use client";
 
-import { get, post } from "./client";
+import { get, patch, post } from "./client";
 
 export type RunKind = "baseline" | "research";
 export type RunStatus =
@@ -264,3 +264,130 @@ export const stopCampaign = (campaignId: string) =>
 
 export const promoteCampaign = (campaignId: string) =>
   post<{ campaign: ResearchCampaign }>(`/api/owner/research/campaigns/${campaignId}/promote`, { confirm: true });
+
+// ------------------------------------------------------------------ 指标契约与独立评测 (Phase B1 & B2.3)
+
+export type MetricDirection = "maximize" | "minimize";
+
+export type MetricGuardrail = {
+  metric: string;
+  direction: MetricDirection;
+  max_regress: number;
+};
+
+export type EvalContractConfig = {
+  command?: string;
+  conda_env?: string;
+  metric_file?: string;
+  timeout_minutes?: number;
+  gpus_per_job?: number;
+  code_paths?: string[];
+  data_paths?: string[];
+  code_hash?: string;
+  data_hash?: string;
+};
+
+export type MetricContract = {
+  primary: string;
+  direction: MetricDirection;
+  guardrails: MetricGuardrail[];
+  eval: EvalContractConfig;
+};
+
+export type MetricContractResponse = {
+  contract: MetricContract | null;
+  metrics: Record<string, string[]>;
+  default: MetricContract;
+};
+
+export const fetchMetricContract = (projectId: string) =>
+  get<MetricContractResponse>(`/api/projects/${projectId}/baseline/contract`);
+
+export const updateMetricContract = (projectId: string, input: {
+  primary: string;
+  direction: MetricDirection;
+  guardrails?: MetricGuardrail[];
+  eval?: EvalContractConfig;
+}) => patch<MetricContractResponse>(`/api/owner/projects/${projectId}/baseline/contract`, input);
+
+// ------------------------------------------------------------------ 结构化研究记忆 (Phase C1)
+
+export type ResearchCase = {
+  id: string;
+  runId: string;
+  roundNo: number;
+  dataset: string;
+  variant: string;
+  hypothesis: string;
+  changes: string;
+  analysis: string;
+  nextIdea: string;
+  kept: boolean;
+  success: boolean;
+  verdict: string;
+  failureClass: string;
+  meanGain: number | null;
+  ciLow: number | null;
+  ciHigh: number | null;
+  significant: boolean;
+  fingerprint: string;
+  createdAt: string;
+  metrics: {
+    meanValue?: number | null;
+    meanGain?: number | null;
+    ciLow?: number | null;
+    ciHigh?: number | null;
+    n?: number | null;
+    seeds?: number[];
+    baseline?: number | null;
+  };
+  evidence: {
+    evidenceHash?: string | null;
+    evalJobIds?: string[];
+    planIds?: string[];
+  };
+};
+
+export const fetchResearchCases = (
+  projectId: string,
+  params?: { query?: string; dataset?: string; limit?: number },
+) => {
+  const sp = new URLSearchParams();
+  if (params?.query?.trim()) sp.set("query", params.query.trim());
+  if (params?.dataset?.trim()) sp.set("dataset", params.dataset.trim());
+  if (params?.limit) sp.set("limit", String(params.limit));
+  const qs = sp.toString();
+  return get<{ cases: ResearchCase[] }>(
+    `/api/projects/${projectId}/research/cases${qs ? `?${qs}` : ""}`,
+  );
+};
+
+// ------------------------------------------------------------------ 结构化 Trace (Phase A2)
+
+export type TraceSpan = {
+  id: number;
+  stepNo: number;
+  kind: "llm" | "tool" | "verify" | string;
+  name: string;
+  attempt: number;
+  status: string;
+  tokensIn: number;
+  tokensOut: number;
+  durationMs: number | null;
+  errorClass: string;
+  input: unknown;
+  output: unknown;
+  startedAt: string;
+  endedAt: string;
+  createdAt: string;
+};
+
+export type RunTraceResponse = {
+  run: Run;
+  spec: Run["spec"];
+  specHash?: string;
+  spans: TraceSpan[];
+};
+
+export const fetchRunTrace = (runId: string) =>
+  get<RunTraceResponse>(`/api/runs/${runId}/trace`);

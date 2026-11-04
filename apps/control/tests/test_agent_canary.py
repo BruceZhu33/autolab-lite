@@ -383,3 +383,45 @@ def test_canary_result_roundtrip_json(repo, monkeypatch):  # noqa: F811
                                    tasks=["baseline_happy"], spawn=False)
     raw = json.dumps(canary["result"], ensure_ascii=False)
     assert json.loads(raw)["recommendation"] == "promote"
+
+
+def test_canary_reconciles_dead_worker_and_stale_running(repo, monkeypatch):  # noqa: F811
+    """worker 进程意外退出或超时失联时,自动收敛为 failed 并解除同 spec 再次发起锁。"""
+    instance = repo["repo"]
+    candidate, _ = _specs(instance)
+
+    class DeadProc:
+        pid = 999999
+
+    monkeypatch.setattr(canaries, "_spawn_worker", lambda *a, **k: DeadProc())
+    monkeypatch.setattr(canaries, "_pid_alive", lambda pid: True)
+    first = canaries.start_canary(instance, candidate["id"], spawn=True,
+                                  tasks=["baseline_happy"])
+    assert first["status"] == "running"
+
+    # 进程消失后,get_canary 自动将僵尸 running 收敛为 failed
+    monkeypatch.setattr(canaries, "_pid_alive", lambda pid: False)
+    reconciled = canaries.get_canary(instance, first["id"])
+    assert reconciled["status"] == "failed"
+    assert "pid=999999" in (reconciled["error"] or "")
+
+    # 并且允许直接重新发起新的 canary(不再因孤儿 running 卡 409)
+    monkeypatch.setattr(canaries, "_spawn_worker", lambda *a, **k: None)
+    second = canaries.start_canary(instance, candidate["id"], spawn=True,
+                                   tasks=["baseline_happy"])
+    assert second["status"] == "running"
+
+    # 无 pid 但超时的陈旧记录也能在 list_canaries / start_canary 时自动收敛
+    conn = instance.db.connect()
+    try:
+        with instance.db.tx(conn):
+            conn.execute(
+                "UPDATE agent_canaries SET updated_at = '2020-01-01T00:00:00Z',"
+                " created_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+                (second["id"],))
+    finally:
+        conn.close()
+    listed = canaries.list_canaries(instance, spec_id=candidate["id"])
+    by_id = {c["id"]: c for c in listed}
+    assert by_id[second["id"]]["status"] == "failed"
+    assert "超时" in (by_id[second["id"]]["error"] or "")

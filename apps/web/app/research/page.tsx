@@ -5,14 +5,15 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
-import { BadgeCheck, FlaskConical, History, Lightbulb } from "lucide-react";
+import { BadgeCheck, FlaskConical, History, Lightbulb, ShieldCheck } from "lucide-react";
 import {
-  fetchLatestRun, fetchProjectDatasets, fetchProjectRuns, fetchResearchRounds,
+  fetchLatestRun, fetchMetricContract, fetchProjectDatasets, fetchProjectRuns, fetchResearchRounds,
   isActive, type Project, type Run,
 } from "@/lib/api";
 import { RunPanel } from "@/components/agent-run/panel";
 import { ProjectTabs, useProjectSelection } from "@/components/project-picker";
 import { CampaignPanel } from "@/components/research/campaign-panel";
+import { ResearchCasesPanel } from "@/components/research/cases-panel";
 import { ResearchJournal } from "@/components/research/journal";
 import { ResearchStartForm } from "@/components/research/start-form";
 import { AdoptButton } from "@/components/research/adopt-button";
@@ -52,7 +53,12 @@ function BaselineCard({ project }: { project: Project }) {
     queryKey: ["datasets", project.id],
     queryFn: () => fetchProjectDatasets(project.id),
   });
+  const { data: contractData } = useQuery({
+    queryKey: ["baseline-contract", project.id],
+    queryFn: () => fetchMetricContract(project.id),
+  });
   const badge = data?.baseline;
+  const contract = contractData?.contract ?? null;
   const confirmed = (data?.datasets ?? []).filter((d) => d.state === "confirmed");
   if (!badge) return null;
   return (
@@ -68,6 +74,23 @@ function BaselineCard({ project }: { project: Project }) {
         {badge.forkedFrom ? (
           <span className="text-micro text-muted-foreground">← 分叉自 {badge.forkedFrom}</span>
         ) : null}
+        {contract ? (
+          <Link
+            href={`/baseline?project=${project.id}`}
+            className="rounded-full bg-success/10 px-2 py-0.5 font-mono text-micro font-medium text-success hover:underline"
+            title="点击前往 Baseline 页查看或修改评测指标契约"
+          >
+            <ShieldCheck className="mr-1 inline size-3 align-[-1px]" />
+            契约: {contract.primary} ({contract.direction === "maximize" ? "↑" : "↓"})
+          </Link>
+        ) : (
+          <Link
+            href={`/baseline?project=${project.id}`}
+            className="rounded-full bg-muted/60 px-2 py-0.5 text-micro text-muted-foreground hover:underline"
+          >
+            未固化指标契约 (去配置 →)
+          </Link>
+        )}
         <span className="ml-auto text-micro text-muted-foreground">
           研究会话的实验都和下面这组数字比
         </span>
@@ -212,6 +235,7 @@ function ResearchSection({ project }: { project: Project }) {
           <ValidateLaunch project={project} sourceRunId={run.id} />
         </div>
       ) : null}
+      <ResearchCasesPanel project={project} />
       <ResearchJournal
         rounds={rounds?.rounds ?? []}
         projectTitle={project.name}

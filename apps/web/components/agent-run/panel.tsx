@@ -16,6 +16,7 @@ import {
   type Project, type Run, type RunEvent, type RunPending,
 } from "@/lib/api";
 import { FolderBrowserDialog } from "@/components/folder-browser";
+import { RunTraceDialog } from "@/components/agent-run/trace-dialog";
 import { MiniMarkdown } from "@/components/mini-markdown";
 import { ChatComposer } from "@/components/chat/chat-composer";
 import { AssistantMessage, JumpToLatest, UserMessage } from "@/components/chat/chat-message";
@@ -384,6 +385,7 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
         <span className="ml-auto font-mono text-micro tabular-nums text-muted-foreground">
           {current.steps} 步 · {Math.round((current.tokensIn + current.tokensOut) / 1000)}k tokens
         </span>
+        <RunTraceDialog runId={current.id} />
         {active ? (
           <Button size="sm" variant="outline" className="h-7 gap-1 px-2 text-micro" onClick={() => void stop()}>
             <Square className="size-3" />停止

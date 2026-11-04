@@ -14,6 +14,7 @@ import {
 } from "@/lib/api";
 import { RunPanel } from "@/components/agent-run/panel";
 import { DatasetBoard } from "@/components/agent-run/datasets";
+import { MetricContractCard } from "@/components/baseline/contract-card";
 import { ProjectTabs, useProjectSelection } from "@/components/project-picker";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "~/vendor/ui/components/ui/button";
@@ -161,6 +162,7 @@ function BaselineSection({ project }: { project: Project }) {
         </div>
       ) : null}
       {run ? <RunPanel key={run.id} project={project} run={run} /> : null}
+      <MetricContractCard project={project} />
       <DatasetBoard project={project} />
     </div>
   );
