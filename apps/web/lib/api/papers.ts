@@ -4,8 +4,10 @@
 
 import { request } from "./client";
 
-/** 论文站浏览器入口(局域网 IP 直达);详情页跳转用。 */
-export const PAPERPULSE_WEB = "http://192.0.2.46:3310";
+/** 论文站浏览器入口;部署地址经 NEXT_PUBLIC_PAPERPULSE_WEB 在构建期注入,
+ *  默认值为文档示例地址(RFC 5737),本机部署务必注入真实入口。 */
+export const PAPERPULSE_WEB =
+  process.env.NEXT_PUBLIC_PAPERPULSE_WEB ?? "http://192.0.2.46:3310";
 export const paperpulseItemUrl = (id: string) => `${PAPERPULSE_WEB}/items/${id}`;
 
 export type PaperColumn = {
