@@ -17,13 +17,54 @@ import math
 import re
 
 _TOLERANCE = 1e-6
+_PERCENT_TOLERANCE = 1e-4
 
-# 比率类指标名(小写包含匹配):值域 [0,1]
-_RATIO_PATTERNS = re.compile(
-    r"dice|iou|auc|acc(?:uracy)?|f1|precision|recall|map\b|ap\b|"
-    r"sensitivity|specificity|jaccard|f1_score|score", re.IGNORECASE)
-# 百分比命名:值域 [0,100]
-_PERCENT_PATTERNS = re.compile(r"percent|pct", re.IGNORECASE)
+# 显式排除无上界/损失/误差/生成距离/性能计数/差值类指标名 token,避免误杀合法值
+_UNBOUNDED_TOKENS = frozenset({
+    "loss", "losses", "err", "error", "errors",
+    "fid", "inception", "clip", "r2",
+    "perplexity", "ppl", "gap",
+    "time", "ms", "sec", "seconds", "latency", "fps",
+    "params", "param", "flops", "macs",
+    "diff", "gain", "delta",
+    "mae", "mse", "rmse", "psnr", "nll", "bpb", "bpc",
+    "hd95", "asd", "assd",
+})
+
+# 显式百分比命名:值域 [0,100]
+_PERCENT_TOKENS = frozenset({"percent", "pct", "percentage"})
+
+# 严格比率域 [0,1] 指标 token(如 dice / auc / auroc / sensitivity / specificity / prob / ratio)
+_UNIT_RATIO_TOKENS = frozenset({
+    "dice", "auc", "auroc", "auprc",
+    "sensitivity", "specificity", "prob", "probability", "ratio",
+})
+
+# 兼容 [0,1] 与百分制 [0,100] 的常见评测指标 token(如 val_acc=85.2, mAP=42.1, BLEU=32.4)
+_BOUNDED_100_TOKENS = frozenset({
+    "iou", "miou", "jaccard",
+    "f1", "precision", "recall",
+    "acc", "accuracy",
+    "map", "ap",
+    "bleu", "rouge", "rougel",
+})
+
+
+def _metric_tokens(name: str) -> set[str]:
+    """按分隔符 [/_.-\\s@:] 与驼峰边界切分指标名 token(保留原段小写以识别 mAP/mIoU/f1/r2)。"""
+    raw_parts = [p for p in re.split(r"[/_.\-\s@:]+", name) if p]
+    tokens: set[str] = set()
+    for part in raw_parts:
+        low = part.lower()
+        tokens.add(low)
+        if low not in ("f1", "r2") and re.fullmatch(r"[a-z]+\d+", low):
+            tokens.add(low.rstrip("0123456789"))
+        for sub in re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", part).split():
+            sub_low = sub.lower()
+            tokens.add(sub_low)
+            if sub_low not in ("f1", "r2") and re.fullmatch(r"[a-z]+\d+", sub_low):
+                tokens.add(sub_low.rstrip("0123456789"))
+    return tokens
 
 
 def metric_domain_issue(name: str, value) -> str | None:
@@ -32,14 +73,21 @@ def metric_domain_issue(name: str, value) -> str | None:
         return None  # 非数值(str/None/嵌套)不是本门的职责
     if math.isnan(value) or math.isinf(value):
         return f"{name}={value}(非有限数值)"
-    key = str(name)
-    if _PERCENT_PATTERNS.search(key):
-        if not (-_TOLERANCE <= value <= 100 + _TOLERANCE):
+    tokens = _metric_tokens(str(name))
+    if tokens & _UNBOUNDED_TOKENS:
+        return None
+    if tokens & _PERCENT_TOKENS:
+        if not (-_TOLERANCE <= value <= 100 + _PERCENT_TOLERANCE):
             return f"{name}={value} 超出百分比域 [0,100]"
         return None
-    if _RATIO_PATTERNS.search(key):
+    if tokens & _UNIT_RATIO_TOKENS:
         if not (-_TOLERANCE <= value <= 1 + _TOLERANCE):
             return f"{name}={value} 超出比率域 [0,1](数据/评估语义可疑)"
+        return None
+    if tokens & _BOUNDED_100_TOKENS:
+        if not (-_TOLERANCE <= value <= 100 + _PERCENT_TOLERANCE):
+            return f"{name}={value} 超出比率域/百分比域 [0,100](数据/评估语义可疑)"
+        return None
     return None
 
 

@@ -171,10 +171,10 @@ def test_mean_judgment_needs_min_seeds_and_tracks_champion(api, tmp_path):
         *multi_seed_round(state, "a", [            # 2 seed 均值 +0.02:过阈值但 <3 seed
             ("s1", "kvasir", "python train.py --attn --seed 1"),
             ("s2", "kvasir", "python train.py --attn --seed 2")]),
-        *multi_seed_round(state, "b", [            # 3 seed 均值 +0.02:达标 → 冠军
-            ("s1", "kvasir", "python train.py --attn --seed 1"),
-            ("s2", "kvasir", "python train.py --attn --seed 2"),
-            ("s3", "kvasir", "python train.py --attn --seed 3")]),
+        *multi_seed_round(state, "b", [            # 3 个新 seed 均值 +0.02:达标 → 冠军
+            ("s3", "kvasir", "python train.py --attn --seed 3"),
+            ("s4", "kvasir", "python train.py --attn --seed 4"),
+            ("s5", "kvasir", "python train.py --attn --seed 5")]),
     ])
     step = stepper(repo, run_id, model)
     assert step() == "running" and step() == "waiting_jobs"
@@ -576,12 +576,12 @@ def test_variant_seed_grouping_two_variants(api, tmp_path):
     assert len(means) == 2 and means[0]["variant"] == "attn"   # 均值增益降序
     attn = next(m for m in means if m["variant"] == "attn")
     assert attn["seeds"] == [1, 2] and attn["n"] == 2
-    assert attn["meanGain"] == pytest.approx(0.04) and attn["significant"] is True
+    assert attn["meanGain"] == pytest.approx(0.04) and attn["significant"] is False
     assert all(r["variant"] in ("attn", "hflip") and r["seed"] in (1, 2)
                for r in rounds[0]["evaluation"]["rows"])
     assert "变体「attn」" in rounds[0]["verdict"]
     journal = (tmp_path / "ws/.autolab/research_journal.md").read_text(encoding="utf-8")
-    assert "变体「attn」" in journal and "95% CI" in journal and "✓" in journal
+    assert "变体「attn」" in journal and "95% CI" in journal and "✓" not in journal
     assert "- 证据:代码 non-git / dirty 否 / 保护路径 未配置" in journal
     assert re.search(r"evidence [0-9a-f]{12}", journal)
 
@@ -661,7 +661,8 @@ def test_guardrail_violation_blocks_heavy_success(api, tmp_path):
 
 
 def test_protected_paths_change_rejects_end_round(api, tmp_path):
-    """契约 eval 保护路径:中途改评测代码 → end_round 被拒并留事件;恢复后放行。"""
+    """契约 eval 保护路径:中途改评测代码 → end_round 被拒且脏 Plan 作废(ABANDONED);
+    仅恢复文件不能洗白旧脏指标,必须重新提交干净实验后才能收束。"""
     client, repo = api["client"], api["repo"]
     pid = make_project(api, tmp_path)
     eval_dir = tmp_path / "ws" / "eval"
@@ -674,15 +675,17 @@ def test_protected_paths_change_rejects_end_round(api, tmp_path):
     assert re.fullmatch(r"[0-9a-f]{64}", contract["eval"]["code_hash"])
     run_id = start(client, pid, tier="medium", max_rounds=1)
     state: dict = {}
+    state_clean: dict = {}
     model = ScriptModel([
         *experiment_round(state, "a"),
         [use("e2", "end_round", hypothesis="h", changes="c", analysis="a", kept=True)],
+        *experiment_round(state_clean, "b", command="python train.py --attn --seed 2"),
     ])
     step = stepper(repo, run_id, model)
     assert step() == "running" and step() == "waiting_jobs"
     finish_job(repo, state["job"], {"val_dice": 0.85})
     (eval_dir / "x.py").write_text("def score():\n    return 2\n", encoding="utf-8")
-    assert step() == "running"                       # end_round 被保护路径门拒绝
+    assert step() == "running"                       # end_round 被保护路径门拒绝且脏 Plan 作废
     blocks = json.loads(_row(repo, run_id)["messages_json"])[-1]["content"]
     rejected = next(b for b in blocks if isinstance(b, dict) and b.get("is_error"))
     assert "评测代码/数据划分被修改" in rejected["content"] and "code" in rejected["content"]
@@ -696,10 +699,20 @@ def test_protected_paths_change_rejects_end_round(api, tmp_path):
     payload = json.loads(events[0]["payload"])
     assert len(events) == 1 and payload["kind"] == "code"
     assert payload["expected"] == contract["eval"]["code_hash"] and payload["paths"] == ["eval"]
+    assert payload["tainted_plan_ids"]
     assert rounds_of(client, pid) == []              # 被拒的轮不留记录
 
+    # 仅恢复文件原样再调 end_round 仍被拒(旧脏 Plan 已 ABANDONED,防洗白)
     (eval_dir / "x.py").write_text("def score():\n    return 1\n", encoding="utf-8")
-    assert step() == "done"                          # 恢复后收束成功
+    assert step() == "running"
+    blocks2 = json.loads(_row(repo, run_id)["messages_json"])[-1]["content"]
+    rejected2 = next(b for b in blocks2 if isinstance(b, dict) and b.get("is_error"))
+    assert "还没有正式实验" in rejected2["content"]
+
+    # 在干净保护路径下重新跑实验后收束成功
+    assert step() == "running" and step() == "waiting_jobs"
+    finish_job(repo, state_clean["job"], {"val_dice": 0.85})
+    assert step() == "done"
     rounds = rounds_of(client, pid)
     report = rounds[0]
     evidence = report["evidence"]

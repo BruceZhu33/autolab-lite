@@ -35,6 +35,7 @@ from autolab_control.core.credentials import CredentialStore  # noqa: E402
 from autolab_control.core.db import Database, utc_now  # noqa: E402
 from autolab_control.core.errors import UserError  # noqa: E402
 from autolab_control.core.repo import Repo  # noqa: E402
+from autolab_control.execution.comparison import infer_metric_direction  # noqa: E402
 from autolab_control.stages import agent_specs  # noqa: E402
 from autolab_control.stages import baseline as baseline_stage  # noqa: E402
 from autolab_control.stages import research as research_stage  # noqa: E402
@@ -174,8 +175,12 @@ def _simulated_metrics(task: dict, job: dict) -> dict:
         except (TypeError, ValueError):
             seed_int = 0
         jitter = ((seed_int % 7) - 3) * float(profile.get("seed_spread") or 0.0)
-    metric = str((task.get("contract") or {}).get("primary") or "val_dice")
-    return {metric: float(baseline) + gain + jitter}
+    contract = task.get("contract") or {}
+    metric = str(contract.get("primary") or "val_dice")
+    raw_dir = str(contract.get("direction") or "").strip()
+    direction = raw_dir if raw_dir in ("maximize", "minimize") else infer_metric_direction(metric)
+    delta = -gain if direction == "minimize" else gain
+    return {metric: float(baseline) + delta + jitter}
 
 
 def _refresh_job_context(repo: Repo, run_id: str, context: dict) -> None:

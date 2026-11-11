@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import statistics
 
 from autolab_protocol import PlanSpecV1
@@ -16,6 +17,15 @@ from ..core.repo import Repo
 from .experiments import job_metrics
 
 _DIRECTIONS = ("maximize", "minimize")
+_MINIMIZE_TOKENS = frozenset({
+    "loss", "losses", "err", "error", "errors",
+    "mae", "mse", "rmse", "fid", "perplexity", "ppl",
+    "cer", "wer", "latency", "hd95", "asd", "assd",
+    "bpb", "bpc", "nll",
+})
+_CLI_SEED_RE = re.compile(
+    r"(?:^|\s)(?:--(?:seed|random[-_]seed)(?:=|\s+)|seed=)(-?\d+)(?:\s|$)"
+)
 
 
 def _numeric(value) -> bool:
@@ -23,8 +33,41 @@ def _numeric(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def infer_metric_direction(name: str, fallback: str = "maximize") -> str:
+    """未锁定契约时按指标名 token 推断优化方向(loss/err/fid/ppl/wer 等为 minimize)。"""
+    raw_parts = [p for p in re.split(r"[/_.\-\s@:]+", str(name or "")) if p]
+    tokens: set[str] = set()
+    for part in raw_parts:
+        tokens.add(part.lower())
+        for sub in re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", part).split():
+            tokens.add(sub.lower())
+    if tokens & _MINIMIZE_TOKENS:
+        return "minimize"
+    return fallback if fallback in _DIRECTIONS else "maximize"
+
+
+def _extract_seed(row: dict) -> tuple[int | None, int | None]:
+    """提取 (explicit_seed, cli_seed):优先取整数 row['seed'],否则回落命令里的 --seed。"""
+    raw_seed = row.get("seed")
+    explicit = raw_seed if (isinstance(raw_seed, int) and not isinstance(raw_seed, bool)) else None
+    cmd = str(row.get("command") or (row.get("params") or {}).get("command") or "")
+    match = _CLI_SEED_RE.search(cmd)
+    cli_seed = int(match.group(1)) if match else None
+    return (explicit if explicit is not None else cli_seed), cli_seed
+
+
+def _metric_signature(row: dict) -> str:
+    all_metrics = row.get("allMetrics")
+    if isinstance(all_metrics, dict) and all_metrics:
+        numeric_items = {k: float(v) for k, v in all_metrics.items() if _numeric(v)}
+        if numeric_items:
+            return json.dumps(numeric_items, sort_keys=True)
+    val = row.get("value")
+    return json.dumps(float(val) if _numeric(val) else val)
+
+
 def bootstrap_ci(values: list[float], *, alpha: float = 0.05,
-                 iterations: int = 1000, seed: int = 0) -> tuple[float, float] | None:
+                 iterations: int = 2000, seed: int = 0) -> tuple[float, float] | None:
     """百分位 bootstrap 均值 CI(纯函数,无第三方依赖)。
 
     len(values) < 2 返回 None;同一输入 + 同一 seed 结果确定。"""
@@ -53,13 +96,16 @@ def compare_plan(repo: Repo, plan: dict, pool: dict[str, dict],
     primary = str((contract or {}).get("primary") or "").strip()
     direction = str((contract or {}).get("direction") or "").strip()
     if primary:
-        direction = direction if direction in _DIRECTIONS else "maximize"
+        direction = direction if direction in _DIRECTIONS else infer_metric_direction(primary)
     else:
-        # 主指标:第一个在基线里出现过的声明指标
-        primary, direction = next(
+        # 主指标:第一个在基线里出现过的声明指标;未锁契约时若声明方向为默认 maximize,
+        # 对 loss/err/fid/ppl 等指标按名称自动推断 minimize,不盲信默认方向。
+        primary, declared_dir = next(
             ((name, d) for name, d in declared
              if any(name in (info.get("metrics") or {}) for info in pool.values())),
             declared[0])
+        direction = ("minimize" if declared_dir == "minimize"
+                     else infer_metric_direction(primary, declared_dir))
     eval_cfg = (contract or {}).get("eval") or {}
     eval_enabled = bool(str(eval_cfg.get("command") or "").strip())
     rows = []
@@ -90,7 +136,8 @@ def compare_plan(repo: Repo, plan: dict, pool: dict[str, dict],
             gain = (value - baseline) if direction == "maximize" else (baseline - value)
         rows.append({"planId": plan["id"], "jobId": job["id"], "name": params.get("name"),
                      "dataset": dataset, "variant": params.get("variant"),
-                     "seed": params.get("seed"), "params": params, "status": status,
+                     "seed": params.get("seed"), "command": params.get("command"),
+                     "params": params, "status": status,
                      "metric": primary, "value": value, "baseline": baseline, "gain": gain,
                      "improved": gain is not None and gain > 0,
                      # guardrail 判定要全指标与该数据集整套基线,不只有 primary
@@ -107,40 +154,70 @@ def variant_means(rows: list[dict]) -> list[dict]:
     """按 (variant|planId, dataset) 聚合 SUCCEEDED 行 → 变体均值组,按均值增益降序。
 
     显式 variant(B1.1)优先作分组身份,同一 plan 里的不同变体不会混在一起;
-    没有 variant 的旧提交仍按 plan 聚合。成功判定与冠军追踪都以这里的均值为
-    口径,不信单 seed 冒尖;B1.2 起每组带 std/95% CI 与 significant。"""
+    没有 variant 的旧提交仍按 plan 聚合。同 (variant, dataset) 内同 seed 先取均值去重,
+    样本量 n 只计去重后的显式整数 seed 数(未传 seed 时 n=1);显著性要求 n>=3。"""
     groups: dict[tuple, dict] = {}
     for row in rows:
         if row["status"] != "SUCCEEDED" or not _numeric(row["value"]):
             continue
         variant = row.get("variant")
-        key = (variant or row.get("planId"), row.get("dataset") or "")
+        id_key = ("variant", variant) if variant else ("plan", row.get("planId"))
+        key = (id_key, row.get("dataset") or "")
         g = groups.setdefault(key, {
             "variant": variant, "planId": row.get("planId"), "dataset": row.get("dataset"),
             "metric": row.get("metric"), "baseline": None,
-            "values": [], "gains": [], "seeds": set(), "jobIds": []})
+            "buckets": {}, "seeds": set(), "cliSeeds": set(),
+            "commands": [], "signatures": set(), "jobIds": []})
         if g["baseline"] is None and _numeric(row.get("baseline")):
             g["baseline"] = row["baseline"]
-        g["values"].append(row["value"])
-        if _numeric(row["gain"]):
-            g["gains"].append(row["gain"])
-        if isinstance(row.get("seed"), int) and not isinstance(row["seed"], bool):
-            g["seeds"].add(row["seed"])
+        seed_val, cli_seed = _extract_seed(row)
+        bucket_key = ("seed", seed_val) if seed_val is not None else ("unseeded", None)
+        bucket = g["buckets"].setdefault(bucket_key, {"values": [], "gains": []})
+        bucket["values"].append(float(row["value"]))
+        if _numeric(row.get("gain")):
+            bucket["gains"].append(float(row["gain"]))
+        if seed_val is not None:
+            g["seeds"].add(seed_val)
+        if cli_seed is not None:
+            g["cliSeeds"].add(cli_seed)
+        cmd = str(row.get("command") or (row.get("params") or {}).get("command") or "").strip()
+        if cmd:
+            g["commands"].append(cmd)
+        g["signatures"].add(_metric_signature(row))
         g["jobIds"].append(row["jobId"])
     out = []
     for g in groups.values():
-        mean_gain = sum(g["gains"]) / len(g["gains"]) if g["gains"] else None
         seeds = sorted(g["seeds"])
-        ci = bootstrap_ci(g["gains"]) if len(g["gains"]) >= 2 else None
-        n = len(seeds) if seeds else len(g["values"])
+        if seeds:
+            active_buckets = [g["buckets"][("seed", s)] for s in seeds if ("seed", s) in g["buckets"]]
+        else:
+            active_buckets = list(g["buckets"].values())
+        dedup_values = [sum(b["values"]) / len(b["values"]) for b in active_buckets if b["values"]]
+        dedup_gains = [sum(b["gains"]) / len(b["gains"]) for b in active_buckets if b["gains"]]
+        mean_gain = sum(dedup_gains) / len(dedup_gains) if dedup_gains else None
+        ci = bootstrap_ci(dedup_gains) if len(dedup_gains) >= 2 else None
+        seed_insensitive = (
+            len(seeds) >= 2
+            and len(g["signatures"]) == 1
+            and bool(g["commands"])
+            and len(g["cliSeeds"]) < 2
+            and not any("AUTOLAB_SEED" in c for c in g["commands"])
+        )
+        n = 1 if (not seeds or seed_insensitive) else len(seeds)
         out.append({"variant": g["variant"], "planId": g["planId"], "dataset": g["dataset"],
                     "metric": g["metric"], "baseline": g["baseline"],
                     "n": n, "seeds": seeds,
-                    "meanValue": sum(g["values"]) / len(g["values"]),
+                    "meanValue": sum(dedup_values) / len(dedup_values),
                     "meanGain": mean_gain, "improved": mean_gain is not None and mean_gain > 0,
-                    "stdGain": statistics.stdev(g["gains"]) if len(g["gains"]) > 1 else 0.0,
+                    "stdGain": statistics.stdev(dedup_gains) if len(dedup_gains) > 1 else 0.0,
                     "ciLow": ci[0] if ci else None, "ciHigh": ci[1] if ci else None,
-                    "significant": bool(ci is not None and ci[0] > 0 and n >= 2),
+                    "significant": bool(
+                        not seed_insensitive
+                        and ci is not None
+                        and ci[0] > 0
+                        and len(dedup_gains) >= 3
+                        and n >= 3
+                    ),
                     "jobIds": g["jobIds"]})
     out.sort(key=lambda m: (m["meanGain"] is not None, m["meanGain"] or 0.0), reverse=True)
     return out
@@ -151,7 +228,7 @@ def evaluate_guardrails(rows: list[dict], contract: dict | None) -> dict:
     自身方向回退超过 max_regress 即违规。
 
     maximize 违规 = 均值 < 基线 - max_regress;minimize 违规 = 均值 > 基线 +
-    max_regress。没有契约/没有 guardrails 时永远无违规(旧行为不变)。"""
+    max_regress。每条违例携带 planId / variant / dataset 归属键。"""
     guardrails = [g for g in ((contract or {}).get("guardrails") or []) if isinstance(g, dict)]
     if not guardrails:
         return {"violations": [], "checked": 0}
@@ -159,30 +236,48 @@ def evaluate_guardrails(rows: list[dict], contract: dict | None) -> dict:
     for row in rows:
         if row.get("status") != "SUCCEEDED":
             continue
-        key = (row.get("variant") or row.get("planId"), row.get("dataset") or "")
+        variant = row.get("variant")
+        id_key = ("variant", variant) if variant else ("plan", row.get("planId"))
+        key = (id_key, row.get("dataset") or "")
         groups.setdefault(key, []).append(row)
     violations, checked = [], 0
-    for (variant, dataset), members in groups.items():
+    for (_, dataset), members in groups.items():
+        variant = members[0].get("variant")
+        plan_id = members[0].get("planId")
         baseline_metrics = next((m.get("baselineMetrics") for m in members
                                  if m.get("baselineMetrics")), {}) or {}
         for rule in guardrails:
             metric = str(rule.get("metric") or "")
             baseline = baseline_metrics.get(metric)
-            values = [v for v in (m.get("allMetrics", {}).get(metric) for m in members)
-                      if _numeric(v)]
-            if not metric or not values or not _numeric(baseline):
+            if not metric or not _numeric(baseline):
                 continue
+            by_seed: dict[tuple, list[float]] = {}
+            for m in members:
+                v = (m.get("allMetrics") or {}).get(metric)
+                if not _numeric(v):
+                    continue
+                seed_val, _ = _extract_seed(m)
+                bkey = ("seed", seed_val) if seed_val is not None else ("unseeded", None)
+                by_seed.setdefault(bkey, []).append(float(v))
+            if not by_seed:
+                continue
+            seeded_keys = [k for k in by_seed if k[0] == "seed"]
+            bucket_keys = seeded_keys if seeded_keys else list(by_seed)
+            dedup_vals = [sum(by_seed[k]) / len(by_seed[k]) for k in bucket_keys]
             checked += 1
-            value = sum(values) / len(values)
+            value = sum(dedup_vals) / len(dedup_vals)
             max_regress = float(rule.get("max_regress") or 0.0)
-            direction = str(rule.get("direction") or "maximize")
+            raw_dir = str(rule.get("direction") or "").strip()
+            direction = raw_dir if raw_dir in _DIRECTIONS else infer_metric_direction(metric)
             violated = (value < baseline - max_regress if direction == "maximize"
                         else value > baseline + max_regress)
             if violated:
-                violations.append({"variant": variant, "dataset": dataset,
+                violations.append({"planId": plan_id, "variant": variant, "dataset": dataset,
                                    "metric": metric, "value": value, "baseline": baseline,
                                    "maxRegress": max_regress, "direction": direction})
-    violations.sort(key=lambda v: (v["metric"], v["dataset"] or "", str(v["variant"])))
+    violations.sort(key=lambda v: (
+        v["metric"], v["dataset"] or "", str(v.get("variant") or ""), str(v.get("planId") or "")
+    ))
     return {"violations": violations, "checked": checked}
 
 

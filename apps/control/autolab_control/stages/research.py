@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,14 +29,15 @@ from ..agent.runtime import (
     ToolError,
 )
 from ..core.db import utc_now
+from ..core.errors import UserError
 from ..core.ids import new_id
 from ..core.repo import TERMINAL_JOB_STATUSES, Repo
 from ..execution.comparison import compare_plan, evaluate_guardrails, variant_means
 from ..execution.evidence import protected_state, round_evidence
-from ..execution.experiments import effective_metrics
-from ..workspace import refs
+from ..execution.experiments import check_dataset_command_consistency, effective_metrics
+from ..workspace import projects, refs
 from ..workspace.fs import Workspace
-from ..workspace.host import open_host
+from ..workspace.host import open_host, q
 from . import agent_specs
 from .baseline import baseline_contract, baseline_pool, baseline_snapshot, refresh_contract_hashes
 
@@ -117,26 +119,58 @@ def list_rounds(repo: Repo, project_id: str, run_id: str | None = None) -> list[
              "createdAt": r["created_at"], **json.loads(r["report_json"])} for r in rows]
 
 
+def _tainted_plan_ids(repo: Repo, run_id: str) -> set[str]:
+    """本会话因保护路径篡改被标记污染的 plan_id 集合(防恢复文件后用旧脏指标洗白收束)。"""
+    tainted: set[str] = set()
+    for ev in runtime.list_events(repo, run_id):
+        if ev.get("kind") == "protected_paths_changed":
+            payload = ev.get("payload") or {}
+            for pid in payload.get("tainted_plan_ids") or []:
+                if pid:
+                    tainted.add(str(pid))
+    return tainted
+
+
+def _abandon_plans(repo: Repo, plans: list[dict]) -> list[str]:
+    """将一轮内受污染的训练计划置为 ABANDONED,使其不能再参与 end_round/adopt。"""
+    ids = [str(p["id"]) for p in plans if p and p.get("id")]
+    if not ids:
+        return []
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            marks = ",".join("?" * len(ids))
+            conn.execute(
+                f"UPDATE plan_revisions SET status = 'ABANDONED' WHERE id IN ({marks})",
+                tuple(ids),
+            )
+    finally:
+        conn.close()
+    return ids
+
+
 def _run_plans(repo: Repo, run_id: str, since: str | None, *,
                include_eval: bool = False) -> list[dict]:
     """本会话经 run_experiment 批准的训练计划(approved_by=agent-run:<id>)。
 
     include_eval=True 时并入平台评测计划(platform-eval:<id>);那只该用于
-    用量统计,不要进 end_round/adopt 的训练计划列表——否则 evaluate_plans
-    会把评测 Job 当训练 Job 再判一次。"""
+    用量统计(含 ABANDONED 计划已消耗的时长),不要进 end_round/adopt 的训练计划列表。"""
     sources = [f"agent-run:{run_id}"]
     if include_eval:
         sources.append(f"platform-eval:{run_id}")
     marks = ",".join("?" * len(sources))
+    status_filter = "" if include_eval else " AND status != 'ABANDONED'"
     conn = repo.db.connect()
     try:
         rows = conn.execute(
             "SELECT id FROM plan_revisions WHERE approved_by IN (" + marks + ")"
-            " AND (? IS NULL OR approved_at > ?) ORDER BY approved_at, id",
+            + status_filter
+            + " AND (? IS NULL OR approved_at > ?) ORDER BY approved_at, id",
             (*sources, since, since)).fetchall()
     finally:
         conn.close()
-    return [repo.get_plan(r["id"]) for r in rows]
+    tainted = set() if include_eval else _tainted_plan_ids(repo, run_id)
+    return [repo.get_plan(r["id"]) for r in rows if r["id"] not in tainted]
 
 
 def _parse_ts(raw: str | None) -> float | None:
@@ -189,9 +223,10 @@ def evaluate_plans(repo: Repo, project: dict, plans: list[dict]) -> dict:
         comparison = compare_plan(repo, plan, pool, contract)
         eval_missing += int(comparison.get("evalMissing") or 0)
         labels[plan["id"]] = str(plan.get("summary") or plan["id"])[:80]
-        rows += [{k: r[k] for k in ("planId", "jobId", "name", "dataset", "variant", "seed",
-                                    "status", "metric", "value", "baseline", "gain", "improved",
-                                    "allMetrics", "baselineMetrics", "evalJobId")}
+        rows += [{k: r.get(k) for k in ("planId", "jobId", "name", "dataset", "variant", "seed",
+                                        "command", "status", "metric", "value", "baseline",
+                                        "gain", "improved", "allMetrics", "baselineMetrics",
+                                        "evalJobId")}
                  for r in comparison["rows"]]
         if comparison["warning"]:
             warnings.append(comparison["warning"])
@@ -272,12 +307,32 @@ def _case_fingerprint(hypothesis: str, changes: str, dataset: str,
         f"{hypothesis}\n{changes}\n{dataset}\n{variant}".encode()).hexdigest()[:32]
 
 
+def _variant_has_violation(violations: list[dict], plan_id: str | None,
+                           variant: str | None, dataset: str | None = None) -> bool:
+    """判定某 (planId, variant[, dataset]) 自身是否触发了护栏违例(消融变体互不连坐)。"""
+    for v in violations or []:
+        if dataset is not None and (v.get("dataset") or "") != (dataset or ""):
+            continue
+        v_var = v.get("variant")
+        if variant:
+            if v_var == variant:
+                return True
+        else:
+            if not v_var and v.get("planId") == plan_id:
+                return True
+            if v_var == plan_id:  # 兼容旧历史 violation 记录
+                return True
+    return False
+
+
 def _case_failure_class(evaluation: dict, m: dict) -> str:
     """失败原因归类,按可行动性排序(先命中先归):违规 > 证据不足 > 没提升 >
     评测失败 > 成功 > 无证据。success 与它独立:单 seed 合法提升也是 success。"""
     dataset = m.get("dataset") or ""
+    variant = m.get("variant")
+    plan_id = m.get("planId")
     violations = (evaluation.get("guardrails") or {}).get("violations") or []
-    if any((v.get("dataset") or "") == dataset for v in violations):
+    if _variant_has_violation(violations, plan_id, variant, dataset):
         return "guardrail"
     if not m.get("significant") and m.get("n", 0) < 3:
         return "insufficient_evidence"
@@ -285,7 +340,8 @@ def _case_failure_class(evaluation: dict, m: dict) -> str:
         return "not_improved"
     if any(r.get("status") in ("FAILED", "EVAL_MISSING")
            for r in evaluation.get("rows") or []
-           if (r.get("dataset") or "") == dataset):
+           if (r.get("dataset") or "") == dataset
+           and (r.get("variant") == variant if variant else r.get("planId") == plan_id)):
         return "eval_failed"
     if m.get("improved"):
         return "success"
@@ -601,6 +657,194 @@ def _status_suffix(env: LoopEnv) -> str:
 
 # ------------------------------------------------------------------ 工具
 
+_SHELL_FORBIDDEN_RE = re.compile(r"&&|\|\||[;|`<>]|\$\(|[\r\n]")
+_SEED_FLAGS = frozenset({"seed", "random-seed", "random_seed"})
+
+
+def _long_flag_pairs(command: str) -> dict[str, str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return {}
+    pairs: dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok.startswith("--"):
+            i += 1
+            continue
+        if "=" in tok:
+            name, _, value = tok.partition("=")
+        else:
+            if i + 1 >= len(tokens) or tokens[i + 1].startswith("-"):
+                i += 1
+                continue
+            name, value = tok, tokens[i + 1]
+            i += 1
+        if name.lstrip("-") not in _SEED_FLAGS:
+            pairs[name] = value
+        i += 1
+    return pairs
+
+
+def _capture_champion_commit(ws: Workspace, run_id: str, round_no: int) -> str | None:
+    """为当前冠军代码生成不可变 git 快照提交(含未提交/未跟踪源码,排除 .autolab、output*、
+    fork 共享链接及未跟踪数据集目录),写入 refs/autolab/champions/<run_id>-r<round_no>,
+    不改动工作区、分支或暂存区。"""
+    if not ws.sh("git rev-parse --is-inside-work-tree 2>/dev/null").ok:
+        return None
+    safe_run = re.sub(r"[^A-Za-z0-9_.-]", "-", run_id)
+    ref = f"refs/autolab/champions/{safe_run}-r{round_no}"
+    msg = f"autolab champion {run_id} round {round_no}"
+    spec_args = " ".join(q(s) for s in projects.source_git_pathspecs(ws.host, ws.workdir))
+    script = (
+        "set -e; "
+        "idx=$(git rev-parse --git-path index); "
+        "tmp=$(mktemp \"${TMPDIR:-/tmp}/autolab-idx.XXXXXX\"); "
+        "trap 'rm -f \"$tmp\"' EXIT; "
+        "if [ -f \"$idx\" ]; then cp \"$idx\" \"$tmp\"; else rm -f \"$tmp\"; fi; "
+        f"GIT_INDEX_FILE=\"$tmp\" git add -A -- {spec_args}; "
+        "tree=$(GIT_INDEX_FILE=\"$tmp\" git write-tree); "
+        "head=$(git rev-parse --verify HEAD 2>/dev/null || true); "
+        "if [ -n \"$head\" ] && [ \"$(git rev-parse \"$head^{tree}\" 2>/dev/null || true)\" = \"$tree\" ]; then "
+        "  sha=\"$head\"; "
+        "else "
+        "  if [ -n \"$head\" ]; then "
+        f"    sha=$(git -c user.name=autolab -c user.email=autolab@local commit-tree \"$tree\" -p \"$head\" -m {q(msg)}); "
+        "  else "
+        f"    sha=$(git -c user.name=autolab -c user.email=autolab@local commit-tree \"$tree\" -m {q(msg)}); "
+        "  fi; "
+        "fi; "
+        f"git update-ref {q(ref)} \"$sha\"; "
+        "printf '%s\\n' \"$sha\""
+    )
+    res = ws.sh(script, timeout=60)
+    sha = (res.out or "").strip().splitlines()[-1] if res.ok and (res.out or "").strip() else ""
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def _maybe_fork_validation_workdir(repo: Repo, credentials, project: dict,
+                                   code_commit: str | None) -> str | None:
+    """若项目是 git 仓库且当前工作区树/HEAD 与冠军快照 code_commit 不一致,
+    用 fork_workspace 检出干净的验证 worktree 并返回其路径。"""
+    commit = str(code_commit or "").strip()
+    source_dir = (project.get("remote_workdir") or "").rstrip("/")
+    if not commit or not source_dir:
+        return None
+    try:
+        host = open_host(repo, credentials, project["server_id"])
+    except Exception:  # noqa: BLE001 - 远端凭据暂不可用时延后到会话步内懒检出
+        return None
+    try:
+        git = f"git -C {q(source_dir)}"
+        if not host.run(f"{git} rev-parse --is-inside-work-tree 2>/dev/null").ok:
+            return None
+        if not host.run(f"{git} cat-file -e {q(commit + '^{commit}')} 2>/dev/null").ok:
+            return None
+        spec_args = " ".join(q(s) for s in projects.source_git_pathspecs(host, source_dir))
+        check_script = (
+            f"set -e; cd {q(source_dir)}; "
+            "idx=$(git rev-parse --git-path index); "
+            "tmp=$(mktemp \"${TMPDIR:-/tmp}/autolab-vchk.XXXXXX\"); "
+            "trap 'rm -f \"$tmp\"' EXIT; "
+            "if [ -f \"$idx\" ]; then cp \"$idx\" \"$tmp\"; else rm -f \"$tmp\"; fi; "
+            f"GIT_INDEX_FILE=\"$tmp\" git add -A -- {spec_args}; "
+            "cur_tree=$(GIT_INDEX_FILE=\"$tmp\" git write-tree); "
+            f"tgt_tree=$(git rev-parse {q(commit + '^{tree}')}); "
+            "head=$(git rev-parse --verify HEAD 2>/dev/null || true); "
+            f"if [ \"$cur_tree\" = \"$tgt_tree\" ] && [ \"$head\" = {q(commit)} ]; then "
+            "  printf 'clean\\n'; "
+            "else "
+            "  printf 'diverged\\n'; "
+            "fi"
+        )
+        chk = host.run(check_script, timeout=60)
+        if chk.ok and (chk.out or "").strip().endswith("clean"):
+            return None
+        tag = new_id("val")[-8:]
+        server = repo.get_server(project["server_id"])
+        sibling = f"{source_dir}-val-{tag}"
+        val_dir = sibling
+        if server:
+            try:
+                projects.ensure_within_roots(server, sibling, project.get("output_root") or "")
+            except UserError:
+                val_dir = f"{source_dir}/.autolab/validation-{tag}"
+        n = 2
+        base_val_dir = val_dir
+        while host.run(f"test -e {q(val_dir)} -o -L {q(val_dir)}").ok:
+            val_dir = f"{base_val_dir}-{n}"
+            n += 1
+        projects.fork_workspace(
+            host, source_dir, val_dir, commit, branch=f"autolab/val-{tag}-{n}",
+        )
+        projects.prepare_workspace(host, val_dir)
+        return val_dir
+    finally:
+        host.close()
+
+
+class _ValidationRepoProxy:
+    """validation 检出独立 worktree 时,在落库前将 cd <val_wd> 注入 PlanSpec.command_template,
+    使 Job params 里的 command 保持原样(通过只读命令门与基线采纳),同时实际执行落在干净 worktree。"""
+
+    def __init__(self, inner: Repo, val_workdir: str) -> None:
+        self._inner = inner
+        self._val_workdir = val_workdir
+
+    def create_draft_plan(self, *, project_id: str, spec, summary: str | None = None,
+                          parent_plan_revision_id: str | None = None) -> dict:
+        tmpl = list(spec.command_template)
+        if len(tmpl) >= 3 and tmpl[0] == "bash" and tmpl[1] == "-c":
+            cd_prefix = f"cd {q(self._val_workdir)} && "
+            if not str(tmpl[2]).startswith(cd_prefix):
+                tmpl[2] = cd_prefix + str(tmpl[2])
+                spec = spec.model_copy(update={"command_template": tmpl})
+        return self._inner.create_draft_plan(
+            project_id=project_id, spec=spec, summary=summary,
+            parent_plan_revision_id=parent_plan_revision_id,
+        )
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
+def _bind_validation_workspace(env: LoopEnv) -> tuple[str | None, str]:
+    """validation 模式下将 env 工作区指向干净的 validation_workdir;返回 (val_wd, main_wd)。"""
+    main_wd = getattr(env, "_main_workdir", None)
+    if main_wd is None:
+        main_wd = (env.project.get("remote_workdir") or "").rstrip("/")
+        env._main_workdir = main_wd
+    if env.config.get("mode") != "validation":
+        return None, main_wd
+    raw_repo = getattr(env.repo, "_inner", env.repo)
+    val_wd = str(env.config.get("validation_workdir") or "").strip() or None
+    if not val_wd:
+        code_commit = (env.config.get("champion") or {}).get("codeCommit")
+        if code_commit:
+            val_wd = _maybe_fork_validation_workdir(
+                raw_repo, env.credentials, {**env.project, "remote_workdir": main_wd}, code_commit,
+            )
+            if val_wd:
+                env.config["validation_workdir"] = val_wd
+                conn = raw_repo.db.connect()
+                try:
+                    with raw_repo.db.tx(conn):
+                        conn.execute(
+                            "UPDATE agent_runs SET config_json = ? WHERE id = ?",
+                            (json.dumps(env.config, ensure_ascii=False), env.run["id"]),
+                        )
+                finally:
+                    conn.close()
+    if val_wd and env.project.get("remote_workdir") != val_wd:
+        env.project = {**env.project, "remote_workdir": val_wd}
+        if env._workspace is not None and env._workspace.workdir != val_wd:
+            env._workspace = Workspace(env._workspace.host, val_wd)
+    if val_wd and val_wd != main_wd and not isinstance(env.repo, _ValidationRepoProxy):
+        env.repo = _ValidationRepoProxy(raw_repo, val_wd)
+    return val_wd, main_wd
+
+
 def _check_gpu_budget(env: LoopEnv) -> None:
     budget = _tier(env)["gpu_hours"]
     if budget and gpu_hours_used(env.repo, env.run["id"]) >= budget:
@@ -615,11 +859,18 @@ def _finish_validation(env: LoopEnv, round_no: int, report: dict,
     tol = float(config.get("regress_tol") or 0.005)
     pool = baseline_pool(env.project)
     selected = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
+    violations = (evaluation.get("guardrails") or {}).get("violations") or []
     verdicts, gains, success = [], [], bool(selected)
     for dataset in selected:
         group = next((m for m in evaluation["means"]
                       if m["dataset"] == dataset and m["n"] >= seeds
-                      and m["meanGain"] is not None), None)
+                      and m["meanGain"] is not None
+                      and not _variant_has_violation(
+                          violations, m.get("planId"), m.get("variant"), dataset)), None)
+        if group is None:
+            group = next((m for m in evaluation["means"]
+                          if m["dataset"] == dataset and m["n"] >= seeds
+                          and m["meanGain"] is not None), None)
         if group is None:
             have = max((m["n"] for m in evaluation["means"] if m["dataset"] == dataset),
                        default=0)
@@ -633,14 +884,13 @@ def _finish_validation(env: LoopEnv, round_no: int, report: dict,
             f",95% CI [{group['ciLow']:+.4f}, {group['ciHigh']:+.4f}]"
         verdicts.append(f"{dataset}:{gain:+.4g} {mark}"
                         f"({group['n']} seed 均值 {group['meanValue']:.4g}{ci})")
-        if gain < -tol:
+        if gain < -tol or _variant_has_violation(
+                violations, group.get("planId"), group.get("variant"), dataset):
             success = False
     if not any(g > 0 for g in gains):
         success = False
     verdict = f"全量验证{'通过' if success else '未通过'}:" + ";".join(verdicts)
     verdict += _guardrail_verdict(evaluation)
-    if (evaluation.get("guardrails") or {}).get("violations"):
-        success = False
     report["verdict"] = verdict
     report["validation"] = True
     _record_round(env, round_no, report)
@@ -662,8 +912,26 @@ def _guardrail_verdict(evaluation: dict) -> str:
     more = f" 等 {len(violations)} 项" if len(violations) > 3 else ""
     return f";guardrail 违规:{listed}{more}"
 
+
+def _round_best_eligible_gain(round_report: dict, min_seeds: int) -> float | None:
+    champ_gain = (round_report.get("champion") or {}).get("meanGain")
+    if champ_gain is not None:
+        return champ_gain
+    ev = round_report.get("evaluation") or {}
+    viol = (ev.get("guardrails") or {}).get("violations") or []
+    gains = [
+        m["meanGain"]
+        for m in (ev.get("means") or [])
+        if m.get("n", 0) >= min_seeds
+        and m.get("meanGain") is not None
+        and not _variant_has_violation(viol, m.get("planId"), m.get("variant"))
+    ]
+    return max(gains) if gains else None
+
+
 def _end_round_tool() -> Tool:
     def handler(env: LoopEnv, args: dict):
+        _bind_validation_workspace(env)
         repo, project, run_id = env.repo, env.project, env.run["id"]
         rounds = list_rounds(repo, project["id"], run_id)
         since = rounds[-1]["createdAt"] if rounds else None
@@ -698,16 +966,20 @@ def _end_round_tool() -> Tool:
         round_no = len(rounds) + 1
 
         # B1.4:保护路径门。契约配置了 eval 路径且 expected hash 非空时,
-        # 评测代码/数据划分被改过 → 本轮结论无效,拒绝收束(只读 hash,不记内容)。
+        # 评测代码/数据划分被改过 → 本轮全部已提交 Plan 立即标记 ABANDONED 污染作废,
+        # 即使事后恢复文件也不能再用旧脏指标收束,必须重新干净跑实验。
         protected = protected_state(env.workspace, evaluation.get("contract"))
         for kind, info in (("code", protected["code"]), ("data", protected["data"])):
             if info and info["changed"]:
+                tainted_ids = _abandon_plans(repo, plans)
                 runtime.record_event(repo, run_id, "protected_paths_changed",
                                      {"kind": kind, "expected": info["expected"],
-                                      "current": info["hash"], "paths": info["paths"]})
+                                      "current": info["hash"], "paths": info["paths"],
+                                      "tainted_plan_ids": tainted_ids})
                 raise ToolError(
-                    f"评测代码/数据划分被修改,本轮结论无效:{kind}"
-                    f" expected={info['expected']} current={info['hash']};请恢复后再 end_round")
+                    f"评测代码/数据划分被修改,本轮实验已标记作废:{kind}"
+                    f" expected={info['expected']} current={info['hash']};"
+                    "请恢复文件后重新提交干净的 run_experiment 再 end_round")
         report["evidence"] = round_evidence(repo, env.workspace, plans,
                                             evaluation.get("contract"),
                                             evaluation["means"], protected)
@@ -731,23 +1003,23 @@ def _end_round_tool() -> Tool:
 
         tier = _tier(env)
         means = evaluation["means"]
-        eligible = [m for m in means
-                    if m["n"] >= tier["min_seeds"] and m["meanGain"] is not None]
-        best = eligible[0] if eligible else None  # variant_means 已按均值增益降序
         violations = (evaluation.get("guardrails") or {}).get("violations") or []
+        seed_eligible = [m for m in means
+                         if m["n"] >= tier["min_seeds"] and m["meanGain"] is not None]
+        eligible = [m for m in seed_eligible
+                    if not _variant_has_violation(violations, m.get("planId"), m.get("variant"))]
+        best = eligible[0] if eligible else None  # 仅零护栏违例的达标变体可竞选本轮胜出
         if best is None:
             success = False
         elif tier["threshold"] > 0:
-            # heavy:均值过阈值 + bootstrap 95% CI 下界 > 0 才算统计上可信
+            # heavy:均值过阈值 + bootstrap 95% CI 下界 > 0(n>=3)才算统计上可信
             success = bool(best.get("significant")) and best["meanGain"] >= tier["threshold"]
         else:
             success = best["meanGain"] > 0   # light/medium:保持均值语义,快速迭代
-        success = success and not violations
 
-        # 冠军:跨轮保留最优的达标变体。判定/报告/通知都以它为准——真机教训:
-        # 最后一轮一个次优变体的单 seed 冒尖触发了停止,而它均值比冠军更差。
+        # 严格冠军门:仅当 best 自身零护栏违例且完全满足当前档位 success 判据时才允许更新冠军!
         champion = rounds[-1].get("champion") if rounds else None
-        if best is not None and best["meanGain"] > 0:
+        if success and best is not None and best["meanGain"] > 0:
             candidate = {"round": round_no, "planId": best["planId"],
                          "variant": best.get("variant"), "label": best.get("label"),
                          "dataset": best["dataset"], "n": best["n"],
@@ -755,23 +1027,27 @@ def _end_round_tool() -> Tool:
                          "stdGain": best.get("stdGain"),
                          "ciLow": best.get("ciLow"), "ciHigh": best.get("ciHigh")}
             if not champion or candidate["meanGain"] > (champion.get("meanGain") or 0):
+                code_commit = _capture_champion_commit(env.workspace, run_id, round_no)
+                if code_commit:
+                    candidate["codeCommit"] = code_commit
                 champion = candidate
         if champion:
             report["champion"] = champion
 
-        if best is not None:
-            ci = "" if best.get("ciLow") is None else \
-                f"(95% CI [{best['ciLow']:+.4f}, {best['ciHigh']:+.4f}])"
-            label = best.get("variant") or best.get("label") or best["planId"]
+        display_best = best if best is not None else (seed_eligible[0] if seed_eligible else None)
+        if display_best is not None:
+            ci = "" if display_best.get("ciLow") is None else \
+                f"(95% CI [{display_best['ciLow']:+.4f}, {display_best['ciHigh']:+.4f}])"
+            label = display_best.get("variant") or display_best.get("label") or display_best["planId"]
             if success:
                 head = "有提升"
-            elif tier["threshold"] > 0 and best["meanGain"] >= tier["threshold"] \
-                    and not best.get("significant"):
+            elif best is not None and tier["threshold"] > 0 \
+                    and best["meanGain"] >= tier["threshold"] and not best.get("significant"):
                 head = "证据不足"   # 均值过线但 CI 下界 ≤ 0:统计上不可信
             else:
                 head = "未提升"
-            verdict = (f"{head}——变体「{label}」[{best['dataset'] or '-'}]"
-                       f" {best['n']} seed 均值增益 {best['meanGain']:+.4g}{ci}")
+            verdict = (f"{head}——变体「{label}」[{display_best['dataset'] or '-'}]"
+                       f" {display_best['n']} seed 均值增益 {display_best['meanGain']:+.4g}{ci}")
             if champion and champion.get("round") != round_no:
                 verdict += (f";当前冠军:第 {champion['round']} 轮「{champion.get('label')}」"
                             f"[{champion.get('dataset')}] {champion.get('meanGain'):+.4g}")
@@ -785,11 +1061,10 @@ def _end_round_tool() -> Tool:
             verdict = "未提升(本轮没有成功产出指标的实验)"
         verdict += _guardrail_verdict(evaluation)
 
-        # B2.1 无进展计数:本轮最优均值相对历史冠军无新提升则累计,有提升清零。
-        # progress 要求正增益;零/负增益也计入 stagnant(此前首轮 0 增益被误判为进展)。
-        prev_best = max((r["champion"]["meanGain"] for r in rounds
-                         if (r.get("champion") or {}).get("meanGain") is not None),
-                        default=None)
+        # B2.1 无进展计数:本轮最优干净均值相对历史最佳无新提升则累计,有提升清零。
+        prior_gains = [g for g in (_round_best_eligible_gain(r, tier["min_seeds"]) for r in rounds)
+                       if g is not None]
+        prev_best = max(prior_gains) if prior_gains else None
         current_best = best["meanGain"] if best else None
         progress = (current_best is not None and current_best > 0
                     and (prev_best is None or current_best > prev_best + 1e-12))
@@ -801,21 +1076,24 @@ def _end_round_tool() -> Tool:
         report["verdict"] = verdict
         _record_round(env, round_no, report)
 
-        result = {"rounds": round_no, "success": success,
-                  "bestGain": (champion or best or {}).get("meanGain"),
+        session_success = bool(champion) or success
+        result = {"rounds": round_no, "success": session_success,
+                  "bestGain": (champion or best or display_best or {}).get("meanGain"),
                   "lastRound": report}
         if champion:
             result["champion"] = champion
         if tier["max_rounds"] and round_no >= tier["max_rounds"]:
-            return Finish({**result, "reason": f"已达轮数上限 {tier['max_rounds']}"})
+            return Finish({**result, "success": bool(champion),
+                           "reason": f"已达轮数上限 {tier['max_rounds']}"})
         if tier["gpu_hours"] and gpu_hours_used(repo, run_id) >= tier["gpu_hours"]:
-            return Finish({**result, "reason": f"GPU 预算 {tier['gpu_hours']:g} 小时已用完"})
+            return Finish({**result, "success": bool(champion),
+                           "reason": f"GPU 预算 {tier['gpu_hours']:g} 小时已用完"})
         cap = int(tier.get("stagnant_rounds") or 0)
         if cap and stagnant >= cap:
-            # B2.1:来自 B1 实测——heavy 在 fixture 上连跑 12 轮相同实验,
-            # Python 判「证据不足」但 agent 不知道停。软预算到点由 Python 收束。
-            return Finish({**result, "reason": f"连续 {stagnant} 轮无新提升(当前冠军 "
-                                              f"{prev_best if prev_best is not None else '-'});停止"})
+            champ_gain = champion.get("meanGain") if champion else None
+            return Finish({**result, "success": bool(champion),
+                           "reason": f"连续 {stagnant} 轮无新提升(当前冠军 "
+                                     f"{champ_gain if champ_gain is not None else '-'});停止"})
         if tier["confirm_each_round"]:
             return Pause("human", {
                 "kind": ROUND_REVIEW_KIND, "roundNo": round_no,
@@ -871,10 +1149,17 @@ def _record_round(env: LoopEnv, round_no: int, report: dict) -> None:
                  json.dumps(report, ensure_ascii=False), utc_now()))
     finally:
         conn.close()
+    md_entry = _round_markdown(round_no, report)
     ws = env.workspace
     old = ws.read_bytes(JOURNAL_REL).decode("utf-8") if ws.exists(JOURNAL_REL) \
         else "# 研究日志\n\n"
-    ws.write_bytes(JOURNAL_REL, (old + _round_markdown(round_no, report)).encode("utf-8"))
+    ws.write_bytes(JOURNAL_REL, (old + md_entry).encode("utf-8"))
+    main_wd = getattr(env, "_main_workdir", "")
+    if main_wd and main_wd != ws.workdir.rstrip("/"):
+        main_ws = Workspace(ws.host, main_wd)
+        main_old = main_ws.read_bytes(JOURNAL_REL).decode("utf-8") \
+            if main_ws.exists(JOURNAL_REL) else "# 研究日志\n\n"
+        main_ws.write_bytes(JOURNAL_REL, (main_old + md_entry).encode("utf-8"))
     try:
         record_research_cases(env, round_no, report, report.get("evaluation") or {})
     except Exception as exc:  # noqa: BLE001 - 记忆失败不毁研究结论
@@ -898,7 +1183,62 @@ def _critic_review(env: LoopEnv, request) -> dict | None:
                 "reasons": [f"critic 输入组装失败:{exc}"], "unavailable": True}
 
 
+def _wrap_validation_experiment_tools(experiment_tools_list: list[Tool]) -> list[Tool]:
+    """validation 模式下收紧 run_experiment:
+    1. 每个 Job 必须显式指定合法 dataset;
+    2. 严禁命令包含 &&、||、;、|、`、$(、>、< 等复合/重定向操作符;
+    3. 校验多数据集及单数据集基线长参数口径一致;
+    4. 若检出了干净的 validation_workdir,将命令定位到该 worktree 执行。"""
+    wrapped: list[Tool] = []
+    for tool in experiment_tools_list:
+        if tool.name != "run_experiment":
+            wrapped.append(tool)
+            continue
+        inner = tool.handler
+
+        def guarded_run_experiment(env: LoopEnv, args: dict, _inner=inner):
+            _bind_validation_workspace(env)
+            pool = baseline_pool(env.project)
+            ds_commands = {name: (info.get("command") or "") for name, info in pool.items()}
+            raw_jobs = args.get("jobs") or []
+            patched_jobs = []
+            for item in raw_jobs:
+                job = dict(item or {})
+                dataset = str(job.get("dataset") or "").strip()
+                if not dataset:
+                    raise ToolError("全量验证模式下每个 Job 必须显式指定 dataset")
+                if dataset not in pool:
+                    raise ToolError(
+                        f"数据集 {dataset} 不在基线确认池里(可选:{', '.join(sorted(pool)) or '无'})"
+                    )
+                raw_cmd = str(job.get("command") or "").strip()
+                if _SHELL_FORBIDDEN_RE.search(raw_cmd):
+                    raise ToolError(
+                        "全量验证模式下命令禁止使用复合或重定向操作符(&&、||、;、|、`、$(、>)"
+                    )
+                try:
+                    check_dataset_command_consistency(dataset, raw_cmd, ds_commands)
+                except UserError as exc:
+                    raise ToolError(str(exc)) from exc
+                base_flags = _long_flag_pairs(ds_commands.get(dataset) or "")
+                sub_flags = _long_flag_pairs(raw_cmd)
+                for flag, expected in base_flags.items():
+                    if sub_flags.get(flag) != expected:
+                        raise ToolError(
+                            f"全量验证命令与 {dataset} 基线口径不一致:"
+                            f"基线含 `{flag} {expected}`,提交命令为 `{flag} {sub_flags.get(flag)}`"
+                        )
+                patched_jobs.append(job)
+            return _inner(env, {**args, "jobs": patched_jobs})
+
+        wrapped.append(Tool(tool.name, tool.description, tool.input_schema, guarded_run_experiment))
+    return wrapped
+
+
 def build_tools(env: LoopEnv) -> list[Tool]:
+    is_validation = env.config.get("mode") == "validation"
+    if is_validation:
+        _bind_validation_workspace(env)
     knowledge_tools = [tools.knowledge_tool()] if knowledge.configured() else []
     from ..agent import paper_radar
     paper_tools = [tools.paper_radar_tool()] if paper_radar.available() else []
@@ -911,11 +1251,12 @@ def build_tools(env: LoopEnv) -> list[Tool]:
         eval_contract=lambda e: baseline_contract(e.project),
         critic=_critic_review if env.config.get("critic") else None)
     cases_tool = tools.search_cases_tool(_case_answer)
-    if env.config.get("mode") == "validation":
-        # 验证会话只读 + 只跑:改代码/shell 都不给,保证验证的是来源会话结束时的代码
+    if is_validation:
+        # 验证会话只读 + 只跑:改代码/shell 都不给,保证验证的是冠军快照代码
         return [*tools.workspace_tools(writable=False), *knowledge_tools, *paper_tools,
-                *experiment, cases_tool, tools.read_paper_tool(),
-                tools.read_reference_tool(), tools.ask_human_tool(), _end_round_tool()]
+                *_wrap_validation_experiment_tools(experiment), cases_tool,
+                tools.read_paper_tool(), tools.read_reference_tool(),
+                tools.ask_human_tool(), _end_round_tool()]
     return [*tools.workspace_tools(), tools.shell_tool(), *knowledge_tools, *paper_tools,
             *experiment, cases_tool, tools.read_paper_tool(),
             tools.read_reference_tool(), tools.ask_human_tool(), _end_round_tool()]
@@ -924,6 +1265,7 @@ def build_tools(env: LoopEnv) -> list[Tool]:
 def _describe_session_jobs(env: LoopEnv, job_ids: list[str]):
     """B2.3a:waiting_jobs 恢复路径的结果出口,与 wait_jobs 工具同一逻辑:
     训练 Job 终态后按契约自动提交平台评测 Job,改等评测;返回文本或新 Pause。"""
+    _bind_validation_workspace(env)
     return tools.jobs_wait_outcome(env, job_ids,
                                    eval_contract=baseline_contract(env.project),
                                    baseline_ref=_baseline_exp_ref(env.repo, env.project))
@@ -1029,6 +1371,7 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
     project = repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
+    runtime.ensure_no_active_run(repo, project_id)
     old_snapshot = baseline_snapshot(project)
     if not old_snapshot.get("datasets"):
         raise AgentLoopError("还没有确认过的基线快照")
@@ -1043,16 +1386,50 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
     if result.get("adopted"):
         raise AgentLoopError("该会话的结果已采纳过")
 
+    plans = _run_plans(repo, run_id, None)
+    evaluation = evaluate_plans(repo, project, plans) if plans else {"means": [], "guardrails": {}}
+    seeds_req = max(1, int((run.get("config") or {}).get("seeds") or 3))
+    violations = (evaluation.get("guardrails") or {}).get("violations") or []
+    selected_job_ids: dict[str, set[str]] = {}
+    for dataset in old_snapshot["datasets"]:
+        group = next(
+            (m for m in evaluation["means"]
+             if m["dataset"] == dataset and m["n"] >= seeds_req
+             and m["meanGain"] is not None
+             and not _variant_has_violation(violations, m.get("planId"), m.get("variant"), dataset)),
+            None,
+        )
+        if group is None:
+            group = next(
+                (m for m in evaluation["means"]
+                 if m["dataset"] == dataset and m["n"] >= seeds_req
+                 and m["meanGain"] is not None),
+                None,
+            )
+        if group is None:
+            group = next((m for m in evaluation["means"] if m["dataset"] == dataset), None)
+        if group is not None and group.get("jobIds"):
+            selected_job_ids[dataset] = set(group["jobIds"])
+
     measured: dict[str, dict[str, list[float]]] = {}
     jobs_of: dict[str, list[str]] = {}
-    for plan in _run_plans(repo, run_id, None):
+    for plan in plans:
         for job in repo.list_jobs(plan_id=plan["id"]):
             dataset = str((json.loads(job["params_json"] or "{}")).get("dataset") or "")
             if job["status"] != "SUCCEEDED" or dataset not in old_snapshot["datasets"]:
                 continue
-            for key, value in (effective_metrics(repo, job) or {}).items():
-                if isinstance(value, (int, float)):
-                    measured.setdefault(dataset, {}).setdefault(key, []).append(float(value))
+            allowed_ids = selected_job_ids.get(dataset)
+            if allowed_ids is not None and job["id"] not in allowed_ids:
+                continue
+            valid_metrics = {
+                key: float(value)
+                for key, value in (effective_metrics(repo, job) or {}).items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+            if not valid_metrics:
+                continue
+            for key, value in valid_metrics.items():
+                measured.setdefault(dataset, {}).setdefault(key, []).append(value)
             jobs_of.setdefault(dataset, []).append(job["id"])
     if not measured:
         raise AgentLoopError("该验证会话没有成功的实验,无从采纳")
@@ -1126,7 +1503,8 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
                      seeds: int = 3, source_run_id: str | None = None,
                      gpu_hours: float | None = None,
                      critic: bool = False, reviewer: bool = False,
-                     agent_spec_id: str | None = None) -> dict:
+                     agent_spec_id: str | None = None,
+                     credentials=None) -> dict:
     """把来源研究会话的冠军改动做成一次全量验证会话:不改代码,在选定数据集上
     按基线口径多 seed 重跑,一轮收束出逐数据集均值结论。owner 点按钮即授权。"""
     project = repo.get_project(project_id)
@@ -1146,8 +1524,10 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
     src_rounds = list_rounds(repo, project_id, source["id"])
     src_round = next((r for r in src_rounds
                       if r.get("roundNo") == champion.get("round")), None)
-    # 旧会话(冠军字段上线前)回落 lastRound;验证对象终究是工作区当前代码
+    # 旧会话(冠军字段上线前)回落 lastRound
     carrier = src_round or result.get("lastRound") or {}
+    code_commit = champion.get("codeCommit") or code_commit_of_run(repo, source["id"])
+    val_workdir = _maybe_fork_validation_workdir(repo, credentials, project, code_commit)
     seeds = max(1, min(int(seeds or 3), 5))
     chosen = [d for d in (datasets or []) if d in pool] or list(pool)
     overrides = {"gpu_hours": max(0.0, float(gpu_hours))} if gpu_hours is not None else {}
@@ -1155,13 +1535,18 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
               "overrides": overrides, "datasets": chosen, "seeds": seeds,
               "regress_tol": 0.005, "source_run_id": source["id"],
               "champion": {"round": champion.get("round"),
+                           "planId": champion.get("planId"),
+                           "variant": champion.get("variant"),
                            "label": champion.get("label"),
                            "dataset": champion.get("dataset"),
                            "n": champion.get("n"), "meanGain": champion.get("meanGain"),
+                           "codeCommit": code_commit,
                            "hypothesis": str(carrier.get("hypothesis") or "")[:2000],
                            "changes": str(carrier.get("changes") or "")[:2000]},
               "kb_assist": False, "kb_spaces": None,
               "critic": bool(critic), "reviewer": bool(reviewer)}
+    if val_workdir:
+        config["validation_workdir"] = val_workdir
     overlay = agent_specs.overlay_for_run(repo, KIND, agent_spec_id)
     if overlay is not None:  # C4a:无 active 且未显式指定时行为与原来一致
         config["agent_spec"] = overlay

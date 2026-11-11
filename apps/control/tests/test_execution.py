@@ -128,7 +128,7 @@ def test_variant_means_groups_by_variant_and_seed():
     assert len(means) == 2                                    # 同一 plan 两个变体不混合
     attn = next(m for m in means if m["variant"] == "attn")
     assert attn["planId"] == "p1" and attn["seeds"] == [1, 2] and attn["n"] == 2
-    assert attn["meanGain"] == 0.045 and attn["significant"] is True and attn["stdGain"] > 0
+    assert attn["meanGain"] == 0.045 and attn["significant"] is False and attn["stdGain"] > 0
     assert attn["ciLow"] is not None and 0.01 <= attn["ciLow"] <= 0.045
     assert means[0]["variant"] == "attn"                      # 按均值增益降序
     hflip = next(m for m in means if m["variant"] == "hflip")
@@ -136,7 +136,7 @@ def test_variant_means_groups_by_variant_and_seed():
     legacy = variant_means([_mean_row("p9", "kvasir", 0.85, 0.05),
                             _mean_row("p9", "kvasir", 0.83, 0.03)])
     assert len(legacy) == 1 and legacy[0]["variant"] is None
-    assert legacy[0]["seeds"] == [] and legacy[0]["n"] == 2   # n = 有效指标行数
+    assert legacy[0]["seeds"] == [] and legacy[0]["n"] == 1   # 未传 seed 折算为 n=1
     mixed = variant_means([_mean_row("p8", "kvasir", 0.85, 0.05, variant="m", seed=1),
                            _mean_row("p8", "kvasir", 0.79, -0.01, variant="m", seed=2)])
     assert mixed[0]["meanGain"] == 0.02 and mixed[0]["significant"] is False

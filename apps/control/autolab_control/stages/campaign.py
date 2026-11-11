@@ -336,9 +336,9 @@ def _is_metric_number(value) -> bool:
 def _champion_primary(winner_snapshot: dict, source_snapshot: dict, repo: Repo,
                       winner_project_id: str, winner_run_id: str,
                       dataset: str) -> str:
-    """主指标:winner 契约 primary → source 契约 primary →
+    """主指标:source 契约 primary → winner 契约 primary →
     最后一轮 evaluation.rows 里该数据集行的 metric。"""
-    for snapshot in (winner_snapshot, source_snapshot):
+    for snapshot in (source_snapshot, winner_snapshot):
         name = str((snapshot.get("metric_contract") or {}).get("primary") or "").strip()
         if name:
             return name
@@ -348,6 +348,66 @@ def _champion_primary(winner_snapshot: dict, source_snapshot: dict, repo: Repo,
         if str(row.get("dataset") or "").strip() == dataset and row.get("metric"):
             return str(row["metric"])
     return ""
+
+
+def _check_multidataset_promotion(
+    repo: Repo,
+    winner_project: dict,
+    winner_run: dict,
+    champion: dict,
+    champion_plan: dict | None,
+) -> dict[str, float]:
+    """多数据集防退化门:检查冠军轮次(或冠军 plan)在所有已实测数据集上的均值增益与护栏违例;
+    若任一已实测数据集出现退化(meanGain < 0)或触发护栏违例则拒绝回灌。
+    返回 {dataset: meanValue} 供回灌同步更新所有已验证提升的数据集。"""
+    winner_project_id = winner_project["id"]
+    winner_run_id = winner_run["id"]
+    rounds = research.list_rounds(repo, winner_project_id, winner_run_id)
+    champ_round = next(
+        (r for r in rounds if r.get("roundNo") == champion.get("round")),
+        rounds[-1] if rounds else ((winner_run.get("result") or {}).get("lastRound") or None),
+    )
+    champ_var = champion.get("variant")
+    champ_plan_id = champion.get("planId")
+    evaluation = (champ_round or {}).get("evaluation")
+    if not evaluation and champion_plan is not None \
+            and champion_plan.get("project_id") == winner_project_id:
+        try:
+            evaluation = research.evaluate_plans(repo, winner_project, [champion_plan])
+        except Exception:  # noqa: BLE001 - 人工构造的轻量 plan(无完整 PlanSpec)跳过重算
+            evaluation = None
+    if not isinstance(evaluation, dict):
+        return {}
+
+    def _belongs_to_champion(item: dict) -> bool:
+        if champ_var:
+            return item.get("variant") == champ_var
+        if champ_plan_id:
+            return item.get("planId") == champ_plan_id
+        return True
+
+    violations = (evaluation.get("guardrails") or {}).get("violations") or []
+    own_violations = [v for v in violations if _belongs_to_champion(v)]
+    if own_violations:
+        v0 = own_violations[0]
+        raise UserError(
+            f"冠军变体在数据集 {v0.get('dataset') or '-'} 上触发护栏违例({v0.get('metric')}),拒绝回灌"
+        )
+
+    verified_means: dict[str, float] = {}
+    for m in evaluation.get("means") or []:
+        if not _belongs_to_champion(m):
+            continue
+        ds = str(m.get("dataset") or "").strip()
+        gain = m.get("meanGain")
+        val = m.get("meanValue")
+        if _is_metric_number(gain) and gain < -1e-9:
+            raise UserError(
+                f"冠军变体在实测数据集 {ds or '-'} 上指标退化(meanGain={gain:+.4g}),拒绝偏科回灌"
+            )
+        if ds and _is_metric_number(val) and (_is_metric_number(gain) and gain > 0):
+            verified_means[ds] = float(val)
+    return verified_means
 
 
 def _abort_merge(host, git: str) -> str | None:
@@ -397,15 +457,18 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
     winner_project = repo.get_project(winner_project_id)
     if source is None or winner_project is None:
         raise UserError("源项目或冠军项目不存在,不能回灌")
+    runtime.ensure_no_active_run(repo, source["id"])
+    runtime.ensure_no_active_run(repo, winner_project_id)
     source_dir = (source.get("remote_workdir") or "").rstrip("/")
-    if not source_dir or not (winner_project.get("remote_workdir") or "").strip():
+    winner_dir = (winner_project.get("remote_workdir") or "").rstrip("/")
+    if not source_dir or not winner_dir:
         raise UserError("源项目或冠军项目没有工作区,不能回灌")
     winner_branch = str(branch["fork"])
     source_snapshot = baseline_snapshot(source)
     winner_snapshot = baseline_snapshot(winner_project)
 
     # ---- 冠军已验证均值:回灌只信 result.champion,不采信冠军分支的旧基线快照。
-    #      放在 merge 之前:均值不可采纳时直接 409,源工作区一个字节都不动。
+    #      放在 merge 之前:均值不可采纳或多数据集退化时直接 409,源工作区一个字节都不动。
     champion = (winner_run.get("result") or {}).get("champion")
     champion_dataset = str((champion or {}).get("dataset") or "").strip()
     champion_mean = (champion or {}).get("meanValue")
@@ -416,8 +479,13 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                                 winner_project_id, winner_run_id, champion_dataset)
     if not primary:
         raise UserError("无法确定主指标,冠军均值不能回灌")
+    champion_plan = repo.get_plan(str(champion.get("planId") or ""))
+    verified_means = _check_multidataset_promotion(
+        repo, winner_project, winner_run, champion, champion_plan,
+    )
 
-    # ---- 代码 merge:源工作区 tracked clean 才动手;失败 abort 还原
+    # ---- 代码 merge:源工作区 tracked clean 才动手;未提交冠军源码自动落盘或取 codeCommit;
+    #      零代码改动拒绝空合并;失败 abort 还原
     with open_host(repo, credentials, source["server_id"]) as host:
         git = f"git -C {q(source_dir)}"
         if not host.run(f"{git} rev-parse --is-inside-work-tree").ok:
@@ -428,7 +496,29 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
             raise UserError(f"源工作区有未提交的 tracked 改动,拒绝回灌:{dirty}")
         if not host.run(f"{git} rev-parse --verify --quiet {q(winner_branch)}").ok:
             raise UserError(f"冠军分支 {winner_branch} 不存在,无法回灌")
-        # ---- untracked 碰撞预检:源工作区未跟踪(非忽略)文件若被冠军分支跟踪,
+        source_before = host.run(f"{git} rev-parse HEAD").out.strip()
+
+        champ_commit = str(champion.get("codeCommit") or "").strip()
+        has_champ_commit = bool(
+            champ_commit
+            and host.run(f"{git} cat-file -e {q(champ_commit + '^{commit}')} 2>/dev/null").ok
+        )
+        wgit = f"git -C {q(winner_dir)}"
+        winner_specs = " ".join(q(s) for s in projects.source_git_pathspecs(host, winner_dir))
+        if not has_champ_commit and host.run(f"{wgit} rev-parse --is-inside-work-tree 2>/dev/null").ok:
+            wstatus = host.run(f"{wgit} status --porcelain -- {winner_specs}")
+            if wstatus.ok and (wstatus.out or "").strip():
+                host.run(f"{wgit} add -A -- {winner_specs}")
+                auto_commit = host.run(
+                    f"{wgit} -c user.name=autolab -c user.email=autolab@local "
+                    f"commit -m {q(f'autolab: capture uncommitted winner changes ({campaign_id})')}"
+                )
+                if not auto_commit.ok:
+                    detail = ((auto_commit.err or auto_commit.out) or "").strip()[:200]
+                    raise UserError(f"自动提交冠军工作区未提交代码失败:{detail}")
+        merge_target = champ_commit if has_champ_commit else winner_branch
+
+        # ---- untracked 碰撞预检:源工作区未跟踪(非忽略)文件若被冠军提交跟踪,
         #      merge 会被 git 以「未跟踪文件将被覆盖」拒绝;提前 409 点名文件,
         #      不自动删除/移动 owner 文件。
         untracked = (host.run(f"{git} ls-files --others --exclude-standard").out
@@ -436,7 +526,7 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
         untracked = [p.strip() for p in untracked if p.strip()]
         if untracked:
             tracked = (host.run(
-                f"{git} ls-tree -r --name-only {q(winner_branch)}").out
+                f"{git} ls-tree -r --name-only {q(merge_target)}").out
                 or "").splitlines()
             tracked_set = {p.strip() for p in tracked if p.strip()}
             collisions = sorted(p for p in untracked if p in tracked_set)
@@ -444,9 +534,16 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                 listed = ";".join(collisions[:10])
                 raise UserError(f"源工作区有未跟踪文件会被冠军分支覆盖:{listed};"
                                 "请先移动/删除后重试")
+        # ---- 空合并门禁:冠军目标相对源 HEAD 无任何源码改动时拒绝空合并改写基线
+        source_specs = " ".join(q(s) for s in projects.source_git_pathspecs(host, source_dir))
+        if host.run(
+            f"{git} diff --quiet {q(source_before)} {q(merge_target)} -- {source_specs}"
+        ).ok:
+            raise UserError("冠军分支没有任何代码改动,拒绝空合并改写基线")
+
         message = f"campaign {campaign_id}: promote {branch.get('name') or winner_branch}"
         try:
-            merge = host.run(f"{git} merge --no-ff -m {q(message)} {q(winner_branch)}",
+            merge = host.run(f"{git} merge --no-ff -m {q(message)} {q(merge_target)}",
                              timeout=300)
         except Exception as exc:  # noqa: BLE001 - 超时/传输异常:先尝试还原再抛
             manual = _abort_merge(host, git)
@@ -462,9 +559,14 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                                 f"{stderr};{manual}")
             raise UserError(f"冠军代码合并失败(源工作区已还原):{stderr}")
         code_commit = host.run(f"{git} rev-parse HEAD").out.strip()
+        if host.run(
+            f"{git} diff --quiet {q(source_before)} {q(code_commit)} -- {source_specs}"
+        ).ok:
+            host.run(f"{git} reset --hard {q(source_before)}")
+            raise UserError("冠军代码合并后源工作区无任何源码变化,拒绝空合并改写基线")
 
-        # ---- 基线采纳:冠军快照为主体,该数据集主指标换成冠军已验证均值,
-        #      旧源快照整条进 history,去掉 fork
+        # ---- 基线采纳:以源项目最新快照为主体保留 metric_contract 与多数据集池,
+        #      更新已验证提升的数据集均值,旧源快照整条进 history,去掉 fork
         now = utc_now()
         history = list(source_snapshot.get("history") or [])
         history.append({"passed_at": source_snapshot.get("passed_at"),
@@ -472,19 +574,23 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                         "version_label": source_snapshot.get("version_label"),
                         "notes": source_snapshot.get("notes"),
                         "datasets": source_snapshot.get("datasets") or {}})
-        datasets = copy.deepcopy(winner_snapshot.get("datasets") or {})
-        entry = datasets.get(champion_dataset)
-        if not isinstance(entry, dict):
-            entry = {}
-            datasets[champion_dataset] = entry
-        metrics = entry.get("metrics")
-        if not isinstance(metrics, dict):
-            metrics = {}
-            entry["metrics"] = metrics
-        metrics[primary] = champion_mean
+        datasets = copy.deepcopy(
+            source_snapshot.get("datasets") or winner_snapshot.get("datasets") or {}
+        )
+        updates = {**verified_means, champion_dataset: float(champion_mean)}
+        for ds_name, ds_mean in updates.items():
+            entry = datasets.get(ds_name)
+            if not isinstance(entry, dict):
+                entry = {}
+                datasets[ds_name] = entry
+            metrics = entry.get("metrics")
+            if not isinstance(metrics, dict):
+                metrics = {}
+                entry["metrics"] = metrics
+            metrics[primary] = ds_mean
+        entry = datasets[champion_dataset]
         # command/job_id:champion.planId 对应 plan 的该数据集训练 Job 实际值
         # (取不到——plan 缺失/不属于冠军项目/该数据集无成功 Job——保留原值)
-        champion_plan = repo.get_plan(str(champion.get("planId") or ""))
         if champion_plan is not None \
                 and champion_plan.get("project_id") == winner_project_id:
             for job in repo.list_jobs(plan_id=champion_plan["id"]):
@@ -499,10 +605,10 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                 if job.get("id"):
                     entry["job_id"] = job["id"]
                 break
-        notes = (f"{(winner_snapshot.get('notes') or '').strip()}"
+        notes = (f"{(source_snapshot.get('notes') or winner_snapshot.get('notes') or '').strip()}"
                  f"\n采纳自 campaign {campaign_id} 分支 {winner_branch}"
-                 f"(代码 {code_commit})")
-        snapshot = {**winner_snapshot,
+                 f"(代码 {code_commit})").strip()
+        snapshot = {**winner_snapshot, **source_snapshot,
                     "passed_at": now, "run_id": winner_run_id,
                     "notes": notes[:2000], "history": history[-5:],
                     "datasets": datasets,
@@ -518,6 +624,15 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                                                    "ciLow": champion.get("ciLow"),
                                                    "ciHigh": champion.get("ciHigh")}}}
         snapshot.pop("fork", None)   # 源项目不再是分叉视角
+        if "metric_contract" in source_snapshot:
+            preserved_contract = copy.deepcopy(source_snapshot.get("metric_contract"))
+        else:
+            preserved_contract = copy.deepcopy(winner_snapshot.get("metric_contract"))
+        if isinstance(preserved_contract, dict) and preserved_contract:
+            refresh_contract_hashes(Workspace(host, source_dir), preserved_contract)
+            snapshot["metric_contract"] = preserved_contract
+        else:
+            snapshot.pop("metric_contract", None)
         repo.update_project(source["id"], baseline_passed_at=now,
                             baseline_json=json.dumps(snapshot, ensure_ascii=False))
 
@@ -527,12 +642,12 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
             old = journal.read_bytes(research.JOURNAL_REL) \
                 .decode("utf-8") if journal.exists(research.JOURNAL_REL) \
                 else "# 研究日志\n\n"
-            entry = (f"\n## Campaign 冠军回灌({now[:10]})\n\n"
-                     f"- campaign {campaign_id} / 分支 {winner_branch} /"
-                     f" run {winner_run_id} / 代码 {code_commit}\n"
-                     f"- 采纳基线:{_metrics_summary(snapshot.get('datasets'))}\n")
+            entry_text = (f"\n## Campaign 冠军回灌({now[:10]})\n\n"
+                          f"- campaign {campaign_id} / 分支 {winner_branch} /"
+                          f" run {winner_run_id} / 代码 {code_commit}\n"
+                          f"- 采纳基线:{_metrics_summary(snapshot.get('datasets'))}\n")
             journal.write_bytes(research.JOURNAL_REL,
-                                (old + entry).encode("utf-8"))
+                                (old + entry_text).encode("utf-8"))
         except Exception as exc:
             log.warning("campaign %s 回灌日志写入失败:%s", campaign_id, exc)
 
@@ -542,7 +657,8 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
                             "winnerProjectId": winner_project_id,
                             "winnerRunId": winner_run_id,
                             "winnerBranch": winner_branch,
-                            "baselineRunId": winner_snapshot.get("run_id")}}
+                            "baselineRunId": source_snapshot.get("run_id")
+                            or winner_snapshot.get("run_id")}}
     _update_campaign(repo, campaign_id, result_json=json.dumps(result,
                                                                ensure_ascii=False))
     return campaign_status(repo, campaign_id)
