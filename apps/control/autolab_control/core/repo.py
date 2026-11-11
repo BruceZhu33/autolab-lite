@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
+import posixpath
+import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
-from autolab_protocol import PlanSpecV1, RunnerEventV1, expand_jobs, spec_hash
+from autolab_protocol import ArtifactV1, PlanSpecV1, RunnerEventV1, expand_jobs, spec_hash
 
 from .db import Database, utc_now
 from .errors import NotFound, UserError
@@ -20,6 +23,42 @@ from .ids import new_id
 TERMINAL_JOB_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"})
 ACTIVE_LEASE_STATUSES = frozenset({"HELD", "RELEASING"})
 MAX_DISPATCH_ATTEMPTS = 3
+_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def is_safe_artifact_id(artifact_id: Any) -> bool:
+    return (
+        isinstance(artifact_id, str)
+        and 1 <= len(artifact_id) <= 128
+        and artifact_id not in {".", ".."}
+        and bool(_ARTIFACT_ID_RE.fullmatch(artifact_id))
+    )
+
+
+def is_within_output_root(remote_path: Any, output_root: Any, *, local: bool = False) -> bool:
+    if not isinstance(remote_path, str) or not isinstance(output_root, str):
+        return False
+    if not remote_path or not output_root or "\x00" in remote_path or "\x00" in output_root:
+        return False
+    if not remote_path.startswith("/") or not output_root.startswith("/"):
+        return False
+    if ".." in remote_path.replace("\\", "/").split("/"):
+        return False
+    if ".." in output_root.replace("\\", "/").split("/"):
+        return False
+    norm_root = posixpath.normpath(output_root)
+    norm_path = posixpath.normpath(remote_path)
+    if norm_root == "/":
+        return False
+    if local:
+        real_root = posixpath.normpath(os.path.realpath(output_root))
+        real_path = posixpath.normpath(os.path.realpath(remote_path))
+        return (
+            real_root != "/"
+            and real_path != real_root
+            and real_path.startswith(real_root + "/")
+        )
+    return norm_path != norm_root and norm_path.startswith(norm_root + "/")
 
 # Runner 拒绝原因 → agent/owner 可行动的提示。这类拒绝不是 agent 能自救的
 # (改 Runner 白名单/重立项都是 owner 权限),要点是让 agent 立刻升级而不是
@@ -54,6 +93,7 @@ class IngestResult:
     unknown_job: bool = False
     job_status: str | None = None
     leased_released: int = 0
+    rejected_artifact: bool = False
 
 
 @dataclass
@@ -184,13 +224,36 @@ class Repo:
                         f"project {project_id} has {jobs} job(s); keep the history"
                     )
                 runs = "SELECT id FROM agent_runs WHERE project_id = ?"
+                conn.execute(f"DELETE FROM agent_spans WHERE run_id IN ({runs})",
+                             (project_id,))
                 conn.execute(f"DELETE FROM agent_run_events WHERE run_id IN ({runs})",
                              (project_id,))
                 conn.execute(f"DELETE FROM agent_run_inbox WHERE run_id IN ({runs})",
                              (project_id,))
                 conn.execute("DELETE FROM agent_runs WHERE project_id = ?", (project_id,))
                 conn.execute("DELETE FROM research_rounds WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM research_cases WHERE project_id = ?", (project_id,))
+                conn.execute(
+                    "UPDATE research_campaigns SET winner_project_id = NULL,"
+                    " winner_run_id = NULL WHERE winner_project_id = ?",
+                    (project_id,),
+                )
+                conn.execute(
+                    "DELETE FROM research_campaigns WHERE source_project_id = ?",
+                    (project_id,),
+                )
+                conn.execute(
+                    "UPDATE plan_revisions SET parent_id = NULL"
+                    " WHERE parent_id IN (SELECT id FROM plan_revisions WHERE project_id = ?)",
+                    (project_id,),
+                )
                 conn.execute("DELETE FROM plan_revisions WHERE project_id = ?", (project_id,))
+                conn.execute(
+                    "DELETE FROM agent_blobs WHERE NOT EXISTS ("
+                    " SELECT 1 FROM agent_spans s"
+                    " WHERE s.input_blob = agent_blobs.id OR s.output_blob = agent_blobs.id"
+                    ")"
+                )
                 conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
             return dict(row)
         finally:
@@ -487,7 +550,50 @@ class Repo:
                     " ORDER BY j.queued_at, j.plan_revision_id, j.ordinal"
                 ).fetchall()
                 for row in rows:
-                    spec = PlanSpecV1.model_validate(json.loads(row["spec_json"]))
+                    try:
+                        spec = PlanSpecV1.model_validate(json.loads(row["spec_json"]))
+                    except Exception as exc:
+                        now = utc_now()
+                        conn.execute(
+                            "UPDATE jobs SET status = 'FAILED', failure_summary = ?,"
+                            " finished_at = ?, updated_at = ? WHERE id = ?",
+                            (f"invalid plan spec: {exc}", now, now, row["id"]),
+                        )
+                        continue
+
+                    server_id = row["server_id"]
+                    server = (
+                        conn.execute(
+                            "SELECT * FROM servers WHERE id = ?", (server_id,)
+                        ).fetchone()
+                        if server_id
+                        else None
+                    )
+                    if server is None:
+                        now = utc_now()
+                        conn.execute(
+                            "UPDATE jobs SET status = 'FAILED', failure_summary = ?,"
+                            " finished_at = ?, updated_at = ? WHERE id = ?",
+                            ("target server not found", now, now, row["id"]),
+                        )
+                        continue
+
+                    gpu_slots = max(0, int(server["gpu_slots"] or 0))
+                    raw_eligible = spec.resources.eligible_gpu_indices
+                    if raw_eligible is None:
+                        eligible = list(range(gpu_slots))
+                    else:
+                        valid_slots = set(range(gpu_slots))
+                        eligible = sorted(idx for idx in raw_eligible if idx in valid_slots)
+                    if spec.resources.gpu_count > gpu_slots or len(eligible) < spec.resources.gpu_count:
+                        now = utc_now()
+                        conn.execute(
+                            "UPDATE jobs SET status = 'FAILED', failure_summary = ?,"
+                            " finished_at = ?, updated_at = ? WHERE id = ?",
+                            ("requested GPUs exceed server gpu_slots", now, now, row["id"]),
+                        )
+                        continue
+
                     running = conn.execute(
                         "SELECT COUNT(*) AS n FROM jobs WHERE plan_revision_id = ?"
                         " AND status IN ('DISPATCHING', 'RUNNING')",
@@ -496,15 +602,6 @@ class Repo:
                     if running >= spec.resources.max_parallel:
                         continue
 
-                    server_id = row["server_id"]
-                    server = conn.execute(
-                        "SELECT * FROM servers WHERE id = ?", (server_id,)
-                    ).fetchone()
-                    if server is None:
-                        continue
-                    eligible = spec.resources.eligible_gpu_indices
-                    if eligible is None:
-                        eligible = list(range(server["gpu_slots"]))
                     busy = {
                         r["gpu_index"]
                         for r in conn.execute(
@@ -513,7 +610,7 @@ class Repo:
                             (server_id,),
                         )
                     }
-                    free = [index for index in sorted(eligible) if index not in busy]
+                    free = [index for index in eligible if index not in busy]
                     if len(free) < spec.resources.gpu_count:
                         continue
                     chosen = free[: spec.resources.gpu_count]
@@ -567,25 +664,75 @@ class Repo:
                 row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
                 if row is None:
                     raise RepoError(f"job {job_id} not found")
+                now = utc_now()
+                if row["status"] in ("CANCELLING", "CANCELLED"):
+                    conn.execute(
+                        "UPDATE gpu_leases SET status = 'RELEASED', released_at = ? WHERE job_id = ?"
+                        " AND status IN ('HELD', 'RELEASING')",
+                        (now, job_id),
+                    )
+                    if row["status"] == "CANCELLING":
+                        conn.execute(
+                            "UPDATE jobs SET status = 'CANCELLED', failure_summary = ?,"
+                            " finished_at = ?, updated_at = ? WHERE id = ?",
+                            (reason or "cancelled during dispatch", now, now, job_id),
+                        )
+                    updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                    return dict(updated)
                 if row["status"] != "DISPATCHING":
                     raise RepoError(f"job {job_id} is {row['status']}, not DISPATCHING")
                 conn.execute(
                     "UPDATE gpu_leases SET status = 'RELEASED', released_at = ? WHERE job_id = ?"
                     " AND status IN ('HELD', 'RELEASING')",
-                    (utc_now(), job_id),
+                    (now, job_id),
                 )
                 attempts = row["dispatch_attempts"]
                 if permanent or attempts >= MAX_DISPATCH_ATTEMPTS:
                     conn.execute(
                         "UPDATE jobs SET status = 'FAILED', failure_summary = ?,"
                         " finished_at = ?, updated_at = ? WHERE id = ?",
-                        (_reject_summary(reason), utc_now(), utc_now(), job_id),
+                        (_reject_summary(reason), now, now, job_id),
                     )
                 else:
                     conn.execute(
                         "UPDATE jobs SET status = 'QUEUED', gpu_indices_json = NULL,"
                         " updated_at = ? WHERE id = ?",
-                        (utc_now(), job_id),
+                        (now, job_id),
+                    )
+                updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                return dict(updated)
+        finally:
+            conn.close()
+
+    def fail_lost_running_job(
+        self, job_id: str, *, reason: str = "runner lost job state (404)"
+    ) -> dict[str, Any]:
+        """Mark a live job FAILED and release its GPU leases when a reachable
+        Runner repeatedly reports 404 (state wiped / lost)."""
+
+        conn = self.db.connect()
+        try:
+            with self.db.tx(conn):
+                row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row is None:
+                    raise RepoError(f"job {job_id} not found")
+                now = utc_now()
+                conn.execute(
+                    "UPDATE gpu_leases SET status = 'RELEASED', released_at = ? WHERE job_id = ?"
+                    " AND status IN ('HELD', 'RELEASING')",
+                    (now, job_id),
+                )
+                if row["status"] == "CANCELLING":
+                    conn.execute(
+                        "UPDATE jobs SET status = 'CANCELLED', failure_summary = ?,"
+                        " finished_at = ?, updated_at = ? WHERE id = ?",
+                        (reason, now, now, job_id),
+                    )
+                elif row["status"] not in TERMINAL_JOB_STATUSES:
+                    conn.execute(
+                        "UPDATE jobs SET status = 'FAILED', failure_summary = ?,"
+                        " finished_at = ?, updated_at = ? WHERE id = ?",
+                        (reason, now, now, job_id),
                     )
                 updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
                 return dict(updated)
@@ -650,18 +797,63 @@ class Repo:
                         (utc_now(), job_id),
                     ).rowcount
                 elif event.event_type == "artifact.discovered":
-                    artifact = event.payload.get("artifact") or {}
-                    conn.execute(
+                    raw_artifact = event.payload.get("artifact")
+                    try:
+                        validated = ArtifactV1.model_validate(raw_artifact)
+                    except Exception:
+                        return IngestResult(
+                            job_status=status, leased_released=released, rejected_artifact=True
+                        )
+                    if validated.job_id != job_id or not is_safe_artifact_id(validated.artifact_id):
+                        return IngestResult(
+                            job_status=status, leased_released=released, rejected_artifact=True
+                        )
+                    proj_row = conn.execute(
+                        "SELECT p.output_root, p.server_id AS project_server_id"
+                        " FROM plan_revisions pr JOIN projects p ON p.id = pr.project_id"
+                        " WHERE pr.id = ?",
+                        (job["plan_revision_id"],),
+                    ).fetchone()
+                    if proj_row is None:
+                        return IngestResult(
+                            job_status=status, leased_released=released, rejected_artifact=True
+                        )
+                    srv_id = job["server_id"] or proj_row["project_server_id"]
+                    srv_row = (
+                        conn.execute(
+                            "SELECT transport_mode FROM servers WHERE id = ?", (srv_id,)
+                        ).fetchone()
+                        if srv_id
+                        else None
+                    )
+                    is_local = bool(srv_row and srv_row["transport_mode"] == "local")
+                    if not is_within_output_root(
+                        validated.remote_path, proj_row["output_root"], local=is_local
+                    ):
+                        return IngestResult(
+                            job_status=status, leased_released=released, rejected_artifact=True
+                        )
+                    cur = conn.execute(
                         "INSERT OR IGNORE INTO artifacts (id, job_id, kind, location_kind,"
                         " remote_path, local_cache_path, sha256, size_bytes, metadata_json, created_at)"
                         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (artifact.get("artifact_id"), job_id, artifact.get("kind", "other"),
-                         artifact.get("location_kind", "remote"), artifact.get("remote_path"),
-                         artifact.get("local_cache_path"), artifact.get("sha256"),
-                         artifact.get("size_bytes", 0),
-                         json.dumps(artifact.get("metadata", {}), ensure_ascii=False),
-                         utc_now()),
+                        (
+                            validated.artifact_id,
+                            job_id,
+                            validated.kind,
+                            validated.location_kind,
+                            validated.remote_path,
+                            validated.local_cache_path,
+                            validated.sha256,
+                            validated.size_bytes,
+                            json.dumps(validated.metadata, ensure_ascii=False),
+                            utc_now(),
+                        ),
                     )
+                    if cur.rowcount > 0 and validated.kind == "metrics":
+                        conn.execute(
+                            "UPDATE jobs SET metrics_done = 0 WHERE id = ?", (job_id,)
+                        )
                 return IngestResult(job_status=status, leased_released=released)
         finally:
             conn.close()
@@ -863,12 +1055,17 @@ class Repo:
                     (row["plan_revision_id"],),
                 ).fetchone()["n"]
                 new_job_id = new_id("job")
+                now = utc_now()
                 conn.execute(
                     "INSERT INTO jobs (id, plan_revision_id, ordinal, params_json, server_id,"
                     " status, retry_of_job_id, queued_at, updated_at)"
                     " VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?)",
                     (new_job_id, row["plan_revision_id"], next_ordinal, row["params_json"],
-                     row["server_id"], job_id, utc_now(), utc_now()),
+                     row["server_id"], job_id, now, now),
+                )
+                conn.execute(
+                    "UPDATE job_evals SET eval_job_id = ? WHERE eval_job_id = ?",
+                    (new_job_id, job_id),
                 )
                 created = conn.execute("SELECT * FROM jobs WHERE id = ?", (new_job_id,)).fetchone()
                 return dict(created)
@@ -886,21 +1083,61 @@ class Repo:
                 row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
                 if row is None:
                     raise RepoError(f"job {job_id} not found")
+                now = utc_now()
+                if row["status"] in ("CANCELLING", "CANCELLED"):
+                    conn.execute(
+                        "UPDATE gpu_leases SET status = 'RELEASED', released_at = ? WHERE job_id = ?"
+                        " AND status IN ('HELD', 'RELEASING')",
+                        (now, job_id),
+                    )
+                    if row["status"] == "CANCELLING":
+                        conn.execute(
+                            "UPDATE jobs SET status = 'CANCELLED', failure_summary = ?,"
+                            " finished_at = ?, updated_at = ? WHERE id = ?",
+                            (reason or "cancelled before dispatch", now, now, job_id),
+                        )
+                    updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                    return dict(updated)
                 if row["status"] != "DISPATCHING":
                     raise RepoError(f"job {job_id} is {row['status']}, not DISPATCHING")
                 conn.execute(
                     "UPDATE gpu_leases SET status = 'RELEASED', released_at = ? WHERE job_id = ?"
                     " AND status IN ('HELD', 'RELEASING')",
-                    (utc_now(), job_id),
+                    (now, job_id),
                 )
                 conn.execute(
                     "UPDATE jobs SET status = 'QUEUED', gpu_indices_json = NULL,"
                     " dispatch_attempts = MAX(dispatch_attempts - 1, 0),"
                     " hold_note = ?, updated_at = ? WHERE id = ?",
-                    (reason or None, utc_now(), job_id),
+                    (reason or None, now, job_id),
                 )
                 updated = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
                 return dict(updated)
+        finally:
+            conn.close()
+
+    def jobs_needing_metrics(self) -> list[dict[str, Any]]:
+        """SUCCEEDED jobs that still have unextracted metric artifacts (or have
+        not yet been swept by _extract_metrics)."""
+
+        conn = self.db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status = 'SUCCEEDED' AND metrics_done = 0"
+                " ORDER BY queued_at"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def mark_job_metrics_done(self, job_id: str) -> None:
+        conn = self.db.connect()
+        try:
+            with self.db.tx(conn):
+                conn.execute(
+                    "UPDATE jobs SET metrics_done = 1 WHERE id = ? AND metrics_done = 0",
+                    (job_id,),
+                )
         finally:
             conn.close()
 

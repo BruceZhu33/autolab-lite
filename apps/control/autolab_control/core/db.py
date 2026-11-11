@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_observed_at TEXT,
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
     hold_note TEXT,
+    metrics_done INTEGER NOT NULL DEFAULT 0,
     queued_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
@@ -112,6 +113,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     UNIQUE (plan_revision_id, ordinal)
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, queued_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_metrics_pending
+    ON jobs(queued_at) WHERE status = 'SUCCEEDED' AND metrics_done = 0;
 CREATE INDEX IF NOT EXISTS idx_jobs_plan ON jobs(plan_revision_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_jobs_server_running ON jobs(server_id, status);
 
@@ -279,14 +282,17 @@ CREATE TABLE IF NOT EXISTS agent_spans (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_spans_run ON agent_spans(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_agent_spans_run_step ON agent_spans(run_id, step_no);
--- 控制台账号(一人一 token):member=只读浏览;写操作仍要求 owner token。
+-- 控制台账号(一人一 token):member=只读浏览;owner=管理员可吊销/可过期会话。
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
+    name TEXT NOT NULL UNIQUE,
     token TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'owner')),
     created_at TEXT NOT NULL,
-    revoked_at TEXT
+    revoked_at TEXT,
+    expires_at TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_name ON accounts(name);
 -- C3a 并行研究分支 campaign:每个方向一条 fork 分支记录,选冠军只信 run.result。
 CREATE TABLE IF NOT EXISTS research_campaigns (
     id TEXT PRIMARY KEY,
@@ -431,20 +437,23 @@ class Database:
         return self._open()
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
-        legacy = "projects" in {r[0] for r in conn.execute(
+        tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        if legacy:
+        if "projects" in tables:
             _migrate_legacy_projects(conn)
-        if "jobs" in {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")} \
-                and "hold_note" not in _columns(conn, "jobs"):
-            # 卡住原因可见性:磁盘水位/Runner 不可达等把 Job 压回队列时,
-            # 原因落在行上(UI 可见),而不是无声等待(真机:盘满任务干等没人知道为何)
-            conn.execute("ALTER TABLE jobs ADD COLUMN hold_note TEXT")
+        if "jobs" in tables:
+            job_cols = _columns(conn, "jobs")
+            if "hold_note" not in job_cols:
+                # 卡住原因可见性:磁盘水位/Runner 不可达等把 Job 压回队列时,
+                # 原因落在行上(UI 可见),而不是无声等待(真机:盘满任务干等没人知道为何)
+                conn.execute("ALTER TABLE jobs ADD COLUMN hold_note TEXT")
+            if "metrics_done" not in job_cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN metrics_done INTEGER NOT NULL DEFAULT 0"
+                )
         # CREATE TABLE IF NOT EXISTS 不会给旧表加列:agent_runs 的 spec/长程安全列
         # (A1 spec 快照、A3 错误连击与 wall-clock)逐列补齐
-        if "agent_runs" in {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}:
+        if "agent_runs" in tables:
             cols = _columns(conn, "agent_runs")
             for col, decl in (("spec_json", "TEXT NOT NULL DEFAULT '{}'"),
                               ("spec_hash", "TEXT NOT NULL DEFAULT ''"),
@@ -454,13 +463,37 @@ class Database:
                 if col not in cols:
                     conn.execute(
                         f"ALTER TABLE agent_runs ADD COLUMN {col} {decl}")
-        if "agent_specs" in {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")} \
-                and "provenance_json" not in _columns(conn, "agent_specs"):
+        if "agent_specs" in tables and "provenance_json" not in _columns(conn, "agent_specs"):
             # C4b-2 变异来源:不升 SCHEMA_VERSION(v27),已有表原地补列;
             # v25 没有 agent_specs 时下面的 executescript 会按新 schema 建表。
             conn.execute("ALTER TABLE agent_specs ADD COLUMN"
                          " provenance_json TEXT NOT NULL DEFAULT '{}'")
+        if "accounts" in tables:
+            acct_cols = _columns(conn, "accounts")
+            if "role" not in acct_cols:
+                conn.execute(
+                    "ALTER TABLE accounts ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"
+                )
+            if "expires_at" not in acct_cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN expires_at TEXT")
+            dup_names = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM accounts GROUP BY name HAVING COUNT(*) > 1"
+                ).fetchall()
+            ]
+            for dup_name in dup_names:
+                keep = conn.execute(
+                    "SELECT rowid FROM accounts WHERE name = ? "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (dup_name,),
+                ).fetchone()
+                if keep is not None:
+                    conn.execute(
+                        "DELETE FROM accounts WHERE name = ? AND rowid != ?",
+                        (dup_name, keep[0]),
+                    )
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_name ON accounts(name)")
         conn.executescript(_SCHEMA)
         conn.execute("INSERT OR IGNORE INTO schema_migrations (version, applied_at)"
                      " VALUES (?, ?)", (SCHEMA_VERSION, utc_now()))
@@ -471,7 +504,8 @@ class Database:
         try:
             yield conn
         except BaseException:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         else:
             conn.execute("COMMIT")

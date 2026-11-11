@@ -123,6 +123,7 @@ def test_gpu_probe_falls_back_to_registered(monkeypatch):
 
 def test_artifact_pull_verifies_hash_and_caches(repo, tmp_path):  # noqa: F811
     instance = repo["repo"]
+    instance.update_project(repo["project"]["id"], output_root=str(tmp_path))
     approve_simple(repo, make_spec(repo))
     job = instance.try_acquire_next_job().job
     blob = b"checkpoint-bytes"
