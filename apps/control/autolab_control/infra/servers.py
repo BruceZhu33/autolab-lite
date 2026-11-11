@@ -25,11 +25,26 @@ def hostkeys_path_for(credentials: CredentialStore) -> Path:
     return credentials.path.with_name(credentials.path.stem + ".hostkeys.json")
 
 
-def resolve_secret(secret: str) -> str:
-    """凭据输入既可以是私钥内容,也可以是本机私钥路径(注册时由 Control
-    读取内容后转存凭据文件,路径本身不落库)。"""
+def resolve_secret(
+    secret: str,
+    *,
+    allow_file_path: bool = False,
+    auth_kind: str = "key",
+) -> str:
+    """解析 SSH 凭据输入。
+
+    HTTP API 默认 allow_file_path=False,严禁将 secret 当作 Control 宿主机
+    本地文件路径读取(阻断通过 password 认证外带宿主机敏感文件)。仅受信任的
+    本地 CLI 辅助调用显式传 allow_file_path=True 且 auth_kind='key' 时才读文件。
+    """
     text = secret.strip()
-    if text.startswith(("~", "/")) and "\n" not in text:
+    if not allow_file_path:
+        if auth_kind == "key" and text.startswith(("~", "/")) and "\n" not in text:
+            raise ServerError(
+                "HTTP 接口不支持直接传服务器本机私钥路径，请直接粘贴私钥全文内容"
+            )
+        return secret
+    if auth_kind == "key" and text.startswith(("~", "/")) and "\n" not in text:
         path = Path(text).expanduser()
         if path.is_file():
             return path.read_text(encoding="utf-8")
@@ -40,14 +55,21 @@ def fetch_and_pin_host_key(
     hostkeys_path: Path, host: str, port: int, *, timeout: float = 8.0
 ) -> str:
     """TOFU:取回远端主机公钥并固定指纹。已固定且不一致 → 拒绝注册。"""
+    transport: paramiko.Transport | None = None
     try:
         transport = paramiko.Transport((host, port))
         transport.banner_timeout = timeout
         transport.start_client(timeout=timeout)
         key = transport.get_remote_server_key()
-        transport.close()
+        if key is None:
+            raise ServerError(f"无法连接 {host}:{port} 获取主机密钥:远端未返回公钥")
+    except ServerError:
+        raise
     except Exception as exc:
         raise ServerError(f"无法连接 {host}:{port} 获取主机密钥:{exc}") from exc
+    finally:
+        if transport is not None:
+            transport.close()
     fingerprint = fingerprint_for(key.get_name(), key.asbytes())
     store = HostKeyStore(hostkeys_path)
     known = store.known(host, port)
@@ -89,18 +111,19 @@ def verify_ssh_auth(
     secret: str,
 ) -> None:
     """注册时验证认证可用:固定密钥后真实连一次。失败抛 ServerError。"""
+    transport = SshTransport(
+        host=host, port=port, username=username, credential_ref="",
+        hostkeys=HostKeyStore(hostkeys_path),
+    )
     try:
-        transport = SshTransport(
-            host=host, port=port, username=username, credential_ref="",
-            hostkeys=HostKeyStore(hostkeys_path),
-        )
         if auth_kind == "key":
             transport.connect(pkey=secret)
         else:
             transport.connect(password=secret)
-        transport.close()
     except Exception as exc:
         raise ServerError(f"SSH 认证失败({username}@{host}:{port}):{exc}") from exc
+    finally:
+        transport.close()
 
 
 def test_connectivity(

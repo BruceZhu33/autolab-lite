@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+import json
+from typing import Annotated
+
+from fastapi import APIRouter, Body, HTTPException
 
 from ...core.errors import NotFound, UserError
 from ...core.ids import new_id
@@ -71,7 +74,9 @@ def build(ctx: Ctx) -> APIRouter:
             raise HTTPException(400, "host、username、secret 为必填")
         if auth_kind not in ("password", "key"):
             raise HTTPException(400, "auth_kind 只能是 password 或 key")
-        secret = servers.resolve_secret(payload["secret"])
+        secret = servers.resolve_secret(
+            payload["secret"], allow_file_path=False, auth_kind=auth_kind
+        )
         # TOFU 固定主机密钥 → 真实认证一次 → 探测 GPU 数
         fingerprint = servers.fetch_and_pin_host_key(ctx.hostkeys_path, host, ssh_port)
         login = {"host": host, "port": ssh_port, "username": username,
@@ -116,18 +121,78 @@ def build(ctx: Ctx) -> APIRouter:
         return {"reachable": reachable, "detail": detail}
 
     @router.post("/api/owner/servers/{server_id}/runner/install", dependencies=[ctx.owner])
-    def runner_install(server_id: str) -> dict:
+    def runner_install(
+        server_id: str,
+        payload: Annotated[dict | None, Body()] = None,
+    ) -> dict:
         """在 SSH 服务器上部署/修复 autolab-runner(每次部署轮换 token/HMAC)。"""
         server = server_or_404(server_id)
         if server["transport_mode"] != "ssh":
             raise UserError("本机服务器的 Runner 由 scripts/demo 启动,无需远程部署")
+
+        raw_force = (payload or {}).get("force", False)
+        if not isinstance(raw_force, bool):
+            raise HTTPException(400, "force 必须是布尔值")
+        force = raw_force
+
+        if not force:
+            active_jobs = [
+                j for j in repo.list_jobs()
+                if j.get("server_id") == server_id
+                and j.get("status") in ("DISPATCHING", "RUNNING", "CANCELLING")
+            ]
+            active_leases = [
+                lease for lease in repo.active_leases()
+                if lease.get("server_id") == server_id
+            ]
+            if active_jobs or active_leases:
+                raise UserError(
+                    "该节点仍有在途 GPU 任务，请等待结束后再升级或显式确认强制重启"
+                )
+
+        existing_work_roots = json.loads(server.get("allowed_work_roots_json") or "[]")
+        existing_output_roots = json.loads(server.get("allowed_output_roots_json") or "[]")
+        old_runner_ref = (server.get("runner_token_ref") or "").strip()
+
         result = runner_deploy.install_runner(
-            server, credentials, ctx.hostkeys_path,
-            runner_port=server.get("runner_port") or 7810, gpu_slots=server["gpu_slots"] or 1)
+            server,
+            credentials,
+            ctx.hostkeys_path,
+            runner_port=server.get("runner_port") or 7810,
+            gpu_slots=server["gpu_slots"] or 1,
+            work_roots=existing_work_roots or None,
+            output_roots=existing_output_roots or None,
+        )
         health = runner_deploy.wait_runner_health(server["host"], result["port"])
         ref = new_id("srvc")
         credentials.put(ref, result["token"], result["hmac_key"])
         repo.update_server_runner(server_id, runner_port=result["port"], runner_token_ref=ref)
+
+        effective_work_roots = result.get("allowed_work_roots") or existing_work_roots
+        effective_output_roots = result.get("allowed_output_roots") or existing_output_roots
+        if effective_work_roots or effective_output_roots:
+            conn = repo.db.connect()
+            try:
+                with repo.db.tx(conn):
+                    conn.execute(
+                        "UPDATE servers SET allowed_work_roots_json = ?,"
+                        " allowed_output_roots_json = ? WHERE id = ?",
+                        (
+                            json.dumps(effective_work_roots),
+                            json.dumps(effective_output_roots),
+                            server_id,
+                        ),
+                    )
+            finally:
+                conn.close()
+
+        ssh_cred_ref = (server.get("credential_ref") or "").strip()
+        if old_runner_ref and old_runner_ref != ref and old_runner_ref != ssh_cred_ref:
+            try:
+                credentials.delete_entry(old_runner_ref)
+            except Exception:  # noqa: BLE001
+                pass
+
         return {"pid": result["pid"], "port": result["port"], "version": health.get("version"),
                 "runner_instance_id": health.get("runner_instance_id")}
 

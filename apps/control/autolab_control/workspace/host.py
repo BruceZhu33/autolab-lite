@@ -6,7 +6,9 @@ agent 工具)只写一遍逻辑,不再到处分支 `if ssh_transport is not None
 
 from __future__ import annotations
 
+import os
 import shlex
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -73,12 +75,38 @@ class LocalHost(Host):
     python = sys.executable
 
     def run(self, command: str, *, timeout: float = 60) -> RunResult:
+        proc = subprocess.Popen(
+            ["bash", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
         try:
-            proc = subprocess.run(["bash", "-c", command], capture_output=True,
-                                  text=True, timeout=timeout)
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                proc.kill()
+                proc.wait()
             raise UserError(f"命令超时({timeout:g}s)") from exc
-        return RunResult(proc.returncode, proc.stdout, proc.stderr)
+        except BaseException:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait()
+            raise
+        return RunResult(proc.returncode, out, err)
 
     def read(self, path: str) -> bytes:
         return Path(path).read_bytes()
