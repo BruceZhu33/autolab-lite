@@ -80,14 +80,25 @@ def _execution_variables(job: dict[str, Any], params: dict[str, Any],
                          output_root: str) -> dict[str, str]:
     """派发环境变量。B2.3a 起评测 Job 通过环境变量拿输入目录/数据集/seed/
     变体(AUTOLAB_JOB_ROLE=train|eval),评测命令不做二次模板渲染。"""
+    role = str(params.get("role") or "train").strip() or "train"
     variables = {
         "AUTOLAB_JOB_ID": job["id"],
         "AUTOLAB_DISPATCH_ID": job["dispatch_id"],
         "AUTOLAB_OUTPUT_DIR": output_root,
-        "AUTOLAB_JOB_ROLE": str(params.get("role") or "train").strip() or "train",
+        "AUTOLAB_JOB_ROLE": role,
     }
-    if str(params.get("eval_input_dir") or "").strip():
-        variables["AUTOLAB_EVAL_INPUT_DIR"] = str(params["eval_input_dir"])
+    eval_input = str(params.get("eval_input_dir") or "").strip()
+    if eval_input:
+        variables["AUTOLAB_EVAL_INPUT_DIR"] = eval_input
+        variables["AUTOLAB_TRAIN_OUTPUT_DIR"] = eval_input
+    if role == "eval":
+        # Python 3.11+: 禁止将 cwd(remote_workdir)或脚本同目录塞进 sys.path[0],
+        # 阻断工作区内恶意 sitecustomize.py 与同名模块劫持
+        variables["PYTHONSAFEPATH"] = "1"
+        locked_dir = str(params.get("locked_eval_dir") or "").strip()
+        if locked_dir:
+            variables["AUTOLAB_LOCKED_EVAL_DIR"] = locked_dir
+            variables["PYTHONPATH"] = locked_dir
     if str(params.get("dataset") or "").strip():
         variables["AUTOLAB_DATASET"] = str(params["dataset"])
     if isinstance(params.get("seed"), int) and not isinstance(params["seed"], bool):

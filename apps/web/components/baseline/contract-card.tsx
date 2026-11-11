@@ -20,6 +20,13 @@ import {
 import { Button } from "~/vendor/ui/components/ui/button";
 import { Input } from "~/vendor/ui/components/ui/input";
 
+const MINIMIZE_METRIC_RE =
+  /(?:^|[/_.-])(loss|err|error|mae|mse|rmse|fid|perplexity|ppl|cer|wer|latency)(?:$|[/_.-])/i;
+
+function inferMetricDirection(metricName: string): MetricDirection {
+  return MINIMIZE_METRIC_RE.test(metricName.trim()) ? "minimize" : "maximize";
+}
+
 function parsePathList(raw: string): string[] {
   return raw
     .split(/[\n,]+/)
@@ -86,7 +93,7 @@ export function MetricContractCard({ project }: { project: Project }) {
     const candidate = allMetrics.find((m) => m !== primary) ?? allMetrics[0] ?? "";
     setGuardrails((prev) => [
       ...prev,
-      { metric: candidate, direction: "maximize", max_regress: 0.01 },
+      { metric: candidate, direction: inferMetricDirection(candidate), max_regress: 0.01 },
     ]);
   };
 
@@ -183,16 +190,27 @@ export function MetricContractCard({ project }: { project: Project }) {
         <div className="space-y-3 border-t-[0.5px] border-surface-border pt-3 text-micro">
           <div className="grid gap-2.5 sm:grid-cols-2">
             <label className="space-y-1">
-              <span className="font-medium text-muted-foreground">主指标 (Primary Metric)</span>
-              <select
+              <span className="font-medium text-muted-foreground">
+                主指标 (Primary Metric · 可选已有或输入独立评测自定义指标)
+              </span>
+              <Input
+                list={`primary-metrics-${project.id}`}
                 value={primary}
-                onChange={(e) => setPrimary(e.target.value)}
-                className="h-8 w-full rounded-md border-[0.5px] border-surface-border bg-background px-2 font-mono text-caption"
-              >
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setPrimary(next);
+                  if (next.trim()) {
+                    setDirection(inferMetricDirection(next));
+                  }
+                }}
+                placeholder="选择基线指标或输入 eval.command 产出的指标名"
+                className="h-8 font-mono text-caption"
+              />
+              <datalist id={`primary-metrics-${project.id}`}>
                 {allMetrics.map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                  <option key={m} value={m} />
                 ))}
-              </select>
+              </datalist>
             </label>
             <label className="space-y-1">
               <span className="font-medium text-muted-foreground">优化方向 (Direction)</span>
@@ -222,19 +240,26 @@ export function MetricContractCard({ project }: { project: Project }) {
               <div className="space-y-1.5">
                 {guardrails.map((g, idx) => (
                   <div key={idx} className="flex flex-wrap items-center gap-1.5">
-                    <select
+                    <Input
+                      list={`primary-metrics-${project.id}`}
                       value={g.metric}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const next = e.target.value;
                         setGuardrails((prev) =>
-                          prev.map((item, i) => (i === idx ? { ...item, metric: e.target.value } : item)),
-                        )
-                      }
-                      className="h-7 rounded-md border-[0.5px] border-surface-border bg-background px-2 font-mono text-micro"
-                    >
-                      {allMetrics.map((m) => (
-                        <option key={m} value={m}>{m}</option>
-                      ))}
-                    </select>
+                          prev.map((item, i) =>
+                            i === idx
+                              ? {
+                                  ...item,
+                                  metric: next,
+                                  direction: next.trim() ? inferMetricDirection(next) : item.direction,
+                                }
+                              : item,
+                          ),
+                        );
+                      }}
+                      placeholder="护栏指标名"
+                      className="h-7 w-44 font-mono text-micro"
+                    />
                     <select
                       value={g.direction}
                       onChange={(e) =>
@@ -305,7 +330,7 @@ export function MetricContractCard({ project }: { project: Project }) {
 
           <div className="space-y-2 rounded-lg border-[0.5px] border-surface-border bg-muted/20 p-2.5">
             <p className="font-medium text-foreground">
-              平台独立评测 Job (可选 · 填命令后训练成功自动派发独立评测, 不信训练自报 metrics.json)
+              平台独立评测 Job (可选 · 填命令后训练成功自动派发独立评测, 注入 $AUTOLAB_TRAIN_OUTPUT_DIR / 别名 $AUTOLAB_EVAL_INPUT_DIR 与 PYTHONSAFEPATH=1)
             </p>
             <Input
               value={evalCommand}

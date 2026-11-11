@@ -9,18 +9,24 @@ Job 成功且有合法指标 → 暂停等 owner 确认。owner 确认 = 写基�
 from __future__ import annotations
 
 import json
+import re
 
 from ..agent import knowledge, runtime, tools
 from ..agent.runtime import AgentLoopError, LoopEnv, LoopProfile, Pause, ToolError
 from ..core.db import utc_now
 from ..core.repo import Repo
-from ..execution.evidence import hash_paths
-from ..execution.experiments import job_metrics, project_job
+from ..execution.evidence import hash_paths, stage_locked_eval
+from ..execution.experiments import effective_metrics, job_metrics, project_job, submit_eval_jobs
 from ..workspace.fs import open_workspace
 from . import agent_specs
 
 KIND = "baseline"
 CONFIRM_KIND = "confirm_baseline"
+_MINIMIZE_METRIC_RE = re.compile(
+    r"(?:^|[/_.-])(loss|err|error|mae|mse|rmse|fid|perplexity|ppl|cer|wer|latency)(?:$|[/_.-])",
+    re.IGNORECASE,
+)
+_METRIC_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-/]+$")
 
 SYSTEM_PROMPT = """你是 AutoLab 的 Baseline Agent。目标:让这个代码库在 GPU 服务器上跑通论文/代码默认的基线训练,并为每个数据集拿到可信的评测指标。你独立工作,owner 只在你需要材料或信息时介入。
 
@@ -71,13 +77,19 @@ def baseline_contract(project: dict) -> dict | None:
     return contract if isinstance(contract, dict) and contract else None
 
 
+def infer_metric_direction(metric_name: str) -> str:
+    """按指标名推断默认优化方向:命中 loss/err/mae/mse/rmse/fid/ppl/wer/cer/latency → minimize。"""
+    return "minimize" if _MINIMIZE_METRIC_RE.search(str(metric_name or "").strip()) else "maximize"
+
+
 def default_metric_contract(pool: dict[str, dict]) -> dict:
-    """未配置契约时的默认形态(第一个数据集的第一个指标)。B1 不强制默认契约:
+    """未配置契约时的默认形态(第一个数据集的第一个指标 + 自动推断优化方向)。B1 不强制默认契约:
     只作 GET 端点的预填建议,判定链不使用它。"""
     for info in pool.values():
         metrics = list(info.get("metrics") or {})
         if metrics:
-            return {"primary": metrics[0], "direction": "maximize",
+            primary = metrics[0]
+            return {"primary": primary, "direction": infer_metric_direction(primary),
                     "guardrails": [], "eval": {}}
     return {"primary": "", "direction": "maximize", "guardrails": [], "eval": {}}
 
@@ -92,26 +104,41 @@ def _clean_eval_paths(paths, field: str) -> list[str]:
             raise ToolError(f"eval.{field} 必须是工作区相对路径:{rel}")
         out.append(rel)
     return out
+
+
 def _clean_contract(payload: dict, pool: dict[str, dict]) -> dict:
     """核验 owner 提交的契约;非法即 ToolError(映射 409)。"""
     if not isinstance(payload, dict):
         raise ToolError("契约必须是对象:{primary, direction, guardrails, eval}")
+    raw_eval = payload.get("eval") or {}
+    if not isinstance(raw_eval, dict):
+        raise ToolError("eval 必须是对象:{command, metric_file, code_paths, data_paths}")
+    # B2.3a:command 非空才启用平台独立评测 Job;启用时允许填写仅由 eval.command 产出的自定义指标名。
+    command = str(raw_eval.get("command") or "").strip()
     known = {name for info in pool.values() for name in (info.get("metrics") or {})}
     primary = str(payload.get("primary") or "").strip()
     if not primary:
         raise ToolError("primary 不能为空")
-    if primary not in known:
+    if not _METRIC_NAME_RE.match(primary):
+        raise ToolError(f"非法 primary 指标名:{primary}")
+    if not command and primary not in known:
         raise ToolError(f"primary 指标 {primary} 不在任何数据集的基线指标里")
-    direction = str(payload.get("direction") or "maximize")
+    raw_dir = payload.get("direction")
+    direction = str(raw_dir if raw_dir is not None else infer_metric_direction(primary))
     if direction not in ("maximize", "minimize"):
         raise ToolError(f"direction 只能是 maximize|minimize:{direction}")
     guardrails = []
     for raw in payload.get("guardrails") or []:
         rule = raw if isinstance(raw, dict) else {}
         metric = str(rule.get("metric") or "").strip()
-        if metric not in known:
-            raise ToolError(f"guardrail 指标 {metric or '(空)'} 不在基线指标里")
-        rule_direction = str(rule.get("direction") or "maximize")
+        if not metric or not _METRIC_NAME_RE.match(metric):
+            if not command:
+                raise ToolError(f"guardrail 指标 {metric or '(空)'} 不在基线指标里")
+            raise ToolError(f"非法 guardrail 指标名:{metric or '(空)'}")
+        if not command and metric not in known:
+            raise ToolError(f"guardrail 指标 {metric} 不在基线指标里")
+        raw_rule_dir = rule.get("direction")
+        rule_direction = str(raw_rule_dir if raw_rule_dir is not None else infer_metric_direction(metric))
         if rule_direction not in ("maximize", "minimize"):
             raise ToolError(f"guardrail direction 只能是 maximize|minimize:{rule_direction}")
         regress = rule.get("max_regress", 0.0)
@@ -119,11 +146,6 @@ def _clean_contract(payload: dict, pool: dict[str, dict]) -> dict:
             raise ToolError(f"guardrail {metric} 的 max_regress 必须 ≥ 0")
         guardrails.append({"metric": metric, "direction": rule_direction,
                            "max_regress": float(regress)})
-    raw_eval = payload.get("eval") or {}
-    if not isinstance(raw_eval, dict):
-        raise ToolError("eval 必须是对象:{command, metric_file, code_paths, data_paths}")
-    # B2.3a:command 非空才启用平台独立评测 Job;为空允许只配 code_paths 做保护。
-    command = str(raw_eval.get("command") or "").strip()
     # B2.3b:评测 Job 运行用的 conda 环境(空串允许 = 不激活)。
     conda_env = str(raw_eval.get("conda_env") or "").strip()
     metric_file = str(raw_eval.get("metric_file") or "metrics.json").strip()
@@ -151,14 +173,50 @@ def _clean_contract(payload: dict, pool: dict[str, dict]) -> dict:
                 "code_hash": "", "data_hash": ""}}
 
 
-def refresh_contract_hashes(workspace, contract: dict) -> dict:
-    """eval 保护路径有配置时重算指纹(owner PATCH / confirm / adopt 共用)。"""
+def refresh_contract_hashes(workspace, contract: dict, *,
+                            output_root: str | None = None) -> dict:
+    """eval 保护路径有配置时重算指纹(owner PATCH / confirm / adopt 共用),并归档只读 .locked_eval。"""
     eval_cfg = contract.get("eval") or {}
     if eval_cfg.get("code_paths"):
         eval_cfg["code_hash"] = hash_paths(workspace, eval_cfg["code_paths"])["hash"]
+        if output_root:
+            stage_locked_eval(workspace, output_root, eval_cfg["code_paths"])
     if eval_cfg.get("data_paths"):
         eval_cfg["data_hash"] = hash_paths(workspace, eval_cfg["data_paths"])["hash"]
     return contract
+
+
+def sync_baseline_eval_metrics(repo: Repo, project_id: str) -> dict | None:
+    """若基线数据集的训练 Job 已有 SUCCEEDED 平台评测 Job,将其指标同步覆盖回基线快照以保证同口径。"""
+    project = repo.get_project(project_id)
+    if project is None or not project.get("baseline_passed_at"):
+        return project
+    snapshot = baseline_snapshot(project)
+    datasets = snapshot.get("datasets")
+    if not isinstance(datasets, dict) or not datasets:
+        return project
+    changed = False
+    for info in datasets.values():
+        if not isinstance(info, dict):
+            continue
+        job_id = str(info.get("job_id") or "").strip()
+        if not job_id:
+            continue
+        eval_job = repo.eval_job_for(job_id)
+        if eval_job is None or eval_job["status"] != "SUCCEEDED":
+            continue
+        eval_vals = job_metrics(repo, eval_job["id"])
+        if not eval_vals:
+            continue
+        merged = {**(info.get("metrics") or {}), **eval_vals}
+        if merged != (info.get("metrics") or {}):
+            info["metrics"] = merged
+            info["eval_job_id"] = eval_job["id"]
+            changed = True
+    if changed:
+        repo.update_project(project_id, baseline_json=json.dumps(snapshot, ensure_ascii=False))
+        project = repo.get_project(project_id)
+    return project
 
 
 def get_metric_contract(project: dict) -> dict:
@@ -171,7 +229,7 @@ def get_metric_contract(project: dict) -> dict:
 
 
 def set_metric_contract(repo: Repo, credentials, project_id: str, payload: dict) -> dict:
-    """owner 固化指标契约:写入基线快照顶层 metric_contract(其余快照字段原样)。"""
+    """owner 固化指标契约:写入基线快照顶层 metric_contract,并在启用 eval.command 时为已有基线产物派发同口径重评。"""
     project = repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
@@ -179,13 +237,37 @@ def set_metric_contract(repo: Repo, credentials, project_id: str, payload: dict)
     if not pool:
         raise AgentLoopError("还没有确认过的基线,无从绑定指标契约")
     contract = _clean_contract(payload, pool)
-    if contract["eval"]["code_paths"] or contract["eval"]["data_paths"]:
-        with open_workspace(repo, credentials, project) as ws:
-            refresh_contract_hashes(ws, contract)
+    baseline_job_ids = [
+        str(info.get("job_id")).strip()
+        for info in pool.values()
+        if isinstance(info, dict) and str(info.get("job_id") or "").strip()
+    ]
+    need_ws = bool(
+        contract["eval"]["code_paths"]
+        or contract["eval"]["data_paths"]
+        or (contract["eval"]["command"] and baseline_job_ids)
+    )
+    eval_ids: list[str] = []
     snapshot = baseline_snapshot(project)
-    snapshot["metric_contract"] = contract
-    repo.update_project(project_id, baseline_json=json.dumps(snapshot, ensure_ascii=False))
-    return get_metric_contract(repo.get_project(project_id))
+    if need_ws:
+        with open_workspace(repo, credentials, project) as ws:
+            if contract["eval"]["code_paths"] or contract["eval"]["data_paths"]:
+                refresh_contract_hashes(ws, contract, output_root=project.get("output_root"))
+            snapshot["metric_contract"] = contract
+            repo.update_project(project_id, baseline_json=json.dumps(snapshot, ensure_ascii=False))
+            if contract["eval"]["command"] and baseline_job_ids:
+                eval_ids = submit_eval_jobs(
+                    repo, ws, repo.get_project(project_id), baseline_job_ids,
+                    contract, run_id=f"baseline:{project_id}",
+                )
+    else:
+        snapshot["metric_contract"] = contract
+        repo.update_project(project_id, baseline_json=json.dumps(snapshot, ensure_ascii=False))
+    refreshed = sync_baseline_eval_metrics(repo, project_id) or repo.get_project(project_id)
+    out = get_metric_contract(refreshed)
+    if eval_ids:
+        out["baselineEvalJobIds"] = eval_ids
+    return out
 
 def baseline_pool(project: dict) -> dict[str, dict]:
     """研究阶段可用的数据集池(只有确认过的才算)。"""
@@ -225,7 +307,7 @@ def dataset_states(repo: Repo, project_id: str) -> list[dict]:
     """按数据集聚合状态(UI 投影,全部从事实派生,不依赖 agent 自报):
     confirmed = owner 已确认的基线快照;ran/running/failed = Job 实况;
     pending_supply = 当前 baseline 会话等待中的 dataset 求助(等 owner 供给)。"""
-    project = repo.get_project(project_id)
+    project = sync_baseline_eval_metrics(repo, project_id) or repo.get_project(project_id)
     if project is None:
         return []
     out: dict[str, dict] = {}
@@ -245,6 +327,8 @@ def dataset_states(repo: Repo, project_id: str) -> list[dict]:
     for r in rows:
         job = repo.get_job(r["id"])
         params = json.loads(job["params_json"] or "{}")
+        if params.get("eval_of_job_id"):
+            continue
         name = str(params.get("dataset") or "").strip()
         if not name:
             continue
@@ -253,7 +337,7 @@ def dataset_states(repo: Repo, project_id: str) -> list[dict]:
         state = ("running" if r["status"] in ("QUEUED", "DISPATCHING", "RUNNING")
                  else "ran" if r["status"] == "SUCCEEDED" else "failed")
         out[name] = {"name": name, "state": state, "jobId": r["id"],
-                     "jobStatus": r["status"], "metrics": job_metrics(repo, r["id"]),
+                     "jobStatus": r["status"], "metrics": effective_metrics(repo, job),
                      "command": str(params.get("command") or "")}
     run = runtime.latest_run(repo, project_id, KIND)
     pending = ((run or {}).get("pending") or {}).get("payload") or {}
@@ -278,10 +362,13 @@ def _facts(env: LoopEnv) -> str:
 
 
 def validate_proposal(repo: Repo, project: dict, args: dict) -> dict:
-    """核验 finish 载荷;命令取 Job 实际执行的命令(不信 agent 自述)。"""
+    """核验 finish 载荷;命令取 Job 实际执行的命令(不信 agent 自述)。
+    若项目已启用 metric_contract.eval.command,同时要求平台独立评测 Job 成功并以评测指标为准。"""
     datasets = args.get("datasets") or []
     if not isinstance(datasets, list) or not datasets:
         raise ToolError("datasets 不能为空")
+    contract = baseline_contract(project)
+    eval_cmd = str(((contract or {}).get("eval") or {}).get("command") or "").strip()
     seen: set[str] = set()
     problems: list[str] = []
     out: list[dict] = []
@@ -303,7 +390,19 @@ def validate_proposal(repo: Repo, project: dict, args: dict) -> dict:
         if job["status"] != "SUCCEEDED":
             problems.append(f"{name}:Job {job_id} 状态 {job['status']},不是 SUCCEEDED")
             continue
-        metrics = job_metrics(repo, job_id)
+        if eval_cmd:
+            eval_job = repo.eval_job_for(job_id)
+            if eval_job is None:
+                problems.append(f"{name}:契约已启用平台独立评测,但 Job {job_id} 尚未完成平台评测"
+                                "(请先调用 wait_jobs 等待平台评测完成)")
+                continue
+            if eval_job["status"] != "SUCCEEDED":
+                problems.append(f"{name}:平台评测 Job {eval_job['id']} 状态 {eval_job['status']},"
+                                "不是 SUCCEEDED")
+                continue
+            metrics = {**job_metrics(repo, job_id), **effective_metrics(repo, job)}
+        else:
+            metrics = job_metrics(repo, job_id)
         if not metrics:
             problems.append(f"{name}:Job {job_id} 没有提取到合法指标"
                             "(metrics.json 缺失、键名不符或数值越界)")
@@ -329,7 +428,7 @@ def build_tools(env: LoopEnv) -> list:
     paper_tools = [tools.paper_radar_tool()] if paper_radar.available() else []
     return [
         *tools.workspace_tools(), tools.shell_tool(), *knowledge_tools, *paper_tools,
-        *tools.experiment_tools(),
+        *tools.experiment_tools(eval_contract=lambda e: baseline_contract(e.project)),
         tools.read_paper_tool(), tools.ask_human_tool(),
         tools.finish_tool(
             "提交基线给 owner 确认。每个数据集给出成功的正式 Job;Python 会核验 Job 成功且有合法指标。",
@@ -354,7 +453,7 @@ PROFILE = LoopProfile(kind=KIND, system_prompt=SYSTEM_PROMPT, build_tools=build_
 
 def start(repo: Repo, project_id: str, *, note: str = "", network: bool = False,
           agent_spec_id: str | None = None) -> dict:
-    project = repo.get_project(project_id)
+    project = sync_baseline_eval_metrics(repo, project_id) or repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
     if not (project.get("remote_workdir") or "").strip():
@@ -380,35 +479,47 @@ def confirm(repo: Repo, credentials, run_id: str) -> dict:
     """owner 确认基线:复核后写基线快照,项目进入研究阶段。
 
     B1.3:已配置的 metric_contract 原样带进新快照(没有则不写,保持旧行为);
-    eval 保护路径有配置时重算指纹(确认时的代码状态即被保护状态)。"""
+    eval 保护路径有配置时重算指纹并归档只读 .locked_eval;若配置了 eval.command
+    且提案中的训练 Job 尚未完成平台评测,自动为其派发同口径评测。"""
     run = runtime.get_run(repo, run_id)
     payload = (run.get("pending") or {}).get("payload") or {}
     if run["kind"] != KIND or payload.get("kind") != CONFIRM_KIND:
         raise AgentLoopError("该会话没有待确认的基线")
     project = repo.get_project(run["projectId"])
     proposal = payload["proposal"]
-    validate_proposal(repo, project, {
+    old_snapshot = baseline_snapshot(project)
+    contract = old_snapshot.get("metric_contract")
+    eval_cfg = (contract or {}).get("eval") if isinstance(contract, dict) else None
+    if isinstance(eval_cfg, dict) and str(eval_cfg.get("command") or "").strip():
+        missing_eval_ids = [
+            d["jobId"] for d in proposal["datasets"]
+            if repo.eval_job_for(d["jobId"]) is None
+        ]
+        if missing_eval_ids:
+            with open_workspace(repo, credentials, project) as ws:
+                if eval_cfg.get("code_paths") or eval_cfg.get("data_paths"):
+                    refresh_contract_hashes(ws, contract, output_root=project.get("output_root"))
+                submit_eval_jobs(repo, ws, project, missing_eval_ids, contract, run_id=run_id)
+    validated = validate_proposal(repo, project, {
         "conda_env": proposal["condaEnv"], "notes": proposal["notes"],
         "datasets": [{"name": d["name"], "job_id": d["jobId"], "dataset_path": d["datasetPath"]}
                      for d in proposal["datasets"]]})
     now = utc_now()
     # 追加确认:新提案覆盖同名数据集,已确认的其他数据集原样保留(池只增不减)
-    old_snapshot = baseline_snapshot(project)
     datasets = {name: info for name, info in old_snapshot.get("datasets", {}).items()}
     datasets.update({d["name"]: {"metrics": d["metrics"], "command": d["command"],
                                  "dataset_path": d["datasetPath"], "job_id": d["jobId"]}
-                     for d in proposal["datasets"]})
+                     for d in validated["datasets"]})
     snapshot = {
-        "passed_at": now, "run_id": run_id, "conda_env": proposal["condaEnv"],
-        "notes": proposal["notes"], "datasets": datasets,
+        "passed_at": now, "run_id": run_id, "conda_env": validated["condaEnv"],
+        "notes": validated["notes"], "datasets": datasets,
     }
-    contract = old_snapshot.get("metric_contract")
     if isinstance(contract, dict) and contract:
         if (contract.get("eval") or {}).get("code_paths") \
                 or (contract.get("eval") or {}).get("data_paths"):
             with open_workspace(repo, credentials, project) as ws:
-                refresh_contract_hashes(ws, contract)
+                refresh_contract_hashes(ws, contract, output_root=project.get("output_root"))
         snapshot["metric_contract"] = contract
     repo.update_project(project["id"], baseline_passed_at=now,
                         baseline_json=json.dumps(snapshot, ensure_ascii=False))
-    return runtime.complete_run(repo, run_id, {"confirmed": True, **proposal})
+    return runtime.complete_run(repo, run_id, {"confirmed": True, **validated})

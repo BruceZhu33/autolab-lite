@@ -221,8 +221,8 @@ AutoLab 针对自主科研场景构建了多层工程护栏，确保实验结论
 
 ### 4.1 评测指标契约与防篡改证据（Phase B1 & B2.3）
 - **固化指标契约（Metric Contract）**：基线确认后，Owner 可在 `/baseline` 页固化主指标（`primary`）、优化方向（`maximize` / `minimize`）及退化护栏（`guardrails`，如规定次要指标最大退化不得超过 `max_regress`）。只要任一数据集触发护栏违规，该变体本轮即不计为有效提升。
-- **受保护路径 SHA-256 指纹锁（Protected Paths）**：契约支持指定工作区内的评测脚本（`code_paths`）与测试数据集划分（`data_paths`）。系统基于工作区相对路径计算确定性 SHA-256 指纹；若 Agent 在迭代中偷改受保护文件，`end_round` 会立即触发 `protected_paths_changed` 拒绝收束并要求还原。
-- **平台独立评测 Job（Platform Independent Evaluation）**：当契约配置了 `eval.command` 时，训练 Job 成功后由平台调度器自动派发独立的 `platform-eval:<run_id>` 评测 Job（注入只读的 `$AUTOLAB_TRAIN_OUTPUT_DIR`），Python 判定链**只认平台独立评测 Job 产出的指标**，彻底剥离「训练脚本自报指标」的作弊空间。
+- **受保护路径 SHA-256 指纹锁（Protected Paths）**：契约支持指定工作区内的评测脚本（`code_paths`）与测试数据集划分（`data_paths`，穿透符号链接统计真实文件哈希）。系统基于工作区相对路径计算确定性 SHA-256 指纹，并在实验派发前、平台评测派发前与 `end_round` 三处门禁校验；一旦受保护文件被篡改或缺失立即拦截并记录 `protected_paths_changed` 事件。
+- **平台独立评测 Job（Platform Independent Evaluation）**：当契约配置了 `eval.command` 时，训练 Job 成功后由平台调度器自动派发独立的 `platform-eval:<run_id>` 评测 Job（同时注入只读的 `$AUTOLAB_TRAIN_OUTPUT_DIR` 与兼容别名 `$AUTOLAB_EVAL_INPUT_DIR`，并开启 `PYTHONSAFEPATH=1` 隔离工作区同目录模块与 `sitecustomize.py` 劫持），Python 判定链**只认平台独立评测 Job 产出的指标**，彻底剥离「训练脚本自报指标」的作弊空间。
 - **轮次证据包（Evidence Bundle）**：每轮收束自动生成包含代码 Git Commit、工作区脏状态、保护路径校验结果、训练与评测 Job 摘要的 `evidenceHash`（SHA-256），在研究日志中永久留痕。
 
 ### 4.2 统计显著性与防浪费门禁（Phase B1 & B2.1）
@@ -277,6 +277,7 @@ uv run autolab-control serve \
   --http-port 8710
 
 # 3) 构建并启动 Next.js Web 控制台 (默认监听 http://127.0.0.1:3430)
+#    可通过 NEXT_PUBLIC_AUTOLAB_API 与 NEXT_PUBLIC_PAPERPULSE_WEB 注入后端与论文雷达入口
 cd apps/web
 NEXT_PUBLIC_AUTOLAB_API=http://127.0.0.1:8710 npm run build
 npm run start

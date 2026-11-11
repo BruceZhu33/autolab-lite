@@ -23,14 +23,25 @@ from autolab_protocol import (
     PlanSpecV1,
 )
 
+from ..core.db import utc_now
 from ..core.errors import UserError
 from ..core.repo import TERMINAL_JOB_STATUSES, Repo
 from ..workspace.fs import Workspace
 from ..workspace.host import open_host, q
+from .evidence import protected_state, stage_locked_eval
 
 EXPERIMENTS_REL = ".autolab/experiments"
 MAX_JOBS_PER_SUBMIT = 8
 _METRIC_NAME = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+_SHELL_CONTROL_OPS = ("&&", "||", ";", "|", "`", "$(", ">", "<", "\n", "\r")
+_INLINE_EXEC_INTERPRETERS = frozenset({"python", "python3", "bash", "sh", "zsh", "perl", "ruby", "node"})
+_DATASET_SCOPE_FLAGS = frozenset({
+    "config", "config-file", "config_file",
+    "dataset", "data", "data-dir", "data_dir", "data-root", "data_root", "data-path", "data_path",
+    "data-percentage", "data_percentage", "data-percent", "data_percent", "data-ratio", "data_ratio",
+    "subset", "max-samples", "max_samples", "num-samples", "num_samples",
+    "split", "val-split", "val_split", "test-split", "test_split",
+})
 
 
 @dataclass
@@ -44,6 +55,7 @@ class ExperimentRequest:
     gpus_per_job: int = 1
     allowed_datasets: set[str] | None = field(default=None)
     dataset_commands: dict[str, str] | None = field(default=None)  # {数据集: 基线命令}
+    strict_readonly: bool = False
 
 
 def list_experiments(ws: Workspace) -> list[str]:
@@ -51,23 +63,130 @@ def list_experiments(ws: Workspace) -> list[str]:
     return sorted(names, key=lambda x: int(x.split("-")[1]))
 
 
+def _is_autolab_status_path(path_part: str) -> bool:
+    parts = [p.strip().strip('"') for p in path_part.split(" -> ") if p.strip()]
+    return bool(parts) and all(p == ".autolab" or p.startswith(".autolab/") for p in parts)
+
+
 def code_anchor(ws: Workspace) -> CodeAnchor:
-    """git 仓库取 commit+branch;否则用文件清单指纹。"""
+    """git 仓库取 commit+branch+未提交改动摘要;否则用工作区源码清单 sha256 指纹。"""
     head = ws.sh("git rev-parse HEAD 2>/dev/null")
     if head.ok and re.fullmatch(r"[0-9a-f]{7,40}", head.out.strip()):
+        commit = head.out.strip()
         branch = ws.sh("git rev-parse --abbrev-ref HEAD 2>/dev/null").out.strip()
-        return CodeAnchor(git_commit=head.out.strip(), branch=branch or None)
-    listing = ws.sh("find . -maxdepth 2 -type f -not -path './.git/*' -not -path './.autolab/*'"
-                    " | sort | head -200 | xargs cksum 2>/dev/null | cksum")
+        status = ws.sh("git status --porcelain --untracked-files=all 2>/dev/null")
+        dirty_lines: list[str] = []
+        untracked_rels: list[str] = []
+        if status.ok:
+            for line in status.out.splitlines():
+                if len(line) < 4:
+                    continue
+                path_part = line[3:].strip()
+                if _is_autolab_status_path(path_part):
+                    continue
+                dirty_lines.append(line)
+                if line.startswith("?? "):
+                    rel = path_part.strip('"')
+                    if rel and ".." not in rel.split("/"):
+                        untracked_rels.append(rel)
+        dirty_sha: str | None = None
+        if dirty_lines:
+            diff = ws.sh("git diff HEAD -- . ':(exclude).autolab' 2>/dev/null")
+            if not diff.ok:
+                diff = ws.sh("git diff HEAD 2>/dev/null")
+            untracked_hash = ""
+            if untracked_rels:
+                quoted = " ".join(q(r) for r in sorted(untracked_rels)[:100])
+                uh = ws.sh(
+                    f"find {quoted} -maxdepth 4 -type f -size -1024k -print0 2>/dev/null"
+                    " | sort -z | xargs -0 -r sha256sum 2>/dev/null"
+                )
+                untracked_hash = uh.out.strip()
+            digest_input = "\n".join(dirty_lines) + "\n--DIFF--\n" + (diff.out or "") + "\n--UNTRACKED--\n" + untracked_hash
+            dirty_sha = hashlib.sha256(digest_input.encode("utf-8", errors="replace")).hexdigest()
+        return CodeAnchor(git_commit=commit, branch=branch or None, dirty_patch_sha256=dirty_sha)
+    listing = ws.sh(
+        "find . -maxdepth 4 -type f -not -path './.git/*' -not -path './.autolab/*'"
+        " -size -1024k -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null"
+    )
     seed = listing.out.strip() or f"workspace:{ws.workdir}"
-    return CodeAnchor(non_git_fingerprint=hashlib.sha256(seed.encode()).hexdigest())
+    return CodeAnchor(non_git_fingerprint=hashlib.sha256(seed.encode("utf-8")).hexdigest())
 
 
-def _clean_jobs(request: ExperimentRequest) -> list[dict]:
+def _positional_prefix(command: str) -> list[str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return []
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("--"):
+            if "=" not in tok and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def check_command_readonly_safe(command: str, *, baseline_command: str = "") -> None:
+    """只读复核(strict_readonly=True / validation)命令安全门:拒绝复合 shell 操作符、重定向与内联脚本。"""
+    for op in _SHELL_CONTROL_OPS:
+        if op in command:
+            label = repr(op) if op in ("\n", "\r") else op
+            raise UserError(f"只读验证模式下命令禁止包含 shell 控制或重定向操作符({label}):{command}")
+    try:
+        tokens = shlex.split(command)
+    except ValueError as exc:
+        raise UserError(f"只读验证模式下命令引号语法非法:{exc}") from exc
+    if not tokens:
+        raise UserError("只读验证模式下命令不能为空")
+    exe_base = tokens[0].rsplit("/", 1)[-1]
+    base_tokens: list[str] = []
+    if baseline_command.strip():
+        try:
+            base_tokens = shlex.split(baseline_command)
+        except ValueError:
+            base_tokens = []
+    if exe_base in _INLINE_EXEC_INTERPRETERS and "-c" in tokens[1:3]:
+        if not (base_tokens and base_tokens[0].rsplit("/", 1)[-1] == exe_base and "-c" in base_tokens[1:3]):
+            raise UserError(f"只读验证模式下禁止通过 `{exe_base} -c` 执行内联代码")
+    if baseline_command.strip():
+        expected_pos = _positional_prefix(baseline_command)
+        actual_pos = _positional_prefix(command)
+        if expected_pos and actual_pos != expected_pos:
+            raise UserError(
+                f"只读验证模式下命令入口必须与基线一致(期望 `{' '.join(expected_pos)}`,"
+                f"收到 `{' '.join(actual_pos) or tokens[0]}`)"
+            )
+        expected_flags = _flag_pairs(baseline_command)
+        actual_flags = _flag_pairs(command)
+        if actual_flags != expected_flags:
+            extra = sorted(set(actual_flags) - set(expected_flags))
+            missing = sorted(set(expected_flags) - set(actual_flags))
+            changed = sorted(f for f in set(actual_flags) & set(expected_flags)
+                             if actual_flags[f] != expected_flags[f])
+            detail = ", ".join([
+                *(f"新增 {f}={actual_flags[f]}" for f in extra),
+                *(f"缺失 {f}={expected_flags[f]}" for f in missing),
+                *(f"改动 {f}={actual_flags[f]}(基线为 {expected_flags[f]})" for f in changed),
+            ])
+            raise UserError(f"只读验证模式下只允许更换 seed 参数,不得改动其他命令行参数({detail})")
+
+
+def _clean_jobs(request: ExperimentRequest, *, strict_readonly: bool = False) -> list[dict]:
     if not request.jobs:
         raise UserError("jobs 不能为空:[{name, command}]")
     if len(request.jobs) > MAX_JOBS_PER_SUBMIT:
         raise UserError(f"一次最多 {MAX_JOBS_PER_SUBMIT} 个 Job,分批提交")
+    readonly = bool(strict_readonly or request.strict_readonly)
     out, names = [], set()
     for item in request.jobs:
         item = item or {}
@@ -79,6 +198,11 @@ def _clean_jobs(request: ExperimentRequest) -> list[dict]:
         names.add(name)
         job = {"name": name, "command": command}
         dataset = str(item.get("dataset") or "").strip()
+        if readonly and request.allowed_datasets is not None and not dataset:
+            raise UserError("只读验证模式下每个 Job 必须指定 dataset")
+        if readonly:
+            base_cmd = (request.dataset_commands or {}).get(dataset, "") if dataset else ""
+            check_command_readonly_safe(command, baseline_command=base_cmd)
         if dataset:
             allowed = request.allowed_datasets
             if allowed is not None and dataset not in allowed:
@@ -99,7 +223,7 @@ def _clean_jobs(request: ExperimentRequest) -> list[dict]:
                 raise UserError(f"seed 必须是整数:{name}")
             job["seed"] = seed
         # B2.3a 平台评测 Job 的内部字段(仅平台 submit_eval_jobs 构造,不进 agent schema)
-        for key in ("eval_of_job_id", "eval_input_dir", "role"):
+        for key in ("eval_of_job_id", "eval_input_dir", "role", "locked_eval_dir"):
             if item.get(key) is not None:
                 job[key] = item[key]
         out.append(job)
@@ -119,43 +243,93 @@ def _clean_jobs(request: ExperimentRequest) -> list[dict]:
     return out
 
 
+def _job_item_key(job: dict) -> tuple[str, str, str, int | None]:
+    return (
+        str(job.get("dataset") or "").strip(),
+        str(job.get("command") or "").strip(),
+        str(job.get("variant") or "").strip(),
+        None if job.get("seed") is None else int(job["seed"]),
+    )
+
+
 def _job_signature(jobs: list[dict]) -> list[tuple]:
-    """排序后的 (dataset, command, variant, seed) 元组集合:重复提交判定用。
-    seed 混有 None/int 时按「无 seed 在前」稳定排序,等值比较不受排序键影响。"""
-    sigs = [(str(j.get("dataset") or "").strip(), str(j.get("command") or "").strip(),
-             str(j.get("variant") or "").strip(),
-             None if j.get("seed") is None else int(j["seed"]))
-            for j in jobs]
+    """排序后的 (dataset, command, variant, seed) 元组集合:重复提交判定用。"""
+    sigs = [_job_item_key(j) for j in jobs]
     return sorted(sigs, key=lambda t: (t[0], t[1], t[2], t[3] is not None, t[3] or 0))
 
 
-def check_duplicate_jobs(repo: Repo, approved_by: str, jobs: list[dict]) -> None:
-    """同一 agent-run 已成功跑过完全相同的一组 Job → UserError。
-    签名 = 排序后的 (dataset, command.strip(), variant, seed) 元组集合。
-    只拿 SUCCEEDED 的旧 Job 比较;旧 Job 失败/取消不算重复(允许重试)。
-    approved_by 不是 agent-run:<id> 时直接返回(CLI/人工路径不拦)。"""
+def _anchor_identity(anchor_obj: CodeAnchor | dict | None) -> tuple[str, str]:
+    if isinstance(anchor_obj, CodeAnchor):
+        return (
+            str(anchor_obj.git_commit or anchor_obj.non_git_fingerprint or ""),
+            str(anchor_obj.dirty_patch_sha256 or ""),
+        )
+    if isinstance(anchor_obj, dict):
+        return (
+            str(anchor_obj.get("git_commit") or anchor_obj.get("non_git_fingerprint") or ""),
+            str(anchor_obj.get("dirty_patch_sha256") or ""),
+        )
+    return ("", "")
+
+
+def _extract_plan_conda_env(spec: dict) -> str:
+    tmpl = spec.get("command_template") or []
+    if len(tmpl) >= 3 and isinstance(tmpl[2], str):
+        m = re.search(r"conda activate\s+(.+?)\s*&&", tmpl[2])
+        if m:
+            raw = m.group(1).strip()
+            try:
+                parts = shlex.split(raw)
+                return parts[0] if parts else raw
+            except ValueError:
+                return raw
+    return ""
+
+
+def check_duplicate_jobs(repo: Repo, approved_by: str, jobs: list[dict], *,
+                         anchor: CodeAnchor | dict | None = None,
+                         conda_env: str = "") -> None:
+    """同一 agent-run 已在相同代码锚点与 conda 环境下成功跑过相同单条 Job → UserError。
+    单条签名 = (code_anchor, conda_env, dataset, command.strip(), variant, seed):
+    - 修改源码(git commit / 未提交 diff / 非 git 指纹变化)或切换 conda_env 后允许同命令复跑;
+    - 代码与环境未变时,哪怕只与历史 SUCCEEDED Job 局部重叠也按单 Job 精准拦截;
+    - 旧 Job 失败/取消不算重复(允许重试);非 agent-run:<id> 不拦。"""
     if not str(approved_by).startswith("agent-run:"):
         return
     conn = repo.db.connect()
     try:
-        plan_ids = [r["id"] for r in conn.execute(
-            "SELECT id FROM plan_revisions WHERE approved_by = ?", (approved_by,))]
+        plan_rows = [dict(r) for r in conn.execute(
+            "SELECT id, spec_json FROM plan_revisions WHERE approved_by = ?", (approved_by,))]
     finally:
         conn.close()
-    signature = _job_signature(jobs)
-    for plan_id in plan_ids:
-        succeeded = [json.loads(j["params_json"]) for j in repo.list_jobs(plan_id=plan_id)
-                     if j["status"] == "SUCCEEDED"]
-        if succeeded and _job_signature(succeeded) == signature:
-            raise UserError("本会话已成功跑过同一组实验(相同 dataset/command/variant/seed);"
-                            "请换 seed、变体或命令,或先分析已有结果,不要原样重复。")
+    use_anchor = anchor is not None
+    cur_anchor = _anchor_identity(anchor) if use_anchor else ("", "")
+    cur_conda = conda_env.strip()
+    seen_succeeded: set[tuple] = set()
+    for plan_row in plan_rows:
+        try:
+            spec = json.loads(plan_row.get("spec_json") or "{}")
+        except ValueError:
+            spec = {}
+        plan_anchor = _anchor_identity(spec.get("code_anchor")) if use_anchor else ("", "")
+        plan_conda = _extract_plan_conda_env(spec)
+        for job_row in repo.list_jobs(plan_id=plan_row["id"]):
+            if job_row["status"] != "SUCCEEDED":
+                continue
+            params = json.loads(job_row["params_json"] or "{}")
+            seen_succeeded.add((plan_anchor, plan_conda, *_job_item_key(params)))
+    for job in jobs:
+        candidate = (cur_anchor, cur_conda, *_job_item_key(job))
+        if candidate in seen_succeeded:
+            raise UserError("本会话已成功跑过同一组实验(相同代码状态/环境/dataset/command/variant/seed);"
+                            "请修改代码、换 seed/变体或先分析已有结果,不要原样重复。")
 
 
 # dataset 标注 vs 命令的「身分参数」比对。真机事故:agent 把 BUSI@10% 的实验
 # 标成 BUSI,对照挂到 100% 基线(0.85 vs 0.68),判定链失明三轮才触发停止。
 # 身分参数 = 值/存在性在确认池各数据集命令间有差异的 flag=值对
-# (如 --config-file configs/BUSI.yaml、--data-percentage 10);seed 类 flag
-# (研究本来就要换 seed)和无值 flag(如 python -u)不参与。
+# (如 --config-file configs/BUSI.yaml、--data-percentage 10),以及单数据集项目中
+# 基线已声明的参数与数据范围覆盖参数;seed 类 flag 和无值 flag 不参与。
 _SEED_FLAG_NAMES = frozenset({"seed", "random-seed", "random_seed"})
 
 
@@ -193,14 +367,31 @@ def check_dataset_command_consistency(dataset: str, command: str,
     tagged = _flag_pairs(commands.get(dataset) or "")
     others = {name: _flag_pairs(cmd or "") for name, cmd in commands.items()
               if name != dataset}
+    submitted = _flag_pairs(command)
+    if not others:
+        # 单数据集项目同样必须与自身基线命令对齐,禁止改配置文件或悄悄加 --data-percentage 10 等缩水参数
+        for flag, expected in sorted(tagged.items()):
+            if flag not in submitted:
+                raise UserError(
+                    f"数据集标注不一致:{dataset} 的基线命令带 `{flag} {expected}`,你的命令没有"
+                    "——数据口径对不上会让对照失真。请补上该参数。")
+            if submitted[flag] != expected:
+                raise UserError(
+                    f"数据集标注不一致:命令带 `{flag} {submitted[flag]}`,但 {dataset} 的基线命令"
+                    f"里它是 `{flag} {expected}`——数据口径对不上会让对照失真。请修正命令。")
+        for flag, actual in sorted(submitted.items()):
+            if flag not in tagged and flag.lstrip("-") in _DATASET_SCOPE_FLAGS:
+                raise UserError(
+                    f"数据集标注不一致:命令带 `{flag} {actual}`,但 {dataset} 的基线命令"
+                    "没有这个参数——不允许通过缩减数据比例或切换配置改变评测口径。")
+        return
     all_flags = set(tagged) | {f for pairs in others.values() for f in pairs}
     for flag in sorted(all_flags):
         # 身分参数:存在性或取值与其他数据集不同 → 提交的命令必须与标注数据集一致
         differs = any(flag not in pairs or pairs[flag] != tagged.get(flag)
-                      for pairs in others.values()) if others else False
+                      for pairs in others.values())
         if not differs:
             continue
-        submitted = _flag_pairs(command)
         expected = tagged.get(flag)
         if flag in submitted and (expected is None or submitted[flag] != expected):
             owners = "/".join(sorted(n for n, p in others.items() if p.get(flag) == submitted[flag])
@@ -231,11 +422,89 @@ def _clean_metrics(raw: list) -> list[MetricDefinition]:
     return out
 
 
+def _project_contract(project: dict) -> dict | None:
+    try:
+        snap = json.loads((project or {}).get("baseline_json") or "{}")
+    except ValueError:
+        return None
+    contract = snap.get("metric_contract") if isinstance(snap, dict) else None
+    return contract if isinstance(contract, dict) and contract else None
+
+
+def _run_context(repo: Repo, approved_by: str) -> tuple[str, str, dict]:
+    """从 approved_by 解析 (run_id, kind, config);非 agent-run/platform-eval 返回空上下文。"""
+    raw = str(approved_by or "")
+    run_id = ""
+    if raw.startswith("agent-run:"):
+        run_id = raw.split(":", 1)[1]
+    elif raw.startswith("platform-eval:"):
+        run_id = raw.split(":", 1)[1]
+    if not run_id:
+        return ("", "", {})
+    conn = repo.db.connect()
+    try:
+        row = conn.execute(
+            "SELECT kind, config_json FROM agent_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return (run_id, "", {})
+    try:
+        cfg = json.loads(row["config_json"] or "{}")
+    except ValueError:
+        cfg = {}
+    return (run_id, str(row["kind"] or ""), cfg if isinstance(cfg, dict) else {})
+
+
+def _record_protected_event(repo: Repo, run_id: str, protected: dict) -> None:
+    if not run_id:
+        return
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            for kind in ("code", "data"):
+                info = protected.get(kind)
+                if info and info.get("changed"):
+                    payload = json.dumps({
+                        "kind": kind,
+                        "paths": info.get("paths") or [],
+                        "missing": info.get("missing") or [],
+                        "expected": info.get("expected") or "",
+                        "hash": info.get("hash") or "",
+                    }, ensure_ascii=False)
+                    conn.execute(
+                        "INSERT INTO agent_run_events (run_id, kind, payload, created_at)"
+                        " VALUES (?, 'protected_paths_changed', ?, ?)",
+                        (run_id, payload, utc_now()),
+                    )
+    finally:
+        conn.close()
+
+
 def submit(repo: Repo, ws: Workspace, project: dict, request: ExperimentRequest, *,
-           approved_by: str, baseline_ref: str = "baseline") -> dict:
+           approved_by: str, baseline_ref: str = "baseline",
+           strict_readonly: bool = False) -> dict:
     """提交并自动批准;返回 {planId, experimentId, jobs:[{id, name}]}。"""
-    jobs = _clean_jobs(request)
-    check_duplicate_jobs(repo, approved_by, jobs)
+    run_id, run_kind, run_cfg = _run_context(repo, approved_by)
+    effective_readonly = bool(
+        strict_readonly or request.strict_readonly or run_cfg.get("mode") == "validation"
+    )
+    # 派发前受保护路径门禁:研究/复核阶段若受保护路径被篡改或缺失,立即拒绝创建 Plan
+    contract = _project_contract(project)
+    if contract is not None and run_kind != "baseline":
+        protected = protected_state(ws, contract)
+        if protected["ok"] is False:
+            _record_protected_event(repo, run_id, protected)
+            bad = ", ".join(k for k in ("code", "data")
+                            if protected.get(k) and protected[k].get("changed"))
+            raise UserError(
+                f"契约保护的评测代码/数据划分被修改或缺失({bad}):"
+                "拒绝派发实验,请先恢复受保护路径再提交。"
+            )
+    jobs = _clean_jobs(request, strict_readonly=effective_readonly)
+    anchor = code_anchor(ws)
+    check_duplicate_jobs(repo, approved_by, jobs, anchor=anchor, conda_env=request.conda_env)
     metrics = _clean_metrics(request.metrics)
     metric_file = (request.metric_file or "metrics.json").strip().lstrip("/")
     if ".." in metric_file.split("/"):
@@ -268,7 +537,7 @@ def submit(repo: Repo, ws: Workspace, project: dict, request: ExperimentRequest,
         baseline=baseline_ref, metrics=metrics,
         success_criteria=[f"{metrics[0].name} 有合法数值"],
         risk_and_fallback="失败日志回给 agent 自行修复",
-        code_anchor=code_anchor(ws),
+        code_anchor=anchor,
         # 不用 exec:命令可以是 `cd x && python ...` 这类复合形式
         command_template=["bash", "-c", prefix + "{{command}}"],
         job_definition={"kind": "explicit", "jobs": jobs},
@@ -288,6 +557,9 @@ def submit(repo: Repo, ws: Workspace, project: dict, request: ExperimentRequest,
                      for j in created]}
 
 
+submit_experiment = submit
+
+
 def project_job(repo: Repo, project: dict, job_id: str) -> dict:
     job = repo.get_job(job_id)
     plan = repo.get_plan(job["plan_revision_id"]) if job else None
@@ -303,10 +575,15 @@ def submit_eval_jobs(repo: Repo, ws: Workspace, project: dict, train_job_ids: li
 
     评测命令来自 owner 固化的 contract.eval.command(agent 不可指定);每个训练
     Job 一个评测 Job,approved_by=platform-eval:<run_id>,登记进 job_evals。
-    返回该批训练 Job 对应的全部评测 Job id(含已存在的)。契约未启用返回 []。"""
+    派发前先复验 protected_state:若受保护路径被改或缺失,记录 protected_paths_changed
+    事件并拒绝创建评测 Job(返回 [])。契约未启用返回 []。"""
     eval_cfg = (contract or {}).get("eval") or {}
     command = str(eval_cfg.get("command") or "").strip()
     if not command:
+        return []
+    protected = protected_state(ws, contract)
+    if protected["ok"] is False:
+        _record_protected_event(repo, run_id, protected)
         return []
     primary = str((contract or {}).get("primary") or "").strip()
     guardrail_metrics = [str(g.get("metric") or "").strip()
@@ -314,6 +591,14 @@ def submit_eval_jobs(repo: Repo, ws: Workspace, project: dict, train_job_ids: li
                          if isinstance(g, dict) and str(g.get("metric") or "").strip()]
     metric_names = [name for name in dict.fromkeys([primary, *guardrail_metrics]) if name]
     output_root = (project.get("output_root") or "").rstrip("/")
+    locked_eval_dir: str | None = None
+    code_paths = [str(p) for p in (eval_cfg.get("code_paths") or []) if str(p).strip()]
+    if output_root and code_paths:
+        candidate = f"{output_root}/.locked_eval"
+        if ws.host.run(f"test -d {q(candidate)}").ok:
+            locked_eval_dir = candidate
+        else:
+            locked_eval_dir = stage_locked_eval(ws, output_root, code_paths)
     eval_ids: list[str] = []
     for train_job_id in train_job_ids:
         train = repo.get_job(train_job_id)
@@ -330,6 +615,8 @@ def submit_eval_jobs(repo: Repo, ws: Workspace, project: dict, train_job_ids: li
                 job[key] = params[key]
         job.update({"eval_of_job_id": train_job_id,
                     "eval_input_dir": f"{output_root}/{train_job_id}", "role": "eval"})
+        if locked_eval_dir:
+            job["locked_eval_dir"] = locked_eval_dir
         request = ExperimentRequest(
             jobs=[job], metrics=metric_names, purpose=f"平台评测 {train_job_id}",
             conda_env=str(eval_cfg.get("conda_env") or ""),
