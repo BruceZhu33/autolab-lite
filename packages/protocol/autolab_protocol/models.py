@@ -19,9 +19,11 @@ NonEmptyText = Annotated[str, StringConstraints(min_length=1, max_length=20000)]
 
 def _relative_path_check(value: str) -> str:
     # mirrors schema pattern: not absolute, no `..` segment
-    if value.startswith("/"):
-        raise ValueError("relative path must not start with '/'")
-    if any(segment == ".." for segment in value.split("/")):
+    if "\x00" in value:
+        raise ValueError("relative path must not contain NUL bytes")
+    if value.startswith(("/", "\\")):
+        raise ValueError("relative path must not start with '/' or '\\'")
+    if any(segment == ".." for segment in value.replace("\\", "/").split("/")):
         raise ValueError("relative path must not contain '..' segments")
     return value
 
@@ -127,7 +129,7 @@ class PlanResources(_StrictModel):
 
 class PlanOutputs(_StrictModel):
     subdir_template: RelativePathStr
-    artifacts: list[Annotated[str, StringConstraints(min_length=1)]] = Field(default_factory=list)
+    artifacts: list[RelativePathStr] = Field(default_factory=list)
     metrics: list[MetricSource] = Field(min_length=1)
 
 
@@ -183,7 +185,7 @@ class ManifestProject(_StrictModel):
 
 class ManifestOutputs(_StrictModel):
     root: AbsolutePathStr
-    artifacts: list[Annotated[str, StringConstraints(min_length=1)]] = Field(default_factory=list)
+    artifacts: list[RelativePathStr] = Field(default_factory=list)
     metrics: list[MetricSource] = Field(min_length=1)
 
 

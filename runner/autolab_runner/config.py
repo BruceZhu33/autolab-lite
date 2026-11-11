@@ -34,7 +34,9 @@ class RunnerConfig:
 
     def __post_init__(self) -> None:
         errors: list[str] = []
-        if not self.test_mode:
+        if not isinstance(self.test_mode, bool):
+            errors.append(f"test_mode must be a boolean, got {self.test_mode!r}")
+        if self.test_mode is not True:
             if not self.token:
                 errors.append("token is required (or set test_mode for local dev only)")
             if not self.manifest_hmac_key:
@@ -48,7 +50,7 @@ class RunnerConfig:
         for root in [*self.allowed_work_roots, *self.allowed_output_roots, self.data_dir]:
             if not root.startswith("/"):
                 errors.append(f"paths must be absolute: {root!r}")
-        if self.gpu_slots < 1:
+        if isinstance(self.gpu_slots, bool) or not isinstance(self.gpu_slots, int) or self.gpu_slots < 1:
             errors.append("gpu_slots must be >= 1")
         if errors:
             raise ConfigError("runner config invalid: " + "; ".join(errors))
@@ -58,16 +60,25 @@ class RunnerConfig:
         path = Path(config_path)
         if not path.is_file():
             raise ConfigError(f"config file not found: {path}")
-        if not cls._is_test_candidate(path):
-            mode = stat.S_IMODE(path.stat().st_mode)
-            if mode & 0o077:
-                raise ConfigError(
-                    f"config file {path} must not be group/world readable (chmod 600); mode={oct(mode)}"
-                )
-        with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh)
+        st_mode = stat.S_IMODE(path.stat().st_mode)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"invalid runner config JSON in {path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ConfigError(f"runner config invalid: expected JSON object in {path}")
+        if "test_mode" in raw and not isinstance(raw["test_mode"], bool):
+            raise ConfigError(
+                f"runner config invalid: test_mode must be a boolean, got {raw['test_mode']!r}"
+            )
+        test_mode = raw.get("test_mode") is True
+        if not test_mode and (st_mode & 0o077) != 0:
+            raise ConfigError(
+                f"config file {path} must not be group/world readable (chmod 600); mode={oct(st_mode)}"
+            )
         raw.setdefault("test_mode", False)
-        if raw["test_mode"] is True:
+        if test_mode:
             # test config may hold generated throwaway creds; still validate structure
             os.chmod(path, 0o600)
         return cls(**{
@@ -79,16 +90,6 @@ class RunnerConfig:
             )
             if key in raw
         })
-
-    @staticmethod
-    def _is_test_candidate(path: Path) -> bool:
-        # a config explicitly in test mode is chmod'ed below; non-test configs
-        # must already be private before we even parse them.
-        try:
-            with open(path, encoding="utf-8") as fh:
-                return bool(json.load(fh).get("test_mode"))
-        except Exception:
-            return False
 
 
 def load_config_or_die(config_path: str | Path) -> RunnerConfig:

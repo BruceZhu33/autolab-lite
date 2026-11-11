@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .models import ExplicitJobs, MatrixJobs, PlanSpecV1
+from .models import ExplicitJobs, MatrixJobs, PlanSpecV1, _relative_path_check
 
 _TEMPLATE_TOKEN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
@@ -20,7 +20,7 @@ class ExpansionError(ValueError):
 
 
 def render_template(template: str, params: dict[str, object]) -> str:
-    """Substitute ``{{name}}`` tokens; any unresolved token is an error."""
+    """Substitute ``{{name}}`` tokens; any unresolved token or leftover brace is an error."""
 
     def replace(match: re.Match[str]) -> str:
         name = match.group(1)
@@ -32,6 +32,8 @@ def render_template(template: str, params: dict[str, object]) -> str:
     leftover = _TEMPLATE_TOKEN.search(rendered)
     if leftover:
         raise ExpansionError(f"template still contains unresolved token {leftover.group(0)!r}")
+    if "{{" in rendered or "}}" in rendered:
+        raise ExpansionError(f"template contains unresolved '{{{{' or '}}}}': {rendered!r}")
     return rendered
 
 
@@ -87,10 +89,25 @@ def expand_jobs(spec: PlanSpecV1) -> list[ExpandedJob]:
 
 
 def render_output_subdir(spec: PlanSpecV1, job: ExpandedJob, job_id: str) -> str:
-    """Render outputs.subdir_template with job params plus {{job_id}}."""
+    """Render outputs.subdir_template with job params plus {{job_id}}, then
+    re-validate the rendered result as a safe non-escaping relative path."""
 
     params = {**job.params, "job_id": job_id}
     try:
-        return render_template(spec.outputs.subdir_template, params)
+        rendered = render_template(spec.outputs.subdir_template, params)
     except ExpansionError as exc:
         raise ExpansionError(f"job #{job.ordinal} output subdir template: {exc}") from exc
+    if not rendered or len(rendered) > 1024:
+        raise ExpansionError(
+            f"job #{job.ordinal} output subdir must be 1..1024 chars, got {rendered!r}"
+        )
+    try:
+        _relative_path_check(rendered)
+    except ValueError as exc:
+        raise ExpansionError(f"job #{job.ordinal} unsafe output subdir {rendered!r}: {exc}") from exc
+    segments = [seg for seg in rendered.replace("\\", "/").split("/") if seg not in ("", ".")]
+    if not segments:
+        raise ExpansionError(
+            f"job #{job.ordinal} output subdir must not resolve to current/empty path: {rendered!r}"
+        )
+    return rendered

@@ -12,6 +12,8 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,23 @@ ACTIVE_STATUSES = frozenset({"ACCEPTED", "RUNNING"})
 TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"})
 
 
+class GpuOutOfRangeError(Exception):
+    def __init__(self, index: int, gpu_slots: int | None):
+        self.index = index
+        self.gpu_slots = gpu_slots
+        super().__init__(
+            f"gpu index {index} not within {gpu_slots} configured slot(s)"
+        )
+
+
+class GpuBusyError(Exception):
+    def __init__(self, busy_indices: list[int]):
+        self.busy_indices = busy_indices
+        super().__init__(
+            f"gpu slot(s) {busy_indices} already occupied by an active job"
+        )
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -64,18 +83,51 @@ class RunnerStorage:
         self.db_path = self.data_dir / "runner-state.db"
         self.runner_instance_id = f"runner-{uuid.uuid4().hex[:12]}"
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            self.db_path,
+            timeout=30.0,
+            isolation_level=None,
+            check_same_thread=False,
+        )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-        row = self._conn.execute("SELECT MAX(event_seq) AS m FROM events WHERE runner_instance_id = ?", (self.runner_instance_id,)).fetchone()
+        if self._conn.in_transaction:
+            self._conn.commit()
+        row = self._conn.execute(
+            "SELECT MAX(event_seq) AS m FROM events WHERE runner_instance_id = ?",
+            (self.runner_instance_id,),
+        ).fetchone()
         self._next_seq = (row["m"] or 0) + 1
 
     def close(self) -> None:
         with self._lock:
+            if self._conn.in_transaction:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
             self._conn.close()
+
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            prev_seq = self._next_seq
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+                if self._conn.in_transaction:
+                    self._conn.commit()
+            except BaseException:
+                self._next_seq = prev_seq
+                if self._conn.in_transaction:
+                    try:
+                        self._conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                raise
 
     # ------------------------------------------------------------------ jobs
 
@@ -89,27 +141,55 @@ class RunnerStorage:
         gpu_indices: list[int],
         output_root: str,
         log_path: str,
+        gpu_slots: int | None = None,
     ) -> bool:
-        """Insert the ACCEPTED row; False means dispatch_id/job_id already known."""
+        """Atomically verify GPU slot availability and insert the ACCEPTED row.
 
-        with self._lock:
+        False means dispatch_id/job_id already exists (replay or conflict).
+        Raises GpuOutOfRangeError or GpuBusyError when GPU slots fail checks.
+        """
+
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM jobs WHERE dispatch_id = ? OR job_id = ? LIMIT 1",
+                (dispatch_id, job_id),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                return False
+            for index in gpu_indices:
+                if index < 0 or (gpu_slots is not None and index >= gpu_slots):
+                    raise GpuOutOfRangeError(index, gpu_slots)
+            if gpu_indices:
+                rows = conn.execute(
+                    "SELECT gpu_indices_json FROM jobs WHERE status IN ('ACCEPTED', 'RUNNING')"
+                ).fetchall()
+                active: set[int] = set()
+                for row in rows:
+                    active.update(json.loads(row["gpu_indices_json"]))
+                busy = sorted(active & set(gpu_indices))
+                if busy:
+                    raise GpuBusyError(busy)
+            prev_seq = self._next_seq
             try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                self._conn.execute(
+                conn.execute(
                     "INSERT INTO jobs (job_id, dispatch_id, payload_hash, manifest_json, status,"
                     " gpu_indices_json, output_root, log_path, created_at)"
                     " VALUES (?, ?, ?, ?, 'ACCEPTED', ?, ?, ?, ?)",
-                    (job_id, dispatch_id, payload_hash, manifest_json, json.dumps(gpu_indices),
-                     output_root, log_path, utc_now()),
+                    (
+                        job_id, dispatch_id, payload_hash, manifest_json,
+                        json.dumps(gpu_indices), output_root, log_path, utc_now(),
+                    ),
                 )
                 self._append_event_locked(
                     job_id=job_id, dispatch_id=dispatch_id, event_type="job.accepted",
                     payload={"log_cursor": 0},
                 )
-                self._conn.commit()
                 return True
             except sqlite3.IntegrityError:
-                self._conn.rollback()
+                self._next_seq = prev_seq
+                if conn.in_transaction:
+                    conn.rollback()
                 return False
 
     def job_by_dispatch(self, dispatch_id: str) -> dict[str, Any] | None:
@@ -157,13 +237,12 @@ class RunnerStorage:
         Terminal statuses never regress (guard is in SQL WHERE).
         """
 
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute(
+        with self._tx() as conn:
+            row = conn.execute(
                 "SELECT dispatch_id, status FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
             if row is None:
-                self._conn.rollback()
+                conn.rollback()
                 return None
             if status is not None and status in TERMINAL_STATUSES and row["status"] in TERMINAL_STATUSES:
                 # terminal is terminal: log the event, never move the state back
@@ -201,8 +280,7 @@ class RunnerStorage:
                 sets.append("last_event_seq = ?")
                 args.append(event["event_seq"])
                 args.append(job_id)
-                self._conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?", args)
-            self._conn.commit()
+                conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?", args)
             return event
 
     def events(self, job_id: str, after_seq: int = 0, limit: int = 1000) -> list[dict[str, Any]]:
@@ -249,6 +327,14 @@ class RunnerStorage:
             "occurred_at": occurred_at,
             "payload": payload,
         }
+
+    def non_terminal_jobs_without_pid(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE status NOT IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT')"
+                " AND pid IS NULL"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def non_terminal_jobs_with_pid(self) -> list[dict[str, Any]]:
         with self._lock:

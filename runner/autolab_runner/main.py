@@ -19,7 +19,13 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config_or_die(args.config)
     app = create_app(config)
-    uvicorn.run(app, host=config.listen_host, port=config.listen_port, log_level="info")
+    uvicorn.run(
+        app,
+        host=config.listen_host,
+        port=config.listen_port,
+        log_level="info",
+        access_log=False,
+    )
     return 0
 
 

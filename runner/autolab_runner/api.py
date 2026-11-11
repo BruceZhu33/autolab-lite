@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hmac
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from autolab_protocol import ManifestV1
@@ -17,18 +19,24 @@ from .storage import RunnerStorage
 
 
 def create_app(config: RunnerConfig, storage: RunnerStorage | None = None) -> FastAPI:
+    owns_storage = storage is None
     storage = storage or RunnerStorage(config.data_dir)
     core = RunnerCore(config, storage)
 
-    app = FastAPI(title="autolab-runner", version=__version__)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # jobs whose watcher died with the previous runner process
+        core.adopt_orphaned_jobs()
+        try:
+            yield
+        finally:
+            if owns_storage:
+                storage.close()
+
+    app = FastAPI(title="autolab-runner", version=__version__, lifespan=lifespan)
     app.state.config = config
     app.state.storage = storage
     app.state.core = core
-
-    @app.on_event("startup")
-    def _adopt_orphans() -> None:
-        # jobs whose watcher died with the previous runner process
-        core.adopt_orphaned_jobs()
 
     def require_token(authorization: str = Header(default="")) -> None:
         scheme, _, token = authorization.partition(" ")
@@ -67,7 +75,7 @@ def create_app(config: RunnerConfig, storage: RunnerStorage | None = None) -> Fa
                 status_code=exc.status_code, detail={"reason": exc.reason, "message": exc.detail}
             ) from exc
         if (
-            config.test_mode
+            config.test_mode is True
             and drop_response == "1"
             and not result.replayed
         ):
