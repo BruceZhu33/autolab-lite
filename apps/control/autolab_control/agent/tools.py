@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Callable
+from pathlib import Path
 
 from ..execution import experiments
 from ..workspace import papers, refs
@@ -72,20 +74,37 @@ _PLATFORM_TOKENS = ("autolab_control", "autolab_runner", "autolab-runner",
 
 
 def _governance_paths(env: LoopEnv) -> list[str]:
-    paths: list[str] = []
+    tokens: list[str] = ["credentials.json", ".autolab-runner/runner.json"]
+    seen = set(tokens)
+
+    def _add(item: str) -> None:
+        if item and item not in seen:
+            seen.add(item)
+            tokens.append(item)
+
     for holder in (getattr(env, "repo", None), getattr(env, "credentials", None)):
         db = getattr(holder, "db", None) or holder
         path = getattr(db, "path", None)
         if path is not None:
-            paths.append(str(path))
-    return paths
+            raw = str(path).strip()
+            if not raw or raw.startswith(":"):
+                continue
+            _add(raw)
+            expanded = os.path.expanduser(raw)
+            _add(expanded)
+            _add(os.path.realpath(expanded))
+            name = Path(raw).name
+            if len(name) >= 4 and not name.startswith(":"):
+                _add(name)
+    return tokens
 
 
 def _governance_check(env: LoopEnv, command: str) -> None:
-    for path in _governance_paths(env):
-        if path and path in command:
+    expanded_cmd = os.path.expanduser(command)
+    for token in _governance_paths(env):
+        if token and (token in command or token in expanded_cmd):
             raise ToolError(
-                f"命令碰到了控制端数据/凭据({path})——这是产品边界,agent 不能直读直改:"
+                f"命令碰到了控制端数据/凭据({token})——这是产品边界,agent 不能直读直改:"
                 "改状态用工具(它们走产品 API);需要 owner 做的事用 ask_human。")
     if _KILL_RE.search(command) and any(t in command.lower() for t in _PLATFORM_TOKENS):
         raise ToolError(
@@ -94,7 +113,7 @@ def _governance_check(env: LoopEnv, command: str) -> None:
 
 
 _DENY = ("sudo ", "rm -rf /", "rm -rf ~", "mkfs", "shutdown", "reboot",
-         "git push", ":(){", "> /dev/sd", "chmod -R 777 /")
+         "git push", ":(){", "> /dev/sd", "chmod -r 777 /")
 
 
 def shell_tool(*, max_timeout: int = 900) -> Tool:

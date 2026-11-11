@@ -53,11 +53,9 @@ import {
   agentVersion,
   deleteServer,
   describeOpResult,
-  getServerTelemetry,
   listServerDetails,
   registerServer,
   serverOp,
-  type GpuTelemetry,
   type ServerDetail,
   type ServerOp,
 } from "~/vendor/views/gpu-sidecar";
@@ -104,27 +102,20 @@ function memColor(pct: number): string {
 function ServerCard({
   s,
   busy,
+  isRefreshing,
+  onRefresh,
   act,
   setUpgradeTarget,
   setDeleteTarget,
 }: {
   s: ServerDetail;
   busy: string | null;
+  isRefreshing: boolean;
+  onRefresh: () => void;
   act: (s: ServerDetail, op: ServerOp, body?: unknown) => Promise<void>;
   setUpgradeTarget: (s: ServerDetail) => void;
   setDeleteTarget: (s: ServerDetail) => void;
 }) {
-  const qc = useQueryClient();
-  const { data: tel, isPending, isFetching, isError, error, refetch } = useQuery({
-    queryKey: ["autolab", "telemetry", s.id],
-    queryFn: () => getServerTelemetry(s.id),
-    staleTime: 30_000,
-    retry: false,
-  });
-
-  const telFor = (idx: number): GpuTelemetry | undefined =>
-    tel?.gpus.find((g) => g.gpu_index === idx);
-
   return (
     <div className="space-y-3 rounded-lg border p-4">
       <div className="flex flex-wrap items-center gap-3">
@@ -134,10 +125,10 @@ function ServerCard({
         </Badge>
         <span className="font-mono text-xs text-muted-foreground">{transportLabel(s)}</span>
         <span className="ml-auto flex flex-wrap items-center gap-2">
-          <Button size="sm" variant="outline" disabled={isFetching}
-                  onClick={() => void refetch().then(() => qc.invalidateQueries({ queryKey: ["autolab", "telemetry", s.id] }))}>
+          <Button size="sm" variant="outline" disabled={isRefreshing}
+                  onClick={onRefresh}>
             <Activity className="size-3.5" />
-            {isFetching ? "遥测中…" : "刷新遥测"}
+            {isRefreshing ? "遥测中…" : "刷新遥测"}
           </Button>
           {/* 次要操作收进菜单:一行 6 个等权按钮读不出主次,破坏性的「删除」隔开防误触 */}
           <DropdownMenu>
@@ -153,15 +144,15 @@ function ServerCard({
                                 onClick={() => void act(s, "connectivity-test")}>
                 连通性测试
               </DropdownMenuItem>
-              <DropdownMenuItem disabled={!s.agent_port || busy === `${s.id}:agent/probe`}
+              <DropdownMenuItem disabled={!s.agent_port || busy === `${s.id}:runner/probe`}
                                 onClick={() => void act(s, "runner/probe")}>
                 Runner 探活
               </DropdownMenuItem>
-              <DropdownMenuItem disabled={busy === `${s.id}:agent/install`}
+              <DropdownMenuItem disabled={busy === `${s.id}:runner/install`}
                                 onClick={() => void act(s, "runner/install")}>
                 部署 / 修复 Agent
               </DropdownMenuItem>
-              <DropdownMenuItem disabled={busy === `${s.id}:agent/upgrade`}
+              <DropdownMenuItem disabled={busy === `${s.id}:runner/upgrade`}
                                 onClick={() => setUpgradeTarget(s)}>
                 升级
               </DropdownMenuItem>
@@ -189,20 +180,19 @@ function ServerCard({
             </thead>
             <tbody>
               {s.gpus.map((g) => {
-                const t = telFor(g.gpu_index);
-                const usedPct = t && t.memory_total_mb > 0
-                  ? Math.round((t.memory_used_mb / t.memory_total_mb) * 100) : null;
+                const usedPct = g.memory_total_mb > 0
+                  ? Math.round((g.memory_used_mb / g.memory_total_mb) * 100) : null;
                 return (
                   <tr key={g.id} className="border-t">
                     <td className="px-3 py-1.5 font-mono text-xs">{g.gpu_index}</td>
                     <td className="px-3 py-1.5">{g.model_name}</td>
                     <td className="px-3 py-1.5">
-                      {t ? (
+                      {usedPct !== null ? (
                         <span className="flex items-center gap-2">
-                          <span className={`font-mono text-xs tabular-nums ${memColor(usedPct ?? 0)}`}>
-                            {fmtMem(t.memory_used_mb)} / {fmtMem(t.memory_total_mb)}
+                          <span className={`font-mono text-xs tabular-nums ${memColor(usedPct)}`}>
+                            {fmtMem(g.memory_used_mb)} / {fmtMem(g.memory_total_mb)}
                           </span>
-                          <Progress className="h-1 w-20" value={usedPct ?? 0} />
+                          <Progress className="h-1 w-20" value={usedPct} />
                         </span>
                       ) : (
                         <span className="font-mono text-xs text-muted-foreground">
@@ -211,7 +201,7 @@ function ServerCard({
                       )}
                     </td>
                     <td className="px-3 py-1.5 font-mono text-xs tabular-nums">
-                      {t ? `${t.utilization_pct}%${t.temperature_c ? ` · ${t.temperature_c}°C` : ""}` : "—"}
+                      {`${g.utilization_pct}%${g.temperature_c ? ` · ${g.temperature_c}°C` : ""}`}
                     </td>
                     <td className="px-3 py-1.5">
                       <Badge variant={g.status === "IDLE" ? "secondary" : "default"}>{g.status}</Badge>
@@ -222,34 +212,6 @@ function ServerCard({
             </tbody>
           </table>
         </div>
-      )}
-
-      {/* 磁盘占用（df -BM 真实块设备） */}
-      {tel?.disks && tel.disks.length > 0 && (
-        <div className="space-y-1">
-          {tel.disks.map((d) => (
-            <div key={d.device} className="flex items-center gap-2 font-mono text-caption text-muted-foreground">
-              <span className="w-24 truncate" title={d.device}>{d.mount}</span>
-              <span className="tabular-nums">{fmtMem(d.used_mb)} / {fmtMem(d.total_mb)}</span>
-              <span className={`w-9 text-right tabular-nums ${d.use_pct >= 95 ? "text-destructive" : d.use_pct >= 85 ? "text-warning" : ""}`}>
-                {d.use_pct}%
-              </span>
-              <Progress className="h-1 w-28" value={d.use_pct} />
-            </div>
-          ))}
-        </div>
-      )}
-
-      {isPending && (
-        <p className="flex items-center gap-1.5 text-caption text-muted-foreground">
-          <RefreshCw className="size-3 animate-spin" /> 遥测获取中…
-        </p>
-      )}
-      {isError && (
-        <p className="text-caption text-warning">
-          遥测不可用（{error instanceof SidecarApiError ? error.message : String(error)}）——
-          SSH 不通时登记数据仍可用，可点「连通性测试」排查。
-        </p>
       )}
     </div>
   );
@@ -426,8 +388,8 @@ export default function GpuPage() {
                     </select>
                   </div>
                   <div className="grid gap-1.5">
-                    <Label>凭据(密钥路径/内容或密码)</Label>
-                    <Input value={form.secret} onChange={(e) => setForm({ ...form, secret: e.target.value })} placeholder="~/.ssh/id_ed25519" />
+                    <Label>凭据(密钥内容或密码)</Label>
+                    <Input type="password" autoComplete="new-password" value={form.secret} onChange={(e) => setForm({ ...form, secret: e.target.value })} placeholder="密码或私钥内容" />
                   </div>
                 </div>
                 <div className="grid grid-cols-3 gap-3">
@@ -437,11 +399,11 @@ export default function GpuPage() {
                   </div>
                   <div className="grid gap-1.5">
                     <Label>Runner token</Label>
-                    <Input value={form.agent_token} onChange={(e) => setForm({ ...form, agent_token: e.target.value })} />
+                    <Input type="password" autoComplete="new-password" value={form.agent_token} onChange={(e) => setForm({ ...form, agent_token: e.target.value })} />
                   </div>
                   <div className="grid gap-1.5">
                     <Label>HMAC key{form.transport_mode === "local" ? "(local 必填)" : ""}</Label>
-                    <Input value={form.manifest_hmac_key} onChange={(e) => setForm({ ...form, manifest_hmac_key: e.target.value })} />
+                    <Input type="password" autoComplete="new-password" value={form.manifest_hmac_key} onChange={(e) => setForm({ ...form, manifest_hmac_key: e.target.value })} />
                   </div>
                 </div>
               </div>
@@ -493,6 +455,8 @@ export default function GpuPage() {
               key={s.id}
               s={s}
               busy={busy}
+              isRefreshing={isFetching}
+              onRefresh={() => void refetch()}
               act={act}
               setUpgradeTarget={setUpgradeTarget}
               setDeleteTarget={setDeleteTarget}

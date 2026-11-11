@@ -21,9 +21,14 @@ def configured() -> bool:
     return bool(LABNOTE_URL and LABNOTE_PAT)
 
 
+def tls_verify() -> str | bool:
+    """默认开启标准 TLS 证书校验;内网私有 CA 可通过 AUTOLAB_SSL_CA_BUNDLE 指定证书包路径。"""
+    bundle = (os.getenv("AUTOLAB_SSL_CA_BUNDLE") or "").strip()
+    return bundle if bundle else True
+
+
 def _client() -> httpx.Client:
-    # 内网自签 TLS(Caddy tls internal)→ verify=False;服务器间直连不吃代理
-    return httpx.Client(verify=False, timeout=60, trust_env=False,
+    return httpx.Client(verify=tls_verify(), timeout=60, trust_env=False,
                         headers={"Authorization": f"Bearer {LABNOTE_PAT}"})
 
 

@@ -121,13 +121,21 @@ function SpaceDetail({ space, onBack }: {
     toast.info(`${file.name} 已提交解析…`);
     try {
       const started = await kbUpload(file, space.id);
+      let completed = false;
       for (let i = 0; i < 60; i++) {
         await new Promise((r) => setTimeout(r, 3000));
         const job = await kbUploadJob(started.job_id);
         if (job.status === "failed") throw new Error(job.error || "解析失败");
-        if (job.status === "completed") break;
+        if (job.status === "completed") {
+          completed = true;
+          break;
+        }
       }
-      toast.success(`${file.name} 已入「${space.name}」`);
+      if (completed) {
+        toast.success(`${file.name} 已入库「${space.name}」`);
+      } else {
+        toast.warning(`${file.name} 仍在后台解析中，稍后刷新查看入库结果`);
+      }
       void queryClient.invalidateQueries({ queryKey: ["kb-space-docs", space.id] });
       void queryClient.invalidateQueries({ queryKey: ["kb-docs-all"] });
     } catch (err) {

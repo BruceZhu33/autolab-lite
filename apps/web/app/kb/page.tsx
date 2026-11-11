@@ -4,7 +4,7 @@
  * 身份 = owner 自己的 labnote 账号(登录一次存本机);请求经 control 代理,
  * 能看到自己有权限的全部空间。autolab 服务链路(PAT)不受影响。 */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { BookOpen, FolderPlus, Loader2, LogOut, Plus, Trash2 } from "lucide-react";
@@ -80,6 +80,7 @@ export default function KnowledgePage() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [spaceIds, setSpaceIds] = useState<string[]>([]);
+  const freshSessionRef = useRef("");
   const { containerRef, showJumpControl, handleScroll, scrollToBottom } =
     useScrollPinning([messages, sending]);
 
@@ -107,15 +108,48 @@ export default function KnowledgePage() {
   });
 
   useEffect(() => {
+    if (!sessionId) {
+      setMessages([]);
+      return;
+    }
+    if (freshSessionRef.current === sessionId) {
+      freshSessionRef.current = "";
+      return;
+    }
+    let alive = true;
+    type RawMsg = { role?: string; content?: string; text?: string };
+    void kbGet<{ messages?: RawMsg[] } | RawMsg[]>(`/sessions/${encodeURIComponent(sessionId)}`)
+      .then((res) => {
+        if (!alive) return;
+        const list = Array.isArray(res) ? res : (res?.messages ?? []);
+        const mapped = list
+          .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+          .map((m) => ({
+            role: m.role as "user" | "assistant",
+            text: String(m.content ?? m.text ?? ""),
+          }));
+        setMessages(mapped);
+      })
+      .catch(() => {
+        if (alive) setMessages([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
     if (sessionId && spaces.data) {
-      void kbGet<{ space_ids: string[] }>(`/sessions/${sessionId}/spaces`)
+      void kbGet<{ space_ids: string[] }>(`/sessions/${encodeURIComponent(sessionId)}/spaces`)
         .then((r) => setSpaceIds(r.space_ids ?? []))
         .catch(() => setSpaceIds([]));
     }
   }, [sessionId, spaces.data]);
 
   const newChat = () => {
-    setSessionId(`autolab-${Date.now().toString(36)}`);
+    const nextSid = `autolab-${Date.now().toString(36)}`;
+    freshSessionRef.current = nextSid;
+    setSessionId(nextSid);
     setMessages([]);
   };
 
@@ -144,7 +178,7 @@ export default function KnowledgePage() {
     }
     setSpaceIds(target);
     try {
-      await kbPut(`/sessions/${sessionId}/spaces`, { space_ids: next });
+      await kbPut(`/sessions/${encodeURIComponent(sessionId)}/spaces`, { space_ids: target });
     } catch (err) {
       toast.error(`空间绑定失败:${(err as Error).message}`);
     }
@@ -156,7 +190,10 @@ export default function KnowledgePage() {
     // 首次发言自动开会话;sessionId 在本闭包里是旧值,必须用局部 sid,
     // 否则流式请求会带着空 session_id 发出去。
     const sid = sessionId || `autolab-${Date.now().toString(36)}`;
-    if (!sessionId) setSessionId(sid);
+    if (!sessionId) {
+      freshSessionRef.current = sid;
+      setSessionId(sid);
+    }
     setInput("");
     setMessages((prev) => {
       const base = sessionId ? prev : []; // 自动开会话时丢掉旧空壳
@@ -187,16 +224,8 @@ export default function KnowledgePage() {
     }
   };
 
-;
-
   const spaceName = (id: string) =>
     (spaces.data ?? []).find((sp) => sp.id === id)?.name ?? id;
-
-;
-
-;
-
-;
 
   if (!user) {
     return (

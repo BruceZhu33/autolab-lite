@@ -13,7 +13,9 @@ const STATUS_TONE: Record<string, string> = {
   SUCCEEDED: "bg-success/10 text-success",
   FAILED: "bg-destructive/10 text-destructive",
   TIMED_OUT: "bg-destructive/10 text-destructive",
+  CANCELLED: "bg-muted text-muted-foreground",
   RUNNING: "bg-info/10 text-info",
+  DISPATCHING: "bg-info/10 text-info",
   QUEUED: "bg-muted text-muted-foreground",
   CANCELLING: "bg-warning/10 text-warning",
 };
@@ -22,7 +24,9 @@ const STATUS_LABEL: Record<string, string> = {
   SUCCEEDED: "成功",
   FAILED: "失败",
   TIMED_OUT: "超时",
+  CANCELLED: "已取消",
   RUNNING: "运行中",
+  DISPATCHING: "派发中",
   QUEUED: "排队中",
   CANCELLING: "取消中",
 };

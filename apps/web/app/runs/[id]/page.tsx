@@ -13,7 +13,9 @@ const STATUS_TONE: Record<string, string> = {
   SUCCEEDED: "bg-success/10 text-success",
   FAILED: "bg-destructive/10 text-destructive",
   TIMED_OUT: "bg-destructive/10 text-destructive",
+  CANCELLED: "bg-muted text-muted-foreground",
   RUNNING: "bg-info/10 text-info",
+  DISPATCHING: "bg-info/10 text-info",
   QUEUED: "bg-muted text-muted-foreground",
   CANCELLING: "bg-warning/10 text-warning",
 };
@@ -22,10 +24,14 @@ const STATUS_LABEL: Record<string, string> = {
   SUCCEEDED: "成功",
   FAILED: "失败",
   TIMED_OUT: "超时",
+  CANCELLED: "已取消",
   RUNNING: "运行中",
+  DISPATCHING: "派发中",
   QUEUED: "排队中",
   CANCELLING: "取消中",
 };
+
+const TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"]);
 
 function fmtDateTime(iso?: string | null): string {
   if (!iso) return "—";
@@ -49,28 +55,56 @@ export default function RunDetailPage({ params }: { params: Promise<{ id: string
   const [error, setError] = useState<unknown>(null);
   const [logs, setLogs] = useState("");
   const cursorRef = useRef(0);
+  const inFlightRef = useRef(false);
 
   useEffect(() => {
     let alive = true;
+    let stopped = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    cursorRef.current = 0;
+    inFlightRef.current = false;
+    setDetail(null);
+    setError(null);
+    setLogs("");
+
     const tick = async () => {
+      if (!alive || stopped || inFlightRef.current) return;
+      inFlightRef.current = true;
       try {
         const data = await fetchJobDetail(id);
         if (!alive) return;
         setDetail(data);
         setError(null);
-        const chunk = await fetchJobLogs(id, cursorRef.current);
+        const chunk = (await fetchJobLogs(id, cursorRef.current)) as {
+          text: string;
+          cursor: number;
+          size: number;
+          eof?: boolean;
+        };
         if (!alive) return;
         if (chunk.text) setLogs((prev) => prev + chunk.text);
         cursorRef.current = chunk.cursor;
+        const jobStatus = String((data.job as Record<string, unknown>)?.status ?? "");
+        const reachedEof = chunk.eof ?? chunk.cursor >= chunk.size;
+        if (TERMINAL_STATUSES.has(jobStatus) && reachedEof) {
+          stopped = true;
+          if (timer !== null) {
+            clearInterval(timer);
+            timer = null;
+          }
+        }
       } catch (e) {
         if (alive) setError(e);
+      } finally {
+        inFlightRef.current = false;
       }
     };
-    tick();
-    const timer = setInterval(tick, 2000);
+    void tick();
+    timer = setInterval(() => void tick(), 2000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      stopped = true;
+      if (timer !== null) clearInterval(timer);
     };
   }, [id]);
 

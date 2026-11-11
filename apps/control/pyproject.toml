@@ -2,6 +2,7 @@
 name = "autolab-control"
 version = "0.1.0"
 description = "AutoLab Control: SQLite transaction layer, scheduler, runner transport"
+# Control targets Python 3.12+ in production (see README.md); >=3.10 is kept here so the shared uv workspace lockfile resolves runner-py310 cleanly.
 requires-python = ">=3.10"
 dependencies = [
     "autolab-protocol",

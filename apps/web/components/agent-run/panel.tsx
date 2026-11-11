@@ -4,7 +4,7 @@
  * 等待项按类型渲染:要材料(选服务器目录链接 / 上传 zip)、要回答、等 GPU、
  * 基线提案确认。Baseline 页使用;研究阶段复用同一面板。 */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -305,25 +305,38 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
-  const lastSeq = events.length ? events[events.length - 1].seq : 0;
+  const lastSeqRef = useRef(0);
   const { containerRef, showJumpControl, handleScroll, scrollToBottom } =
     useScrollPinning([events.length]);
 
+  useEffect(() => {
+    lastSeqRef.current = 0;
+    setEvents([]);
+  }, [run.id]);
+
   const { data } = useQuery({
-    queryKey: ["agent-run", run.id, lastSeq],
-    queryFn: () => fetchRunEvents(run.id, lastSeq),
+    queryKey: ["agent-run", run.id],
+    refetchOnMount: "always",
+    queryFn: async () => {
+      const res = await fetchRunEvents(run.id, lastSeqRef.current);
+      if (res.events.length) {
+        const maxSeq = res.events.reduce(
+          (acc, evt) => (evt.seq > acc ? evt.seq : acc),
+          lastSeqRef.current,
+        );
+        lastSeqRef.current = maxSeq;
+        setEvents((prev) => {
+          const seen = new Set(prev.map((e) => e.seq));
+          const merged = [...prev, ...res.events.filter((e) => !seen.has(e.seq))];
+          merged.sort((a, b) => a.seq - b.seq);
+          return merged;
+        });
+      }
+      return res;
+    },
     refetchInterval: (query) =>
       isActive(query.state.data?.run ?? run) ? 2500 : false,
   });
-  useEffect(() => {
-    if (data?.events.length) {
-      setEvents((prev) => {
-        const seen = new Set(prev.map((e) => e.seq));
-        return [...prev, ...data.events.filter((e) => !seen.has(e.seq))];
-      });
-    }
-  }, [data]);
-  useEffect(() => { setEvents([]); }, [run.id]);
 
   const current = data?.run ?? run;
   const active = isActive(current);

@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -36,9 +37,18 @@ print("done", flush=True)
 
 
 class Proc:
-    def __init__(self, popen: subprocess.Popen, name: str):
+    def __init__(
+        self,
+        popen: subprocess.Popen,
+        name: str,
+        *,
+        port: int | None = None,
+        own_pgid: bool = False,
+    ):
         self.popen = popen
         self.name = name
+        self.port = port
+        self._own_pgid = own_pgid
         self.lines: list[str] = []
         self._queue: queue.Queue[str] = queue.Queue()
         threading.Thread(target=self._drain, daemon=True).start()
@@ -73,11 +83,23 @@ class Proc:
         )
 
     def stop(self) -> None:
-        self.popen.terminate()
+        if self._own_pgid and self.popen.poll() is None:
+            try:
+                os.killpg(self.popen.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            self.popen.terminate()
         try:
             self.popen.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            self.popen.kill()
+            if self._own_pgid:
+                try:
+                    os.killpg(self.popen.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                self.popen.kill()
             self.popen.wait(timeout=5)
 
 
@@ -85,6 +107,27 @@ def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def port_busy(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        return sock.connect_ex((host, port)) == 0
+
+
+def resolve_e2e_port(env_name: str, *, avoid: set[int] | None = None) -> int:
+    raw = os.environ.get(env_name, "").strip()
+    if raw:
+        port = int(raw)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"{env_name}={raw!r} must be in 1..65535")
+        return port
+    excluded = avoid or set()
+    for _ in range(20):
+        candidate = free_port()
+        if candidate not in excluded:
+            return candidate
+    return free_port()
 
 
 @pytest.fixture()
@@ -103,7 +146,7 @@ def stack(tmp_path, request):
 
     token = secrets.token_hex(16)
     hmac_key = secrets.token_hex(16)
-    port = free_port()
+    port = resolve_e2e_port("AUTOLAB_E2E_RUNNER_PORT")
     runner_config = tmp_path / "runner.json"
     runner_config.write_text(json.dumps({
         "listen_host": "127.0.0.1",
@@ -121,30 +164,34 @@ def stack(tmp_path, request):
     runner_proc = Proc(subprocess.Popen(
         [sys.executable, "-m", "autolab_runner", "--config", str(runner_config)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT),
-    ), "runner")
+    ), "runner", port=port)
     db_path = tmp_path / "control.db"
     credentials = tmp_path / "credentials.json"
     from autolab_control.api.app import API_REF
     from autolab_control.core.credentials import CredentialStore
 
-    if getattr(request, "param", {}).get("http"):
+    params = getattr(request, "param", {}) or {}
+    http_enabled = bool(params.get("http"))
+    api_port: int | None = None
+    if http_enabled:
+        api_port = resolve_e2e_port("AUTOLAB_E2E_API_PORT", avoid={port})
         store = CredentialStore(credentials)
         store.put_entry(API_REF, {"owner_token": "e2e-owner-token",
                                   "agent_token": "e2e-agent-token"})
 
     control_env = dict(os.environ)
     control_env.pop("AUTOLAB_TEST_MODE", None)
-    if getattr(request, "param", {}).get("drop_first_dispatch"):
+    if params.get("drop_first_dispatch"):
         control_env["AUTOLAB_TEST_DROP_FIRST_DISPATCH"] = "1"
     serve_argv = [sys.executable, "-m", "autolab_control", "serve",
                   "--db", str(db_path), "--credentials", str(credentials),
                   "--poll-interval", "0.1"]
-    if getattr(request, "param", {}).get("http"):
-        serve_argv += ["--http-port", "8710"]
+    if api_port is not None:
+        serve_argv += ["--http-port", str(api_port)]
     control_proc = Proc(subprocess.Popen(
         serve_argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         cwd=str(REPO_ROOT), env=control_env,
-    ), "control")
+    ), "control", port=api_port)
 
     try:
         # trust_env=False:本机探活直连,不吃 macOS 系统代理(否则 502)
@@ -159,10 +206,23 @@ def stack(tmp_path, request):
                 time.sleep(0.05)
             else:
                 raise AssertionError("runner never became healthy")
-        control_proc.wait_for("scheduler started")
+            control_proc.wait_for("scheduler started")
+            if api_port is not None:
+                api_deadline = time.monotonic() + 20
+                while time.monotonic() < api_deadline:
+                    try:
+                        resp = probe.get(f"http://127.0.0.1:{api_port}/api/board")
+                        if resp.status_code in (200, 401, 403):
+                            break
+                    except httpx.HTTPError:
+                        pass
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError(f"control http api on port {api_port} never became ready")
         yield {
             "tmp_path": tmp_path, "project_dir": project_dir, "work_root": work_root,
-            "out_root": out_root, "port": port, "token": token, "hmac_key": hmac_key,
+            "out_root": out_root, "port": port, "runner_port": port, "api_port": api_port,
+            "token": token, "hmac_key": hmac_key,
             "db": str(db_path), "credentials": str(credentials),
             "runner": runner_proc, "control": control_proc,
         }
@@ -208,18 +268,22 @@ print("done", flush=True)
 
 
 def spawn_control(stack_dict, drop_first_dispatch: bool = False) -> Proc:
-    import os
-
     env = dict(os.environ)
     env.pop("AUTOLAB_TEST_MODE", None)
     if drop_first_dispatch:
         env["AUTOLAB_TEST_DROP_FIRST_DISPATCH"] = "1"
+    argv = [
+        sys.executable, "-m", "autolab_control", "serve",
+        "--db", stack_dict["db"], "--credentials", stack_dict["credentials"],
+        "--poll-interval", "0.1",
+    ]
+    api_port = stack_dict.get("api_port")
+    if api_port is not None:
+        argv += ["--http-port", str(api_port)]
     proc = Proc(subprocess.Popen(
-        [sys.executable, "-m", "autolab_control", "serve",
-         "--db", stack_dict["db"], "--credentials", stack_dict["credentials"],
-         "--poll-interval", "0.1"],
+        argv,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT), env=env,
-    ), "control-2")
+    ), "control-2", port=api_port)
     proc.wait_for("scheduler started")
     return proc
 
@@ -229,7 +293,7 @@ def spawn_runner(stack_dict) -> Proc:
     proc = Proc(subprocess.Popen(
         [sys.executable, "-m", "autolab_runner", "--config", str(config)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT),
-    ), "runner-2")
+    ), "runner-2", port=stack_dict["port"])
     with httpx.Client(timeout=httpx.Timeout(2.0), trust_env=False) as probe:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:

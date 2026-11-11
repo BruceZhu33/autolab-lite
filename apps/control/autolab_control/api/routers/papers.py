@@ -28,6 +28,8 @@ from ...workspace.fs import Workspace
 from ...workspace.host import open_host
 from ..app import Ctx
 
+_SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
+
 
 def _base() -> str:
     return os.environ.get("PAPERPULSE_API", "http://127.0.0.1:3311").rstrip("/")
@@ -35,7 +37,7 @@ def _base() -> str:
 
 def _item_markdown(client: httpx.Client, item_id: str) -> tuple[str, str]:
     """论文站单篇全文提炼;返回(原始文件名, 正文)。"""
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", item_id):
+    if not _SAFE_ID.fullmatch(item_id):
         raise UserError("无效的论文 id")
     try:
         response = client.get(f"{_base()}/items/{item_id}/markdown")
@@ -60,7 +62,7 @@ def _title_of(text: str, fallback: str) -> str:
 def build(ctx: Ctx) -> APIRouter:
     router = APIRouter()
     repo, credentials = ctx.repo, ctx.credentials
-    client = httpx.Client(verify=False, timeout=30, trust_env=False)
+    client = httpx.Client(verify=knowledge.tls_verify(), timeout=30, trust_env=False)
 
     def _proxy(path: str, params: dict | None = None) -> JSONResponse:
         try:
@@ -81,6 +83,8 @@ def build(ctx: Ctx) -> APIRouter:
     @router.get("/api/papers/columns/{slug}", dependencies=[ctx.reader])
     def column(slug: str, page: int = 1) -> JSONResponse:
         """单个专栏的分页内容(论文卡列表)。"""
+        if not _SAFE_ID.fullmatch(slug):
+            raise UserError("无效的专栏 slug")
         return _proxy(f"/api/site/topics/{slug}", {"page": page})
 
     @router.get("/api/papers/stats", dependencies=[ctx.reader])
@@ -127,8 +131,10 @@ def build(ctx: Ctx) -> APIRouter:
         _, text = _item_markdown(client, item_id)
         filename = f"paper-{item_id}.md"
         with open_host(repo, credentials, project["server_id"]) as host:
-            paper_files.save_paper(Workspace(host, project["remote_workdir"]),
-                                   filename, text.encode("utf-8"))
+            ws = Workspace(host, project["remote_workdir"])
+            paper_files.save_paper(ws, filename, text.encode("utf-8"))
+            count = len(paper_files.list_papers(ws))
+        repo.update_project(project_id, papers_count=count)
         notified = False
         run = runtime.latest_run(repo, project_id, "research")
         if run and run.get("status") in runtime.ACTIVE_STATUSES:

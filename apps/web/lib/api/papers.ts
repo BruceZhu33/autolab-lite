@@ -4,11 +4,14 @@
 
 import { request } from "./client";
 
-/** 论文站浏览器入口;部署地址经 NEXT_PUBLIC_PAPERPULSE_WEB 在构建期注入,
- *  默认值为文档示例地址(RFC 5737),本机部署务必注入真实入口。 */
+/** 论文站浏览器入口:优先读取 NEXT_PUBLIC_PAPERPULSE_WEB,否则动态跟随当前控制台所在主机的 3310 端口。 */
 export const PAPERPULSE_WEB =
-  process.env.NEXT_PUBLIC_PAPERPULSE_WEB ?? "http://192.0.2.46:3310";
-export const paperpulseItemUrl = (id: string) => `${PAPERPULSE_WEB}/items/${id}`;
+  (typeof process !== "undefined" && process.env.NEXT_PUBLIC_PAPERPULSE_WEB) ||
+  (typeof window !== "undefined" && window.location?.hostname
+    ? `http://${window.location.hostname}:3310`
+    : "http://127.0.0.1:3310");
+export const paperpulseItemUrl = (id: string) =>
+  `${PAPERPULSE_WEB.replace(/\/$/, "")}/items/${encodeURIComponent(id)}`;
 
 export type PaperColumn = {
   slug: string;
@@ -47,7 +50,7 @@ export const fetchPaperColumns = () =>
 
 export const fetchPaperColumn = (slug: string, page = 1) =>
   request<{ topic: PaperColumn; items: PaperCard[]; page: number; pageCount: number }>(
-    `/api/papers/columns/${slug}?page=${page}`);
+    `/api/papers/columns/${encodeURIComponent(slug)}?page=${page}`);
 
 export const fetchPaperTimeline = (page = 1) =>
   request<{ cards: Array<{ item: PaperCard }>; hot: PaperHotEntry[] | null }>(

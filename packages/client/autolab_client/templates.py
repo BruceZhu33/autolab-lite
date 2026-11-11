@@ -9,6 +9,8 @@ RUNNING, GPU lease, PID) must never appear in these files.
 
 from __future__ import annotations
 
+import re
+
 CONTEXT_TEMPLATE = """---
 schema_version: 1
 project_id: PROJECT_ID
@@ -86,6 +88,46 @@ EXPERIMENT_SECTIONS: list[tuple[str, str]] = [
     ),
 ]
 
+_ISO_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_NUMERIC_SCALAR_RE = re.compile(r"^[+-]?[0-9]+(?:\.[0-9]+)?$")
+_RESERVED_SCALARS = frozenset({"null", "true", "false", "~", "---", "..."})
+_SPECIAL_STARTS = frozenset({"'", "[", "{", "&", "*", "!", "|", ">", "%", "@", "`", "-", "?"})
+
+
+def sanitize_front_matter_str(value: str) -> str:
+    """Collapse CR/LF/NUL into single spaces so front-matter values never inject new keys."""
+
+    cleaned = value.strip("\r\n\x00")
+    return re.sub(r"[\r\n\x00]+", " ", cleaned)
+
+
+def format_front_matter_scalar(value: object) -> str:
+    """Render a front-matter scalar safely with newline sanitization and quote/backslash escaping."""
+
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+
+    text = sanitize_front_matter_str(str(value))
+    if _ISO_STAMP_RE.fullmatch(text):
+        return text
+
+    needs_quotes = (
+        text == ""
+        or text != text.strip()
+        or text.lower() in _RESERVED_SCALARS
+        or bool(_NUMERIC_SCALAR_RE.fullmatch(text))
+        or any(ch in text for ch in (":", '"', "\\", "#", "\t"))
+        or text[0] in _SPECIAL_STARTS
+    )
+    if needs_quotes:
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("\t", "\\t")
+        return f'"{escaped}"'
+    return text
+
 
 def experiment_markdown(
     experiment_id: str,
@@ -99,14 +141,19 @@ def experiment_markdown(
     text (validate() will demand real content for the pre-registration ones)."""
 
     provided = sections or {}
+    clean_id = sanitize_front_matter_str(experiment_id).strip()
+    clean_title = sanitize_front_matter_str(title)
+    clean_created = sanitize_front_matter_str(created_at).strip()
+    parent_val = sanitize_front_matter_str(parent_experiment_id).strip() if parent_experiment_id else None
+    plan_val = sanitize_front_matter_str(plan_revision_id).strip() if plan_revision_id else None
     lines = [
         "---",
         "schema_version: 1",
-        f"id: {experiment_id}",
-        f"title: {title}",
-        f"created_at: {created_at}",
-        f"parent_experiment_id: {parent_experiment_id or 'null'}",
-        f"plan_revision_id: {plan_revision_id or 'null'}",
+        f"id: {format_front_matter_scalar(clean_id)}",
+        f"title: {format_front_matter_scalar(clean_title)}",
+        f"created_at: {format_front_matter_scalar(clean_created)}",
+        f"parent_experiment_id: {format_front_matter_scalar(parent_val)}",
+        f"plan_revision_id: {format_front_matter_scalar(plan_val)}",
         "conclusion: pending",
         "next_decision: null",
         "---",

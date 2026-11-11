@@ -62,6 +62,82 @@ def _repo(db: str | None) -> Repo:
     return Repo(Database(db))
 
 
+def _credential_store(credentials: str | None) -> CredentialStore:
+    if not credentials:
+        typer.secho("error: --credentials or AUTOLAB_CREDENTIALS is required",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    return CredentialStore(credentials)
+
+
+def _resolve_runner_secrets(
+    token: str | None,
+    hmac_key: str | None,
+    *,
+    token_stdin: bool = False,
+    hmac_key_stdin: bool = False,
+) -> tuple[str, str]:
+    """Resolve runner secrets from env vars or stdin so secrets do not appear in `ps aux`."""
+
+    resolved_token = (token or "").strip() or os.environ.get("AUTOLAB_RUNNER_TOKEN", "").strip()
+    resolved_hmac = (hmac_key or "").strip() or os.environ.get("AUTOLAB_HMAC_KEY", "").strip()
+
+    if token_stdin or hmac_key_stdin:
+        raw_stdin = sys.stdin.read()
+        stripped = raw_stdin.strip()
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                typer.secho(f"error: invalid JSON on stdin: {exc}", fg=typer.colors.RED, err=True)
+                raise typer.Exit(2) from exc
+            if not isinstance(payload, dict):
+                typer.secho("error: JSON on stdin must be an object", fg=typer.colors.RED, err=True)
+                raise typer.Exit(2)
+            if token_stdin and not (token and token.strip()):
+                resolved_token = str(payload.get("token") or payload.get("runner_token") or "").strip()
+            if (hmac_key_stdin or not resolved_hmac) and not (hmac_key and hmac_key.strip()):
+                resolved_hmac = str(
+                    payload.get("hmac_key") or payload.get("manifest_hmac_key") or ""
+                ).strip()
+        else:
+            lines = [ln.strip() for ln in raw_stdin.splitlines() if ln.strip()]
+            idx = 0
+            if token_stdin:
+                if idx >= len(lines):
+                    typer.secho("error: --token-stdin specified but stdin had no token line",
+                                fg=typer.colors.RED, err=True)
+                    raise typer.Exit(2)
+                resolved_token = lines[idx]
+                idx += 1
+            if hmac_key_stdin:
+                if idx >= len(lines):
+                    typer.secho("error: --hmac-key-stdin specified but stdin had no hmac key line",
+                                fg=typer.colors.RED, err=True)
+                    raise typer.Exit(2)
+                resolved_hmac = lines[idx]
+                idx += 1
+            elif token_stdin and not resolved_hmac and idx < len(lines):
+                resolved_hmac = lines[idx]
+
+    if not resolved_token:
+        typer.secho(
+            "error: runner token is required (set AUTOLAB_RUNNER_TOKEN, pass --token-stdin, or --token)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+    if not resolved_hmac:
+        typer.secho(
+            "error: manifest HMAC key is required "
+            "(set AUTOLAB_HMAC_KEY, pass --hmac-key-stdin / --token-stdin, or --hmac-key)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+    return resolved_token, resolved_hmac
+
+
 # --------------------------------------------------------------------- server
 
 
@@ -69,17 +145,43 @@ def _repo(db: str | None) -> Repo:
 def server_add_local(
     name: str = typer.Option(...),
     runner_port: int = typer.Option(...),
-    token: str = typer.Option(..., help="runner bearer token"),
-    hmac_key: str = typer.Option(..., help="manifest HMAC key"),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        envvar="AUTOLAB_RUNNER_TOKEN",
+        help="runner bearer token (prefer AUTOLAB_RUNNER_TOKEN or --token-stdin over CLI argv)",
+    ),
+    hmac_key: str | None = typer.Option(
+        None,
+        "--hmac-key",
+        envvar="AUTOLAB_HMAC_KEY",
+        help="manifest HMAC key (prefer AUTOLAB_HMAC_KEY or --hmac-key-stdin / --token-stdin)",
+    ),
+    token_stdin: bool = typer.Option(
+        False,
+        "--token-stdin",
+        help="read runner token (and optional second-line/JSON hmac_key) from stdin",
+    ),
+    hmac_key_stdin: bool = typer.Option(
+        False,
+        "--hmac-key-stdin",
+        help="read manifest HMAC key from stdin",
+    ),
     gpu_slots: int = typer.Option(1),
     work_root: list[str] = typer.Option(None, "--work-root"),
     output_root: list[str] = typer.Option(None, "--output-root"),
     db: str = DbOption,
     credentials: str = CredsOption,
 ):
-    store = CredentialStore(credentials)
+    resolved_token, resolved_hmac = _resolve_runner_secrets(
+        token,
+        hmac_key,
+        token_stdin=token_stdin,
+        hmac_key_stdin=hmac_key_stdin,
+    )
+    store = _credential_store(credentials)
     ref = f"{name}:runner"
-    store.put(ref, runner_token=token, manifest_hmac_key=hmac_key)
+    store.put(ref, runner_token=resolved_token, manifest_hmac_key=resolved_hmac)
     server = _repo(db).add_local_server(
         name=name, runner_port=runner_port, runner_token_ref=ref, gpu_slots=gpu_slots,
         allowed_work_roots=work_root or [], allowed_output_roots=output_root or [],
@@ -404,7 +506,7 @@ def job_logs(
         typer.secho(f"error: job {job_id} not found", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
     server = repo.get_server(job["server_id"])
-    creds = CredentialStore(credentials).get(server["runner_token_ref"])
+    creds = _credential_store(credentials).get(server["runner_token_ref"])
     transport = RunnerTransport(
         base_url=f"http://{server['host']}:{server['runner_port']}",
         runner_token=creds["runner_token"],

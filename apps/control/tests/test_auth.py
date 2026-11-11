@@ -118,8 +118,18 @@ def test_login_maps_admin_to_owner(auth_env, monkeypatch):
     client, OWNER, _ = _client(auth_env)
     data = client.post("/api/auth/login", json={"username": "boss", "password": "p"}).json()
     assert data["kind"] == "owner"
-    assert data["token"] == OWNER
+    assert data["token"].startswith("owner-")
+    assert data["token"] != OWNER
     assert data["kb_token"] == "jwt-admin"
+
+    admin_h = {"Authorization": f"Bearer {data['token']}"}
+    who = client.get("/api/whoami", headers=admin_h)
+    assert who.status_code == 200
+    assert who.json() == {"kind": "owner", "name": "boss", "identity": "owner:boss"}
+
+    accts = client.get("/api/owner/accounts", headers=admin_h)
+    assert accts.status_code == 200
+    assert any(a["name"] == "boss" and a["role"] == "owner" for a in accts.json())
 
 
 def test_login_member_token_is_stable_across_logins(auth_env, monkeypatch):

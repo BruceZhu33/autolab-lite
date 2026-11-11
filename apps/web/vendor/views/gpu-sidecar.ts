@@ -48,9 +48,15 @@ export class SidecarApiError extends Error {
   }
 }
 
-const API_URL =
-  (typeof process !== "undefined" && process.env.NEXT_PUBLIC_AUTOLAB_API) ||
-  "http://127.0.0.1:8710";
+function resolveApiUrl(): string {
+  const envUrl =
+    typeof process !== "undefined" ? process.env.NEXT_PUBLIC_AUTOLAB_API : "";
+  if (envUrl) return envUrl.replace(/\/$/, "");
+  if (typeof window !== "undefined" && window.location?.hostname) {
+    return `http://${window.location.hostname}:8710`;
+  }
+  return "http://127.0.0.1:8710";
+}
 
 function token(): string {
   if (typeof window === "undefined") return "";
@@ -58,7 +64,7 @@ function token(): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
+  const response = await fetch(`${resolveApiUrl()}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${token()}`,
@@ -218,13 +224,16 @@ export function describeOpResult(op: ServerOp, result: unknown): OpResultView {
   return { ok: true, title: `${label}完成`, detail: String(result ?? "") };
 }
 
-export async function serverOp(id: string, op: ServerOp, _body?: unknown): Promise<unknown> {
+export async function serverOp(id: string, op: ServerOp, body?: unknown): Promise<unknown> {
   const path = op === "runner/install" || op === "runner/upgrade"
     ? "runner/install" // 升级 = 重新部署(强制重装 wheel + 轮换凭据)
     : op;
   return request<Record<string, unknown>>(
     `/api/owner/servers/${encodeURIComponent(id)}/${path}`,
-    { method: "POST" },
+    {
+      method: "POST",
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    },
   );
 }
 

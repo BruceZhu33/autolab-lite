@@ -74,10 +74,10 @@ export function createProjectFromZip(name: string, serverId: string, file: File)
 
 export const updateProject = (
   id: string, input: { github_url?: string; workdir?: string; local_workspace?: string },
-) => request<{ project: Project }>(`/api/owner/projects/${id}`, { method: "PATCH", body: input });
+) => request<{ project: Project }>(`/api/owner/projects/${encodeURIComponent(id)}`, { method: "PATCH", body: input });
 
 export const deleteProject = (id: string) =>
-  request<{ deleted: string; name: string }>(`/api/owner/projects/${id}`, { method: "DELETE" });
+  request<{ deleted: string; name: string }>(`/api/owner/projects/${encodeURIComponent(id)}`, { method: "DELETE" });
 
 export const syncProjectCode = (id: string, source?: "github" | "local") =>
   post<{ source: string; detail: string }>(`/api/owner/projects/${id}/code/sync`,

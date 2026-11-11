@@ -11,12 +11,14 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ..core.credentials import CredentialStore
+from ..core.db import utc_now
 from ..core.errors import NotFound, UserError
 from ..core.repo import Repo
 from ..infra.servers import hostkeys_path_for
@@ -36,15 +38,41 @@ class Ctx:
         return hostkeys_path_for(self.credentials)
 
 
-def _account_name_for_token(repo: Repo, token: str) -> str | None:
-    """账号 token → 账号名;已吊销/不存在返回 None。"""
+def _not_expired(expires_at: str | None) -> bool:
+    if expires_at is None or not str(expires_at).strip():
+        return True
+    try:
+        exp_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        return exp_dt > datetime.now(timezone.utc)
+    except ValueError:
+        return str(expires_at) > utc_now()
+
+
+def _account_for_token(repo: Repo, token: str) -> tuple[str, str] | None:
+    """账号 token → (账号名, role);已吊销/已过期/不存在返回 None。"""
     conn = repo.db.connect()
     try:
         row = conn.execute(
-            "SELECT name FROM accounts WHERE token = ? AND revoked_at IS NULL", (token,)).fetchone()
-        return row[0] if row else None
+            "SELECT name, role, expires_at FROM accounts "
+            "WHERE token = ? AND revoked_at IS NULL",
+            (token,),
+        ).fetchone()
     finally:
         conn.close()
+    if row is None:
+        return None
+    name, role, expires_at = row[0], row[1] or "member", row[2]
+    if not _not_expired(expires_at):
+        return None
+    return name, role
+
+
+def _account_name_for_token(repo: Repo, token: str) -> str | None:
+    """账号 token → 账号名;已吊销/已过期/不存在返回 None。"""
+    acct = _account_for_token(repo, token)
+    return acct[0] if acct is not None else None
 
 
 def _auth(owner_token: str, agent_token: str, repo: Repo, scope: str):
@@ -54,11 +82,14 @@ def _auth(owner_token: str, agent_token: str, repo: Repo, scope: str):
             raise HTTPException(status_code=401, detail="missing bearer token")
         if hmac.compare_digest(token, owner_token):
             return "owner"
-        if scope == "agent":
-            if agent_token and hmac.compare_digest(token, agent_token):
-                return "agent"
-            name = _account_name_for_token(repo, token)
-            if name:
+        if scope == "agent" and agent_token and hmac.compare_digest(token, agent_token):
+            return "agent"
+        acct = _account_for_token(repo, token)
+        if acct is not None:
+            name, role = acct
+            if role == "owner":
+                return f"owner:{name}"
+            if role == "member" and scope == "agent":
                 return f"member:{name}"
         raise HTTPException(status_code=403, detail=f"requires {scope} scope")
     return check
@@ -73,13 +104,15 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
             f"credentials file lacks an '{API_REF}' entry with owner_token/agent_token") from exc
 
     app = FastAPI(title="autolab-control", version="2")
-    # 只允许本机与本机局域网 IP 的控制台访问(AUTOLAB_HTTP_HOST 放开绑定时,
+    # 只允许本机与显式配置的局域网控制台访问(AUTOLAB_HTTP_HOST 放开绑定时,
     # 局域网内可用 http://<server-ip>:3430 直达控制台,API 同样仅限这些来源)
-    lan = os.getenv("AUTOLAB_API_ALLOWED_LAN", "192.0.2.46")
-    allowed = r"^https?://(127\.0\.0\.1|localhost"
-    if lan:
-        allowed += "|" + re.escape(lan)
-    allowed += r")(:\d+)?$"
+    lan_raw = os.getenv("AUTOLAB_API_ALLOWED_LAN", "")
+    hosts = [r"127\.0\.0\.1", r"localhost", r"\[::1\]"]
+    for item in lan_raw.split(","):
+        host = item.strip()
+        if host:
+            hosts.append(re.escape(host))
+    allowed = rf"^https?://({'|'.join(hosts)})(:\d+)?$"
     app.add_middleware(CORSMiddleware,
                        allow_origin_regex=allowed,
                        allow_methods=["*"], allow_headers=["*"])

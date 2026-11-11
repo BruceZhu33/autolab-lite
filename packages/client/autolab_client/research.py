@@ -18,6 +18,8 @@ from .templates import (
     EXPERIMENT_SECTIONS,
     FAILURES_TEMPLATE,
     experiment_markdown,
+    format_front_matter_scalar,
+    sanitize_front_matter_str,
 )
 
 AUTOLAB_DIR = ".autolab"
@@ -29,6 +31,7 @@ CONTEXT_FILE = "context.md"
 _CREATED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _EXP_ID_RE = re.compile(r"^EXP-[0-9]{4,}$")
 _EVIDENCE_REF_RE = re.compile(r"^- (job|artifact|metric):[\w.:#-]+")
+_FM_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 CONCLUSIONS = frozenset({"pending", "supported", "rejected", "inconclusive"})
 NEXT_DECISIONS = frozenset({"iterate", "promote", "stop"})
@@ -85,6 +88,36 @@ def sha256_bytes(data: bytes) -> str:
 # ---------------------------------------------------------------- front matter
 
 
+def _unescape_quoted_scalar(value: str, path: Path, line: str) -> str:
+    inner = value[1:-1]
+    out: list[str] = []
+    idx = 0
+    while idx < len(inner):
+        ch = inner[idx]
+        if ch == "\\":
+            if idx + 1 >= len(inner):
+                raise ResearchError(f"{path}: trailing backslash in front-matter line {line!r}")
+            nxt = inner[idx + 1]
+            if nxt == '"':
+                out.append('"')
+            elif nxt == "\\":
+                out.append("\\")
+            elif nxt == "t":
+                out.append("\t")
+            elif nxt in ("n", "r"):
+                out.append(" ")
+            else:
+                out.append("\\")
+                out.append(nxt)
+            idx += 2
+        elif ch == '"':
+            raise ResearchError(f"{path}: unescaped quote in front-matter line {line!r}")
+        else:
+            out.append(ch)
+            idx += 1
+    return "".join(out)
+
+
 def parse_front_matter(text: str, path: Path) -> tuple[dict, str]:
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -101,9 +134,14 @@ def parse_front_matter(text: str, path: Path) -> tuple[dict, str]:
             raise ResearchError(f"{path}: malformed front-matter line {line!r}")
         key, _, raw = line.partition(":")
         key = key.strip()
-        value = raw.strip()
+        if not _FM_KEY_RE.fullmatch(key):
+            raise ResearchError(f"{path}: invalid front-matter key {key!r}")
+        value: object = raw.strip()
+        assert isinstance(value, str)
         if value.startswith('"') and value.endswith('"') and len(value) >= 2:
-            value = value[1:-1]
+            value = _unescape_quoted_scalar(value, path, line)
+        elif value.startswith('"'):
+            raise ResearchError(f"{path}: unterminated quoted string in front-matter line {line!r}")
         elif value == "null":
             value = None
         elif value in ("true", "false"):
@@ -135,15 +173,10 @@ def split_sections(body: str) -> dict[str, str]:
 def _render_front_matter(meta: dict) -> list[str]:
     lines = ["---"]
     for key, value in meta.items():
-        if value is None:
-            rendered = "null"
-        elif isinstance(value, bool):
-            rendered = "true" if value else "false"
-        elif isinstance(value, str) and (":" in value or value.startswith('"')):
-            rendered = f'"{value}"'
-        else:
-            rendered = str(value)
-        lines.append(f"{key}: {rendered}")
+        clean_key = sanitize_front_matter_str(str(key)).strip()
+        if not _FM_KEY_RE.fullmatch(clean_key):
+            raise ResearchError(f"invalid front-matter key {key!r}")
+        lines.append(f"{clean_key}: {format_front_matter_scalar(value)}")
     lines.append("---")
     return lines
 
@@ -156,6 +189,10 @@ def autolab_root(project_root: Path) -> Path:
 
 
 def init_workspace(project_root: Path, project_id: str) -> Path:
+    clean_pid = sanitize_front_matter_str(project_id).strip()
+    if not clean_pid:
+        raise ResearchError("project_id must not be empty")
+    rendered_pid = format_front_matter_scalar(clean_pid)
     root = autolab_root(project_root)
     context_path = root / CONTEXT_FILE
     if context_path.exists():
@@ -164,11 +201,11 @@ def init_workspace(project_root: Path, project_id: str) -> Path:
     (root / KNOWLEDGE_DIR).mkdir(parents=True, exist_ok=True)
     stamp = utc_now_stamp()
     context_path.write_text(
-        CONTEXT_TEMPLATE.replace("PROJECT_ID", project_id).replace("UPDATED_AT", stamp),
+        CONTEXT_TEMPLATE.replace("PROJECT_ID", rendered_pid).replace("UPDATED_AT", stamp),
         encoding="utf-8",
     )
     (root / KNOWLEDGE_DIR / FAILURES_FILE).write_text(
-        FAILURES_TEMPLATE.replace("PROJECT_ID", project_id).replace("UPDATED_AT", stamp),
+        FAILURES_TEMPLATE.replace("PROJECT_ID", rendered_pid).replace("UPDATED_AT", stamp),
         encoding="utf-8",
     )
     return root
@@ -196,6 +233,9 @@ def create_experiment(
     sections: dict[str, str] | None = None,
     parent_experiment_id: str | None = None,
 ) -> Path:
+    clean_title = sanitize_front_matter_str(title)
+    if not clean_title.strip():
+        raise ResearchError("experiment title must not be empty")
     experiment_id = next_experiment_id(project_root)
     path = autolab_root(project_root) / EXPERIMENTS_DIR / f"{experiment_id}.md"
     if path.exists():  # pragma: no cover - id collision requires concurrent writers
@@ -203,7 +243,7 @@ def create_experiment(
     path.write_text(
         experiment_markdown(
             experiment_id=experiment_id,
-            title=title,
+            title=clean_title,
             created_at=utc_now_stamp(),
             parent_experiment_id=parent_experiment_id,
             sections=sections,

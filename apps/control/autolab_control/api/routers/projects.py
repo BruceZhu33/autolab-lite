@@ -3,30 +3,68 @@
 from __future__ import annotations
 
 import json
+import posixpath
 import re
+import tempfile
+from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
+from ...agent import runtime
 from ...core.errors import NotFound, UserError
 from ...core.ids import new_id
 from ...stages import baseline as baseline_stage
 from ...stages import board
 from ...stages import research as research_stage
 from ...workspace import assets, papers, projects
-from ...workspace.fs import Workspace, open_workspace
+from ...workspace.fs import Workspace, open_workspace, validate_safe_local_path
 from ...workspace.host import open_host, q
 from ..app import Ctx
 
-MAX_UPLOAD = 2 * 1024 * 1024 * 1024  # 2 GiB
+MAX_UPLOAD = 2 * 1024 * 1024 * 1024     # 2 GiB
+MAX_PAPER_BYTES = 50 * 1024 * 1024      # 50 MiB
+_STREAM_CHUNK = 1024 * 1024             # 1 MiB
 
 
-async def _read_zip(file: UploadFile | None) -> bytes:
+async def _stream_zip_to_temp(file: UploadFile | None) -> Path:
     if file is None or not (file.filename or "").lower().endswith(".zip"):
         raise HTTPException(400, "请上传 .zip 文件")
-    data = await file.read(MAX_UPLOAD + 1)
-    if len(data) > MAX_UPLOAD:
-        raise HTTPException(413, "zip 超过 2 GiB 上限")
-    return data
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    total = 0
+    try:
+        with tmp_path.open("wb") as out:
+            while True:
+                chunk = await file.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD:
+                    raise HTTPException(413, "zip 超过 2 GiB 上限")
+                out.write(chunk)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    if total == 0:
+        tmp_path.unlink(missing_ok=True)
+        raise UserError("上传内容为空")
+    return tmp_path
+
+
+async def _read_pdf_upload(file: UploadFile) -> bytes:
+    buf = bytearray()
+    while True:
+        chunk = await file.read(_STREAM_CHUNK)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > MAX_PAPER_BYTES:
+            raise HTTPException(413, "论文 PDF 超过 50 MiB 上限")
+    if not buf:
+        raise UserError("上传内容为空")
+    if not bytes(buf[:5]).startswith(b"%PDF-"):
+        raise HTTPException(400, "仅支持上传有效的 PDF 文件(缺少 %PDF- 文件头)")
+    return bytes(buf)
 
 
 def _slug(name: str) -> str:
@@ -87,8 +125,8 @@ def build(ctx: Ctx) -> APIRouter:
             "server": {"id": project["server_id"], "name": server["name"] if server else "?",
                        "transport_mode": server["transport_mode"] if server else "?"},
             "workdir": project["remote_workdir"], "output_root": project["output_root"],
-            "githubUrl": project.get("github_url"),
-            "localWorkspace": project.get("local_workspace"),
+            "githubUrl": project.get("github_url") or None,
+            "localWorkspace": project.get("local_workspace") or None,
             "papersCount": project.get("papers_count") or 0,
             "baselinePassedAt": project.get("baseline_passed_at"),
             "baseline": baseline_stage.baseline_label(project),
@@ -96,17 +134,24 @@ def build(ctx: Ctx) -> APIRouter:
             "updated_at": card["updatedAt"],
         }
 
-    def register(name: str, server_id: str, workdir_for) -> dict:
-        """workdir_for(host) 负责把代码放到服务器上并返回工作区路径。"""
+    def register(name: str, server_id: str, workdir_for, *,
+                 precheck_for=None) -> dict:
+        """workdir_for(host) 负责把代码放到服务器上并返回工作区路径;
+        precheck_for(host) 在落盘/克隆/解压前先做白名单边界校验。"""
         if not name or not server_id:
             raise HTTPException(400, "name、server_id 为必填")
+        projects.validate_project_name(name)
         server = repo.get_server(server_id)
         with open_host(repo, credentials, server_id) as host:
+            if precheck_for is not None and server:
+                expected = precheck_for(host)
+                if expected:
+                    projects.ensure_within_roots(server, expected, f"{expected}/output")
             workdir = workdir_for(host)
+            if workdir and server:
+                projects.ensure_within_roots(server, workdir, f"{workdir}/output")
             if workdir:
                 projects.prepare_workspace(host, workdir)
-        if workdir and server:
-            projects.ensure_within_roots(server, workdir, f"{workdir}/output")
         return repo.add_project(name=name, server_id=server_id, workdir=workdir or "",
                                 output_root=f"{workdir}/output" if workdir else "",
                                 project_id=new_id("proj"))
@@ -169,15 +214,15 @@ def build(ctx: Ctx) -> APIRouter:
             while host.run(f"test -e {q(new_dir)}").ok:  # 同名分叉:追加序号
                 new_dir = f"{source_dir}-{suffix}-{n}"
                 n += 1
+            server = repo.get_server(source["server_id"])
+            out_root = f"{new_dir}/output"
+            if server:
+                projects.ensure_within_roots(server, new_dir, out_root)
             try:
                 projects.fork_workspace(host, source_dir, new_dir, commit)
             except UserError as exc:
                 raise HTTPException(409, str(exc)) from exc
             projects.prepare_workspace(host, new_dir)
-            server = repo.get_server(source["server_id"])
-            out_root = f"{new_dir}/output"
-            if server:
-                projects.ensure_within_roots(server, new_dir, out_root)
         project = repo.add_project(name=name, server_id=source["server_id"],
                                    workdir=new_dir, output_root=out_root,
                                    project_id=new_id("proj"))
@@ -205,45 +250,100 @@ def build(ctx: Ctx) -> APIRouter:
         kind = source.get("kind") or "dir"
         url = (source.get("url") or "").strip()
         workdir = (payload.get("workdir") or source.get("path") or "").strip()
+        local_ws = (payload.get("local_workspace") or "").strip()
         if kind == "github" and not url:
             raise HTTPException(400, "github 来源需要 url")
+        if url:
+            projects.validate_git_url(url)
+        if local_ws:
+            local_ws = str(validate_safe_local_path(local_ws, label="本机代码目录"))
+
+        def precheck(host) -> str:
+            if kind == "github":
+                clean_name = projects.validate_project_name(name)
+                return posixpath.normpath(
+                    f"{host.home().rstrip('/')}/{projects.PROJECTS_DIR}/{clean_name}"
+                )
+            if workdir and workdir.startswith("/"):
+                return workdir.rstrip("/") or "/"
+            return ""
 
         def place(host):
             if kind == "github":
                 return projects.clone_repo(host, url=url, name=name)
             return projects.use_existing_dir(host, workdir) if workdir else ""
 
-        project = register(name, (payload.get("server_id") or "").strip(), place)
+        project = register(name, (payload.get("server_id") or "").strip(), place,
+                           precheck_for=precheck)
         repo.update_project(project["id"], github_url=url or None,
-                            local_workspace=(payload.get("local_workspace") or "").strip() or None)
+                            local_workspace=local_ws or None)
         return {"project": view(repo.get_project(project["id"]))}
 
     @router.post("/api/owner/projects/upload", dependencies=[ctx.owner])
     async def create_from_zip(name: str = Form(""), server_id: str = Form(""),
                               file: UploadFile = File(None)) -> dict:
         """上传 zip → 解包到服务器 ~/autolab-projects/<name>(服务器连不上 GitHub 时用)。"""
-        data = await _read_zip(file)
-        project = register(name.strip(), server_id.strip(),
-                           lambda host: projects.extract_zip(host, data, name=name.strip()))
+        clean_name = name.strip()
+        clean_server = server_id.strip()
+        if not clean_name or not clean_server:
+            raise HTTPException(400, "name、server_id 为必填")
+        projects.validate_project_name(clean_name)
+        zip_path = await _stream_zip_to_temp(file)
+        try:
+            project = register(
+                clean_name,
+                clean_server,
+                lambda host: projects.extract_zip(host, zip_path, name=clean_name),
+                precheck_for=lambda host: posixpath.normpath(
+                    f"{host.home().rstrip('/')}/{projects.PROJECTS_DIR}/{clean_name}"
+                ),
+            )
+        finally:
+            zip_path.unlink(missing_ok=True)
         return {"project": view(project)}
 
     @router.patch("/api/owner/projects/{project_id}", dependencies=[ctx.owner])
     def patch_project(project_id: str, payload: dict) -> dict:
-        """补全:没有工作区时给 workdir 或 github_url;随时可改本机同步目录。"""
+        """补全:没有工作区时给 workdir 或 github_url;随时可改/清空本机同步目录与 GitHub 地址。"""
         project = project_or_404(project_id)
-        github_url = (payload.get("github_url") or "").strip() or None
+        has_github = "github_url" in payload and payload.get("github_url") is not None
+        has_local = "local_workspace" in payload and payload.get("local_workspace") is not None
+
+        github_update: str | None = None
+        if has_github:
+            github_update = str(payload.get("github_url") or "").strip()
+            if github_update:
+                github_update = projects.validate_git_url(github_update)
+
+        local_update: str | None = None
+        if has_local:
+            local_update = str(payload.get("local_workspace") or "").strip()
+            if local_update:
+                local_update = str(validate_safe_local_path(local_update, label="本机代码目录"))
+
         workdir = (payload.get("workdir") or "").strip() or None
-        if not project["remote_workdir"] and (workdir or github_url):
-            with open_host(repo, credentials, project["server_id"]) as host:
-                workdir = projects.use_existing_dir(host, workdir) if workdir \
-                    else projects.clone_repo(host, url=github_url, name=project["name"])
-                projects.prepare_workspace(host, workdir)
+        github_for_init = github_update or None
+        if not project["remote_workdir"] and (workdir or github_for_init):
             server = repo.get_server(project["server_id"])
-            if server:
-                projects.ensure_within_roots(server, workdir, f"{workdir}/output")
+            with open_host(repo, credentials, project["server_id"]) as host:
+                if workdir:
+                    if server and workdir.startswith("/"):
+                        norm_wd = workdir.rstrip("/") or "/"
+                        projects.ensure_within_roots(server, norm_wd, f"{norm_wd}/output")
+                    workdir = projects.use_existing_dir(host, workdir)
+                else:
+                    clean_name = projects.validate_project_name(project["name"])
+                    expected = posixpath.normpath(
+                        f"{host.home().rstrip('/')}/{projects.PROJECTS_DIR}/{clean_name}"
+                    )
+                    if server:
+                        projects.ensure_within_roots(server, expected, f"{expected}/output")
+                    workdir = projects.clone_repo(host, url=github_for_init, name=clean_name)
+                if server:
+                    projects.ensure_within_roots(server, workdir, f"{workdir}/output")
+                projects.prepare_workspace(host, workdir)
             repo.update_project(project_id, workdir=workdir, output_root=f"{workdir}/output")
-        repo.update_project(project_id, github_url=github_url,
-                            local_workspace=(payload.get("local_workspace") or "").strip() or None)
+        repo.update_project(project_id, github_url=github_update, local_workspace=local_update)
         return {"project": view(repo.get_project(project_id))}
 
     @router.delete("/api/owner/projects/{project_id}", dependencies=[ctx.owner])
@@ -256,6 +356,7 @@ def build(ctx: Ctx) -> APIRouter:
     def sync_code(project_id: str, payload: dict) -> dict:
         """从 GitHub(git pull)或本机目录(打包上传)更新服务器上的代码。"""
         project = project_or_404(project_id)
+        runtime.ensure_no_active_run(repo, project_id)
         source = payload.get("source") or ("local" if project.get("local_workspace")
                                            else "github")
         with open_workspace(repo, credentials, project) as ws:
@@ -271,7 +372,7 @@ def build(ctx: Ctx) -> APIRouter:
     @router.post("/api/owner/projects/{project_id}/papers", dependencies=[ctx.owner])
     async def upload_paper(project_id: str, file: UploadFile = File(...)) -> dict:
         project = project_or_404(project_id)
-        content = await file.read()
+        content = await _read_pdf_upload(file)
         with open_workspace(repo, credentials, project) as ws:
             path = papers.save_paper(ws, file.filename or "paper.pdf", content)
             count = len(papers.list_papers(ws))
@@ -293,9 +394,13 @@ def build(ctx: Ctx) -> APIRouter:
     @router.post("/api/owner/projects/{project_id}/assets/upload", dependencies=[ctx.owner])
     async def upload_asset(project_id: str, target_path: str = Form(""),
                            merge: bool = Form(False), file: UploadFile = File(None)) -> dict:
-        data = await _read_zip(file)
+        project = project_or_404(project_id)
+        zip_path = await _stream_zip_to_temp(file)
         ws: Workspace
-        with open_workspace(repo, credentials, project_or_404(project_id)) as ws:
-            return assets.unzip_into(ws, target_path, data, merge=merge)
+        try:
+            with open_workspace(repo, credentials, project) as ws:
+                return assets.unzip_into(ws, target_path, zip_path, merge=merge)
+        finally:
+            zip_path.unlink(missing_ok=True)
 
     return router

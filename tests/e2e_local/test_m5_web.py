@@ -13,12 +13,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from .conftest import REPO_ROOT, Proc, run_cli
+from .conftest import REPO_ROOT, Proc, port_busy, resolve_e2e_port, run_cli
 from .test_m1_e2e import create_plan, setup_world, wait_terminal
-
-# 端口可被环境覆盖;默认撞常驻 demo 时 skip(红色假失败消除,D-025)
-WEB_PORT = int(os.environ.get("AUTOLAB_E2E_WEB_PORT", "3430"))
-API_PORT = int(os.environ.get("AUTOLAB_E2E_API_PORT", "8710"))
 
 OWNER_TOKEN = "e2e-owner-token"
 AGENT_TOKEN = "e2e-agent-token"
@@ -26,57 +22,78 @@ OWNER_H = {"Authorization": f"Bearer {OWNER_TOKEN}"}
 AGENT_H = {"Authorization": f"Bearer {AGENT_TOKEN}"}
 
 
-def _port_busy(port: int) -> bool:
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(1.0)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
 @pytest.fixture(scope="module")
 def _require_ports():
-    busy = [p for p in (WEB_PORT, API_PORT) if _port_busy(p)]
-    if busy:
-        pytest.skip(
-            f"端口 {busy} 被占用(常驻 demo?):停掉占用进程,或设 "
-            "AUTOLAB_E2E_WEB_PORT / AUTOLAB_E2E_API_PORT(注意 web 的 API "
-            "地址是 build 期内联,换 API 端口需重建 web)")
+    """若显式通过环境变量固定了端口但该端口已被占用,清晰 skip;默认动态分配临时空闲端口不互撞。"""
+    pinned_busy: list[str] = []
+    for env_name in ("AUTOLAB_E2E_WEB_PORT", "AUTOLAB_E2E_API_PORT", "AUTOLAB_E2E_RUNNER_PORT"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw and port_busy(int(raw)):
+            pinned_busy.append(f"{env_name}={raw}")
+    if pinned_busy:
+        pytest.skip(f"显式指定的 E2E 端口已被占用 ({', '.join(pinned_busy)}); 请释放端口或取消该环境变量以使用动态空闲端口")
 
 
 pytestmark = pytest.mark.parametrize("stack", [{"http": True}], indirect=True)
 
 
-@pytest.fixture(scope="module")
-def web_server(_require_ports):
+@pytest.fixture()
+def web_server(_require_ports, stack):
     web_dir = REPO_ROOT / "apps" / "web"
+    api_port = stack["api_port"]
+    assert isinstance(api_port, int) and api_port > 0
+    web_port = resolve_e2e_port("AUTOLAB_E2E_WEB_PORT", avoid={stack["port"], api_port})
+
+    web_env = dict(os.environ)
+    web_env["NEXT_PUBLIC_AUTOLAB_API"] = f"http://127.0.0.1:{api_port}"
     if not (web_dir / ".next" / "BUILD_ID").exists():
-        subprocess.run(["npm", "run", "build"], cwd=web_dir, check=True,
-                       capture_output=True, text=True)
-    proc = Proc(subprocess.Popen(
-        # package.json 的 start 硬编码 -p 3430;追加的 -p 覆盖它,否则
-        # AUTOLAB_E2E_WEB_PORT 只改探活端口,server 还是撞旧端口(D-025 半成品)
-        ["npm", "run", "start", "--", "-p", str(WEB_PORT)], cwd=web_dir,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    ), "web")
+        subprocess.run(
+            ["npm", "run", "build"],
+            cwd=web_dir,
+            env=web_env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    proc = Proc(
+        subprocess.Popen(
+            # package.json 的 start 默认带 -p 3430;追加 -p <web_port> 覆盖监听端口
+            ["npm", "run", "start", "--", "-p", str(web_port)],
+            cwd=web_dir,
+            env=web_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        ),
+        "web",
+        port=web_port,
+        own_pgid=True,
+    )
     deadline = time.monotonic() + 60
-    with httpx.Client(timeout=3.0, trust_env=False) as probe:
-        while time.monotonic() < deadline:
-            try:
-                if probe.get(f"http://127.0.0.1:{WEB_PORT}/").status_code == 200:
-                    break
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.3)
-        else:
-            pytest.fail(f"web never started; log:\n{chr(10).join(proc.lines[-20:])}")
-    yield proc
-    proc.stop()
+    try:
+        with httpx.Client(timeout=3.0, trust_env=False) as probe:
+            while time.monotonic() < deadline:
+                try:
+                    if probe.get(f"http://127.0.0.1:{web_port}/").status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                time.sleep(0.3)
+            else:
+                pytest.fail(f"web never started on port {web_port}; log:\n{chr(10).join(proc.lines[-20:])}")
+        yield proc
+    finally:
+        proc.stop()
 
 
 def test_m5_full_stack_smoke(stack, web_server):
     from autolab_control.core.db import Database
     from autolab_control.core.repo import Repo
+
+    api_port = stack["api_port"]
+    web_port = web_server.port
+    assert isinstance(api_port, int) and api_port > 0
+    assert isinstance(web_port, int) and web_port > 0
 
     ids = setup_world(stack)
     created = create_plan(stack, ids, seeds="1")
@@ -88,7 +105,7 @@ def test_m5_full_stack_smoke(stack, web_server):
 
     # 1. control HTTP API:三段看板 + 权限分离
     with httpx.Client(timeout=5.0, trust_env=False,
-                      base_url=f"http://127.0.0.1:{API_PORT}") as api:
+                      base_url=f"http://127.0.0.1:{api_port}") as api:
         board = api.get("/api/board", headers=OWNER_H).json()
         card = next(c for c in board if c["projectId"] == ids["project_id"])
         # 有工作区、没基线快照 → 停在 Baseline 段
@@ -113,7 +130,7 @@ def test_m5_full_stack_smoke(stack, web_server):
 
     # 2. web console serves real HTML for every page
     with httpx.Client(timeout=10.0, trust_env=False,
-                      base_url=f"http://127.0.0.1:{WEB_PORT}") as web:
+                      base_url=f"http://127.0.0.1:{web_port}") as web:
         board_page = web.get("/")
         assert board_page.status_code == 200 and "AutoLab" in board_page.text
         assert "实验看板" in board_page.text
