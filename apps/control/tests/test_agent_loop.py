@@ -406,7 +406,11 @@ def test_manager_caps_concurrent_runs(repo, monkeypatch):
     for i in range(3):
         kind = f"test{i}"
         profiles[kind] = profile()
-        al.start_run(repo["repo"], repo["project"]["id"], kind, "做事")
+        proj = repo["repo"].add_project(
+            name=f"cap-{i}", server_id=repo["server"]["id"],
+            workdir=f"/tmp/cap-{i}", output_root=f"/tmp/out-{i}",
+        )
+        al.start_run(repo["repo"], proj["id"], kind, "做事")
     manager = al.AgentLoopManager(repo["repo"], None, profiles, max_concurrent=2)
     manager.tick()
     assert len(manager._busy) == 2

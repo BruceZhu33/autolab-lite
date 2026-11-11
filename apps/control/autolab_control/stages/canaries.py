@@ -264,11 +264,29 @@ def start_canary(repo: Repo, spec_id: str, *, mode: str = "cassette",
             proc = _spawn_worker(repo, canary_id, credentials_path)
             pid = getattr(proc, "pid", None)
             if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
-                _update(repo, canary_id, result_json=json.dumps(
-                    {"compare": bool(compare), "pid": pid}, ensure_ascii=False))
+                conn = repo.db.connect()
+                try:
+                    with repo.db.tx(conn):
+                        conn.execute(
+                            "UPDATE agent_canaries"
+                            " SET result_json = json_set(COALESCE(result_json, '{}'), '$.pid', ?),"
+                            "     updated_at = ?"
+                            " WHERE id = ? AND status = 'running'",
+                            (pid, utc_now(), canary_id),
+                        )
+                finally:
+                    conn.close()
         except Exception as exc:  # noqa: BLE001 - 启动失败必须落 failed 并报 409
-            _update(repo, canary_id, status="failed",
-                    error=f"worker 启动失败:{str(exc)[:2000]}")
+            conn = repo.db.connect()
+            try:
+                with repo.db.tx(conn):
+                    conn.execute(
+                        "UPDATE agent_canaries SET status = 'failed', error = ?, updated_at = ?"
+                        " WHERE id = ? AND status = 'running'",
+                        (f"worker 启动失败:{str(exc)[:2000]}", utc_now(), canary_id),
+                    )
+            finally:
+                conn.close()
             raise UserError(f"canary worker 启动失败:{exc}") from exc
     else:
         run_canary(repo, canary_id, credentials_path=credentials_path)

@@ -32,7 +32,7 @@ from ..execution.experiments import describe_jobs
 from ..workspace.fs import Workspace
 from ..workspace.host import open_host
 from . import trace
-from .model import ModelFn, call_model, model_settings
+from .model import FatalModelError, ModelFn, call_model, model_settings
 from .spec import apply_profile_overlay, build_agent_spec, spec_from_json
 
 KEEP_RECENT = 12  # _compact_view 保留最近 N 个工具结果不截短(spec.contextPolicy)
@@ -180,6 +180,28 @@ def _update(repo: Repo, run_id: str, **fields: Any) -> None:
         conn.close()
 
 
+def _update_if_active(repo: Repo, run_id: str, **fields: Any) -> bool:
+    """乐观锁更新:若会话已并发进入终态(done/stopped/failed),拒绝覆盖并返回 False。"""
+    fields["updated_at"] = utc_now()
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            cur = conn.execute(
+                f"UPDATE agent_runs SET {sets} WHERE id = ?"
+                f" AND status NOT IN ({','.join('?' * len(TERMINAL_STATUSES))})",
+                (*fields.values(), run_id, *TERMINAL_STATUSES),
+            )
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def _terminal_status(repo: Repo, run_id: str) -> str:
+    row = _row(repo, run_id)
+    return row["status"] if row else "missing"
+
+
 def record_event(repo: Repo, run_id: str, kind: str,
                  payload: dict | None = None) -> None:
     conn = repo.db.connect()
@@ -226,9 +248,26 @@ def _public(row: dict) -> dict:
 
 # ------------------------------------------------------------------ 对外 API
 
+def ensure_no_active_run(repo: Repo, project_id: str) -> None:
+    """检查目标项目当前无进行中的阶段会话(防外部代码同步/基线采纳/冠军回灌与活跃会话并发踩踏工作区)。"""
+    conn = repo.db.connect()
+    try:
+        active = conn.execute(
+            "SELECT id, kind FROM agent_runs WHERE project_id = ?"
+            f" AND status IN ({','.join('?' * len(ACTIVE_STATUSES))})",
+            (project_id, *ACTIVE_STATUSES),
+        ).fetchone()
+    finally:
+        conn.close()
+    if active is not None:
+        raise AgentLoopError(
+            f"该项目已有进行中的 {active['kind']} 会话 {active['id']}"
+        )
+
+
 def start_run(repo: Repo, project_id: str, kind: str, task: str,
               config: dict | None = None) -> dict:
-    """起一个阶段会话;同项目同 kind 只能有一个活跃会话。"""
+    """起一个阶段会话;同一项目同一时刻只能有一个活跃会话(防跨阶段并发踩踏工作区)。"""
     if repo.get_project(project_id) is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
     if not task.strip():
@@ -239,12 +278,12 @@ def start_run(repo: Repo, project_id: str, kind: str, task: str,
     try:
         with repo.db.tx(conn):
             active = conn.execute(
-                "SELECT id FROM agent_runs WHERE project_id = ? AND kind = ?"
+                "SELECT id, kind FROM agent_runs WHERE project_id = ?"
                 f" AND status IN ({','.join('?' * len(ACTIVE_STATUSES))})",
-                (project_id, kind, *ACTIVE_STATUSES)).fetchone()
+                (project_id, *ACTIVE_STATUSES)).fetchone()
             if active is not None:
                 raise AgentLoopError(
-                    f"该项目已有进行中的 {kind} 会话 {active['id']}")
+                    f"该项目已有进行中的 {active['kind']} 会话 {active['id']}")
             messages = [{"role": "user",
                          "content": [{"type": "text", "text": task}]}]
             conn.execute(
@@ -323,12 +362,25 @@ def stop_run(repo: Repo, run_id: str) -> dict:
 
 
 def complete_run(repo: Repo, run_id: str, result: dict) -> dict:
-    """外部动作结束会话(如 owner 确认 agent 的提案);只允许从等人态结束。"""
-    run = get_run(repo, run_id)
-    if run["status"] != "waiting_human":
-        raise AgentLoopError(f"会话不在等待确认(当前 {run['status']})")
-    _update(repo, run_id, status="done", pending_json=None,
-            result_json=_dumps(result))
+    """外部动作结束会话(如 owner 确认 agent 的提案);只允许从等人态原子结束。"""
+    now = utc_now()
+    conn = repo.db.connect()
+    try:
+        with repo.db.tx(conn):
+            cur = conn.execute(
+                "UPDATE agent_runs SET status = 'done', pending_json = NULL,"
+                " result_json = ?, updated_at = ?"
+                " WHERE id = ? AND status = 'waiting_human'",
+                (_dumps(result), now, run_id),
+            )
+            if cur.rowcount == 0:
+                row = conn.execute("SELECT status FROM agent_runs WHERE id = ?",
+                                   (run_id,)).fetchone()
+                if row is None:
+                    raise NotFound(f"会话 {run_id} 不存在")
+                raise AgentLoopError(f"会话不在等待确认(当前 {row['status']})")
+    finally:
+        conn.close()
     record_event(repo, run_id, "done", result)
     return get_run(repo, run_id)
 
@@ -368,21 +420,50 @@ def _tool_result(tool_use_id: str, text: str, *, error: bool = False) -> dict:
     return block
 
 
+def _older_positions(positions: list[tuple[int, int]], keep_recent: int) -> set[tuple[int, int]]:
+    if keep_recent <= 0:
+        return set(positions)
+    return set(positions[:-keep_recent]) if len(positions) > keep_recent else set()
+
+
 def _compact_view(messages: list[dict], keep_recent: int = KEEP_RECENT) -> list[dict]:
-    """发给模型的视图:较早的工具结果截短(库里保留全文)。长会话不爆上下文,
-    关键信息靠 agent 自己写进 journal。"""
-    positions = [(i, j) for i, m in enumerate(messages) if m["role"] == "user"
-                 for j, b in enumerate(m["content"]) if b.get("type") == "tool_result"]
-    old = set(positions[:-keep_recent]) if len(positions) > keep_recent else set()
-    if not old:
+    """发给模型的视图:较早的工具结果与巨型 write_file 入参截短(库里保留全文)。
+    长会话不爆上下文,关键信息靠 agent 自己写进 journal。"""
+    result_positions = [
+        (i, j) for i, m in enumerate(messages) if m["role"] == "user"
+        for j, b in enumerate(m["content"]) if b.get("type") == "tool_result"
+    ]
+    use_positions = [
+        (i, j) for i, m in enumerate(messages) if m["role"] == "assistant"
+        for j, b in enumerate(m["content"]) if b.get("type") == "tool_use"
+    ]
+    old_results = _older_positions(result_positions, keep_recent)
+    old_uses = _older_positions(use_positions, keep_recent)
+    if not old_results and not old_uses:
         return messages
     view = []
     for i, message in enumerate(messages):
         content = []
         for j, block in enumerate(message["content"]):
-            if (i, j) in old and len(str(block.get("content", ""))) > 400:
+            if (i, j) in old_results and len(str(block.get("content", ""))) > 400:
                 block = {**block, "content":
                          str(block["content"])[:300] + "\n…(早期结果已截短)"}
+            elif (
+                (i, j) in old_uses
+                and block.get("name") == "write_file"
+                and isinstance(block.get("input"), dict)
+            ):
+                inp = block["input"]
+                raw_content = inp.get("content")
+                if isinstance(raw_content, str) and len(raw_content) > 400:
+                    path = str(inp.get("path") or "")
+                    n_lines = len(raw_content.splitlines())
+                    n_bytes = len(raw_content.encode("utf-8"))
+                    placeholder = (
+                        f"<早期 write_file({path}) 内容已折叠: "
+                        f"{n_lines} 行, {n_bytes} bytes>"
+                    )
+                    block = {**block, "input": {**inp, "content": placeholder}}
             content.append(block)
         view.append({"role": message["role"], "content": content})
     return view
@@ -404,17 +485,17 @@ def _parse_ts(raw: str | None) -> float | None:
         return None
 
 
-def _accrue_wall_clock(repo: Repo, row: dict) -> float:
-    """上一步到现在的时长:上一步状态是 running 才计入活跃;等人/等 GPU 不计。
-    每次进入 step 都刷新锚点,返回累计活跃秒数(同时落库)。"""
+def _accrue_wall_clock(repo: Repo, row: dict) -> tuple[float, bool]:
+    """上一步到现在的间隔时长:上一步状态是 running 才计入活跃;等人/等 GPU 不计。
+    每次进入 step 刷新锚点,返回 (累计活跃秒数, 是否仍活跃未终结)。"""
     now = datetime.now(timezone.utc).timestamp()
     active = float(row["active_seconds"] or 0.0)
     if row["status"] == "running":
         anchor = _parse_ts(row["last_active_at"])
         if anchor is not None:
             active += max(0.0, now - anchor)
-    _update(repo, row["id"], active_seconds=active, last_active_at=utc_now())
-    return active
+    ok = _update_if_active(repo, row["id"], active_seconds=active, last_active_at=utc_now())
+    return active, ok
 
 
 def _reset_active_anchors(repo: Repo) -> None:
@@ -470,7 +551,7 @@ def _tool_span_output(output: Any) -> tuple[str, str, Any]:
     return "ok", "", str(output)
 
 
- # ------------------------------------------------------------------ 单步推进
+# ------------------------------------------------------------------ 单步推进
 
 
 def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
@@ -481,9 +562,10 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
         return row["status"] if row else "missing"
     project = repo.get_project(row["project_id"])
     if project is None:
-        _update(repo, run_id, status="failed", stop_reason="项目已删除")
-        notify.notify_run(repo, row, "failed", detail="项目已删除")
-        return "failed"
+        if _update_if_active(repo, run_id, status="failed", stop_reason="项目已删除"):
+            notify.notify_run(repo, row, "failed", detail="项目已删除")
+            return "failed"
+        return _terminal_status(repo, run_id)
     messages: list[dict] = _loads(row["messages_json"], [])
     pending = _loads(row["pending_json"], None)
     status = row["status"]
@@ -500,16 +582,21 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
     notes: list[str] = []
     for item in _drain_inbox(repo, run_id):
         if item["kind"] == "stop":
-            _update(repo, run_id, status="stopped", stop_reason="owner 停止")
-            record_event(repo, run_id, "stopped", {"by": "owner"})
+            updated = _update_if_active(repo, run_id, status="stopped",
+                                        stop_reason="owner 停止")
+            if updated:
+                record_event(repo, run_id, "stopped", {"by": "owner"})
             _cancel_active_jobs(repo, run_id)
-            return "stopped"
+            return "stopped" if updated else _terminal_status(repo, run_id)
         notes.append(item.get("text", ""))
         record_event(repo, run_id, "owner_message", {"text": item.get("text", "")})
 
     # 1.5) wall-clock:上一步后经过的时间按上一步状态归类(活跃 / 等待)
-    active_seconds = _accrue_wall_clock(repo, row)
+    active_seconds, still_active = _accrue_wall_clock(repo, row)
+    if not still_active:
+        return _terminal_status(repo, run_id)
 
+    step_t0: float | None = time.monotonic() if status == "running" else None
     env = LoopEnv(repo, credentials, row, project)
     try:
         # 2) 暂停态:外部事件到了才恢复
@@ -523,15 +610,18 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                       else [{"type": "text", "text": answer}])
             _append_user_blocks(messages, (pending or {}).get("results", []) + blocks)
             status, pending = "running", None
+            step_t0 = time.monotonic()
         elif status == "waiting_jobs":
             job_ids = list((pending or {}).get("payload", {}).get("job_ids") or [])
             jobs = [repo.get_job(j) for j in job_ids]
             if any(j is not None and j["status"] not in TERMINAL_JOB_STATUSES
                    for j in jobs):
                 if notes:  # 等 GPU 期间 owner 说的话留到恢复时一起给
-                    _update(repo, run_id, pending_json=_dumps(
-                        {**pending, "notes": pending.get("notes", []) + notes}))
+                    if not _update_if_active(repo, run_id, pending_json=_dumps(
+                            {**pending, "notes": pending.get("notes", []) + notes})):
+                        return _terminal_status(repo, run_id)
                 return status
+            step_t0 = time.monotonic()
             described = (profile.describe_jobs(env, job_ids) if profile.describe_jobs
                          else describe_jobs(repo, credentials, project, job_ids))
             if isinstance(described, Pause):
@@ -539,7 +629,12 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                 pending = {**pending, "payload": described.payload}
                 if notes:  # 等待期间 owner 说的话留到恢复时一起给
                     pending["notes"] = list(pending.get("notes", [])) + notes
-                _update(repo, run_id, pending_json=_dumps(pending))
+                elapsed = max(0.0, time.monotonic() - step_t0)
+                if not _update_if_active(repo, run_id, pending_json=_dumps(pending),
+                                         active_seconds=active_seconds + elapsed,
+                                         last_active_at=utc_now()):
+                    _cancel_active_jobs(repo, run_id)
+                    return _terminal_status(repo, run_id)
                 return "waiting_jobs"
             text = described
             notes = pending.get("notes", []) + notes
@@ -549,19 +644,30 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                                                      "summary": text[:3000]})
             status, pending = "running", None
 
+        assert step_t0 is not None
+
+        def _active_now() -> float:
+            return active_seconds + max(0.0, time.monotonic() - step_t0)
+
         if notes:
             _append_user_blocks(messages, [{"type": "text", "text":
                                 "owner 插话:\n" + "\n\n".join(notes)}])
 
         # 3) 硬预算(步数 / tokens / wall-clock)
         if row["steps"] >= profile.max_steps:
-            return _finish_by_budget(repo, run_id, messages, f"步数上限 {profile.max_steps}")
+            return _finish_by_budget(repo, run_id, messages,
+                                     f"步数上限 {profile.max_steps}",
+                                     active_seconds=_active_now())
         if row["tokens_in"] + row["tokens_out"] >= profile.max_tokens:
-            return _finish_by_budget(repo, run_id, messages, f"tokens 上限 {profile.max_tokens}")
-        if profile.wall_clock_seconds and active_seconds >= profile.wall_clock_seconds:
+            return _finish_by_budget(repo, run_id, messages,
+                                     f"tokens 上限 {profile.max_tokens}",
+                                     active_seconds=_active_now())
+        cur_active = _active_now()
+        if profile.wall_clock_seconds and cur_active >= profile.wall_clock_seconds:
             return _finish_by_budget(
                 repo, run_id, messages,
-                f"wall-clock {profile.wall_clock_seconds}s(活跃 {int(active_seconds)}s)")
+                f"wall-clock {profile.wall_clock_seconds}s(活跃 {int(cur_active)}s)",
+                active_seconds=cur_active)
 
         # 4) 调模型(spec 快照在首次调用前固化,之后只读)
         tools = profile.build_tools(env)
@@ -572,8 +678,8 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
         if not row["spec_hash"]:
             snapshot = build_agent_spec(profile, credentials, tools,
                                         overlay=overlay or None)
-            _update(repo, run_id, spec_json=_dumps(snapshot.to_dict()),
-                    spec_hash=snapshot.spec_hash())
+            _update_if_active(repo, run_id, spec_json=_dumps(snapshot.to_dict()),
+                              spec_hash=snapshot.spec_hash())
         view = _compact_view(messages, profile.keep_recent)
         tool_specs = [t.spec() for t in tools]
         model_override = profile.model_override or None
@@ -592,24 +698,47 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                               output_obj={"error": str(exc)[:2000]}, attempt=streak,
                               error_class=type(exc).__name__,
                               started_at=started_at, ended_at=ended_at)
-            if streak >= profile.max_consecutive_model_errors:
-                _update(repo, run_id, status="failed",
-                        stop_reason=f"模型连续失败 {streak} 次",
-                        messages_json=_dumps(messages), pending_json=None,
-                        error_streak=streak)
+            cur_active = _active_now()
+            fatal = (isinstance(exc, FatalModelError)
+                     or getattr(exc, "retryable", True) is False)
+            if fatal or streak >= profile.max_consecutive_model_errors:
+                stop_reason = (f"模型不可重试错误:{str(exc)[:200]}"
+                               if fatal else f"模型连续失败 {streak} 次")
+                if not _update_if_active(
+                    repo, run_id, status="failed", stop_reason=stop_reason,
+                    messages_json=_dumps(messages), pending_json=None,
+                    error_streak=streak, active_seconds=cur_active,
+                    last_active_at=utc_now(),
+                ):
+                    return _terminal_status(repo, run_id)
                 record_event(repo, run_id, "failed",
-                             {"error": str(exc)[:500], "streak": streak})
+                             {"error": str(exc)[:500], "streak": streak, "fatal": fatal})
+                notify.notify_run(repo, row, "failed", detail=stop_reason)
                 _cancel_active_jobs(repo, run_id)
                 return "failed"
+            if profile.wall_clock_seconds and cur_active >= profile.wall_clock_seconds:
+                return _finish_by_budget(
+                    repo, run_id, messages,
+                    f"wall-clock {profile.wall_clock_seconds}s(活跃 {int(cur_active)}s)",
+                    active_seconds=cur_active,
+                    extra_fields={"error_streak": streak},
+                )
             # 模型不可用:保存已拼好的上下文,留在 running 等下一次 tick 退避重试
-            _update(repo, run_id, status="running", messages_json=_dumps(messages),
-                    pending_json=None, error_streak=streak)
+            if not _update_if_active(
+                repo, run_id, status="running", messages_json=_dumps(messages),
+                pending_json=None, error_streak=streak,
+                active_seconds=cur_active, last_active_at=utc_now(),
+            ):
+                return _terminal_status(repo, run_id)
             record_event(repo, run_id, "model_error",
                          {"error": str(exc)[:500], "streak": streak})
             return "running"
+
         content = [b for b in response.get("content") or []
                    if b.get("type") in ("text", "tool_use")]
         usage = response.get("usage") or {}
+        llm_tok_in = int(usage.get("input_tokens") or 0)
+        llm_tok_out = int(usage.get("output_tokens") or 0)
         messages.append({"role": "assistant", "content": content})
         text = _text_of(content)
         truncated = response.get("stop_reason") == "max_tokens"
@@ -617,106 +746,119 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
             repo, run_id, step_no, "llm", model_id,
             status="truncated" if truncated else "ok",
             input_obj=llm_in, output_obj=response,
-            tokens_in=int(usage.get("input_tokens") or 0),
-            tokens_out=int(usage.get("output_tokens") or 0),
+            tokens_in=llm_tok_in, tokens_out=llm_tok_out,
             started_at=started_at, ended_at=utc_now())
         if text:
             record_event(repo, run_id, "assistant", {"text": text[:6000]})
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
 
-        fields: dict[str, Any] = {
-            "steps": step_no,
-            "tokens_in": row["tokens_in"] + int(usage.get("input_tokens") or 0),
-            "tokens_out": row["tokens_out"] + int(usage.get("output_tokens") or 0),
-            "error_streak": 0,
-        }
         if truncated:
             # max_tokens 截断:本步工具一律不执行(半截参数只会引祸),提示 agent
             # 缩小单次输出后重试;状态保持 running,不等人
-            record_event(repo, run_id, "llm_truncated", {"step": step_no})
-            # assistant 的 tool_use 后必须跟 tool_result(消息约定),否则端点 400:
-            # 对本次 content 里的每个 tool_use 补一个 is_error 的 tool_result,再跟 text 提示
             blocks = [_tool_result(
                 use["id"], "上一条回复因 max_tokens 被截断,该调用未执行;请缩小输出后重试",
                 error=True) for use in tool_uses]
             blocks.append({"type": "text", "text": TRUNCATED_HINT})
             _append_user_blocks(messages, blocks)
-            fields.update(status="running", pending_json=None,
-                          messages_json=_dumps(messages), last_active_at=utc_now())
-            _update(repo, run_id, **fields)
+            cur_active = _active_now()
+            step_fields = {
+                "steps": step_no,
+                "tokens_in": row["tokens_in"] + llm_tok_in,
+                "tokens_out": row["tokens_out"] + llm_tok_out,
+                "error_streak": 0,
+            }
+            if profile.wall_clock_seconds and cur_active >= profile.wall_clock_seconds:
+                record_event(repo, run_id, "llm_truncated", {"step": step_no})
+                return _finish_by_budget(
+                    repo, run_id, messages,
+                    f"wall-clock {profile.wall_clock_seconds}s(活跃 {int(cur_active)}s)",
+                    active_seconds=cur_active, extra_fields=step_fields,
+                )
+            step_fields.update(status="running", pending_json=None,
+                               messages_json=_dumps(messages),
+                               active_seconds=cur_active, last_active_at=utc_now())
+            if not _update_if_active(repo, run_id, **step_fields):
+                return _terminal_status(repo, run_id)
+            record_event(repo, run_id, "llm_truncated", {"step": step_no})
             return "running"
 
         new_status, new_pending, result, reset = "running", None, None, None
         results: list[dict] = []
-        if not tool_uses:
-            # 纯文本回复 = 对 owner 说话:等人回
-            new_status = "waiting_human"
-            new_pending = {"kind": "human", "tool_use_id": None,
-                           "payload": {"question": text}}
-            record_event(repo, run_id, "waiting_human", {"question": text[:4000]})
-        for use in tool_uses:
-            name, args = use.get("name", ""), use.get("input") or {}
-            record_event(repo, run_id, "tool_call", {"name": name, "input": args})
-            tool = tool_map.get(name)
-            if tool is None:
-                results.append(_tool_result(use["id"], f"未知工具 {name}", error=True))
-                trace.record_span(repo, run_id, step_no, "tool", name, status="error",
-                                  error_class="unknown_tool", input_obj=args,
-                                  output_obj={"type": "tool_error",
-                                              "message": f"未知工具 {name}"})
-                continue
-            if new_pending is not None or result is not None or reset is not None:
-                results.append(_tool_result(
-                    use["id"], "本步已暂停/结束,该调用未执行;恢复后需要请重新调用",
-                    error=True))
-                continue
-            tool_started = utc_now()
-            try:
-                output = tool.handler(env, args)
-            except UserError as exc:  # 工具里的业务错误(含 ToolError)回给 agent
-                output = ToolError(str(exc))
-            except Exception as exc:  # 工具自身故障也只是观察,agent 自适应
-                output = ToolError(f"工具执行失败:{exc}")
-            span_status, span_error, span_output = _tool_span_output(output)
-            trace.record_span(repo, run_id, step_no, "tool", name, status=span_status,
-                              error_class=span_error, input_obj=args,
-                              output_obj=span_output, started_at=tool_started,
-                              ended_at=utc_now())
-            if isinstance(output, ToolError):
-                results.append(_tool_result(use["id"], str(output), error=True))
-                record_event(repo, run_id, "tool_error", {"name": name,
-                                                          "error": str(output)[:2000]})
-            elif isinstance(output, Pause):
-                new_status = "waiting_human" if output.kind == "human" else "waiting_jobs"
-                new_pending = {"kind": output.kind, "tool_use_id": use["id"],
-                               "payload": output.payload}
-                record_event(repo, run_id, new_status, output.payload)
-            elif isinstance(output, NewContext):
-                reset = output.seed
-                results.append(_tool_result(use["id"], "已翻篇"))
-                record_event(repo, run_id, "new_context", {"seed": reset[:4000]})
-            elif isinstance(output, Finish):
-                rejection = profile.on_finish(env, output.payload)
-                trace.record_span(repo, run_id, step_no, "verify", "on_finish",
-                                  input_obj=output.payload,
-                                  output_obj={"rejected": bool(rejection),
-                                              "reason": rejection})
-                if rejection:
-                    results.append(_tool_result(use["id"], f"验收未通过:{rejection}",
-                                                error=True))
-                    record_event(repo, run_id, "finish_rejected", {"reason": rejection})
+        with trace.span_context(repo, run_id, step_no) as extra_tokens:
+            if not tool_uses:
+                # 纯文本回复 = 对 owner 说话:等人回
+                new_status = "waiting_human"
+                new_pending = {"kind": "human", "tool_use_id": None,
+                               "payload": {"question": text}}
+                record_event(repo, run_id, "waiting_human", {"question": text[:4000]})
+            for use in tool_uses:
+                name, args = use.get("name", ""), use.get("input") or {}
+                record_event(repo, run_id, "tool_call", {"name": name, "input": args})
+                tool = tool_map.get(name)
+                if tool is None:
+                    results.append(_tool_result(use["id"], f"未知工具 {name}", error=True))
+                    trace.record_span(repo, run_id, step_no, "tool", name, status="error",
+                                      error_class="unknown_tool", input_obj=args,
+                                      output_obj={"type": "tool_error",
+                                                  "message": f"未知工具 {name}"})
+                    continue
+                if new_pending is not None or result is not None or reset is not None:
+                    results.append(_tool_result(
+                        use["id"], "本步已暂停/结束,该调用未执行;恢复后需要请重新调用",
+                        error=True))
+                    continue
+                tool_started = utc_now()
+                try:
+                    output = tool.handler(env, args)
+                except UserError as exc:  # 工具里的业务错误(含 ToolError)回给 agent
+                    output = ToolError(str(exc))
+                except Exception as exc:  # 工具自身故障也只是观察,agent 自适应
+                    output = ToolError(f"工具执行失败:{exc}")
+                span_status, span_error, span_output = _tool_span_output(output)
+                trace.record_span(repo, run_id, step_no, "tool", name, status=span_status,
+                                  error_class=span_error, input_obj=args,
+                                  output_obj=span_output, started_at=tool_started,
+                                  ended_at=utc_now())
+                if isinstance(output, ToolError):
+                    results.append(_tool_result(use["id"], str(output), error=True))
+                    record_event(repo, run_id, "tool_error", {"name": name,
+                                                              "error": str(output)[:2000]})
+                elif isinstance(output, Pause):
+                    new_status = "waiting_human" if output.kind == "human" else "waiting_jobs"
+                    new_pending = {"kind": output.kind, "tool_use_id": use["id"],
+                                   "payload": output.payload}
+                    record_event(repo, run_id, new_status, output.payload)
+                elif isinstance(output, NewContext):
+                    reset = output.seed
+                    results.append(_tool_result(use["id"], "已翻篇"))
+                    record_event(repo, run_id, "new_context", {"seed": reset[:4000]})
+                elif isinstance(output, Finish):
+                    rejection = profile.on_finish(env, output.payload)
+                    trace.record_span(repo, run_id, step_no, "verify", "on_finish",
+                                      input_obj=output.payload,
+                                      output_obj={"rejected": bool(rejection),
+                                                  "reason": rejection})
+                    if rejection:
+                        results.append(_tool_result(use["id"], f"验收未通过:{rejection}",
+                                                    error=True))
+                        record_event(repo, run_id, "finish_rejected", {"reason": rejection})
+                    else:
+                        result = output.payload
+                        results.append(_tool_result(use["id"], "已验收,会话结束"))
                 else:
-                    result = output.payload
-                    results.append(_tool_result(use["id"], "已验收,会话结束"))
-            else:
-                results.append(_tool_result(use["id"], str(output)))
-                record_event(repo, run_id, "tool_result",
-                             {"name": name, "output": str(output)[:3000]})
+                    results.append(_tool_result(use["id"], str(output)))
+                    record_event(repo, run_id, "tool_result",
+                                 {"name": name, "output": str(output)[:3000]})
 
+        fields: dict[str, Any] = {
+            "steps": step_no,
+            "tokens_in": row["tokens_in"] + llm_tok_in + extra_tokens["tokens_in"],
+            "tokens_out": row["tokens_out"] + llm_tok_out + extra_tokens["tokens_out"],
+            "error_streak": 0,
+        }
         if result is not None:
             _append_user_blocks(messages, results)
             fields.update(status="done", pending_json=None, result_json=_dumps(result))
-            record_event(repo, run_id, "done", result)
             new_status = "done"
         elif new_pending is not None:
             # 暂停:其余工具结果先存着,恢复时与暂停工具的结果一起回填
@@ -728,24 +870,56 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
         else:
             _append_user_blocks(messages, results)
             fields.update(status="running", pending_json=None)
+
+        cur_active = _active_now()
+        if new_status != "done" and profile.wall_clock_seconds \
+                and cur_active >= profile.wall_clock_seconds:
+            return _finish_by_budget(
+                repo, run_id, messages,
+                f"wall-clock {profile.wall_clock_seconds}s(活跃 {int(cur_active)}s)",
+                active_seconds=cur_active,
+                extra_fields={
+                    "steps": step_no,
+                    "tokens_in": fields["tokens_in"],
+                    "tokens_out": fields["tokens_out"],
+                    "error_streak": 0,
+                },
+            )
+
         fields["messages_json"] = _dumps(messages)
+        fields["active_seconds"] = cur_active
         fields["last_active_at"] = utc_now()
-        _update(repo, run_id, **fields)
-        if new_status == "waiting_human":
+        if not _update_if_active(repo, run_id, **fields):
+            _cancel_active_jobs(repo, run_id)
+            return _terminal_status(repo, run_id)
+        if new_status == "done":
+            record_event(repo, run_id, "done", result)
+            notify.notify_run(repo, row, "done", detail=notify.finish_detail(result))
+        elif new_status == "waiting_human":
             notify.notify_run(repo, row, "waiting_human", detail=str(
                 ((new_pending or {}).get("payload") or {}).get("question") or "")[:500])
-        elif new_status == "done":
-            notify.notify_run(repo, row, "done", detail=notify.finish_detail(result))
         return new_status
     finally:
         env.close()
 
 
 def _finish_by_budget(repo: Repo, run_id: str, messages: list[dict],
-                      reason: str) -> str:
+                      reason: str, *, active_seconds: float | None = None,
+                      extra_fields: dict[str, Any] | None = None) -> str:
     row = _row(repo, run_id) or {"id": run_id}
-    _update(repo, run_id, status="stopped", stop_reason=f"预算耗尽:{reason}",
-            messages_json=_dumps(messages), pending_json=None)
+    fields: dict[str, Any] = {
+        **(extra_fields or {}),
+        "status": "stopped",
+        "stop_reason": f"预算耗尽:{reason}",
+        "messages_json": _dumps(messages),
+        "pending_json": None,
+        "last_active_at": utc_now(),
+    }
+    if active_seconds is not None:
+        fields["active_seconds"] = active_seconds
+    if not _update_if_active(repo, run_id, **fields):
+        _cancel_active_jobs(repo, run_id)
+        return _terminal_status(repo, run_id)
     record_event(repo, run_id, "stopped", {"by": "budget", "reason": reason})
     notify.notify_run(repo, row, "stopped", detail=f"预算耗尽:{reason}")
     _cancel_active_jobs(repo, run_id)
@@ -755,8 +929,8 @@ def _finish_by_budget(repo: Repo, run_id: str, messages: list[dict],
 # ------------------------------------------------------------------ 驱动线程
 
 class AgentLoopManager:
-    """serve 进程内的驱动:每个活跃会话一个工作线程,互不阻塞
-    (一次模型调用可能几分钟,等 GPU 可能几小时)。"""
+    """serve 进程内的驱动:每个需推进的会话一个工作线程,互不阻塞
+    (一次模型调用可能几分钟,挂起等人工/等 GPU 时零轮询零占槽)。"""
 
     def __init__(self, repo: Repo, credentials: CredentialStore | None,
                  profiles: dict[str, LoopProfile], *, interval: float = 3.0,
@@ -770,26 +944,125 @@ class AgentLoopManager:
         self.max_concurrent = max(1, int(max_concurrent))
         self.model_error_backoff = model_error_backoff
         self._busy: set[str] = set()
+        self._threads: dict[str, Any] = {}
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         _reset_active_anchors(repo)
-    
+
+    def stop(self, timeout: float = 0.0) -> None:
+        """通知管理器与在途工作线程停止推进;可选等待在途单步收敛。"""
+        self._stop.set()
+        if timeout <= 0:
+            return
+        deadline = time.monotonic() + timeout
+        with self._lock:
+            threads = list(self._threads.values())
+        for thread in threads:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            if hasattr(thread, "join"):
+                thread.join(timeout=remaining)
+
     def active_run_ids(self) -> list[tuple[str, str]]:
+        """返回此刻真正需要推进的会话列表(running 最高优先级;waiting 仅当唤醒条件就绪)。"""
+        custom_get_job = "get_job" in vars(self.repo)
         conn = self.repo.db.connect()
         try:
-            rows = conn.execute(
-                "SELECT id, kind FROM agent_runs WHERE status IN"
-                f" ({','.join('?' * len(ACTIVE_STATUSES))})",
-                ACTIVE_STATUSES).fetchall()
+            running = [
+                (r["id"], r["kind"])
+                for r in conn.execute(
+                    "SELECT id, kind FROM agent_runs WHERE status = 'running'"
+                    " ORDER BY created_at ASC, rowid ASC"
+                ).fetchall()
+            ]
+            ready_human = [
+                (r["id"], r["kind"])
+                for r in conn.execute(
+                    "SELECT r.id, r.kind FROM agent_runs r"
+                    " WHERE r.status = 'waiting_human'"
+                    " AND EXISTS ("
+                    "   SELECT 1 FROM agent_run_inbox i"
+                    "   WHERE i.run_id = r.id AND i.consumed_at IS NULL"
+                    " )"
+                    " ORDER BY r.created_at ASC, r.rowid ASC"
+                ).fetchall()
+            ]
+            job_rows = conn.execute(
+                "SELECT id, kind, pending_json FROM agent_runs"
+                " WHERE status = 'waiting_jobs'"
+                " ORDER BY created_at ASC, rowid ASC"
+            ).fetchall()
+            ready_jobs: list[tuple[str, str]] = []
+            if job_rows:
+                stop_runs = {
+                    r["run_id"]
+                    for r in conn.execute(
+                        "SELECT DISTINCT run_id FROM agent_run_inbox"
+                        " WHERE consumed_at IS NULL AND kind = 'stop'"
+                    ).fetchall()
+                }
+                needed_job_ids: list[str] = []
+                parsed_jobs: list[tuple[str, str, list[str]]] = []
+                for row in job_rows:
+                    run_id, kind = row["id"], row["kind"]
+                    if run_id in stop_runs:
+                        ready_jobs.append((run_id, kind))
+                        continue
+                    pending = _loads(row["pending_json"], {})
+                    jids = [
+                        str(j)
+                        for j in ((pending or {}).get("payload") or {}).get("job_ids") or []
+                        if j
+                    ]
+                    if not jids:
+                        ready_jobs.append((run_id, kind))
+                        continue
+                    parsed_jobs.append((run_id, kind, jids))
+                    needed_job_ids.extend(jids)
+
+                job_statuses: dict[str, str | None] = {}
+                unique_jids = list(dict.fromkeys(needed_job_ids))
+                if custom_get_job:
+                    for jid in unique_jids:
+                        job = self.repo.get_job(jid)
+                        job_statuses[jid] = job["status"] if job is not None else None
+                else:
+                    for idx in range(0, len(unique_jids), 900):
+                        chunk = unique_jids[idx:idx + 900]
+                        placeholders = ",".join("?" * len(chunk))
+                        found = {
+                            jr["id"]: jr["status"]
+                            for jr in conn.execute(
+                                f"SELECT id, status FROM jobs WHERE id IN ({placeholders})",
+                                chunk,
+                            ).fetchall()
+                        }
+                        for jid in chunk:
+                            job_statuses[jid] = found.get(jid)
+
+                for run_id, kind, jids in parsed_jobs:
+                    if all(
+                        job_statuses.get(jid) is None
+                        or job_statuses[jid] in TERMINAL_JOB_STATUSES
+                        for jid in jids
+                    ):
+                        ready_jobs.append((run_id, kind))
         finally:
             conn.close()
-        return [(r["id"], r["kind"]) for r in rows]
+        return [*running, *ready_human, *ready_jobs]
 
     def tick(self) -> None:
         """最多补到 max_concurrent 个在驱动的会话;其余下一轮 tick 再启动。"""
+        if self._stop.is_set():
+            return
+        candidates = self.active_run_ids()
         started: list[tuple[str, LoopProfile]] = []
         with self._lock:
+            if self._stop.is_set():
+                return
             slots = self.max_concurrent - len(self._busy)
-            for run_id, kind in self.active_run_ids():
+            for run_id, kind in candidates:
                 if slots <= 0:
                     break
                 profile = self.profiles.get(kind)
@@ -799,30 +1072,35 @@ class AgentLoopManager:
                 started.append((run_id, profile))
                 slots -= 1
         for run_id, profile in started:
-            threading.Thread(target=self._drive, args=(run_id, profile),
-                             daemon=True, name=f"agent-run-{run_id}").start()
+            thread = threading.Thread(
+                target=self._drive, args=(run_id, profile),
+                daemon=True, name=f"agent-run-{run_id}",
+            )
+            with self._lock:
+                self._threads[run_id] = thread
+            thread.start()
 
     def _drive(self, run_id: str, profile: LoopProfile) -> None:
-        """running 时连续推进;暂停或结束就退出,交回 tick 轮询。"""
+        """running 时连续推进;暂停、结束或收到停机信号即退出。"""
         try:
-            while True:
+            while not self._stop.is_set():
                 status = step(self.repo, self.credentials, run_id, profile,
                               model=self.model)
-                if status != "running":
+                if status != "running" or self._stop.is_set():
                     return
                 row = _row(self.repo, run_id)
                 if row is None or row["status"] != "running":
                     return
                 # model_error 时 step 原地返回 running:按错误连击退避,别打满端点
-                if row["error_streak"]:
-                    time.sleep(self.model_error_backoff)
+                if row["error_streak"] and self._stop.wait(self.model_error_backoff):
+                    return
         except Exception as exc:  # 运行时自身 bug:终结会话并留因,不明灭
             try:
-                _update(self.repo, run_id, status="failed",
-                        stop_reason=f"运行时异常:{str(exc)[:300]}")
-                record_event(self.repo, run_id, "failed", {"error": str(exc)[:2000]})
-                notify.notify_run(self.repo, _row(self.repo, run_id) or {"id": run_id},
-                                  "failed", detail=f"运行时异常:{str(exc)[:300]}")
+                if _update_if_active(self.repo, run_id, status="failed",
+                                     stop_reason=f"运行时异常:{str(exc)[:300]}"):
+                    record_event(self.repo, run_id, "failed", {"error": str(exc)[:2000]})
+                    notify.notify_run(self.repo, _row(self.repo, run_id) or {"id": run_id},
+                                      "failed", detail=f"运行时异常:{str(exc)[:300]}")
                 _cancel_active_jobs(self.repo, run_id)
             except Exception:  # 磁盘满/IO 故障时连留痕都写不进:至少别炸线程
                 print(f"autolab-control: driver crash-logging failed (run {run_id}):"
@@ -830,12 +1108,13 @@ class AgentLoopManager:
         finally:
             with self._lock:
                 self._busy.discard(run_id)
+                self._threads.pop(run_id, None)
 
     def run_forever(self, stop: threading.Event | None = None) -> None:
-        stop = stop or threading.Event()
-        while not stop.is_set():
+        wait_event = stop or self._stop
+        while not self._stop.is_set() and not wait_event.is_set():
             try:
                 self.tick()
             except Exception as exc:
                 print(f"autolab-control: agent loop tick failed: {exc}")
-            stop.wait(self.interval)
+            wait_event.wait(self.interval)

@@ -11,7 +11,11 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
+from ..core.db import utc_now
+from ..core.repo import Repo
+from . import trace
 from .model import call_model
 
 _CRITIC_VERDICTS = ("approve", "revise", "reject")
@@ -48,11 +52,13 @@ def _ask_json(credentials, system: str, user: str, *, max_tokens: int = 800) -> 
     去掉 ```json fence,取第一个 `{` 到最后一个 `}` 再 json.loads;解析结果附带
     响应 usage(供事件留痕)。所有异常都吞掉——fail-open 是硬要求。
     """
+    usage: dict[str, Any] = {}
     try:
         response = call_model(credentials, system=system, max_tokens=max_tokens,
                               messages=[{"role": "user",
                                          "content": [{"type": "text", "text": user}]}],
                               tools=[])
+        usage = response.get("usage") or {}
         text = "".join(str(b.get("text") or "") for b in response.get("content") or []
                        if isinstance(b, dict) and b.get("type") == "text")
         text = text.strip()
@@ -64,10 +70,14 @@ def _ask_json(credentials, system: str, user: str, *, max_tokens: int = 800) -> 
         payload = json.loads(text[start:end + 1])
         if not isinstance(payload, dict):
             raise ValueError(f"顶层不是 JSON 对象:{type(payload).__name__}")
-        payload["usage"] = response.get("usage") or {}
+        payload["usage"] = usage
         return payload
     except Exception as exc:  # noqa: BLE001 - 审阅器故障必须 fail-open
-        return {"error": str(exc)[:300], "unavailable": True}
+        out: dict[str, Any] = {"error": str(exc)[:300], "unavailable": True,
+                               "_error_class": type(exc).__name__}
+        if usage:
+            out["_raw_usage"] = usage
+        return out
 
 
 def _norm(value) -> str:
@@ -85,13 +95,51 @@ def _fail_open(payload: dict, *, verdict: str, note: str,
     return out
 
 
+def _record_audit(name: str, *, input_obj: Any, output_obj: dict,
+                  raw_usage: dict | None, error_class: str = "",
+                  started_at: str = "", ended_at: str = "",
+                  repo: Repo | None = None, run_id: str = "",
+                  step_no: int = 0) -> None:
+    """记录 critic/reviewer 的 verify span 并把 token 消耗累加到会话账本。"""
+    try:
+        ctx = trace.current_span_context()
+        if repo is None and ctx is not None:
+            repo = ctx[0]
+        if not run_id and ctx is not None:
+            run_id = ctx[1]
+        if not step_no and ctx is not None:
+            step_no = ctx[2]
+        if repo is None or not run_id:
+            return
+        usage = raw_usage or {}
+        tok_in = max(0, int(usage.get("input_tokens") or 0))
+        tok_out = max(0, int(usage.get("output_tokens") or 0))
+        status = "error" if output_obj.get("unavailable") else "ok"
+        trace.record_span(
+            repo, run_id, int(step_no or 0), "verify", name,
+            status=status,
+            error_class=error_class if status == "error" else "",
+            input_obj=input_obj,
+            output_obj=output_obj,
+            tokens_in=tok_in,
+            tokens_out=tok_out,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+        trace.accrue_run_tokens(repo, run_id, tok_in, tok_out)
+    except Exception:  # noqa: BLE001 - 审计落库故障绝不破坏 fail-open
+        return
+
+
 def critique_experiment(credentials, *, purpose: str, jobs: list[dict],
                         metrics: list[dict], contract: dict | None,
-                        pool: dict, cases: list[dict]) -> dict:
+                        pool: dict, cases: list[dict],
+                        repo: Repo | None = None, run_id: str = "",
+                        step_no: int = 0) -> dict:
     """返回 {"verdict": "approve|revise|reject", "reasons": [...],
              "suggestions": [...], "usage": {...}};基础设施失败 → approve+unavailable。"""
     eval_cfg = (contract or {}).get("eval") or {}
-    user = json.dumps({
+    user_obj = {
         "purpose": purpose,
         "jobs": [{"name": j.get("name"), "command": j.get("command"),
                   "dataset": j.get("dataset"), "variant": j.get("variant"),
@@ -111,30 +159,51 @@ def critique_experiment(credentials, *, purpose: str, jobs: list[dict],
                          "failureClass": c.get("failureClass"),
                          "meanGain": c.get("meanGain")}
                         for c in (cases or [])[:5]],
-    }, ensure_ascii=False)
+    }
+    user = json.dumps(user_obj, ensure_ascii=False)
+    started_at = utc_now()
     payload = _ask_json(credentials, _CRITIC_SYSTEM, user)
+    ended_at = utc_now()
+    raw_usage = payload.get("usage") or payload.get("_raw_usage") or {}
     if payload.get("unavailable"):
-        return {**_fail_open(payload, verdict="approve", note="critic 不可用,放行"),
-                "suggestions": [], "usage": {}}
+        out = {**_fail_open(payload, verdict="approve", note="critic 不可用,放行"),
+               "suggestions": [], "usage": {}}
+        _record_audit("critic", input_obj=user_obj, output_obj=out,
+                      raw_usage=raw_usage,
+                      error_class=str(payload.get("_error_class") or "critic_unavailable"),
+                      started_at=started_at, ended_at=ended_at,
+                      repo=repo, run_id=run_id, step_no=step_no)
+        return out
     raw_verdict = payload.get("verdict")
     verdict = _norm(raw_verdict)
     if verdict not in _CRITIC_VERDICTS:
-        return {**_fail_open(payload, verdict="approve",
-                             note=f"critic 输出非法 verdict:{raw_verdict!r}",
-                             model_reasons=_clip(payload.get("reasons"))),
-                "suggestions": [], "usage": {}}
-    return {"verdict": verdict, "reasons": _clip(payload.get("reasons")),
-            "suggestions": _clip(payload.get("suggestions")),
-            "usage": payload.get("usage") or {}}
+        out = {**_fail_open(payload, verdict="approve",
+                            note=f"critic 输出非法 verdict:{raw_verdict!r}",
+                            model_reasons=_clip(payload.get("reasons"))),
+               "suggestions": [], "usage": {}}
+        _record_audit("critic", input_obj=user_obj, output_obj=out,
+                      raw_usage=raw_usage, error_class="invalid_verdict",
+                      started_at=started_at, ended_at=ended_at,
+                      repo=repo, run_id=run_id, step_no=step_no)
+        return out
+    out = {"verdict": verdict, "reasons": _clip(payload.get("reasons")),
+           "suggestions": _clip(payload.get("suggestions")),
+           "usage": payload.get("usage") or {}}
+    _record_audit("critic", input_obj=user_obj, output_obj=out,
+                  raw_usage=raw_usage, started_at=started_at, ended_at=ended_at,
+                  repo=repo, run_id=run_id, step_no=step_no)
+    return out
 
 
 def review_round(credentials, *, report: dict, evaluation: dict,
-                 evidence: dict, contract: dict | None) -> dict:
+                 evidence: dict, contract: dict | None,
+                 repo: Repo | None = None, run_id: str = "",
+                 step_no: int = 0) -> dict:
     """返回 {"verdict": "valid|suspect", "severity": "low|medium|high",
              "reasons": [...], "usage": {...}};失败 → valid+unavailable。"""
     evd = evidence or {}
     code = evd.get("code") or {}
-    user = json.dumps({
+    user_obj = {
         "report": {k: report.get(k) for k in
                    ("hypothesis", "changes", "analysis", "nextIdea", "kept", "verdict")},
         "evaluation": {"rows": evaluation.get("rows"), "means": evaluation.get("means"),
@@ -148,19 +217,38 @@ def review_round(credentials, *, report: dict, evaluation: dict,
                      "evidenceHash": evd.get("evidenceHash"),
                      "codeDirty": code.get("dirty"), "gitHead": code.get("gitHead")},
         "contract": contract,
-    }, ensure_ascii=False)
+    }
+    user = json.dumps(user_obj, ensure_ascii=False)
+    started_at = utc_now()
     payload = _ask_json(credentials, _REVIEWER_SYSTEM, user)
+    ended_at = utc_now()
+    raw_usage = payload.get("usage") or payload.get("_raw_usage") or {}
     if payload.get("unavailable"):
-        return {**_fail_open(payload, verdict="valid", note="reviewer 不可用,放行"),
-                "severity": "low", "usage": {}}
+        out = {**_fail_open(payload, verdict="valid", note="reviewer 不可用,放行"),
+               "severity": "low", "usage": {}}
+        _record_audit("reviewer", input_obj=user_obj, output_obj=out,
+                      raw_usage=raw_usage,
+                      error_class=str(payload.get("_error_class") or "reviewer_unavailable"),
+                      started_at=started_at, ended_at=ended_at,
+                      repo=repo, run_id=run_id, step_no=step_no)
+        return out
     raw_verdict, raw_severity = payload.get("verdict"), payload.get("severity")
     verdict, severity = _norm(raw_verdict), _norm(raw_severity)
     if verdict not in _REVIEW_VERDICTS or \
             (verdict == "suspect" and severity not in _SEVERITIES):
-        return {**_fail_open(payload, verdict="valid",
-                             note=f"reviewer 输出非法 verdict/severity:"
-                                  f"{raw_verdict!r}/{raw_severity!r}",
-                             model_reasons=_clip(payload.get("reasons"))),
-                "severity": "low", "usage": {}}
-    return {"verdict": verdict, "severity": severity or "low",
-            "reasons": _clip(payload.get("reasons")), "usage": payload.get("usage") or {}}
+        out = {**_fail_open(payload, verdict="valid",
+                            note=f"reviewer 输出非法 verdict/severity:"
+                                 f"{raw_verdict!r}/{raw_severity!r}",
+                            model_reasons=_clip(payload.get("reasons"))),
+               "severity": "low", "usage": {}}
+        _record_audit("reviewer", input_obj=user_obj, output_obj=out,
+                      raw_usage=raw_usage, error_class="invalid_verdict",
+                      started_at=started_at, ended_at=ended_at,
+                      repo=repo, run_id=run_id, step_no=step_no)
+        return out
+    out = {"verdict": verdict, "severity": severity or "low",
+           "reasons": _clip(payload.get("reasons")), "usage": payload.get("usage") or {}}
+    _record_audit("reviewer", input_obj=user_obj, output_obj=out,
+                  raw_usage=raw_usage, started_at=started_at, ended_at=ended_at,
+                  repo=repo, run_id=run_id, step_no=step_no)
+    return out
