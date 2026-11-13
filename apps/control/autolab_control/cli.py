@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import IO
 
 from . import __version__
+from .acceptance import add_acceptance_parser, run_acceptance_cli
 from .agent.runtime import AgentLoopManager
 from .core.credentials import CredentialStore
 from .core.db import Database
@@ -120,7 +121,10 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--poll-interval", type=float, default=0.2)
     serve.add_argument("--http-port", type=int, default=0,
                        help="also serve the loopback web API on this port (0 = off)")
+    add_acceptance_parser(sub)
     args = parser.parse_args(argv)
+    if args.command == "acceptance":
+        return run_acceptance_cli(args)
 
     db = Database(args.db)
     credentials = CredentialStore(args.credentials)  # 尽早校验 0600 权限
