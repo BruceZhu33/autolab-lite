@@ -383,55 +383,95 @@ def test_wp5_clean_validation_worktree_command_guards_and_adopt(api, tmp_path): 
     assert (val_wd / "helper_mod.py").read_text(encoding="utf-8") == "FACTOR = 2\n"
     assert (val_wd / "data" / "kvasir.bin").exists()
 
-    # 验证模式下:缺 dataset 被拒;含 && / ; / > 等 shell 操作符被拒;合法命令指向干净 val_wd
-    vstate: dict = {}
-    vmodel = ScriptModel([
-        # 1) 缺 dataset -> ToolError
-        [use("bad1", "run_experiment", purpose="missing ds", metrics=["val_dice"],
-             jobs=[{"name": "j1", "command": "python train.py --seed 1"}])],
-        # 2) 含复合/重定向操作符 -> ToolError
-        [use("bad2", "run_experiment", purpose="shell injection", metrics=["val_dice"],
-             jobs=[{"name": "j1", "dataset": "kvasir",
-                    "command": "python train.py --seed 1 && echo hacked > train.py"}])],
-        # 3) 读取 train.py 确认读到的是干净 worktree 而非被破坏的主工作区,随后提交合规实验
-        [use("rd", "read_file", path="train.py")],
-        *_variant_round(vstate, "ok", [
-            {"name": " main-1", "dataset": "kvasir", "command": "python train.py --seed 10",
-             "variant": "winner_v", "seed": 10},
-            {"name": "main-2", "dataset": "kvasir", "command": "python train.py --seed 11",
-             "variant": "winner_v", "seed": 11},
-            {"name": "other-1", "dataset": "kvasir", "command": "python train.py --seed 12",
-             "variant": "ablation_low", "seed": 12},
-        ]),
-    ])
-    vstep = _stepper(repo_obj, vrun_id, vmodel)
-    assert vstep() == "running"  # bad1 rejected
-    assert vstep() == "running"  # bad2 rejected
-    assert vstep() == "running"  # read_file ok
-    assert vstep() == "running" and vstep() == "waiting_jobs"  # ok submitted + wait_jobs
+    # 纵深防御(build_tools 工具面):缺 dataset 被拒;含 && / ; / > 等 shell 操作符被拒;read_file 指向干净 val_wd
+    venv = al.LoopEnv(
+        repo_obj,
+        api["store"],
+        {"id": vrun_id, "kind": research_stage.KIND, "config_json": json.dumps(vrun["config"])},
+        repo_obj.get_project(pid),
+    )
+    try:
+        vtool_map = {t.name: t for t in research_stage.build_tools(venv)}
+        with pytest.raises(al.ToolError, match="dataset"):
+            vtool_map["run_experiment"].handler(
+                venv,
+                {
+                    "purpose": "missing ds",
+                    "metrics": ["val_dice"],
+                    "jobs": [{"name": "j1", "command": "python train.py --seed 1"}],
+                },
+            )
+        with pytest.raises(al.ToolError, match="操作符"):
+            vtool_map["run_experiment"].handler(
+                venv,
+                {
+                    "purpose": "shell injection",
+                    "metrics": ["val_dice"],
+                    "jobs": [
+                        {
+                            "name": "j1",
+                            "dataset": "kvasir",
+                            "command": "python train.py --seed 1 && echo hacked > train.py",
+                        }
+                    ],
+                },
+            )
+        read_out = vtool_map["read_file"].handler(venv, {"path": "train.py"})
+        assert "round1-champion-clean" in read_out and "corrupted" not in read_out
+    finally:
+        venv.close()
 
-    err1 = vmodel.seen[1][-1]["content"][0]
-    assert err1["is_error"] and "dataset" in err1["content"]
-    err2 = vmodel.seen[2][-1]["content"][0]
-    assert err2["is_error"] and "操作符" in err2["content"]
-    read_out = vmodel.seen[3][-1]["content"][0]["content"]
-    assert "round1-champion-clean" in read_out and "corrupted" not in read_out
-    j_m1, j_m2, j_other = vstate["round_jobs"][0]
-    # Job 落库 params 保持纯净,而 PlanSpec.command_template 已注入 cd 到干净的 val_wd
+    # WP-S1A 零 LLM 确定性全量验证:哨兵模型保证 0 次 LLM 调用,两步完成派发与收束
+    def _no_llm(**_kw):
+        raise AssertionError("validation mode must not invoke LLM")
+
+    vstep = _stepper(repo_obj, vrun_id, _no_llm)
+    assert vstep() == "waiting_jobs"
+    j_m1, j_m2 = al.get_run(repo_obj, vrun_id)["pending"]["payload"]["job_ids"]
+    # Job 落库 params 保持纯净(独立留存 seed 101/102),而 PlanSpec.command_template 已注入 cd 到干净的 val_wd
     j_m1_row = repo_obj.get_job(j_m1)
     j_m1_cmd = json.loads(j_m1_row["params_json"])["command"]
-    assert j_m1_cmd == "python train.py --seed 10"
+    assert j_m1_cmd == "python train.py --seed 101"
     plan_spec = json.loads(repo_obj.get_plan(j_m1_row["plan_revision_id"])["spec_json"])
     assert str(val_wd) in plan_spec["command_template"][2]
+
+    # 附带一个未达标消融变体 ablation_low(0.60),验证 adopt 只聚合达标获胜变体且过滤 bool 指标
+    extra_sub = submit(
+        repo_obj,
+        Workspace(LocalHost(), str(val_wd)),
+        {**repo_obj.get_project(pid), "remote_workdir": str(val_wd)},
+        ExperimentRequest(
+            jobs=[
+                {
+                    "name": "other-1",
+                    "dataset": "kvasir",
+                    "command": "python train.py --seed 201",
+                    "variant": "ablation_low",
+                    "seed": 201,
+                }
+            ],
+            metrics=["val_dice", "val_iou"],
+            purpose="extra ablation variant",
+            allowed_datasets={"kvasir"},
+            dataset_commands={"kvasir": "python train.py --seed 0"},
+            strict_readonly=True,
+        ),
+        approved_by=f"agent-run:{vrun_id}",
+        strict_readonly=True,
+    )
+    j_other = extra_sub["jobs"][0]["id"]
+
     # 带 bool 字段 converged=True,且另一变体 ablation_low 分数很低(0.60)
     finish_job(repo_obj, j_m1, {"val_dice": 0.87, "val_iou": 0.78, "converged": True})
     finish_job(repo_obj, j_m2, {"val_dice": 0.89, "val_iou": 0.80, "converged": False})
     finish_job(repo_obj, j_other, {"val_dice": 0.60, "val_iou": 0.40, "converged": True})
     assert vstep() == "done"
-    vres = al.get_run(repo_obj, vrun_id)["result"]
+    vfinal = al.get_run(repo_obj, vrun_id)
+    assert vfinal["steps"] == 2 and vfinal["tokensIn"] == 0 and vfinal["tokensOut"] == 0
+    vres = vfinal["result"]
     assert vres["success"] is True
 
-    # adopt():过滤掉 bool 字段,且只聚合达标获胜变体 winner_v(0.88),绝不混入 ablation_low(0.60)
+    # adopt():过滤掉 bool 字段,且只聚合达标获胜变体 validation(0.88),绝不混入 ablation_low(0.60)
     adopted = research_stage.adopt(repo_obj, api["store"], pid, vrun_id)
     kvasir_metrics = adopted["baseline"]["kvasir"]
     assert kvasir_metrics["val_dice"] == pytest.approx(0.88)

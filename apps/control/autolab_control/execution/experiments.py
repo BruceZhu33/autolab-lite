@@ -32,7 +32,9 @@ from .evidence import protected_state, stage_locked_eval
 
 EXPERIMENTS_REL = ".autolab/experiments"
 MAX_JOBS_PER_SUBMIT = 8
+MAX_INTERNAL_JOBS_PER_SUBMIT = 64
 _METRIC_NAME = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+_SEED_KV_TOKEN = re.compile(r"^(?:seed|random[-_]seed)=-?\d+$")
 _SHELL_CONTROL_OPS = ("&&", "||", ";", "|", "`", "$(", ">", "<", "\n", "\r")
 _INLINE_EXEC_INTERPRETERS = frozenset({"python", "python3", "bash", "sh", "zsh", "perl", "ruby", "node"})
 _DATASET_SCOPE_FLAGS = frozenset({
@@ -56,6 +58,7 @@ class ExperimentRequest:
     allowed_datasets: set[str] | None = field(default=None)
     dataset_commands: dict[str, str] | None = field(default=None)  # {数据集: 基线命令}
     strict_readonly: bool = False
+    max_jobs: int = MAX_JOBS_PER_SUBMIT
 
 
 def list_experiments(ws: Workspace) -> list[str]:
@@ -122,8 +125,16 @@ def _positional_prefix(command: str) -> list[str]:
     i = 0
     while i < len(tokens):
         tok = tokens[i]
+        if _SEED_KV_TOKEN.match(tok):
+            i += 1
+            continue
         if tok.startswith("--"):
-            if "=" not in tok and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+            if (
+                "=" not in tok
+                and i + 1 < len(tokens)
+                and not tokens[i + 1].startswith("-")
+                and not _SEED_KV_TOKEN.match(tokens[i + 1])
+            ):
                 i += 2
             else:
                 i += 1
@@ -184,8 +195,12 @@ def check_command_readonly_safe(command: str, *, baseline_command: str = "") -> 
 def _clean_jobs(request: ExperimentRequest, *, strict_readonly: bool = False) -> list[dict]:
     if not request.jobs:
         raise UserError("jobs 不能为空:[{name, command}]")
-    if len(request.jobs) > MAX_JOBS_PER_SUBMIT:
-        raise UserError(f"一次最多 {MAX_JOBS_PER_SUBMIT} 个 Job,分批提交")
+    effective_max = max(
+        1,
+        min(int(request.max_jobs or MAX_JOBS_PER_SUBMIT), MAX_INTERNAL_JOBS_PER_SUBMIT),
+    )
+    if len(request.jobs) > effective_max:
+        raise UserError(f"一次最多 {effective_max} 个 Job,分批提交")
     readonly = bool(strict_readonly or request.strict_readonly)
     out, names = [], set()
     for item in request.jobs:
@@ -350,7 +365,11 @@ def _flag_pairs(command: str) -> dict[str, str]:
         if "=" in tok:
             name, _, value = tok.partition("=")
         else:
-            if i + 1 >= len(tokens) or tokens[i + 1].startswith("-"):
+            if (
+                i + 1 >= len(tokens)
+                or (tokens[i + 1].startswith("-") and not re.fullmatch(r"-\d+", tokens[i + 1]))
+                or _SEED_KV_TOKEN.match(tokens[i + 1])
+            ):
                 i += 1
                 continue  # 无值旗标不构成数据集身分
             name, value = tok, tokens[i + 1]
@@ -487,8 +506,11 @@ def submit(repo: Repo, ws: Workspace, project: dict, request: ExperimentRequest,
            strict_readonly: bool = False) -> dict:
     """提交并自动批准;返回 {planId, experimentId, jobs:[{id, name}]}。"""
     run_id, run_kind, run_cfg = _run_context(repo, approved_by)
+    is_platform_eval = str(approved_by or "").startswith("platform-eval:")
     effective_readonly = bool(
-        strict_readonly or request.strict_readonly or run_cfg.get("mode") == "validation"
+        strict_readonly
+        or request.strict_readonly
+        or (run_cfg.get("mode") == "validation" and not is_platform_eval)
     )
     # 派发前受保护路径门禁:研究/复核阶段若受保护路径被篡改或缺失,立即拒绝创建 Plan
     contract = _project_contract(project)
@@ -529,6 +551,8 @@ def submit(repo: Repo, ws: Workspace, project: dict, request: ExperimentRequest,
     body = record.encode("utf-8")
     ws.write_bytes(f"{EXPERIMENTS_REL}/{exp_id}.md", body)
 
+    server = repo.get_server(project.get("server_id") or "") if project.get("server_id") else None
+    slot_cap = max(4, min(int((server or {}).get("gpu_slots") or 4), 8))
     spec = PlanSpecV1(
         schema_version=1, project_id=project["id"],
         experiment_ref=f"{EXPERIMENTS_REL}/{exp_id}.md",
@@ -541,7 +565,7 @@ def submit(repo: Repo, ws: Workspace, project: dict, request: ExperimentRequest,
         # 不用 exec:命令可以是 `cd x && python ...` 这类复合形式
         command_template=["bash", "-c", prefix + "{{command}}"],
         job_definition={"kind": "explicit", "jobs": jobs},
-        resources=PlanResources(gpu_count=gpus, max_parallel=min(len(jobs), 4)),
+        resources=PlanResources(gpu_count=gpus, max_parallel=min(len(jobs), slot_cap)),
         timeout_seconds=timeout_minutes * 60,
         outputs=PlanOutputs(subdir_template="{{job_id}}", metrics=[
             MetricSource(kind="json", path=metric_file, selector=m.name) for m in metrics]),

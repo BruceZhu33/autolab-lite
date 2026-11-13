@@ -27,6 +27,7 @@ from ..agent.runtime import (
     Pause,
     Tool,
     ToolError,
+    ToolOutput,
 )
 from ..core.db import utc_now
 from ..core.errors import UserError
@@ -34,7 +35,16 @@ from ..core.ids import new_id
 from ..core.repo import TERMINAL_JOB_STATUSES, Repo
 from ..execution.comparison import compare_plan, evaluate_guardrails, variant_means
 from ..execution.evidence import protected_state, round_evidence
-from ..execution.experiments import check_dataset_command_consistency, effective_metrics
+from ..execution.experiments import (
+    MAX_INTERNAL_JOBS_PER_SUBMIT,
+    MAX_JOBS_PER_SUBMIT,
+    ExperimentRequest,
+    check_command_readonly_safe,
+    check_dataset_command_consistency,
+    effective_metrics,
+    submit_eval_jobs,
+    submit_experiment,
+)
 from ..workspace import projects, refs
 from ..workspace.fs import Workspace
 from ..workspace.host import open_host, q
@@ -549,12 +559,14 @@ def _tier(env_or_config) -> dict:
 
 
 def _validation_task(repo: Repo, project: dict, config: dict) -> str:
-    """全量验证任务书:工作区代码即被验证状态,原样在各数据集上按基线口径多 seed 重跑。"""
+    """全量验证任务书:工作区代码即被验证状态,由 Python 确定性状态机原样多 seed 重跑。"""
     pool = baseline_pool(project)
     chosen = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
     seeds = int(config.get("seeds") or 3)
+    seed_start = int(config.get("seed_start") if config.get("seed_start") is not None else 101)
+    seed_end = seed_start + max(1, seeds) - 1
     ch = config.get("champion") or {}
-    lines = ["# 全量验证任务", "",
+    lines = ["# 全量验证任务(0-LLM 确定性复核)", "",
              "## 被验证的方案(研究阶段的冠军)", "",
              f"- 假设:{ch.get('hypothesis') or ch.get('label') or '(见研究日志)'}",
              f"- 改动:{ch.get('changes') or '(工作区当前状态)'}",
@@ -562,13 +574,11 @@ def _validation_task(repo: Repo, project: dict, config: dict) -> str:
              + (f",第 {ch.get('round')} 轮,{ch.get('n')} seed 均值增益 {ch.get('meanGain'):+.4g}"
                 f"({ch.get('dataset')})" if ch.get("round") is not None else ""), "",
              "## 验证规则(硬规则)", "",
-             "- **不改任何代码、不改评测与指标定义**:工作区就是被验证状态,原样运行;"
-             "发现代码问题用 ask_human 报告,不要修。",
-             f"- 每个数据集跑 **{seeds} 个 seed**:命令与该数据集的基线命令同口径,"
-             "只把 seed 参数换成不同取值,其余参数一律不动。",
-             "- 一次最多 8 个 Job,可以分批提交;全部数据集的 Job 终态后用 end_round 收束,"
-             "analysis 里逐数据集给出均值对比结论。",
-             "- 某数据集跑不通(环境/材料)时:报告失败原因,不要为了跑通而改口径。", "",
+             "- **0-LLM 确定性执行、不改任何代码、不改评测与指标定义**:由 Python 状态机直接检出干净冠军快照并原子派发。",
+             f"- 每个数据集跑 **{seeds} 个 seed**(独立留存种子 `{seed_start}..{seed_end}`):命令与该数据集的基线命令同口径,"
+             "只把 seed 参数换成留存种子取值,其余参数一律不动。",
+             "- 单次原子提交全部 `数据集 × seed` 验证矩阵;全部训练与平台评测 Job 终态后自动校验受保护路径并收束报告。",
+             "- 某数据集跑不通(环境/材料)或受保护路径被篡改时:直接失败留痕,绝不篡改口径。", "",
              "## 基线(确认过的,对比对象)"]
     for name in chosen:
         info = pool.get(name) or {}
@@ -1271,11 +1281,510 @@ def _describe_session_jobs(env: LoopEnv, job_ids: list[str]):
                                    baseline_ref=_baseline_exp_ref(env.repo, env.project))
 
 
+_VALID_METRIC_RE = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+_SEED_KV_RE = re.compile(r"^(seed|random[-_]seed)=(-?\d+)$")
+
+
+def synthesize_validation_command(base_command: str, seed: int) -> str:
+    """将数据集基线命令确定性合成为指定留存 seed 的只读验证命令。
+
+    - 原位替换已有 `--seed <v>` / `--seed=<v>` / `--random-seed` / `--random_seed` / `seed=<v>`;
+    - 若基线命令未显式带 seed 参数,则在末尾追加 `--seed <seed>`;
+    - 全程通过 `check_command_readonly_safe` 严防 shell 控制符、重定向与非 seed 参数漂移。
+    """
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise UserError(f"验证 seed 必须是整数,收到:{seed!r}")
+    raw = str(base_command or "").strip()
+    if not raw:
+        raise UserError("基线命令不能为空,无法合成验证命令")
+    check_command_readonly_safe(raw, baseline_command=raw)
+    tokens = shlex.split(raw)
+    out: list[str] = []
+    replaced = False
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        kv_match = _SEED_KV_RE.match(tok)
+        if kv_match:
+            out.append(f"{kv_match.group(1)}={seed}")
+            replaced = True
+            i += 1
+            continue
+        if tok.startswith("--") and "=" in tok:
+            flag_name, _, _ = tok.partition("=")
+            if flag_name.lstrip("-") in _SEED_FLAGS:
+                out.append(f"{flag_name}={seed}")
+                replaced = True
+                i += 1
+                continue
+        if tok.startswith("--") and "=" not in tok and tok.lstrip("-") in _SEED_FLAGS:
+            out.append(tok)
+            out.append(str(seed))
+            replaced = True
+            if i + 1 < len(tokens) and (
+                not tokens[i + 1].startswith("-") or re.fullmatch(r"-\d+", tokens[i + 1])
+            ):
+                i += 2
+            else:
+                i += 1
+            continue
+        out.append(tok)
+        i += 1
+    if not replaced:
+        out.extend(["--seed", str(seed)])
+    synthesized = shlex.join(out)
+    check_command_readonly_safe(synthesized, baseline_command=raw)
+    return synthesized
+
+
+def synthesize_validation_jobs(project: dict, config: dict) -> list[dict]:
+    """按固定 (dataset, seed) 顺序合成 D × S 个确定性全量验证 Job(variant='validation')。"""
+    pool = baseline_pool(project)
+    if not pool:
+        raise ToolError("还没有确认过的基线:无法生成全量验证实验")
+    chosen = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
+    if not chosen:
+        raise ToolError("没有可验证的数据集(不在确认基线池中)")
+    seeds = max(1, int(config.get("seeds") or 3))
+    seed_start = int(config.get("seed_start") if config.get("seed_start") is not None else 101)
+    total = len(chosen) * seeds
+    if total > MAX_INTERNAL_JOBS_PER_SUBMIT:
+        raise ToolError(
+            f"全量验证单次最多支持 {MAX_INTERNAL_JOBS_PER_SUBMIT} 个 Job"
+            f"(当前 {len(chosen)} 数据集 × {seeds} seed = {total})"
+        )
+    jobs: list[dict] = []
+    used_names: set[str] = set()
+    for ds_idx, dataset in enumerate(chosen, start=1):
+        info = pool.get(dataset) or {}
+        base_cmd = str(info.get("command") or "").strip()
+        if not base_cmd:
+            raise ToolError(f"数据集 {dataset} 缺少基线命令,无法合成确定性验证命令")
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", dataset).strip("-")[:32] or f"ds{ds_idx}"
+        for offset in range(seeds):
+            seed = seed_start + offset
+            try:
+                cmd = synthesize_validation_command(base_cmd, seed)
+            except UserError as exc:
+                raise ToolError(f"数据集 {dataset} 验证命令合成失败:{exc}") from exc
+            name = f"val-{slug}-s{seed}"
+            if name in used_names:
+                name = f"val-{ds_idx}-{slug}-s{seed}"
+            used_names.add(name)
+            jobs.append({
+                "name": name,
+                "dataset": dataset,
+                "command": cmd,
+                "variant": "validation",
+                "seed": seed,
+            })
+    return jobs
+
+
+def _reference_plan_specs(repo: Repo, project: dict, config: dict) -> list[dict]:
+    """收集冠军来源 Plan 与基线 Job 所属 Plan 的 spec_json,用于继承指标方向与运行参数。"""
+    specs: list[dict] = []
+    seen_plan_ids: set[str] = set()
+
+    def _add_plan(plan_id: str | None) -> None:
+        pid = str(plan_id or "").strip()
+        if not pid or pid in seen_plan_ids:
+            return
+        seen_plan_ids.add(pid)
+        plan = repo.get_plan(pid)
+        if not plan:
+            return
+        try:
+            spec = json.loads(plan.get("spec_json") or "{}")
+        except ValueError:
+            return
+        if isinstance(spec, dict) and spec:
+            specs.append(spec)
+
+    champ_plan_id = (config.get("champion") or {}).get("planId")
+    _add_plan(champ_plan_id)
+    src_run_id = str(config.get("source_run_id") or "").strip()
+    if src_run_id:
+        for p in reversed(_run_plans(repo, src_run_id, None)):
+            _add_plan(p.get("id"))
+    for info in baseline_pool(project).values():
+        job_id = str((info or {}).get("job_id") or "").strip()
+        if job_id:
+            job = repo.get_job(job_id)
+            if job:
+                _add_plan(job.get("plan_revision_id"))
+    return specs
+
+
+def _validation_metrics(repo: Repo, project: dict, config: dict,
+                        contract: dict | None) -> list[dict]:
+    """收集契约主指标/护栏指标 + 冠军实验指标 + 基线确认池全部指标,确保 adopt 可晋级全指标。"""
+    specs = _reference_plan_specs(repo, project, config)
+    known_directions: dict[str, str] = {}
+    for spec in reversed(specs):
+        for m in spec.get("metrics") or []:
+            if isinstance(m, dict):
+                m_name = str(m.get("name") or "").strip()
+                m_dir = str(m.get("direction") or "")
+                if m_name and m_dir in ("maximize", "minimize"):
+                    known_directions[m_name] = m_dir
+
+    ordered: dict[str, str] = {}
+
+    def _register(name: str, direction: str | None = None) -> None:
+        clean = str(name or "").strip()
+        if not clean or not _VALID_METRIC_RE.match(clean):
+            return
+        if clean in ordered:
+            return
+        resolved = (
+            direction
+            if direction in ("maximize", "minimize")
+            else known_directions.get(clean, "maximize")
+        )
+        ordered[clean] = resolved
+
+    if isinstance(contract, dict):
+        _register(str(contract.get("primary") or ""), str(contract.get("direction") or ""))
+        for g in contract.get("guardrails") or []:
+            if isinstance(g, dict):
+                _register(str(g.get("metric") or ""), str(g.get("direction") or ""))
+
+    for spec in specs:
+        for m in spec.get("metrics") or []:
+            if isinstance(m, dict):
+                _register(str(m.get("name") or ""), str(m.get("direction") or ""))
+
+    pool = baseline_pool(project)
+    chosen = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
+    for ds in [*chosen, *pool.keys()]:
+        metrics_map = (pool.get(ds) or {}).get("metrics") or {}
+        if isinstance(metrics_map, dict):
+            for k in metrics_map:
+                _register(str(k))
+
+    if not ordered:
+        raise ToolError("基线快照与指标契约均未声明任何合法指标名,无法启动全量验证")
+    return [{"name": k, "direction": v} for k, v in ordered.items()]
+
+
+def _validation_exec_options(repo: Repo, project: dict, config: dict) -> dict:
+    """从基线快照与来源冠军 Plan 继承 conda_env / metric_file / timeout_minutes / gpus_per_job。"""
+    snap = baseline_snapshot(project)
+    conda_env = str(snap.get("conda_env") or "").strip()
+    metric_file = "metrics.json"
+    timeout_minutes = 120
+    gpus_per_job = 1
+
+    specs = _reference_plan_specs(repo, project, config)
+    if specs:
+        primary_spec = specs[0]
+        outputs = primary_spec.get("outputs") or {}
+        out_metrics = outputs.get("metrics") or []
+        if out_metrics and isinstance(out_metrics[0], dict) and out_metrics[0].get("path"):
+            metric_file = str(out_metrics[0]["path"]).strip() or "metrics.json"
+        if primary_spec.get("timeout_seconds"):
+            timeout_minutes = max(1, round(int(primary_spec["timeout_seconds"]) / 60))
+        resources = primary_spec.get("resources") or {}
+        if resources.get("gpu_count"):
+            gpus_per_job = max(1, min(int(resources["gpu_count"]), 8))
+        if not conda_env:
+            tmpl = primary_spec.get("command_template") or []
+            if len(tmpl) >= 3 and isinstance(tmpl[2], str):
+                m = re.search(r"conda activate\s+(.+?)\s*&&", tmpl[2])
+                if m:
+                    raw_env = m.group(1).strip()
+                    try:
+                        parts = shlex.split(raw_env)
+                        conda_env = parts[0] if parts else raw_env
+                    except ValueError:
+                        conda_env = raw_env
+
+    return {
+        "conda_env": conda_env,
+        "metric_file": metric_file,
+        "timeout_minutes": timeout_minutes,
+        "gpus_per_job": gpus_per_job,
+    }
+
+
+def _all_agent_run_plans(repo: Repo, run_id: str) -> list[dict]:
+    conn = repo.db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, status FROM plan_revisions WHERE approved_by = ? ORDER BY approved_at, id",
+            (f"agent-run:{run_id}",),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def _synthesize_validation_analysis(project: dict, config: dict, evaluation: dict) -> str:
+    pool = baseline_pool(project)
+    selected = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
+    seeds = max(1, int(config.get("seeds") or 3))
+    seed_start = int(config.get("seed_start") if config.get("seed_start") is not None else 101)
+    seed_end = seed_start + seeds - 1
+    parts = [
+        f"0-LLM 确定性复核完成(独立留存 seed {seed_start}..{seed_end},共 {len(evaluation.get('rows') or [])} 个训练 Job):"
+    ]
+    for ds in selected:
+        group = next(
+            (m for m in (evaluation.get("means") or []) if m.get("dataset") == ds),
+            None,
+        )
+        if group is None or group.get("meanValue") is None:
+            parts.append(f"{ds}: 无有效成功指标(0/{seeds} seed)")
+            continue
+        gain_txt = (
+            f"{group['meanGain']:+.4g}" if group.get("meanGain") is not None else "n/a"
+        )
+        base_txt = (
+            f"{group['baseline']:.4g}" if group.get("baseline") is not None else "-"
+        )
+        ci_txt = (
+            f", 95% CI [{group['ciLow']:+.4f}, {group['ciHigh']:+.4f}]"
+            if group.get("ciLow") is not None
+            else ""
+        )
+        parts.append(
+            f"{ds}: {group.get('n', 0)}/{seeds} seed 均值 {group['meanValue']:.4g}"
+            f" vs 基线 {base_txt} (增益 {gain_txt}{ci_txt})"
+        )
+    return "；".join(parts)
+
+
+def _deterministic_validation_step(env: LoopEnv) -> ToolOutput | None:
+    """WP-S1A:validation 模式下的 2 步零 LLM 确定性重放控制器;普通研究会话返回 None。"""
+    if env.config.get("mode") != "validation":
+        return None
+
+    _bind_validation_workspace(env)
+    raw_repo = getattr(env.repo, "_inner", env.repo)
+    run_id = env.run["id"]
+    existing_plan_rows = _all_agent_run_plans(raw_repo, run_id)
+
+    # Phase 1: 尚未创建任何验证 Plan -> 预检受保护路径 + 合成留存种子矩阵 + 单次原子提交
+    if not existing_plan_rows:
+        contract = baseline_contract(env.project)
+        if contract is not None:
+            protected = protected_state(env.workspace, contract)
+            for kind in ("code", "data"):
+                info = protected.get(kind)
+                if info and info.get("changed"):
+                    runtime.record_event(
+                        raw_repo,
+                        run_id,
+                        "protected_paths_changed",
+                        {
+                            "kind": kind,
+                            "expected": info.get("expected") or "",
+                            "current": info.get("hash") or "",
+                            "paths": info.get("paths") or [],
+                            "missing": info.get("missing") or [],
+                            "tainted_plan_ids": [],
+                        },
+                    )
+                    raise ToolError(
+                        f"契约保护的评测代码/数据划分被修改或缺失({kind}):"
+                        f" expected={info.get('expected')} current={info.get('hash')};"
+                        "拒绝派发全量验证实验"
+                    )
+        _check_gpu_budget(env)
+        jobs = synthesize_validation_jobs(env.project, env.config)
+        pool = baseline_pool(env.project)
+        chosen = [d for d in (env.config.get("datasets") or []) if d in pool] or list(pool)
+        seeds = max(1, int(env.config.get("seeds") or 3))
+        seed_start = int(
+            env.config.get("seed_start") if env.config.get("seed_start") is not None else 101
+        )
+        metrics = _validation_metrics(raw_repo, env.project, env.config, contract)
+        exec_opts = _validation_exec_options(raw_repo, env.project, env.config)
+        purpose = (
+            f"确定性全量验证(来源 {env.config.get('source_run_id') or '-'},"
+            f" {len(chosen)} 数据集 × {seeds} 留存 seed {seed_start}..{seed_start + seeds - 1})"
+        )
+        request = ExperimentRequest(
+            jobs=jobs,
+            metrics=metrics,
+            purpose=purpose,
+            conda_env=exec_opts["conda_env"],
+            metric_file=exec_opts["metric_file"],
+            timeout_minutes=exec_opts["timeout_minutes"],
+            gpus_per_job=exec_opts["gpus_per_job"],
+            allowed_datasets=set(pool),
+            dataset_commands={name: (info.get("command") or "") for name, info in pool.items()},
+            strict_readonly=True,
+            max_jobs=max(MAX_JOBS_PER_SUBMIT, len(jobs)),
+        )
+        if env.config.get("critic"):
+            decision = _critic_review(env, request)
+            if decision is not None:
+                runtime.record_event(raw_repo, run_id, "critic", decision)
+                if decision.get("verdict") in ("revise", "reject"):
+                    reasons = ";".join(str(r) for r in decision.get("reasons") or [])
+                    tips = ";".join(str(s) for s in decision.get("suggestions") or [])
+                    raise ToolError(
+                        f"Critic 要求修改/拒绝:{reasons or '(无理由)'}"
+                        + (f";建议:{tips}" if tips else "")
+                    )
+        try:
+            submitted = submit_experiment(
+                env.repo,
+                env.workspace,
+                env.project,
+                request,
+                approved_by=f"agent-run:{run_id}",
+                baseline_ref=_baseline_exp_ref(raw_repo, env.project),
+                strict_readonly=True,
+            )
+        except UserError as exc:
+            raise ToolError(str(exc)) from exc
+        job_ids = [j["id"] for j in submitted["jobs"]]
+        runtime.record_event(
+            raw_repo,
+            run_id,
+            "tool_call",
+            {
+                "name": "deterministic_validate_dispatch",
+                "input": {
+                    "planId": submitted["planId"],
+                    "experimentId": submitted["experimentId"],
+                    "datasets": chosen,
+                    "seeds": seeds,
+                    "seedStart": seed_start,
+                    "jobCount": len(job_ids),
+                },
+            },
+        )
+        return Pause("jobs", {"job_ids": job_ids, "plan_id": submitted["planId"]})
+
+    # Phase 2: 训练(+ 可选平台评测)Job 已终态 -> 复检受保护路径 + Python 判定 + 落库收束
+    plans = _run_plans(raw_repo, run_id, None)
+    if not plans:
+        raise ToolError("全量验证的实验计划均已被标记污染作废,无法收束")
+    pending_train = [
+        j["id"]
+        for p in plans
+        for j in raw_repo.list_jobs(plan_id=p["id"])
+        if j["status"] not in TERMINAL_JOB_STATUSES
+    ]
+    if pending_train:
+        return Pause("jobs", {"job_ids": pending_train})
+
+    contract = baseline_contract(env.project)
+    protected = protected_state(env.workspace, contract)
+    for kind, info in (("code", protected["code"]), ("data", protected["data"])):
+        if info and info["changed"]:
+            tainted_ids = _abandon_plans(raw_repo, plans)
+            runtime.record_event(
+                raw_repo,
+                run_id,
+                "protected_paths_changed",
+                {
+                    "kind": kind,
+                    "expected": info["expected"],
+                    "current": info["hash"],
+                    "paths": info["paths"],
+                    "tainted_plan_ids": tainted_ids,
+                },
+            )
+            raise ToolError(
+                f"评测代码/数据划分被修改,全量验证实验已标记作废:{kind}"
+                f" expected={info['expected']} current={info['hash']}"
+            )
+
+    eval_command = str((((contract or {}).get("eval")) or {}).get("command") or "").strip()
+    if eval_command:
+        missing_train_ids: list[str] = []
+        pending_eval_ids: list[str] = []
+        for p in plans:
+            for j in raw_repo.list_jobs(plan_id=p["id"]):
+                if j["status"] != "SUCCEEDED":
+                    continue
+                eval_job = raw_repo.eval_job_for(j["id"])
+                if eval_job is None:
+                    missing_train_ids.append(j["id"])
+                elif eval_job["status"] not in TERMINAL_JOB_STATUSES:
+                    pending_eval_ids.append(eval_job["id"])
+        if missing_train_ids:
+            eval_ids = submit_eval_jobs(
+                env.repo,
+                env.workspace,
+                env.project,
+                missing_train_ids,
+                contract,
+                run_id=run_id,
+                baseline_ref=_baseline_exp_ref(raw_repo, env.project),
+            )
+            if eval_ids:
+                return Pause("jobs", {"job_ids": [*pending_eval_ids, *eval_ids], "parents": missing_train_ids})
+            raise ToolError(f"平台评测 Job 尚未创建({', '.join(missing_train_ids)})")
+        if pending_eval_ids:
+            return Pause("jobs", {"job_ids": pending_eval_ids})
+
+    evaluation = evaluate_plans(raw_repo, env.project, plans)
+    ch = env.config.get("champion") or {}
+    hypothesis = str(
+        ch.get("hypothesis") or ch.get("label") or "确定性全量复核研究冠军改动"
+    ).strip()
+    changes = str(
+        ch.get("changes")
+        or (
+            f"检出冠军快照 {str(ch.get('codeCommit'))[:12]} 只读复核(无代码修改)"
+            if ch.get("codeCommit")
+            else "只读原样复核(无代码修改)"
+        )
+    ).strip()
+    report = {
+        "hypothesis": hypothesis,
+        "changes": changes,
+        "analysis": _synthesize_validation_analysis(env.project, env.config, evaluation),
+        "nextIdea": "",
+        "kept": True,
+        "planIds": [p["id"] for p in plans],
+        "evaluation": evaluation,
+    }
+    report["evidence"] = round_evidence(
+        raw_repo,
+        env.workspace,
+        plans,
+        evaluation.get("contract"),
+        evaluation["means"],
+        protected,
+    )
+    report["evidenceHash"] = report["evidence"]["evidenceHash"]
+
+    if env.config.get("reviewer"):
+        decision = critic.review_round(
+            env.credentials,
+            report=report,
+            evaluation=evaluation,
+            evidence=report["evidence"],
+            contract=evaluation.get("contract"),
+        )
+        runtime.record_event(raw_repo, run_id, "reviewer", decision)
+        if decision.get("verdict") == "suspect" and decision.get("severity") in (
+            "medium",
+            "high",
+        ):
+            reasons = ";".join(str(r) for r in decision.get("reasons") or [])
+            raise ToolError(
+                f"Reviewer 判定本轮验证证据可疑({decision.get('severity')}):"
+                f"{reasons or '(无理由)'}"
+            )
+
+    return _finish_validation(env, 1, report, evaluation)
+
+
 PROFILE = LoopProfile(
     kind=KIND, system_prompt=SYSTEM_PROMPT, build_tools=build_tools,
     system_suffix=_status_suffix, max_steps=2000, max_tokens=40_000_000,
     # B2.3a:waiting_jobs 恢复时训练 Job 终态 → 自动提交平台评测 Job 并改等评测
     describe_jobs=_describe_session_jobs,
+    # WP-S1A:validation 模式下走 0-LLM 纯 Python 确定性重放状态机
+    deterministic_step=_deterministic_validation_step,
     wall_clock_seconds=48 * 3600,  # 研究阶段安全上限;light/medium/heavy 三档细分留 Phase B
     verifier={"id": "research-end-round", "version": 1})
 
@@ -1500,19 +2009,27 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
 
 
 def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None = None,
-                     seeds: int = 3, source_run_id: str | None = None,
+                     seeds: int = 3, seed_start: int = 101,
+                     source_run_id: str | None = None,
                      gpu_hours: float | None = None,
                      critic: bool = False, reviewer: bool = False,
                      agent_spec_id: str | None = None,
                      credentials=None) -> dict:
     """把来源研究会话的冠军改动做成一次全量验证会话:不改代码,在选定数据集上
-    按基线口径多 seed 重跑,一轮收束出逐数据集均值结论。owner 点按钮即授权。"""
+    按基线口径用独立留存 seed 确定性重跑(0-LLM),一轮收束出逐数据集均值结论。"""
     project = repo.get_project(project_id)
     if project is None:
         raise AgentLoopError(f"项目 {project_id} 不存在")
     pool = baseline_pool(project)
     if not pool:
         raise AgentLoopError("还没有确认过的基线:先完成 Baseline")
+    if (
+        isinstance(seed_start, bool)
+        or not isinstance(seed_start, int)
+        or seed_start < 0
+        or seed_start > 1_000_000
+    ):
+        raise AgentLoopError("seed_start 需在 0..1000000 之间")
     source = runtime.get_run(repo, source_run_id) if source_run_id else \
         runtime.latest_run(repo, project_id, KIND)
     if source is None or source.get("status") != "done" \
@@ -1528,11 +2045,12 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
     carrier = src_round or result.get("lastRound") or {}
     code_commit = champion.get("codeCommit") or code_commit_of_run(repo, source["id"])
     val_workdir = _maybe_fork_validation_workdir(repo, credentials, project, code_commit)
-    seeds = max(1, min(int(seeds or 3), 5))
+    seeds = max(1, min(int(seeds or 3), 10))
     chosen = [d for d in (datasets or []) if d in pool] or list(pool)
     overrides = {"gpu_hours": max(0.0, float(gpu_hours))} if gpu_hours is not None else {}
     config = {"tier": "validation", "mode": "validation", "idea": "", "network": False,
               "overrides": overrides, "datasets": chosen, "seeds": seeds,
+              "seed_start": int(seed_start),
               "regress_tol": 0.005, "source_run_id": source["id"],
               "champion": {"round": champion.get("round"),
                            "planId": champion.get("planId"),

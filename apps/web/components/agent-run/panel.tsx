@@ -257,11 +257,16 @@ function PendingCard({ project, run }: { project: Project; run: Run }) {
   const pending = run.pending;
   if (!pending) return null;
   if (run.status === "waiting_jobs") {
+    const isValidation = run.config?.mode === "validation";
     return (
       <div className="rounded-lg border-[0.5px] border-info/30 bg-info/5 p-3 text-caption">
         <Hourglass className="mr-1 inline size-3.5 align-[-3px] text-info" />
         等待 GPU 实验结束:<span className="font-mono">{(pending.payload.job_ids ?? []).join(", ")}</span>
-        <p className="mt-1 text-micro text-muted-foreground">结束后结果会自动交给 Agent;现在发的话会一起带上。</p>
+        <p className="mt-1 text-micro text-muted-foreground">
+          {isValidation
+            ? "全部训练与锁定平台评测 Job 终态后,Python 确定性状态机将自动复验受保护路径并生成逐数据集结论(0 Token)。"
+            : "结束后结果会自动交给 Agent;现在发的话会一起带上。"}
+        </p>
       </div>
     );
   }
@@ -370,7 +375,9 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
         <Bot className="size-4 text-brand" />
         <span className="text-caption font-semibold">Agent 会话</span>
         {current.config?.mode === "validation" ? (
-          <span className="rounded-full bg-info/10 px-2 py-0.5 text-micro font-medium text-info">全量验证</span>
+          <span className="rounded-full bg-info/10 px-2 py-0.5 text-micro font-medium text-info">
+            全量验证 · 确定性复核
+          </span>
         ) : current.config?.tier ? (
           <span className="rounded-full bg-muted/60 px-2 py-0.5 text-micro text-muted-foreground">
             {String(current.config.tier)}
@@ -417,7 +424,7 @@ export function RunPanel({ project, run }: { project: Project; run: Run }) {
 
       {active ? <PendingCard project={project} run={current} /> : null}
 
-      {active ? (
+      {active && (current.config?.mode !== "validation" || current.status === "waiting_human") ? (
         <ChatComposer
           value={text} onChange={setText} onSend={() => void send()} sending={sending}
           placeholder={current.status === "waiting_human" ? "回复 Agent…" : "给 Agent 插一句话(下一步生效)…"}

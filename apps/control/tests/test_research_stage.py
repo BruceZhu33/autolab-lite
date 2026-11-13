@@ -332,18 +332,29 @@ def test_validation_session_e2e(api, tmp_path):
     assert "write_file" not in names and "shell" not in names
     assert "run_experiment" in names and "end_round" in names and "read_file" in names
 
-    vstate: dict = {}
-    jobs = [(f"kv-s{i}", "kvasir", f"python train.py --config-file configs/kvasir.yaml --seed {i}")
-            for i in (1, 2)] + \
-           [(f"po-s{i}", "polyp", f"python train.py --config-file configs/polyp.yaml --seed {i}")
-            for i in (1, 2)]
-    model = ScriptModel([*multi_seed_round(vstate, "v", jobs)])
-    step = stepper(repo, vrun, model)
-    assert step() == "running" and step() == "waiting_jobs"
-    for jid, value in zip(vstate["jobs"], (0.83, 0.83, 0.705, 0.705), strict=True):
+    def _no_llm(**_kw):
+        raise AssertionError("validation session must not invoke LLM")
+
+    step = stepper(repo, vrun, _no_llm)
+    assert step() == "waiting_jobs"
+    vpending = al.get_run(repo, vrun)["pending"]["payload"]
+    job_ids = vpending["job_ids"]
+    assert len(job_ids) == 4
+    job_params = [json.loads(repo.get_job(jid)["params_json"]) for jid in job_ids]
+    assert [(p["dataset"], p["seed"], p["variant"]) for p in job_params] == [
+        ("kvasir", 101, "validation"),
+        ("kvasir", 102, "validation"),
+        ("polyp", 101, "validation"),
+        ("polyp", 102, "validation"),
+    ]
+    for jid, value in zip(job_ids, (0.83, 0.83, 0.705, 0.705), strict=True):
         finish_job(repo, jid, {"val_dice": value})
     assert step() == "done"
-    result = al.get_run(repo, vrun)["result"]
+    vdone = al.get_run(repo, vrun)
+    assert vdone["steps"] == 2
+    assert vdone["tokensIn"] == 0 and vdone["tokensOut"] == 0
+    assert vdone["spec"]["modelId"] == "deterministic-python"
+    result = vdone["result"]
     assert result["success"] is True
     assert len(result["validation"]["datasets"]) == 2
     assert "kvasir:+0.03" in result["reason"] and "polyp:+0.005" in result["reason"]
@@ -367,18 +378,20 @@ def test_adopt_validation_as_new_baseline(api, tmp_path):
     resp = client.post(f"/api/owner/projects/{pid}/research/validate",
                        json={"datasets": ["kvasir", "polyp"], "seeds": 2}, headers=OWNER_H)
     vrun = resp.json()["run"]["id"]
-    vstate: dict = {}
-    jobs = [(f"kv-s{i}", "kvasir", f"python train.py --config-file configs/kvasir.yaml --seed {i}")
-            for i in (1, 2)] + \
-           [(f"po-s{i}", "polyp", f"python train.py --config-file configs/polyp.yaml --seed {i}")
-            for i in (1, 2)]
-    step = stepper(repo, vrun, ScriptModel([*multi_seed_round(vstate, "v", jobs)]))
-    assert step() == "running" and step() == "waiting_jobs"
+
+    def _no_llm(**_kw):
+        raise AssertionError("validation session must not invoke LLM")
+
+    step = stepper(repo, vrun, _no_llm)
+    assert step() == "waiting_jobs"
+    job_ids = al.get_run(repo, vrun)["pending"]["payload"]["job_ids"]
     # kvasir 均值 0.835(+0.035 ✓);polyp 均值 0.6925(-0.0075 ✗)→ 验证未通过
-    for jid, value in zip(vstate["jobs"], (0.83, 0.84, 0.69, 0.695), strict=True):
+    for jid, value in zip(job_ids, (0.83, 0.84, 0.69, 0.695), strict=True):
         finish_job(repo, jid, {"val_dice": value})
     assert step() == "done"
-    assert al.get_run(repo, vrun)["result"]["success"] is False
+    vdone = al.get_run(repo, vrun)
+    assert vdone["steps"] == 2 and vdone["tokensIn"] == 0 and vdone["tokensOut"] == 0
+    assert vdone["result"]["success"] is False
 
     # 非验证会话不可采纳
     resp = client.post(f"/api/owner/projects/{pid}/research/adopt",

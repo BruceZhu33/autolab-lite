@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -33,7 +35,7 @@ from ..workspace.fs import Workspace
 from ..workspace.host import open_host
 from . import trace
 from .model import FatalModelError, ModelFn, call_model, model_settings
-from .spec import apply_profile_overlay, build_agent_spec, spec_from_json
+from .spec import AgentSpec, apply_profile_overlay, build_agent_spec, overlay_hash, spec_from_json
 
 KEEP_RECENT = 12  # _compact_view 保留最近 N 个工具结果不截短(spec.contextPolicy)
 TRUNCATED_HINT = ("上一条回复因 max_tokens 被截断。请缩小单次输出"
@@ -74,7 +76,7 @@ class Finish:
     payload: dict = field(default_factory=dict)
 
 
-ToolOutput = "str | Pause | Finish"
+ToolOutput = str | Pause | Finish
 
 
 @dataclass
@@ -98,7 +100,7 @@ class LoopProfile:
     # 验收 finish 载荷:返回 None=接受;返回字符串=拒绝理由(回给 agent 继续)
     on_finish: Callable[[LoopEnv, dict], str | None] = lambda env, payload: None
     # Job 终态后回给 agent 的结果文本;缺省给状态 + 指标 + 失败日志尾部
-    describe_jobs: Callable[[LoopEnv, list[str]], str] | None = None
+    describe_jobs: Callable[[LoopEnv, list[str]], Any] | None = None
     max_steps: int = 200
     max_tokens: int = 3_000_000
     max_output_tokens: int = 4000
@@ -113,6 +115,8 @@ class LoopProfile:
     model_override: str = ""
     # 每步之前塞给模型的系统提示补充(如:剩余预算);由 profile 自定
     system_suffix: Callable[[LoopEnv], str] | None = None
+    # Step 1(WP-S1A):可选纯 Python 确定性单步钩子;返回 None 则回落正常 LLM 循环
+    deterministic_step: Callable[[LoopEnv], ToolOutput | None] | None = None
 
 
 class LoopEnv:
@@ -551,6 +555,61 @@ def _tool_span_output(output: Any) -> tuple[str, str, Any]:
     return "ok", "", str(output)
 
 
+def _deterministic_code_rev() -> str:
+    try:
+        import autolab_control
+
+        pkg_dir = autolab_control.__file__.rsplit("/", 1)[0]
+        out = subprocess.run(  # noqa: S603 - 固定参数调用 git
+            ["git", "-C", pkg_dir, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import autolab_control
+
+        return str(autolab_control.__version__)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _deterministic_spec_snapshot(profile: LoopProfile, *,
+                                 overlay: dict | None = None) -> tuple[dict, str]:
+    """0-LLM 确定性步的 AgentSpec 快照:完全不依赖凭据库或模型配置。"""
+    prompt_hash = hashlib.sha256(profile.system_prompt.encode("utf-8")).hexdigest()
+    overlay_cfg = (overlay or {}).get("config") or {}
+    spec = AgentSpec(
+        spec_id=f"{profile.kind}:deterministic-python:{prompt_hash[:8]}",
+        kind=profile.kind,
+        prompt_hash=prompt_hash,
+        tool_names=(),
+        model_id="deterministic-python",
+        model_base_url="builtin",
+        max_output_tokens=0,
+        budgets={
+            "max_steps": profile.max_steps,
+            "max_tokens": profile.max_tokens,
+            "max_output_tokens": 0,
+            "wall_clock_seconds": profile.wall_clock_seconds,
+        },
+        context_policy={
+            "compact": True,
+            "reset": True,
+            "keep_recent": profile.keep_recent,
+        },
+        verifier=dict(profile.verifier),
+        code_rev=_deterministic_code_rev(),
+        agent_spec_id=str((overlay or {}).get("id") or ""),
+        agent_spec_hash=overlay_hash(overlay_cfg) if overlay_cfg else "",
+    )
+    spec_dict = {**spec.to_dict(), "provider": "builtin", "tools": []}
+    canonical = json.dumps(spec_dict, sort_keys=True, ensure_ascii=False)
+    return spec_dict, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 # ------------------------------------------------------------------ 单步推进
 
 
@@ -637,9 +696,11 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                     return _terminal_status(repo, run_id)
                 return "waiting_jobs"
             text = described
-            notes = pending.get("notes", []) + notes
-            _append_user_blocks(messages, pending.get("results", []) + [
-                _tool_result(pending["tool_use_id"], text)])
+            notes = (pending or {}).get("notes", []) + notes
+            blocks = ([_tool_result(pending["tool_use_id"], text)]
+                      if pending and pending.get("tool_use_id")
+                      else [{"type": "text", "text": text}])
+            _append_user_blocks(messages, (pending or {}).get("results", []) + blocks)
             record_event(repo, run_id, "jobs_done", {"jobIds": job_ids,
                                                      "summary": text[:3000]})
             status, pending = "running", None
@@ -668,6 +729,175 @@ def step(repo: Repo, credentials: CredentialStore | None, run_id: str,
                 repo, run_id, messages,
                 f"wall-clock {profile.wall_clock_seconds}s(活跃 {int(cur_active)}s)",
                 active_seconds=cur_active)
+
+        # 3.5) Step 1(WP-S1A):纯 Python 确定性步(不读 LLM 凭据、0 模型调用)
+        if profile.deterministic_step is not None:
+            det_started = utc_now()
+            with trace.span_context(repo, run_id, step_no) as det_extra_tokens:
+                try:
+                    det_out = profile.deterministic_step(env)
+                    if isinstance(det_out, ToolError):
+                        raise det_out
+                except (ToolError, AgentLoopError, UserError) as exc:
+                    if not row["spec_hash"]:
+                        spec_dict, spec_h = _deterministic_spec_snapshot(
+                            profile, overlay=overlay or None)
+                        _update_if_active(repo, run_id, spec_json=_dumps(spec_dict),
+                                          spec_hash=spec_h)
+                    trace.record_span(
+                        repo, run_id, step_no, "tool", "deterministic_step",
+                        status="error", error_class=type(exc).__name__,
+                        input_obj={"mode": env.config.get("mode") or ""},
+                        output_obj={"type": "error", "message": str(exc)[:2000]},
+                        started_at=det_started, ended_at=utc_now(),
+                    )
+                    cur_active = _active_now()
+                    stop_reason = str(exc)[:500]
+                    if not _update_if_active(
+                        repo, run_id, status="failed", stop_reason=stop_reason,
+                        steps=step_no,
+                        tokens_in=row["tokens_in"] + det_extra_tokens["tokens_in"],
+                        tokens_out=row["tokens_out"] + det_extra_tokens["tokens_out"],
+                        messages_json=_dumps(messages), pending_json=None,
+                        error_streak=0, active_seconds=cur_active,
+                        last_active_at=utc_now(),
+                    ):
+                        _cancel_active_jobs(repo, run_id)
+                        return _terminal_status(repo, run_id)
+                    record_event(repo, run_id, "failed",
+                                 {"error": stop_reason, "deterministic": True})
+                    notify.notify_run(repo, row, "failed", detail=stop_reason)
+                    _cancel_active_jobs(repo, run_id)
+                    return "failed"
+
+                if det_out is not None:
+                    if not row["spec_hash"]:
+                        spec_dict, spec_h = _deterministic_spec_snapshot(
+                            profile, overlay=overlay or None)
+                        _update_if_active(repo, run_id, spec_json=_dumps(spec_dict),
+                                          spec_hash=spec_h)
+                    _, _, span_output = _tool_span_output(det_out)
+                    trace.record_span(
+                        repo, run_id, step_no, "tool", "deterministic_step",
+                        status="ok",
+                        input_obj={"mode": env.config.get("mode") or ""},
+                        output_obj=span_output,
+                        started_at=det_started, ended_at=utc_now(),
+                    )
+                    det_status, det_pending, det_result, det_reset = (
+                        "running", None, None, None)
+                    if isinstance(det_out, Pause):
+                        det_status = ("waiting_human" if det_out.kind == "human"
+                                      else "waiting_jobs")
+                        det_pending = {"kind": det_out.kind, "tool_use_id": None,
+                                       "payload": det_out.payload, "results": []}
+                        if det_out.note:
+                            messages.append({"role": "assistant", "content": [
+                                {"type": "text", "text": det_out.note}]})
+                            record_event(repo, run_id, "assistant",
+                                         {"text": det_out.note[:6000]})
+                        record_event(repo, run_id, det_status, det_out.payload)
+                    elif isinstance(det_out, Finish):
+                        rejection = profile.on_finish(env, det_out.payload)
+                        trace.record_span(
+                            repo, run_id, step_no, "verify", "on_finish",
+                            input_obj=det_out.payload,
+                            output_obj={"rejected": bool(rejection),
+                                        "reason": rejection})
+                        if rejection:
+                            stop_reason = f"验收未通过:{rejection}"[:500]
+                            record_event(repo, run_id, "finish_rejected",
+                                         {"reason": rejection})
+                            cur_active = _active_now()
+                            if not _update_if_active(
+                                repo, run_id, status="failed",
+                                stop_reason=stop_reason, steps=step_no,
+                                tokens_in=row["tokens_in"] + det_extra_tokens["tokens_in"],
+                                tokens_out=row["tokens_out"] + det_extra_tokens["tokens_out"],
+                                messages_json=_dumps(messages), pending_json=None,
+                                error_streak=0, active_seconds=cur_active,
+                                last_active_at=utc_now(),
+                            ):
+                                _cancel_active_jobs(repo, run_id)
+                                return _terminal_status(repo, run_id)
+                            record_event(repo, run_id, "failed",
+                                         {"error": stop_reason, "deterministic": True})
+                            notify.notify_run(repo, row, "failed", detail=stop_reason)
+                            _cancel_active_jobs(repo, run_id)
+                            return "failed"
+                        summary_txt = str(
+                            det_out.payload.get("summary")
+                            or det_out.payload.get("reason")
+                            or ""
+                        )
+                        if summary_txt:
+                            messages.append({"role": "assistant", "content": [
+                                {"type": "text", "text": summary_txt}]})
+                            record_event(repo, run_id, "assistant",
+                                         {"text": summary_txt[:6000]})
+                        det_result = det_out.payload
+                        det_status = "done"
+                    elif isinstance(det_out, NewContext):
+                        det_reset = det_out.seed
+                        record_event(repo, run_id, "new_context",
+                                     {"seed": det_reset[:4000]})
+                    else:
+                        out_txt = str(det_out)
+                        if out_txt:
+                            messages.append({"role": "assistant", "content": [
+                                {"type": "text", "text": out_txt}]})
+                            record_event(repo, run_id, "assistant",
+                                         {"text": out_txt[:6000]})
+
+                    det_fields: dict[str, Any] = {
+                        "steps": step_no,
+                        "tokens_in": row["tokens_in"] + det_extra_tokens["tokens_in"],
+                        "tokens_out": row["tokens_out"] + det_extra_tokens["tokens_out"],
+                        "error_streak": 0,
+                    }
+                    if det_result is not None:
+                        det_fields.update(status="done", pending_json=None,
+                                          result_json=_dumps(det_result))
+                    elif det_pending is not None:
+                        det_fields.update(status=det_status,
+                                          pending_json=_dumps(det_pending))
+                    elif det_reset is not None:
+                        messages = [{"role": "user",
+                                     "content": [{"type": "text", "text": det_reset}]}]
+                        det_fields.update(status="running", pending_json=None)
+                    else:
+                        det_fields.update(status="running", pending_json=None)
+
+                    cur_active = _active_now()
+                    if det_status != "done" and profile.wall_clock_seconds \
+                            and cur_active >= profile.wall_clock_seconds:
+                        return _finish_by_budget(
+                            repo, run_id, messages,
+                            f"wall-clock {profile.wall_clock_seconds}s(活跃 {int(cur_active)}s)",
+                            active_seconds=cur_active,
+                            extra_fields={
+                                "steps": step_no,
+                                "tokens_in": det_fields["tokens_in"],
+                                "tokens_out": det_fields["tokens_out"],
+                                "error_streak": 0,
+                            },
+                        )
+
+                    det_fields["messages_json"] = _dumps(messages)
+                    det_fields["active_seconds"] = cur_active
+                    det_fields["last_active_at"] = utc_now()
+                    if not _update_if_active(repo, run_id, **det_fields):
+                        _cancel_active_jobs(repo, run_id)
+                        return _terminal_status(repo, run_id)
+                    if det_status == "done":
+                        record_event(repo, run_id, "done", det_result)
+                        notify.notify_run(repo, row, "done",
+                                          detail=notify.finish_detail(det_result))
+                    elif det_status == "waiting_human":
+                        notify.notify_run(repo, row, "waiting_human", detail=str(
+                            ((det_pending or {}).get("payload") or {}).get("question")
+                            or "")[:500])
+                    return det_status
 
         # 4) 调模型(spec 快照在首次调用前固化,之后只读)
         tools = profile.build_tools(env)

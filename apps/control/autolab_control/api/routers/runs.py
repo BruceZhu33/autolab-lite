@@ -6,11 +6,25 @@ import json
 
 from fastapi import APIRouter
 from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict, Field
 
 from ...agent import runtime, trace
 from ...core.errors import NotFound
 from ...stages import baseline, campaign, research
 from ..app import Ctx
+
+
+class ValidateIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    datasets: list[str] | None = None
+    seeds: int | None = 3
+    seed_start: int = Field(default=101, ge=0, le=1_000_000)
+    source_run_id: str | None = None
+    gpu_hours: float | str | None = None
+    critic: bool = False
+    reviewer: bool = False
+    agent_spec_id: str | None = None
 
 
 def build(ctx: Ctx) -> APIRouter:
@@ -114,18 +128,19 @@ def build(ctx: Ctx) -> APIRouter:
 
     @router.post("/api/owner/projects/{project_id}/research/validate",
                  dependencies=[ctx.owner])
-    def research_validate(project_id: str, payload: dict) -> dict:
+    def research_validate(project_id: str, payload: ValidateIn) -> dict:
         """把最近一次成功研究会话的冠军改动做成全量验证会话(不改代码,
-        选定数据集 × N seed 按基线口径重跑,一轮收束)。"""
-        gpu_hours = payload.get("gpu_hours")
+        选定数据集 × N seed 按基线口径确定性重跑,0-LLM 一轮收束)。"""
+        gpu_hours = payload.gpu_hours
         return {"run": research.start_validation(
-            repo, project_id,
-            datasets=[str(d) for d in (payload.get("datasets") or []) if str(d).strip()] or None,
-            seeds=int(payload.get("seeds") or 3),
-            source_run_id=str(payload.get("source_run_id") or "").strip() or None,
+            repo, project_id, credentials=ctx.credentials,
+            datasets=[str(d) for d in (payload.datasets or []) if str(d).strip()] or None,
+            seeds=int(payload.seeds) if payload.seeds is not None else 3,
+            seed_start=payload.seed_start,
+            source_run_id=str(payload.source_run_id or "").strip() or None,
             gpu_hours=float(gpu_hours) if gpu_hours not in (None, "") else None,
-            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")),
-            agent_spec_id=str(payload.get("agent_spec_id") or "").strip() or None)}
+            critic=bool(payload.critic), reviewer=bool(payload.reviewer),
+            agent_spec_id=str(payload.agent_spec_id or "").strip() or None)}
 
     @router.post("/api/owner/projects/{project_id}/research/adopt",
                  dependencies=[ctx.owner])
