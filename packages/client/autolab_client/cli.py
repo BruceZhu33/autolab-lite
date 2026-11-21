@@ -14,7 +14,9 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
+import httpx
 import typer
 from autolab_control.core.credentials import CredentialStore
 from autolab_control.core.db import Database
@@ -31,6 +33,7 @@ from autolab_protocol import (
 )
 
 from . import research
+from .sitonholy import sitonholy_app
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="AutoLab Lite control CLI")
 server_app = typer.Typer(no_args_is_help=True)
@@ -45,10 +48,23 @@ app.add_typer(research_app, name="research")
 app.add_typer(experiment_app, name="experiment")
 app.add_typer(plan_app, name="plan")
 app.add_typer(job_app, name="job")
+app.add_typer(sitonholy_app, name="sitonholy")
 
 DbOption = typer.Option(None, "--db", envvar="AUTOLAB_DB", help="control SQLite path")
 CredsOption = typer.Option(None, "--credentials", envvar="AUTOLAB_CREDENTIALS",
                            help="0600 credentials JSON path")
+ApiUrlOption = typer.Option(
+    None,
+    "--api-url",
+    envvar="AUTOLAB_API_URL",
+    help="control HTTP API base URL (default: http://127.0.0.1:8710)",
+)
+OwnerTokenOption = typer.Option(
+    None,
+    "--owner-token",
+    envvar="AUTOLAB_OWNER_TOKEN",
+    help="control owner bearer token (or read from --credentials / AUTOLAB_CREDENTIALS)",
+)
 
 
 def _out(payload: dict) -> None:
@@ -138,6 +154,120 @@ def _resolve_runner_secrets(
     return resolved_token, resolved_hmac
 
 
+def _resolve_api_connection(
+    api_url: str | None,
+    owner_token: str | None,
+    credentials: str | None,
+) -> tuple[str, str]:
+    base_url = (
+        api_url
+        or os.environ.get("AUTOLAB_API_URL")
+        or os.environ.get("AUTOLAB_API")
+        or "http://127.0.0.1:8710"
+    ).strip().rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        typer.secho(
+            f"error: invalid --api-url {base_url!r} (expected http:// or https://)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    token = (
+        owner_token
+        or os.environ.get("AUTOLAB_OWNER_TOKEN")
+        or os.environ.get("AUTOLAB_API_TOKEN")
+        or ""
+    ).strip()
+    if not token and credentials:
+        try:
+            entry = CredentialStore(credentials).get_entry("control:api")
+            token = str(entry.get("owner_token") or "").strip()
+        except Exception as exc:
+            typer.secho(
+                f"error: failed to read owner_token from credentials ({credentials}): {exc}",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(2) from exc
+
+    if not token:
+        typer.secho(
+            "error: owner token is required "
+            "(pass --owner-token, set AUTOLAB_OWNER_TOKEN, or pass --credentials / AUTOLAB_CREDENTIALS)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+    return base_url, token
+
+
+def _api_post(base_url: str, owner_token: str, path: str, payload: dict) -> dict:
+    try:
+        with httpx.Client(timeout=30.0, trust_env=False) as client:
+            resp = client.post(
+                f"{base_url}{path}",
+                json=payload,
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+    except httpx.HTTPError as exc:
+        typer.secho(
+            f"error: control API request failed ({base_url}{path}): {exc}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+
+    if resp.status_code >= 400:
+        detail = ""
+        try:
+            err_json = resp.json()
+            if isinstance(err_json, dict):
+                detail = str(err_json.get("detail") or err_json.get("error") or "")
+        except ValueError:
+            detail = ""
+        msg = detail or resp.text.strip() or f"HTTP {resp.status_code}"
+        typer.secho(
+            f"error: control API returned {resp.status_code}: {msg}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        return resp.json()
+    except ValueError as exc:
+        typer.secho(
+            f"error: control API returned invalid JSON ({base_url}{path}): {exc}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+
+
+def _read_ssh_key_file(key_file: str) -> str:
+    raw = key_file.strip()
+    if not raw:
+        typer.secho("error: --key-file cannot be empty", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    path = Path(raw).expanduser()
+    if not path.exists():
+        typer.secho(f"error: --key-file does not exist: {path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    if not path.is_file():
+        typer.secho(f"error: --key-file is not a regular file: {path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        typer.secho(f"error: failed to read --key-file ({path}): {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
+    if not content.strip():
+        typer.secho(f"error: --key-file is empty: {path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    return content
+
+
 # --------------------------------------------------------------------- server
 
 
@@ -187,6 +317,181 @@ def server_add_local(
         allowed_work_roots=work_root or [], allowed_output_roots=output_root or [],
     )
     _out({"server": server, "credentials_ref": ref})
+
+
+@server_app.command("add-ssh")
+def server_add_ssh(
+    name: str = typer.Option(..., "--name", help="display name for the SSH server"),
+    host: str = typer.Option(..., "--host", help="SSH hostname or IP address"),
+    port: int = typer.Option(22, "--port", help="SSH port (default: 22)"),
+    user: str = typer.Option(..., "--user", help="SSH login username"),
+    password: str | None = typer.Option(
+        None,
+        "--password",
+        help="SSH password (prefer AUTOLAB_SSH_PASSWORD env var over CLI argv)",
+    ),
+    key_file: str | None = typer.Option(
+        None,
+        "--key-file",
+        help="path to SSH private key file (read client-side and posted over Control API)",
+    ),
+    gpu_slots: int = typer.Option(1, "--gpu-slots", help="fallback GPU slot count"),
+    work_root: list[str] = typer.Option(None, "--work-root"),
+    output_root: list[str] = typer.Option(None, "--output-root"),
+    runner_port: int = typer.Option(0, "--runner-port"),
+    runner_token: str | None = typer.Option(
+        None,
+        "--runner-token",
+        help="optional pre-deployed runner bearer token (or AUTOLAB_RUNNER_TOKEN when --runner-port > 0)",
+    ),
+    hmac_key: str | None = typer.Option(
+        None,
+        "--hmac-key",
+        help="optional pre-deployed runner HMAC key (or AUTOLAB_HMAC_KEY when --runner-port > 0)",
+    ),
+    api_url: str | None = ApiUrlOption,
+    owner_token: str | None = OwnerTokenOption,
+    credentials: str | None = CredsOption,
+):
+    if not (1 <= port <= 65535):
+        typer.secho("error: --port must be in 1..65535", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    if gpu_slots < 1:
+        typer.secho("error: --gpu-slots must be >= 1", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    if runner_port < 0 or runner_port > 65535:
+        typer.secho("error: --runner-port must be in 0..65535", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    if password is not None and key_file is not None:
+        typer.secho("error: provide only one of --password or --key-file", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+
+    if key_file is not None:
+        auth_kind = "key"
+        secret = _read_ssh_key_file(key_file)
+    else:
+        resolved_pw = password if password is not None else os.environ.get("AUTOLAB_SSH_PASSWORD")
+        if not resolved_pw:
+            typer.secho(
+                "error: SSH credential is required (pass --key-file, --password, or set AUTOLAB_SSH_PASSWORD)",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(2)
+        auth_kind = "password"
+        secret = resolved_pw
+
+    if runner_port == 0 and ((runner_token and runner_token.strip()) or (hmac_key and hmac_key.strip())):
+        typer.secho(
+            "error: --runner-token and --hmac-key require --runner-port > 0",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    payload: dict = {
+        "name": name.strip(),
+        "transport_mode": "ssh",
+        "host": host.strip(),
+        "ssh_port": port,
+        "username": user.strip(),
+        "auth_kind": auth_kind,
+        "secret": secret,
+        "gpu_slots": gpu_slots,
+        "allowed_work_roots": work_root or [],
+        "allowed_output_roots": output_root or [],
+    }
+    if runner_port > 0:
+        payload["runner_port"] = runner_port
+        resolved_rtok = (
+            runner_token.strip()
+            if runner_token is not None
+            else os.environ.get("AUTOLAB_RUNNER_TOKEN", "").strip()
+        )
+        resolved_hmac = (
+            hmac_key.strip()
+            if hmac_key is not None
+            else os.environ.get("AUTOLAB_HMAC_KEY", "").strip()
+        )
+        if resolved_hmac and not resolved_rtok:
+            typer.secho(
+                "error: --hmac-key requires --runner-token (or AUTOLAB_RUNNER_TOKEN)",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(2)
+        if resolved_rtok:
+            payload["runner_token"] = resolved_rtok
+            payload["manifest_hmac_key"] = resolved_hmac
+
+    base_url, token = _resolve_api_connection(api_url, owner_token, credentials)
+    _out(_api_post(base_url, token, "/api/owner/servers", payload))
+
+
+@server_app.command("confirm-fingerprint")
+def server_confirm_fingerprint(
+    server: str | None = typer.Option(None, "--server", help="registered server id"),
+    host: str | None = typer.Option(None, "--host", help="SSH hostname or IP address"),
+    port: int | None = typer.Option(None, "--port", help="SSH port (default: 22 when using --host)"),
+    fingerprint: str | None = typer.Option(
+        None,
+        "--fingerprint",
+        help="expected SHA256:... SSH host key fingerprint (required for key rotation)",
+    ),
+    key_type: str | None = typer.Option(None, "--key-type", help="SSH host key type (e.g. ssh-ed25519)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="confirm without interactive prompt"),
+    api_url: str | None = ApiUrlOption,
+    owner_token: str | None = OwnerTokenOption,
+    credentials: str | None = CredsOption,
+):
+    has_server = bool(server and server.strip())
+    has_host = bool(host and host.strip())
+    if has_server == has_host:
+        typer.secho(
+            "error: provide exactly one of --server or --host",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+    if port is not None and not (1 <= port <= 65535):
+        typer.secho("error: --port must be in 1..65535", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+
+    target_desc = (
+        f"server {server.strip()}"
+        if has_server
+        else f"{host.strip()}:{port if port is not None else 22}"
+    )
+    if not yes:
+        if not sys.stdin.isatty():
+            typer.secho(
+                "error: refusing to confirm SSH host key fingerprint non-interactively without --yes",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(2)
+        if not typer.confirm(f"Confirm and pin SSH host key for {target_desc}?", default=False):
+            typer.secho("aborted; host key fingerprint not confirmed", fg=typer.colors.RED, err=True)
+            raise typer.Exit(2)
+
+    payload: dict = {}
+    if fingerprint and fingerprint.strip():
+        payload["fingerprint"] = fingerprint.strip()
+    if key_type and key_type.strip():
+        payload["key_type"] = key_type.strip()
+
+    if has_server:
+        server_id = server.strip()
+        if port is not None:
+            payload["port"] = port
+        endpoint = f"/api/owner/servers/{quote(server_id, safe='')}/confirm-fingerprint"
+    else:
+        payload["host"] = host.strip()
+        payload["port"] = port if port is not None else 22
+        endpoint = "/api/owner/servers/confirm-fingerprint"
+
+    base_url, token = _resolve_api_connection(api_url, owner_token, credentials)
+    _out(_api_post(base_url, token, endpoint, payload))
 
 
 @server_app.command("list")

@@ -20,6 +20,8 @@ from .fs import safe_extract_zip, validate_safe_local_path
 from .host import Host, q
 
 PROJECTS_DIR = "autolab-projects"
+SITONHOLY_PERSIST_ROOT = "/root/data1"
+_PERSIST_DATA1_MARKER = "__AUTOLAB_DATA1__"
 SYNC_EXCLUDES = {
     ".git", ".venv", "venv", "__pycache__", ".autolab", ".autolab-runner", ".ssh",
     ".gnupg", "node_modules",
@@ -54,13 +56,30 @@ def validate_git_url(url: str) -> str:
     return clean
 
 
-def _new_target(host: Host, name: str) -> str:
+def default_projects_dir(host: Host) -> str:
+    """容器/服务器挂载了可写的持久化卷 `/root/data1` 时优先用 `/root/data1/autolab-projects`,否则回落 `~/autolab-projects`。"""
+    probe = host.run(
+        f"test -d {SITONHOLY_PERSIST_ROOT} && test -w {SITONHOLY_PERSIST_ROOT} && echo {_PERSIST_DATA1_MARKER}",
+        timeout=10,
+    )
+    if probe.ok and _PERSIST_DATA1_MARKER in (probe.out or ""):
+        return posixpath.normpath(f"{SITONHOLY_PERSIST_ROOT}/{PROJECTS_DIR}")
+    return posixpath.normpath(f"{host.home().rstrip('/')}/{PROJECTS_DIR}")
+
+
+def project_target(host: Host, name: str) -> str:
+    """解析并校验新项目目标路径(`<default_projects_dir>/<clean_name>`),不创建目录。"""
     clean = validate_project_name(name)
-    base = posixpath.normpath(f"{host.home().rstrip('/')}/{PROJECTS_DIR}")
+    base = default_projects_dir(host)
     target = posixpath.normpath(f"{base}/{clean}")
     if posixpath.dirname(target) != base:
         raise UserError(f"项目目标路径越界:{name}")
-    host.run(f"mkdir -p {q(base)}")
+    return target
+
+
+def _new_target(host: Host, name: str) -> str:
+    target = project_target(host, name)
+    host.run(f"mkdir -p {q(posixpath.dirname(target))}")
     if host.exists(target):
         raise UserError(f"目标目录已存在:{target}")
     return target

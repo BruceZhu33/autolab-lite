@@ -175,3 +175,21 @@ def test_hostkey_store_persists_private_permissions(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
     reopened = HostKeyStore(path)
     assert reopened.known("h", 22)["fingerprint"] == "SHA256:AA"
+
+
+def test_load_pkey_accepts_private_key_strings(tmp_path):
+    import io
+
+    import paramiko
+    from autolab_control.core.credentials import CredentialStore
+    from autolab_control.infra.sitonholy import ensure_sitonholy_ssh_key
+
+    priv_ed, _ = ensure_sitonholy_ssh_key(CredentialStore(tmp_path / "creds.json"))
+    loaded_ed = SshTransport._load_pkey(priv_ed)
+    assert loaded_ed.get_name() == "ssh-ed25519"
+
+    rsa = paramiko.RSAKey.generate(2048)
+    buf = io.StringIO()
+    rsa.write_private_key(buf)
+    loaded_rsa = SshTransport._load_pkey(buf.getvalue())
+    assert loaded_rsa.get_name() == "ssh-rsa"

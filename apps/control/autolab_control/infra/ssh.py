@@ -11,6 +11,7 @@ Security rules (M3 gate):
 
 from __future__ import annotations
 
+import io
 import posixpath
 import select
 import shlex
@@ -127,10 +128,11 @@ class SshTransport:
 
     @staticmethod
     def _load_pkey(pkey: str) -> paramiko.PKey:
+        raw = pkey.strip() + "\n"
         errors = []
         for loader in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
             try:
-                return loader.from_private_key_string(pkey)
+                return loader.from_private_key(io.StringIO(raw))
             except Exception as exc:
                 errors.append(f"{loader.__name__}: {exc}")
         raise SshError("unsupported private key format: " + "; ".join(errors[:2]))

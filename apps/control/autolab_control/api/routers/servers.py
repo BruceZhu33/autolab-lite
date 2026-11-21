@@ -3,22 +3,56 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Annotated
 
-from fastapi import APIRouter, Body, HTTPException
+import paramiko
+from fastapi import APIRouter, Body, HTTPException, Query
 
+from ...core.db import utc_now
 from ...core.errors import NotFound, UserError
 from ...core.ids import new_id
 from ...infra import gpu, runner_deploy, servers
+from ...infra.hostkeys import HostKeyStore, fingerprint_for
 from ...workspace.host import browse_dirs, open_host
 from ..app import Ctx
 
 PUBLIC_FIELDS = ("id", "name", "transport_mode", "host", "port", "username",
                  "status_hint", "gpu_slots", "runner_port", "last_seen_at")
+SERVER_TELEMETRY_TIMEOUT = 3.0
+_MAX_TELEMETRY_WORKERS = 8
 
 
 def _public(server: dict) -> dict:
     return {k: server[k] for k in PUBLIC_FIELDS}
+
+
+def _normalize_fingerprint(fp: str) -> str:
+    text = fp.strip()
+    if text[:7].upper() == "SHA256:":
+        return "SHA256:" + text[7:].strip()
+    return text
+
+
+def _fetch_remote_host_key(host: str, port: int, *, timeout: float = 8.0) -> tuple[str, str]:
+    """Fetch the live SSH server public key type and SHA256 fingerprint."""
+    transport: paramiko.Transport | None = None
+    try:
+        transport = paramiko.Transport((host, port))
+        transport.banner_timeout = timeout
+        transport.start_client(timeout=timeout)
+        key = transport.get_remote_server_key()
+        if key is None:
+            raise servers.ServerError(f"无法连接 {host}:{port} 获取主机密钥:远端未返回公钥")
+    except servers.ServerError:
+        raise
+    except Exception as exc:
+        raise servers.ServerError(f"无法连接 {host}:{port} 获取主机密钥:{exc}") from exc
+    finally:
+        if transport is not None:
+            transport.close()
+    key_type = key.get_name()
+    return key_type, fingerprint_for(key_type, key.asbytes())
 
 
 def build(ctx: Ctx) -> APIRouter:
@@ -31,19 +65,61 @@ def build(ctx: Ctx) -> APIRouter:
             raise NotFound("server not found")
         return server
 
+    def _probe_server_telemetry(server: dict) -> tuple[list[dict], int, str]:
+        if server["transport_mode"] == "ssh":
+            gpus = gpu.remote_gpu_telemetry(server, credentials, ctx.hostkeys_path)
+            slots, source = (len(gpus), "nvidia-smi") if gpus \
+                else (server["gpu_slots"], "registered")
+            return gpus, slots, source
+        gpus = gpu.probe_gpu_telemetry()
+        slots, source = gpu.probe_gpu_slots(fallback=server["gpu_slots"])
+        return gpus, slots, source
+
     @router.get("/api/servers", dependencies=[ctx.reader])
-    def list_servers() -> list[dict]:
-        out = []
-        for server in repo.list_servers():
-            if server["transport_mode"] == "ssh":
-                gpus = gpu.remote_gpu_telemetry(server, credentials, ctx.hostkeys_path)
-                slots, source = (len(gpus), "nvidia-smi") if gpus \
-                    else (server["gpu_slots"], "registered")
-            else:
-                gpus = gpu.probe_gpu_telemetry()
-                slots, source = gpu.probe_gpu_slots(fallback=server["gpu_slots"])
-            out.append({**_public(server), "gpu_slot_source": source, "gpus": gpus})
-        return out
+    def list_servers(live: bool = Query(default=True)) -> list[dict]:
+        rows = repo.list_servers()
+        if not rows:
+            return []
+        if not live:
+            return [
+                {
+                    **_public(server),
+                    "slots": server["gpu_slots"],
+                    "gpu_slot_source": "registered",
+                    "gpus": [],
+                }
+                for server in rows
+            ]
+        results: list[tuple[list[dict], int, str]] = [
+            ([], server["gpu_slots"], "registered") for server in rows
+        ]
+        pool = ThreadPoolExecutor(max_workers=min(len(rows), _MAX_TELEMETRY_WORKERS))
+        future_to_idx = {
+            pool.submit(_probe_server_telemetry, server): idx
+            for idx, server in enumerate(rows)
+        }
+        try:
+            done, not_done = wait(future_to_idx.keys(), timeout=SERVER_TELEMETRY_TIMEOUT)
+            for fut in done:
+                idx = future_to_idx[fut]
+                try:
+                    results[idx] = fut.result()
+                except Exception:
+                    pass
+            for fut in not_done:
+                fut.cancel()
+        finally:
+            # hung SSH sockets shouldn't block worker pool exit beyond telemetry timeout
+            pool.shutdown(wait=False, cancel_futures=True)
+        return [
+            {
+                **_public(server),
+                "slots": slots,
+                "gpu_slot_source": source,
+                "gpus": gpus,
+            }
+            for server, (gpus, slots, source) in zip(rows, results, strict=True)
+        ]
 
     @router.post("/api/owner/servers", dependencies=[ctx.owner])
     def register_server(payload: dict) -> dict:
@@ -98,6 +174,139 @@ def build(ctx: Ctx) -> APIRouter:
         return {"server": _public(server), "gpu_slot_source": slot_source,
                 "host_key_fingerprint": fingerprint}
 
+    def _parse_ssh_port(raw_port: object) -> int:
+        if isinstance(raw_port, bool):
+            raise HTTPException(400, "port 必须是 1..65535 的整数")
+        try:
+            port = int(raw_port)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "port 必须是 1..65535 的整数") from exc
+        if not (1 <= port <= 65535):
+            raise HTTPException(400, "port 必须在 1..65535 范围内")
+        return port
+
+    def _confirm_host_fingerprint(
+        payload: dict | None, path_server_id: str | None = None
+    ) -> dict:
+        body = payload or {}
+        body_server_id = str(body.get("server_id") or "").strip()
+        if path_server_id and body_server_id and path_server_id != body_server_id:
+            raise HTTPException(400, "请求体 server_id 与路径参数不一致")
+        resolved_server_id = path_server_id or body_server_id
+
+        if resolved_server_id:
+            server = server_or_404(resolved_server_id)
+            if server["transport_mode"] != "ssh":
+                raise HTTPException(400, "local 模式服务器不使用 SSH 主机密钥")
+            host = (server.get("host") or "").strip()
+            port = int(server.get("port") or 22)
+            body_host = str(body.get("host") or "").strip()
+            if body_host and body_host != host:
+                raise HTTPException(400, "提供的 host 与已登记服务器不一致")
+            raw_body_port = body.get("port") if body.get("port") is not None else body.get("ssh_port")
+            if raw_body_port is not None and _parse_ssh_port(raw_body_port) != port:
+                raise HTTPException(400, "提供的 port 与已登记服务器不一致")
+        else:
+            host = str(body.get("host") or "").strip()
+            if not host:
+                raise HTTPException(400, "需要提供 server_id 或 host")
+            raw_port = (
+                body.get("port") if body.get("port") is not None else body.get("ssh_port", 22)
+            )
+            port = _parse_ssh_port(raw_port)
+
+        supplied_fp = str(body.get("fingerprint") or "").strip()
+        supplied_key_type = str(body.get("key_type") or "").strip()
+        norm_supplied = ""
+        if supplied_fp:
+            norm_supplied = _normalize_fingerprint(supplied_fp)
+            suffix = norm_supplied[7:] if norm_supplied.startswith("SHA256:") else ""
+            if not suffix or any(ch.isspace() for ch in suffix):
+                raise HTTPException(400, "fingerprint 格式无效,应为 SHA256:...")
+
+        store = HostKeyStore(ctx.hostkeys_path)
+        existing = store.known(host, port)
+        prev_fp = str(existing.get("fingerprint") or "") if existing else None
+
+        try:
+            remote_key_type, remote_fp = _fetch_remote_host_key(host, port)
+        except servers.ServerError:
+            if not (norm_supplied and supplied_key_type):
+                raise
+            key_type, fingerprint = supplied_key_type, norm_supplied
+            source = "explicit"
+        else:
+            source = "ssh-probe"
+            if norm_supplied and norm_supplied != _normalize_fingerprint(remote_fp):
+                raise HTTPException(
+                    409,
+                    f"提供的指纹与远端 SSH 主机公钥不一致({host}:{port}): "
+                    f"期望 {norm_supplied}, 远端 {remote_fp}",
+                )
+            if supplied_key_type and supplied_key_type != remote_key_type:
+                raise HTTPException(
+                    409,
+                    f"提供的 key_type 与远端 SSH 主机公钥不一致({host}:{port}): "
+                    f"期望 {supplied_key_type}, 远端 {remote_key_type}",
+                )
+            if (
+                existing is not None
+                and _normalize_fingerprint(prev_fp or "") != _normalize_fingerprint(remote_fp)
+                and not norm_supplied
+            ):
+                raise HTTPException(
+                    409,
+                    f"主机密钥已发生变更({host}:{port}): 已固定 {prev_fp}, "
+                    f"当前远端 {remote_fp}; 请显式传入 fingerprint 确认轮换",
+                )
+            key_type, fingerprint = remote_key_type, remote_fp
+
+        store.confirm_and_pin(host, port, key_type=key_type, fingerprint=fingerprint)
+
+        updated_ids: list[str] = []
+        conn = repo.db.connect()
+        try:
+            with repo.db.tx(conn):
+                rows = conn.execute(
+                    "SELECT id FROM servers WHERE transport_mode = 'ssh' "
+                    "AND (id = ? OR (host = ? AND COALESCE(port, 22) = ?))",
+                    (resolved_server_id or "", host, port),
+                ).fetchall()
+                updated_ids = [r["id"] for r in rows]
+                if updated_ids:
+                    placeholders = ",".join("?" for _ in updated_ids)
+                    conn.execute(
+                        f"UPDATE servers SET host_key_fingerprint = ?, updated_at = ? "
+                        f"WHERE id IN ({placeholders})",
+                        (fingerprint, utc_now(), *updated_ids),
+                    )
+        finally:
+            conn.close()
+
+        return {
+            "host": host,
+            "port": port,
+            "key_type": key_type,
+            "fingerprint": fingerprint,
+            "previous_fingerprint": prev_fp,
+            "rotated": bool(
+                prev_fp and _normalize_fingerprint(prev_fp) != _normalize_fingerprint(fingerprint)
+            ),
+            "source": source,
+            "updated_server_ids": updated_ids,
+        }
+
+    @router.post("/api/owner/servers/confirm-fingerprint", dependencies=[ctx.owner])
+    def confirm_fingerprint(payload: Annotated[dict, Body()]) -> dict:
+        return _confirm_host_fingerprint(payload)
+
+    @router.post("/api/owner/servers/{server_id}/confirm-fingerprint", dependencies=[ctx.owner])
+    def confirm_server_fingerprint(
+        server_id: str,
+        payload: Annotated[dict | None, Body()] = None,
+    ) -> dict:
+        return _confirm_host_fingerprint(payload, path_server_id=server_id)
+
     @router.delete("/api/owner/servers/{server_id}", dependencies=[ctx.owner])
     def remove_server(server_id: str) -> dict:
         removed = repo.delete_server(server_id)
@@ -149,6 +358,11 @@ def build(ctx: Ctx) -> APIRouter:
                 raise UserError(
                     "该节点仍有在途 GPU 任务，请等待结束后再升级或显式确认强制重启"
                 )
+
+        from ...infra.sitonholy import find_sitonholy_task_for_server, repair_sitonholy_server_runner
+
+        if find_sitonholy_task_for_server(server, credentials) is not None:
+            return repair_sitonholy_server_runner(server, credentials, repo, force=force)
 
         existing_work_roots = json.loads(server.get("allowed_work_roots_json") or "[]")
         existing_output_roots = json.loads(server.get("allowed_output_roots_json") or "[]")

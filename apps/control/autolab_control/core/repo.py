@@ -535,7 +535,11 @@ class Repo:
         finally:
             conn.close()
 
-    def try_acquire_next_job(self) -> AcquiredJob | None:
+    def try_acquire_next_job(
+        self,
+        *,
+        exclude_server_ids: set[str] | None = None,
+    ) -> AcquiredJob | None:
         """Pick the earliest QUEUED job, honor plan max_parallel, and acquire
         ALL gpu leases atomically (or none). Persists dispatch_id and
         DISPATCHING before any network call can happen."""
@@ -550,6 +554,8 @@ class Repo:
                     " ORDER BY j.queued_at, j.plan_revision_id, j.ordinal"
                 ).fetchall()
                 for row in rows:
+                    if exclude_server_ids and row["server_id"] in exclude_server_ids:
+                        continue
                     try:
                         spec = PlanSpecV1.model_validate(json.loads(row["spec_json"]))
                     except Exception as exc:

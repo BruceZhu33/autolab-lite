@@ -136,11 +136,27 @@ def main(argv: list[str] | None = None) -> int:
 
     agent_thread: threading.Thread | None = None
     agents: AgentLoopManager | None = None
+    keepalive_watchdog = None
+    auto_acquire_watchdog = None
     prev_sigterm = None
     prev_sigint = None
     in_main_thread = threading.current_thread() is threading.main_thread()
     try:
+        from .infra.sitonholy import (
+            SitonholyAutoAcquireWatchdog,
+            SitonholyKeepaliveWatchdog,
+            get_bridge_manager,
+        )
+
         repo = Repo(db)
+        if credentials is not None:
+            get_bridge_manager().restore_from_credentials(credentials)
+            if os.environ.get("AUTOLAB_DISABLE_KEEPALIVE_WATCHDOG") != "1":
+                keepalive_watchdog = SitonholyKeepaliveWatchdog(repo, credentials)
+                keepalive_watchdog.start()
+            if os.environ.get("AUTOLAB_DISABLE_AUTO_ACQUIRE_WATCHDOG") != "1":
+                auto_acquire_watchdog = SitonholyAutoAcquireWatchdog(repo, credentials)
+                auto_acquire_watchdog.start()
         if args.http_port and not _start_http(repo, credentials, args.http_port):
             return 2
         stop = threading.Event()
@@ -169,6 +185,14 @@ def main(argv: list[str] | None = None) -> int:
         print("autolab-control: stopped", flush=True)
         return 0
     finally:
+        from .infra.sitonholy import get_bridge_manager, get_terminal_manager
+
+        if auto_acquire_watchdog is not None:
+            auto_acquire_watchdog.stop()
+        if keepalive_watchdog is not None:
+            keepalive_watchdog.stop()
+        get_terminal_manager().stop_all()
+        get_bridge_manager().stop_all()
         if agents is not None:
             agents.stop(timeout=5.0)
         if agent_thread is not None and hasattr(agent_thread, "join"):

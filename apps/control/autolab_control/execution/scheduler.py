@@ -36,6 +36,8 @@ _MAX_UNCERTAIN_ATTEMPTS = 30
 # 磁盘水位:本地服务器根目录空闲低于该比例时暂停新派发(1.7T 的盘≈85G 缓冲,
 # 够一次训练的 checkpoint 波动;真机事故:盘写满,SQLite disk I/O error 拖崩控制端)
 _DISK_FREE_MIN = 0.05
+_DB_DISK_FREE_CAP_BYTES = 10 * 1024 * 1024 * 1024
+_LOCAL_DISK_FREE_CAP_BYTES = 20 * 1024 * 1024 * 1024
 _UNCERTAIN_BACKOFF_TICKS = 1
 _MAX_UNREACHABLE_BACKOFF_TICKS = 75
 _MAX_RUNNING_404_POLLS = 5
@@ -178,26 +180,25 @@ class Scheduler:
             else ""
         )
         for server in self.repo.list_servers():
-            roots: list[str] = []
+            root_caps: dict[str, int] = {}
             if db_root:
-                roots.append(db_root)
+                root_caps[db_root] = _DB_DISK_FREE_CAP_BYTES
             if server["transport_mode"] == "local":
                 for column in ("allowed_work_roots_json", "allowed_output_roots_json"):
                     try:
-                        roots += json.loads(server.get(column) or "[]")
+                        for p in json.loads(server.get(column) or "[]"):
+                            if p:
+                                root_caps[p] = max(root_caps.get(p, 0), _LOCAL_DISK_FREE_CAP_BYTES)
                     except ValueError:
                         continue
             low_root = ""
-            seen_roots: set[str] = set()
-            for root in roots:
-                if not root or root in seen_roots:
-                    continue
-                seen_roots.add(root)
+            for root, cap_bytes in root_caps.items():
                 try:
                     usage = shutil.disk_usage(root)
                 except OSError:
                     continue
-                if usage.free / max(usage.total, 1) < _DISK_FREE_MIN:
+                threshold_bytes = min(usage.total * _DISK_FREE_MIN, float(cap_bytes))
+                if usage.free < threshold_bytes:
                     low_root = root
                     break
             server_id = server["id"]
@@ -366,8 +367,11 @@ class Scheduler:
 
     def _dispatch_new_jobs(self) -> None:
         held: dict[str, str] = {}  # job_id -> 保护原因(本 tick 已压回过的)
+        blocked_servers: set[str] = set()
         while True:
-            acquired = self.repo.try_acquire_next_job()
+            acquired = self.repo.try_acquire_next_job(
+                exclude_server_ids=blocked_servers or None
+            )
             if acquired is None:
                 return
             job = acquired.job
@@ -394,6 +398,7 @@ class Scheduler:
                     # runner known unreachable: hold the job, do not burn attempts
                     self.repo.return_to_queued(job["id"], reason="runner unreachable")
                     held[job["id"]] = "runner unreachable"
+                    blocked_servers.add(job["server_id"])
                     continue
             low_root = self._disk_low.get(job["server_id"])
             if low_root:
@@ -402,6 +407,7 @@ class Scheduler:
                           f"{_DISK_FREE_MIN:.0%},清理 checkpoint 后自动恢复")
                 self.repo.return_to_queued(job["id"], reason=reason)
                 held[job["id"]] = reason
+                blocked_servers.add(job["server_id"])
                 continue
             try:
                 manifest = build_manifest(acquired, self._project_for(job))

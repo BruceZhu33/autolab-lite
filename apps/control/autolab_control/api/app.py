@@ -12,6 +12,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -95,6 +96,36 @@ def _auth(owner_token: str, agent_token: str, repo: Repo, scope: str):
     return check
 
 
+class _JsonExceptionMiddleware:
+    """在 CORSMiddleware 内层兜底未捕获异常，保留 CORS 响应头避免浏览器误报 Failed to fetch。"""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        response_started = False
+
+        async def _send_wrapper(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send_wrapper)
+        except Exception as exc:
+            if response_started:
+                raise
+            resp = JSONResponse(
+                status_code=500,
+                content={"detail": f"服务器内部错误 ({type(exc).__name__}): {exc}"},
+            )
+            await resp(scope, receive, send)
+
+
 def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
     try:
         tokens = credentials.get_entry(API_REF)
@@ -113,6 +144,8 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
         if host:
             hosts.append(re.escape(host))
     allowed = rf"^https?://({'|'.join(hosts)})(:\d+)?$"
+    # 后添加的 CORSMiddleware 位于最外层，保证未捕获异常转成的 JSON 500 仍带 CORS 头
+    app.add_middleware(_JsonExceptionMiddleware)
     app.add_middleware(CORSMiddleware,
                        allow_origin_regex=allowed,
                        allow_methods=["*"], allow_headers=["*"])
@@ -137,9 +170,21 @@ def create_api_app(repo: Repo, credentials: CredentialStore) -> FastAPI:
     ctx = Ctx(repo=repo, credentials=credentials,
               owner=Depends(_auth(owner_token, agent_token, repo, "owner")),
               reader=Depends(_auth(owner_token, agent_token, repo, "agent")))
-    from .routers import agent_specs, auth, canaries, jobs, kb, papers, projects, runs, servers, system
+    from .routers import (
+        agent_specs,
+        auth,
+        canaries,
+        jobs,
+        kb,
+        papers,
+        projects,
+        runs,
+        servers,
+        sitonholy,
+        system,
+    )
 
-    for module in (auth, system, servers, agent_specs, canaries, projects, jobs,
+    for module in (auth, system, servers, sitonholy, agent_specs, canaries, projects, jobs,
                    runs, kb, papers):
         app.include_router(module.build(ctx))
     return app

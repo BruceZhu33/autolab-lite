@@ -37,6 +37,8 @@ export interface ServerDetail {
   status: "REACHABLE" | "UNREACHABLE" | "UNKNOWN";
   agent_port: number | null;
   agent_version: string | null;
+  gpu_slots?: number;
+  gpu_slot_source?: string;
   gpus: GpuTelemetry[];
 }
 
@@ -139,6 +141,8 @@ function toDetail(server: ApiServer): ServerDetail {
           : "UNKNOWN",
     agent_port: server.runner_port || null,
     agent_version: null,
+    gpu_slots: server.gpu_slots ?? (server.gpus?.length ?? 0),
+    gpu_slot_source: server.gpu_slot_source ?? "registered",
     gpus: (server.gpus ?? []).map((g) => ({
       index: g.gpu_index,
       gpu_index: g.gpu_index,
@@ -279,3 +283,82 @@ export async function deleteServer(id: string): Promise<{ name: string }> {
   );
   return { name: result.name };
 }
+
+export interface ServerWorkspaceAccess {
+  server_id: string;
+  server_name: string;
+  provider: "sitonholy" | "ssh" | "local" | string;
+  task_id: string | null;
+  status_label: string;
+  vscode_url: string;
+  vscode_password: string;
+  novnc_url: string;
+  novnc_via_vscode?: boolean;
+  vnc_password: string;
+  jupyter_url: string;
+  jupyter_password: string;
+  terminal_url: string;
+  web_terminal_supported: boolean;
+  work_roots: string[];
+  ssh_hint: string;
+  remote_hint: string;
+}
+
+export const getServerWorkspaceAccess = (serverId: string) =>
+  request<ServerWorkspaceAccess>(
+    `/api/servers/${encodeURIComponent(serverId)}/workspace-access`,
+  );
+
+export const openServerTerminal = (
+  serverId: string,
+  opts?: { cols?: number; rows?: number; command?: string },
+) =>
+  request<{
+    session: {
+      session_id: string;
+      task_id: string;
+      task_name: string;
+      ip_address: string;
+      container_id: string;
+      command: string;
+      cols: number;
+      rows: number;
+      cursor: number;
+      closed: boolean;
+      error: string | null;
+    };
+  }>(`/api/servers/${encodeURIComponent(serverId)}/terminal/sessions`, {
+    method: "POST",
+    body: JSON.stringify({
+      cols: opts?.cols ?? 140,
+      rows: opts?.rows ?? 36,
+      command: opts?.command ?? "/bin/bash",
+    }),
+  });
+
+export const serverTerminalStreamUrl = (sessionId: string, after = 0) =>
+  `${resolveApiUrl()}/api/servers/terminal/sessions/${encodeURIComponent(sessionId)}/stream?after=${after}`;
+
+export const serverTerminalInput = (sessionId: string, data: string) =>
+  request<{ ok: boolean; session_id: string }>(
+    `/api/servers/terminal/sessions/${encodeURIComponent(sessionId)}/input`,
+    {
+      method: "POST",
+      body: JSON.stringify({ data }),
+    },
+  );
+
+export const closeServerTerminal = (sessionId: string, keepalive = false) =>
+  fetch(
+    `${resolveApiUrl()}/api/servers/terminal/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token()}`,
+      },
+      keepalive,
+    },
+  ).then(async (res) => {
+    if (!res.ok) return { ok: false, closed: false };
+    return (await res.json()) as { ok: boolean; closed: boolean };
+  });
