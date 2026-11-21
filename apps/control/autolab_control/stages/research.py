@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import posixpath
 import re
 import shlex
 from datetime import datetime, timezone
@@ -42,6 +44,8 @@ from ..execution.experiments import (
     check_command_readonly_safe,
     check_dataset_command_consistency,
     effective_metrics,
+    format_shell_command,
+    split_command_env_prefix,
     submit_eval_jobs,
     submit_experiment,
 )
@@ -655,8 +659,10 @@ def _status_suffix(env: LoopEnv) -> str:
                      f" / {tier['gpu_hours']:g} 小时")
     if validation:
         seeds = int(env.config.get("seeds") or 3)
+        raw_tol = env.config.get("regress_tol")
+        tol = 0.005 if raw_tol is None else float(raw_tol)
         lines.append(f"- 成功标准:每个数据集 ≥{seeds} seed 的均值不恶化(容忍 "
-                     f"{float(env.config.get('regress_tol') or 0.005):g}),且至少一个数据集改善")
+                     f"{tol:g}),且至少一个数据集改善")
     elif tier["threshold"]:
         lines.append(f"- 成功标准:任一变体 ≥{tier['min_seeds']} seed 的均值改善 ≥"
                      f" {tier['threshold']:g} 且 95% CI 下界 > 0")
@@ -667,34 +673,80 @@ def _status_suffix(env: LoopEnv) -> str:
 
 # ------------------------------------------------------------------ 工具
 
-_SHELL_FORBIDDEN_RE = re.compile(r"&&|\|\||[;|`<>]|\$\(|[\r\n]")
 _SEED_FLAGS = frozenset({"seed", "random-seed", "random_seed"})
 
 
-def _long_flag_pairs(command: str) -> dict[str, str]:
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return {}
-    pairs: dict[str, str] = {}
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if not tok.startswith("--"):
-            i += 1
-            continue
-        if "=" in tok:
-            name, _, value = tok.partition("=")
-        else:
-            if i + 1 >= len(tokens) or tokens[i + 1].startswith("-"):
-                i += 1
-                continue
-            name, value = tok, tokens[i + 1]
-            i += 1
-        if name.lstrip("-") not in _SEED_FLAGS:
-            pairs[name] = value
-        i += 1
-    return pairs
+def _stage_temp_index_cmd(spec_args: str) -> str:
+    """将工作区跟踪源码改动与非忽略未跟踪源码写入 `$tmp` 临时 index;
+    用 `git add -u` + `ls-files --others` 规避 `git add -A -- . :(exclude)...` 命中 `.gitignore` 报错。"""
+    return (
+        "if [ -f \"$idx\" ]; then cp \"$idx\" \"$tmp\"; else rm -f \"$tmp\"; fi; "
+        f"if [ -n \"$(GIT_INDEX_FILE=\"$tmp\" git ls-files -- {spec_args} | head -n 1)\" ]; then "
+        f"  GIT_INDEX_FILE=\"$tmp\" git add -u -- {spec_args}; "
+        "fi; "
+        f"git ls-files --others --exclude-standard -z -- {spec_args} "
+        "| GIT_INDEX_FILE=\"$tmp\" git update-index --add -z --stdin; "
+    )
+
+
+def _workdir_matches_commit(ws: Workspace, commit: str) -> bool:
+    """判断工作区源码树(遵循 source_git_pathspecs)与 HEAD 是否与 commit 完全一致。"""
+    spec_args = " ".join(q(s) for s in projects.source_git_pathspecs(ws.host, ws.workdir))
+    check_script = (
+        "set -e; "
+        "idx=$(git rev-parse --git-path index); "
+        "tmp=$(mktemp \"${TMPDIR:-/tmp}/autolab-vchk.XXXXXX\"); "
+        "trap 'rm -f \"$tmp\"' EXIT; "
+        + _stage_temp_index_cmd(spec_args)
+        + "cur_tree=$(GIT_INDEX_FILE=\"$tmp\" git write-tree); "
+        + f"tgt_tree=$(git rev-parse {q(commit + '^{tree}')}); "
+        + "head=$(git rev-parse --verify HEAD 2>/dev/null || true); "
+        + f"if [ \"$cur_tree\" = \"$tgt_tree\" ] && [ \"$head\" = {q(commit)} ]; then "
+        + "  printf 'clean\\n'; "
+        + "else "
+        + "  printf 'diverged\\n'; "
+        + "fi"
+    )
+    chk = ws.sh(check_script, timeout=60)
+    return bool(chk.ok and (chk.out or "").strip().endswith("clean"))
+
+
+def _snapshot_tree_ref_detail(ws: Workspace, ref: str, msg: str) -> tuple[str | None, str]:
+    """使用临时 GIT_INDEX_FILE 将当前工作区源码(遵循 source_git_pathspecs)写成不可变 git commit 并写入 ref,
+    不改动工作区、分支或真实 index。返回 (sha_or_none, error_text)。"""
+    spec_args = " ".join(q(s) for s in projects.source_git_pathspecs(ws.host, ws.workdir))
+    script = (
+        "set -e; "
+        "idx=$(git rev-parse --git-path index); "
+        "tmp=$(mktemp \"${TMPDIR:-/tmp}/autolab-idx.XXXXXX\"); "
+        "trap 'rm -f \"$tmp\"' EXIT; "
+        + _stage_temp_index_cmd(spec_args)
+        + "tree=$(GIT_INDEX_FILE=\"$tmp\" git write-tree); "
+        + "head=$(git rev-parse --verify HEAD 2>/dev/null || true); "
+        + "if [ -n \"$head\" ] && [ \"$(git rev-parse \"$head^{tree}\" 2>/dev/null || true)\" = \"$tree\" ]; then "
+        + "  sha=\"$head\"; "
+        + "else "
+        + "  if [ -n \"$head\" ]; then "
+        + f"    sha=$(git -c user.name=autolab -c user.email=autolab@local commit-tree \"$tree\" -p \"$head\" -m {q(msg)}); "
+        + "  else "
+        + f"    sha=$(git -c user.name=autolab -c user.email=autolab@local commit-tree \"$tree\" -m {q(msg)}); "
+        + "  fi; "
+        + "fi; "
+        + f"git update-ref {q(ref)} \"$sha\"; "
+        + "printf '%s\\n' \"$sha\""
+    )
+    res = ws.sh(script, timeout=60)
+    sha = (res.out or "").strip().splitlines()[-1] if res.ok and (res.out or "").strip() else ""
+    if re.fullmatch(r"[0-9a-f]{40}", sha):
+        return sha, ""
+    return None, (res.text or f"code={res.code}").strip()[-300:]
+
+
+def _snapshot_tree_ref(ws: Workspace, ref: str, msg: str) -> str | None:
+    """使用临时 GIT_INDEX_FILE 将当前工作区源码(遵循 source_git_pathspecs)写成不可变 git commit 并写入 ref,
+    不改动工作区、分支或真实 index。"""
+    sha, _ = _snapshot_tree_ref_detail(ws, ref, msg)
+    return sha
 
 
 def _capture_champion_commit(ws: Workspace, run_id: str, round_no: int) -> str | None:
@@ -705,32 +757,7 @@ def _capture_champion_commit(ws: Workspace, run_id: str, round_no: int) -> str |
         return None
     safe_run = re.sub(r"[^A-Za-z0-9_.-]", "-", run_id)
     ref = f"refs/autolab/champions/{safe_run}-r{round_no}"
-    msg = f"autolab champion {run_id} round {round_no}"
-    spec_args = " ".join(q(s) for s in projects.source_git_pathspecs(ws.host, ws.workdir))
-    script = (
-        "set -e; "
-        "idx=$(git rev-parse --git-path index); "
-        "tmp=$(mktemp \"${TMPDIR:-/tmp}/autolab-idx.XXXXXX\"); "
-        "trap 'rm -f \"$tmp\"' EXIT; "
-        "if [ -f \"$idx\" ]; then cp \"$idx\" \"$tmp\"; else rm -f \"$tmp\"; fi; "
-        f"GIT_INDEX_FILE=\"$tmp\" git add -A -- {spec_args}; "
-        "tree=$(GIT_INDEX_FILE=\"$tmp\" git write-tree); "
-        "head=$(git rev-parse --verify HEAD 2>/dev/null || true); "
-        "if [ -n \"$head\" ] && [ \"$(git rev-parse \"$head^{tree}\" 2>/dev/null || true)\" = \"$tree\" ]; then "
-        "  sha=\"$head\"; "
-        "else "
-        "  if [ -n \"$head\" ]; then "
-        f"    sha=$(git -c user.name=autolab -c user.email=autolab@local commit-tree \"$tree\" -p \"$head\" -m {q(msg)}); "
-        "  else "
-        f"    sha=$(git -c user.name=autolab -c user.email=autolab@local commit-tree \"$tree\" -m {q(msg)}); "
-        "  fi; "
-        "fi; "
-        f"git update-ref {q(ref)} \"$sha\"; "
-        "printf '%s\\n' \"$sha\""
-    )
-    res = ws.sh(script, timeout=60)
-    sha = (res.out or "").strip().splitlines()[-1] if res.ok and (res.out or "").strip() else ""
-    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+    return _snapshot_tree_ref(ws, ref, f"autolab champion {run_id} round {round_no}")
 
 
 def _maybe_fork_validation_workdir(repo: Repo, credentials, project: dict,
@@ -751,25 +778,7 @@ def _maybe_fork_validation_workdir(repo: Repo, credentials, project: dict,
             return None
         if not host.run(f"{git} cat-file -e {q(commit + '^{commit}')} 2>/dev/null").ok:
             return None
-        spec_args = " ".join(q(s) for s in projects.source_git_pathspecs(host, source_dir))
-        check_script = (
-            f"set -e; cd {q(source_dir)}; "
-            "idx=$(git rev-parse --git-path index); "
-            "tmp=$(mktemp \"${TMPDIR:-/tmp}/autolab-vchk.XXXXXX\"); "
-            "trap 'rm -f \"$tmp\"' EXIT; "
-            "if [ -f \"$idx\" ]; then cp \"$idx\" \"$tmp\"; else rm -f \"$tmp\"; fi; "
-            f"GIT_INDEX_FILE=\"$tmp\" git add -A -- {spec_args}; "
-            "cur_tree=$(GIT_INDEX_FILE=\"$tmp\" git write-tree); "
-            f"tgt_tree=$(git rev-parse {q(commit + '^{tree}')}); "
-            "head=$(git rev-parse --verify HEAD 2>/dev/null || true); "
-            f"if [ \"$cur_tree\" = \"$tgt_tree\" ] && [ \"$head\" = {q(commit)} ]; then "
-            "  printf 'clean\\n'; "
-            "else "
-            "  printf 'diverged\\n'; "
-            "fi"
-        )
-        chk = host.run(check_script, timeout=60)
-        if chk.ok and (chk.out or "").strip().endswith("clean"):
+        if _workdir_matches_commit(Workspace(host, source_dir), commit):
             return None
         tag = new_id("val")[-8:]
         server = repo.get_server(project["server_id"])
@@ -866,7 +875,8 @@ def _finish_validation(env: LoopEnv, round_no: int, report: dict,
     """全量验证收束:逐数据集取达标均值组,一轮结束;reason 带逐数据集结论表。"""
     config = env.config
     seeds = max(1, int(config.get("seeds") or 3))
-    tol = float(config.get("regress_tol") or 0.005)
+    raw_tol = config.get("regress_tol")
+    tol = 0.005 if raw_tol is None else float(raw_tol)
     pool = baseline_pool(env.project)
     selected = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
     violations = (evaluation.get("guardrails") or {}).get("violations") or []
@@ -1222,22 +1232,11 @@ def _wrap_validation_experiment_tools(experiment_tools_list: list[Tool]) -> list
                         f"数据集 {dataset} 不在基线确认池里(可选:{', '.join(sorted(pool)) or '无'})"
                     )
                 raw_cmd = str(job.get("command") or "").strip()
-                if _SHELL_FORBIDDEN_RE.search(raw_cmd):
-                    raise ToolError(
-                        "全量验证模式下命令禁止使用复合或重定向操作符(&&、||、;、|、`、$(、>)"
-                    )
                 try:
+                    check_command_readonly_safe(raw_cmd, baseline_command=ds_commands.get(dataset) or "")
                     check_dataset_command_consistency(dataset, raw_cmd, ds_commands)
                 except UserError as exc:
                     raise ToolError(str(exc)) from exc
-                base_flags = _long_flag_pairs(ds_commands.get(dataset) or "")
-                sub_flags = _long_flag_pairs(raw_cmd)
-                for flag, expected in base_flags.items():
-                    if sub_flags.get(flag) != expected:
-                        raise ToolError(
-                            f"全量验证命令与 {dataset} 基线口径不一致:"
-                            f"基线含 `{flag} {expected}`,提交命令为 `{flag} {sub_flags.get(flag)}`"
-                        )
                 patched_jobs.append(job)
             return _inner(env, {**args, "jobs": patched_jobs})
 
@@ -1298,7 +1297,7 @@ def synthesize_validation_command(base_command: str, seed: int) -> str:
     if not raw:
         raise UserError("基线命令不能为空,无法合成验证命令")
     check_command_readonly_safe(raw, baseline_command=raw)
-    tokens = shlex.split(raw)
+    export_clauses, inline_envs, tokens = split_command_env_prefix(raw)
     out: list[str] = []
     replaced = False
     i = 0
@@ -1332,7 +1331,7 @@ def synthesize_validation_command(base_command: str, seed: int) -> str:
         i += 1
     if not replaced:
         out.extend(["--seed", str(seed)])
-    synthesized = shlex.join(out)
+    synthesized = format_shell_command(export_clauses, inline_envs, out)
     check_command_readonly_safe(synthesized, baseline_command=raw)
     return synthesized
 
@@ -1345,7 +1344,8 @@ def synthesize_validation_jobs(project: dict, config: dict) -> list[dict]:
     chosen = [d for d in (config.get("datasets") or []) if d in pool] or list(pool)
     if not chosen:
         raise ToolError("没有可验证的数据集(不在确认基线池中)")
-    seeds = max(1, int(config.get("seeds") or 3))
+    raw_seeds = config.get("seeds")
+    seeds = max(1, int(3 if raw_seeds is None else raw_seeds))
     seed_start = int(config.get("seed_start") if config.get("seed_start") is not None else 101)
     total = len(chosen) * seeds
     if total > MAX_INTERNAL_JOBS_PER_SUBMIT:
@@ -1791,6 +1791,25 @@ PROFILE = LoopProfile(
 
 # ------------------------------------------------------------------ 对外动作
 
+def validate_run_limits(*, max_rounds: int | None = None,
+                        gpu_hours: float | None = None) -> tuple[int | None, float | None]:
+    """校验运行上限参数(max_rounds 非负整数,gpu_hours 非负有限浮点数);非法直接抛 AgentLoopError。"""
+    parsed_rounds: int | None = None
+    if max_rounds is not None:
+        if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 0:
+            raise AgentLoopError("max_rounds 必须是非负整数")
+        parsed_rounds = max_rounds
+    parsed_hours: float | None = None
+    if gpu_hours is not None:
+        if isinstance(gpu_hours, bool) or not isinstance(gpu_hours, (int, float)):
+            raise AgentLoopError("gpu_hours 必须是非负数字")
+        val = float(gpu_hours)
+        if not math.isfinite(val) or val < 0.0:
+            raise AgentLoopError("gpu_hours 必须是大于等于 0 的有限数字")
+        parsed_hours = val
+    return parsed_rounds, parsed_hours
+
+
 def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
           reference: str = "", network: bool = False,
           max_rounds: int | None = None, gpu_hours: float | None = None,
@@ -1805,6 +1824,9 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
         raise AgentLoopError(f"未知档位 {tier}(可选:{', '.join(TIERS)})")
     if not baseline_pool(project):
         raise AgentLoopError("还没有确认过的基线:先完成 Baseline")
+    parsed_rounds, parsed_hours = validate_run_limits(
+        max_rounds=max_rounds, gpu_hours=gpu_hours,
+    )
     if reference.strip():
         ref = refs.register(reference)
         registered = [r for r in json.loads(project.get("refs_json") or "[]")
@@ -1812,10 +1834,10 @@ def start(repo: Repo, project_id: str, *, tier: str = "light", idea: str = "",
         project = repo.update_project(project_id, refs_json=json.dumps(
             registered, ensure_ascii=False))
     overrides: dict = {}
-    if max_rounds is not None:
-        overrides["max_rounds"] = max(0, int(max_rounds))
-    if gpu_hours is not None:
-        overrides["gpu_hours"] = max(0.0, float(gpu_hours))
+    if parsed_rounds is not None:
+        overrides["max_rounds"] = parsed_rounds
+    if parsed_hours is not None:
+        overrides["gpu_hours"] = parsed_hours
     config = {"tier": tier, "idea": idea.strip(), "network": bool(network),
               "overrides": overrides,
               "datasets": [d for d in (datasets or []) if d in baseline_pool(project)] or None,
@@ -1854,6 +1876,121 @@ def _mark_adopted(repo: Repo, run_id: str, result: dict) -> None:
                          (json.dumps(result, ensure_ascii=False), utc_now(), run_id))
     finally:
         conn.close()
+
+
+def _sync_workdir_to_commit(ws: Workspace, commit: str, run_id: str) -> None:
+    """将项目主工作区同步到已验证的 codeCommit:保留 `.autolab/`、数据集、weights/outputs
+    与共享 symlink,把任何脏改/偏离树安全保存为 `refs/autolab/pre-adopt/<run_id>`。"""
+    if not ws.sh("git rev-parse --is-inside-work-tree 2>/dev/null").ok:
+        return
+    resolved_res = ws.sh(
+        f"git rev-parse --verify {q(commit + '^{commit}')} 2>/dev/null", timeout=15,
+    )
+    if not resolved_res.ok or not (resolved_res.out or "").strip():
+        return
+    target = resolved_res.out.strip().splitlines()[-1]
+    if _workdir_matches_commit(ws, target):
+        return
+    specs = projects.source_git_pathspecs(ws.host, ws.workdir)
+    spec_args = " ".join(q(s) for s in specs)
+    safe_run = re.sub(r"[^A-Za-z0-9_.-]", "-", run_id)
+    pre_ref = f"refs/autolab/pre-adopt/{safe_run}"
+    pre_sha, pre_err = _snapshot_tree_ref_detail(ws, pre_ref, f"autolab pre-adopt {run_id}")
+    if pre_sha is None:
+        raise AgentLoopError(f"采纳前保存主工作区历史快照失败,已中止工作区同步:{pre_err}")
+    sync_script = (
+        "set -e; "
+        f"git reset --mixed {q(target)} -q; "
+        "while IFS= read -r -d '' f; do "
+        "  [ -z \"$f\" ] && continue; "
+        "  [ -L \"$f\" ] && continue; "
+        "  case \"$f\" in "
+        "    .autolab/*|.autolab|data/*|dataset/*|datasets/*|checkpoints/*) continue ;; "
+        "    *.ckpt|*.pt|*.pth|*.safetensors|*.bin|*.h5|*.onnx) continue ;; "
+        "  esac; "
+        "  rm -f -- \"$f\"; "
+        "  d=$(dirname -- \"$f\"); "
+        "  while [ \"$d\" != \".\" ] && [ \"$d\" != \"/\" ]; do "
+        "    rmdir -- \"$d\" 2>/dev/null || break; "
+        "    d=$(dirname -- \"$d\"); "
+        "  done; "
+        f"done < <(git ls-files --others --exclude-standard -z -- {spec_args}); "
+        f"if [ -n \"$(git ls-files -- {spec_args} | head -n 1)\" ]; then "
+        f"  git checkout -f {q(target)} -- {spec_args}; "
+        "fi"
+    )
+    res = ws.sh(sync_script, timeout=60)
+    if not res.ok:
+        raise AgentLoopError(f"采纳同步主工作区到代码版本 {target[:12]} 失败:{res.text}")
+
+
+def _cleanup_validation_workdir(host, main_workdir: str, val_workdir: str | None) -> None:
+    """安全清理全量验证临时 worktree 及其 `autolab/val-*` 临时分支;已被删除或非 git 时不阻塞采纳。"""
+    main_dir = (main_workdir or "").strip().rstrip("/")
+    val_dir = str(val_workdir or "").strip().rstrip("/")
+    if not val_dir or val_dir == "/" or posixpath.normpath(val_dir) == posixpath.normpath(main_dir):
+        return
+    try:
+        if main_dir and host.run(
+            f"git -C {q(main_dir)} rev-parse --is-inside-work-tree 2>/dev/null", timeout=15,
+        ).ok:
+            parent = posixpath.dirname(val_dir)
+            base = posixpath.basename(val_dir)
+            wt_probe = host.run(
+                f"parent_real=$(cd {q(parent)} 2>/dev/null && pwd -P || true); "
+                f"[ -n \"$parent_real\" ] && printf 'REAL:%s/%s\\n' \"$parent_real\" {q(base)} || true; "
+                f"git -C {q(main_dir)} worktree list --porcelain",
+                timeout=30,
+            )
+            candidates = {posixpath.normpath(val_dir)}
+            matched_path = ""
+            branch = ""
+            if wt_probe.ok and wt_probe.out:
+                cur_wt = ""
+                cur_branch = ""
+                for line in wt_probe.out.splitlines():
+                    if line.startswith("REAL:"):
+                        candidates.add(posixpath.normpath(line[5:].strip()))
+                    elif line.startswith("worktree "):
+                        cur_wt = line[9:].strip()
+                        cur_branch = ""
+                    elif line.startswith("branch refs/heads/"):
+                        cur_branch = line[len("branch refs/heads/"):].strip()
+                    elif not line.strip():
+                        if cur_wt and posixpath.normpath(cur_wt) in candidates:
+                            matched_path = cur_wt
+                            branch = cur_branch
+                            break
+                        cur_wt = ""
+                        cur_branch = ""
+                if cur_wt and not matched_path and posixpath.normpath(cur_wt) in candidates:
+                    matched_path = cur_wt
+                    branch = cur_branch
+            if not branch:
+                br = host.run(
+                    f"git -C {q(val_dir)} symbolic-ref --short HEAD 2>/dev/null || true", timeout=15,
+                )
+                if br.ok and (br.out or "").strip():
+                    branch = br.out.strip().splitlines()[-1]
+            target_rm = matched_path or val_dir
+            branch_cmd = (
+                f"git -C {q(main_dir)} branch -D {q(branch)} >/dev/null 2>&1 || true; "
+                if branch.startswith("autolab/val-")
+                else ""
+            )
+            host.run(
+                f"git -C {q(main_dir)} worktree remove --force {q(target_rm)} >/dev/null 2>&1 "
+                f"|| git -C {q(main_dir)} worktree remove --force {q(val_dir)} >/dev/null 2>&1 "
+                f"|| rm -rf {q(val_dir)} >/dev/null 2>&1 || true; "
+                f"git -C {q(main_dir)} worktree prune >/dev/null 2>&1 || true; "
+                f"{branch_cmd}"
+                "true",
+                timeout=30,
+            )
+        else:
+            host.run(f"rm -rf {q(val_dir)} >/dev/null 2>&1 || true", timeout=20)
+    except Exception:
+        return
 
 
 def _append_journal(repo: Repo, credentials, project: dict, text: str) -> None:
@@ -1974,6 +2111,16 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
                     "datasets": old_datasets})
     champion = result.get("champion") or {}
     config_champion = (run.get("config") or {}).get("champion") or {}
+    source_run_id = (run.get("config") or {}).get("source_run_id")
+    code_commit = str(
+        champion.get("codeCommit")
+        or config_champion.get("codeCommit")
+        or code_commit_of_run(repo, run_id)
+        or (code_commit_of_run(repo, str(source_run_id)) if source_run_id else "")
+        or ""
+    ).strip() or None
+    val_workdir = str((run.get("config") or {}).get("validation_workdir") or "").strip() or None
+    workdir = (project.get("remote_workdir") or "").strip()
     version_label = str(champion.get("label") or config_champion.get("label") or "") \
         .strip()[:40] or f"采纳晋级({now[:10]})"
     snapshot = {"passed_at": now, "run_id": run_id,
@@ -1981,17 +2128,30 @@ def adopt(repo: Repo, credentials, project_id: str, run_id: str) -> dict:
                 "version_label": version_label,
                 "notes": notes[:2000], "datasets": new_datasets,
                 "history": history[-5:]}
-    # B1.3:契约跨基线晋级保留;新基线采纳后按当前工作区重算保护路径指纹
+    # B1.3:契约跨基线晋级保留;新基线采纳前先将主工作区同步到 codeCommit 并清理验证 worktree,
+    # 再按当前同步后的工作区重算保护路径指纹与 .locked_eval
     contract = old_snapshot.get("metric_contract")
-    if isinstance(contract, dict) and contract:
-        if (contract.get("eval") or {}).get("code_paths") \
-                or (contract.get("eval") or {}).get("data_paths"):
-            host = open_host(repo, credentials, project["server_id"])
-            try:
+    needs_contract_refresh = (
+        isinstance(contract, dict) and bool(contract)
+        and bool((contract.get("eval") or {}).get("code_paths")
+                 or (contract.get("eval") or {}).get("data_paths"))
+    )
+    if (workdir and code_commit) or val_workdir or needs_contract_refresh:
+        host = open_host(repo, credentials, project["server_id"])
+        try:
+            if workdir and code_commit:
+                _sync_workdir_to_commit(Workspace(host, workdir), code_commit, run_id)
+            if val_workdir:
+                _cleanup_validation_workdir(host, workdir, val_workdir)
+            if needs_contract_refresh:
                 refresh_contract_hashes(
-                    Workspace(host, project.get("remote_workdir") or ""), contract)
-            finally:
-                host.close()
+                    Workspace(host, workdir),
+                    contract,
+                    output_root=project.get("output_root"),
+                )
+        finally:
+            host.close()
+    if isinstance(contract, dict) and contract:
         snapshot["metric_contract"] = contract
     repo.update_project(project_id, baseline_passed_at=now,
                         baseline_json=json.dumps(snapshot, ensure_ascii=False))
@@ -2012,6 +2172,7 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
                      seeds: int = 3, seed_start: int = 101,
                      source_run_id: str | None = None,
                      gpu_hours: float | None = None,
+                     regress_tol: float | None = None,
                      critic: bool = False, reviewer: bool = False,
                      agent_spec_id: str | None = None,
                      credentials=None) -> dict:
@@ -2024,12 +2185,28 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
     if not pool:
         raise AgentLoopError("还没有确认过的基线:先完成 Baseline")
     if (
+        isinstance(seeds, bool)
+        or not isinstance(seeds, int)
+        or seeds < 1
+        or seeds > 10
+    ):
+        raise AgentLoopError("seeds 需在 1..10 之间")
+    if (
         isinstance(seed_start, bool)
         or not isinstance(seed_start, int)
         or seed_start < 0
         or seed_start > 1_000_000
     ):
         raise AgentLoopError("seed_start 需在 0..1000000 之间")
+    _, parsed_hours = validate_run_limits(gpu_hours=gpu_hours)
+    if regress_tol is None:
+        tol = 0.005
+    else:
+        if isinstance(regress_tol, bool) or not isinstance(regress_tol, (int, float)):
+            raise AgentLoopError("regress_tol 需在 0.0..1.0 之间")
+        tol = float(regress_tol)
+        if not math.isfinite(tol) or tol < 0.0 or tol > 1.0:
+            raise AgentLoopError("regress_tol 需在 0.0..1.0 之间")
     source = runtime.get_run(repo, source_run_id) if source_run_id else \
         runtime.latest_run(repo, project_id, KIND)
     if source is None or source.get("status") != "done" \
@@ -2045,13 +2222,12 @@ def start_validation(repo: Repo, project_id: str, *, datasets: list[str] | None 
     carrier = src_round or result.get("lastRound") or {}
     code_commit = champion.get("codeCommit") or code_commit_of_run(repo, source["id"])
     val_workdir = _maybe_fork_validation_workdir(repo, credentials, project, code_commit)
-    seeds = max(1, min(int(seeds or 3), 10))
     chosen = [d for d in (datasets or []) if d in pool] or list(pool)
-    overrides = {"gpu_hours": max(0.0, float(gpu_hours))} if gpu_hours is not None else {}
+    overrides = {"gpu_hours": parsed_hours} if parsed_hours is not None else {}
     config = {"tier": "validation", "mode": "validation", "idea": "", "network": False,
               "overrides": overrides, "datasets": chosen, "seeds": seeds,
               "seed_start": int(seed_start),
-              "regress_tol": 0.005, "source_run_id": source["id"],
+              "regress_tol": tol, "source_run_id": source["id"],
               "champion": {"round": champion.get("round"),
                            "planId": champion.get("planId"),
                            "variant": champion.get("variant"),

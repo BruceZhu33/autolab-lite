@@ -11,6 +11,7 @@ import {
   fetchProjectDatasets, fetchSpecs, kbGet, kbToken, startCampaign, startResearch,
   type KbSpace, type Project, type ResearchTier,
 } from "@/lib/api";
+import { parseStrictFloat, parseStrictInt } from "@/lib/validation";
 import { Button } from "~/vendor/ui/components/ui/button";
 
 const TIERS: Array<{ key: ResearchTier; title: string; badge: string; desc: string }> = [
@@ -30,6 +31,7 @@ export function ResearchStartForm({ project }: { project: Project }) {
   const [idea, setIdea] = useState("");
   const [campaignIdeas, setCampaignIdeas] = useState<string[]>(["", ""]);
   const [reference, setReference] = useState("");
+  const [maxRounds, setMaxRounds] = useState("");
   const [gpuHours, setGpuHours] = useState("");
   const [network, setNetwork] = useState(false);
   const [picked, setPicked] = useState<string[]>([]);
@@ -42,7 +44,7 @@ export function ResearchStartForm({ project }: { project: Project }) {
 
   const kbLoggedIn = typeof window !== "undefined" && !!kbToken();
   const kbSpacesQuery = useQuery({
-    queryKey: ["kb-spaces-research"], enabled: kbLoggedIn,
+    queryKey: ["kb-spaces-research"], enabled: kbLoggedIn && mode === "single",
     queryFn: () => kbGet<KbSpace[]>("/spaces"),
   });
   const { data: dsData } = useQuery({
@@ -59,6 +61,20 @@ export function ResearchStartForm({ project }: { project: Project }) {
   const activeSpec = availableSpecs.find((s) => s.status === "active");
   const confirmed = (dsData?.datasets ?? []).filter((d) => d.state === "confirmed");
 
+  const maxRoundsParsed = parseStrictInt(maxRounds, {
+    label: "最大轮数", min: 0, max: 1000, optional: true,
+  });
+  const gpuHoursParsed = parseStrictFloat(gpuHours, {
+    label: "GPU 小时上限", min: 0, optional: true,
+  });
+  const cleanedCampaignIdeas = campaignIdeas.map((s) => s.trim()).filter(Boolean);
+  const hasDuplicateIdeas =
+    mode === "campaign" && new Set(cleanedCampaignIdeas).size !== cleanedCampaignIdeas.length;
+  const limitError =
+    (!maxRoundsParsed.ok && maxRoundsParsed.error)
+    || (!gpuHoursParsed.ok && gpuHoursParsed.error)
+    || (hasDuplicateIdeas ? "并行研究方向不能重复" : null);
+
   const toggle = (name: string) =>
     setPicked((prev) => prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]);
 
@@ -72,31 +88,42 @@ export function ResearchStartForm({ project }: { project: Project }) {
     setCampaignIdeas((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev));
 
   const start = async () => {
+    if (!maxRoundsParsed.ok || !gpuHoursParsed.ok) {
+      toast.error(limitError ?? "运行上限参数格式有误");
+      return;
+    }
+    if (mode === "campaign") {
+      if (cleanedCampaignIdeas.length === 0) {
+        toast.error("请至少填写 1 个并行研究方向");
+        return;
+      }
+      if (hasDuplicateIdeas) {
+        toast.error("并行研究方向不能重复");
+        return;
+      }
+    }
     setStarting(true);
     try {
       if (mode === "campaign") {
-        const cleaned = campaignIdeas.map((s) => s.trim()).filter(Boolean);
-        if (cleaned.length === 0) {
-          toast.error("请至少填写 1 个并行研究方向");
-          return;
-        }
         await startCampaign(project.id, {
-          ideas: cleaned,
+          ideas: cleanedCampaignIdeas,
           tier,
           datasets: picked.length ? picked : undefined,
-          gpu_hours: tier === "heavy" && gpuHours ? Number(gpuHours) : undefined,
+          max_rounds: maxRoundsParsed.value,
+          gpu_hours: gpuHoursParsed.value,
           critic,
           reviewer,
           agent_spec_id: agentSpecId || undefined,
         });
-        toast.success(`已分叉启动 ${cleaned.length} 个并行研究分支`);
+        toast.success(`已分叉启动 ${cleanedCampaignIdeas.length} 个并行研究分支`);
         setCampaignIdeas(["", ""]);
         void queryClient.invalidateQueries({ queryKey: ["campaigns", project.id] });
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
       } else {
         await startResearch(project.id, {
           tier, idea, reference, network,
-          gpu_hours: tier === "heavy" && gpuHours ? Number(gpuHours) : undefined,
+          max_rounds: maxRoundsParsed.value,
+          gpu_hours: gpuHoursParsed.value,
           datasets: picked.length ? picked : undefined,
           kb_assist: kbAssist,
           kb_spaces: kbAssist && kbSpaces.length ? kbSpaces : undefined,
@@ -327,17 +354,27 @@ export function ResearchStartForm({ project }: { project: Project }) {
           </label>
         ) : null}
 
-        {tier === "heavy" ? (
-          <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
-            GPU 小时上限
-            <input
-              value={gpuHours}
-              onChange={(e) => setGpuHours(e.target.value)}
-              placeholder="24"
-              className={`${FIELD} h-7 w-16`}
-            />
-          </label>
-        ) : null}
+        <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
+          最大轮数
+          <input
+            value={maxRounds}
+            onChange={(e) => setMaxRounds(e.target.value)}
+            placeholder={tier === "light" ? "3" : tier === "medium" ? "5" : "0 (不限)"}
+            aria-invalid={!maxRoundsParsed.ok}
+            className={`${FIELD} h-7 w-20 font-mono ${!maxRoundsParsed.ok ? "border-destructive" : ""}`}
+          />
+        </label>
+
+        <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
+          GPU 小时上限
+          <input
+            value={gpuHours}
+            onChange={(e) => setGpuHours(e.target.value)}
+            placeholder={tier === "heavy" ? "24" : "不限"}
+            aria-invalid={!gpuHoursParsed.ok}
+            className={`${FIELD} h-7 w-16 font-mono ${!gpuHoursParsed.ok ? "border-destructive" : ""}`}
+          />
+        </label>
 
         {mode === "single" ? (
           <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
@@ -348,12 +385,16 @@ export function ResearchStartForm({ project }: { project: Project }) {
             />
             服务器可访问外网
           </label>
-        ) : null}
+        ) : (
+          <span className="text-micro text-muted-foreground">
+            注:外网下载/参考库/知识库检索仅单线迭代可用
+          </span>
+        )}
 
         <Button
           size="sm"
           className="ml-auto gap-1"
-          disabled={starting}
+          disabled={starting || limitError !== null}
           onClick={() => void start()}
         >
           {starting ? (
@@ -366,6 +407,9 @@ export function ResearchStartForm({ project }: { project: Project }) {
           {mode === "campaign" ? "分叉并启动" : "启动"}
         </Button>
       </div>
+      {limitError ? (
+        <p role="alert" className="text-micro text-destructive">{limitError}</p>
+      ) : null}
     </div>
   );
 }

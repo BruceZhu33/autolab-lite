@@ -1127,3 +1127,42 @@ def test_delete_project_cascades_spans_cases_campaigns_and_unreferenced_blobs(en
     assert "camp-p1" not in camps
     assert camps["camp-p2"]["winner_project_id"] is None
     assert camps["camp-p2"]["winner_run_id"] is None
+
+
+def test_check_disk_watermark_caps_large_terabyte_disk(env, monkeypatch):
+    """Multi-TB disks with >20 GiB free (e.g. 62 GiB free on 1.7 TB) must not halt dispatches."""
+    repo: Repo = env["repo"]
+    ssh_srv = repo.add_ssh_server(
+        name="sitonholy-ssh",
+        host="127.0.0.1",
+        port=2222,
+        username="root",
+        credential_ref="ssh-cred",
+        host_key_fingerprint="SHA256:abc",
+        runner_port=7810,
+        runner_token_ref="srv-c",
+        gpu_slots=1,
+    )
+    sched = Scheduler(repo, env["creds"])
+
+    # 1.7 TB disk with 62 GiB free (~3.6% < 5%, but well above 10/20 GiB caps)
+    monkeypatch.setattr(
+        sched_mod.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=1700 * 1024**3, used=1638 * 1024**3, free=62 * 1024**3),
+    )
+    sched._last_disk_check = 0.0
+    sched._check_disk_watermark()
+    assert env["server"]["id"] not in sched._disk_low
+    assert ssh_srv["id"] not in sched._disk_low
+
+    # Drop below 10 GiB free -> blocks both DB-backed SSH and local servers
+    monkeypatch.setattr(
+        sched_mod.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=1700 * 1024**3, used=1695 * 1024**3, free=5 * 1024**3),
+    )
+    sched._last_disk_check = 0.0
+    sched._check_disk_watermark()
+    assert env["server"]["id"] in sched._disk_low
+    assert ssh_srv["id"] in sched._disk_low

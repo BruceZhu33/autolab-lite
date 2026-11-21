@@ -55,12 +55,15 @@ export function MetricContractCard({ project }: { project: Project }) {
   }, [data?.metrics]);
 
   const active = data?.contract ?? null;
-  const fallback = data?.default ?? {
-    primary: allMetrics[0] ?? "",
-    direction: "maximize" as MetricDirection,
-    guardrails: [],
-    eval: {},
-  };
+  const fallback = useMemo(
+    () => data?.default ?? {
+      primary: allMetrics[0] ?? "",
+      direction: "maximize" as MetricDirection,
+      guardrails: [],
+      eval: {},
+    },
+    [data?.default, allMetrics],
+  );
 
   const [primary, setPrimary] = useState("");
   const [direction, setDirection] = useState<MetricDirection>("maximize");
@@ -73,7 +76,14 @@ export function MetricContractCard({ project }: { project: Project }) {
   const [timeoutMinutes, setTimeoutMinutes] = useState("30");
   const [gpusPerJob, setGpusPerJob] = useState("1");
 
+  // Reset edit mode whenever the user switches to another project.
   useEffect(() => {
+    setEditing(false);
+  }, [project.id]);
+
+  // Preserve unsaved local draft inputs while editing; sync only when not editing.
+  useEffect(() => {
+    if (editing) return;
     const src = active ?? fallback;
     setPrimary(src.primary || allMetrics[0] || "");
     setDirection(src.direction || "maximize");
@@ -85,7 +95,7 @@ export function MetricContractCard({ project }: { project: Project }) {
     setMetricFile(src.eval?.metric_file || "metrics.json");
     setTimeoutMinutes(String(src.eval?.timeout_minutes ?? 30));
     setGpusPerJob(String(src.eval?.gpus_per_job ?? 1));
-  }, [active, fallback.primary, fallback.direction, allMetrics]);
+  }, [editing, project.id, active, fallback, allMetrics]);
 
   if (!project.baselinePassedAt) return null;
 

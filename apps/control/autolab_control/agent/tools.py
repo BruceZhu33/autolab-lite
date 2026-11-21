@@ -308,16 +308,58 @@ def jobs_wait_outcome(env: LoopEnv, job_ids: list[str], *,
     if any(j is not None and json.loads(j["params_json"] or "{}").get("eval_of_job_id")
            for j in jobs):
         described = list(job_ids)
-        # 同会话里失败/超时/取消的训练 Job 一并汇报:不能只看评测侧
-        conn = env.repo.db.connect()
-        try:
-            failed_rows = conn.execute(
-                "SELECT j.id FROM jobs j JOIN plan_revisions p ON p.id = j.plan_revision_id"
-                " WHERE p.approved_by = ? AND j.status IN ('FAILED', 'TIMED_OUT', 'CANCELLED')"
-                " ORDER BY j.queued_at", (f"agent-run:{env.run['id']}",)).fetchall()
-        finally:
-            conn.close()
-        described += [r["id"] for r in failed_rows if r["id"] not in set(described)]
+        # 只汇报本批 waited 评测对应的父训练批次中失败/超时/取消的 Job,避免重报历史轮次已处理失败
+        parent_ids: list[str] = []
+        seen_parents: set[str] = set()
+
+        def _add_parent(pid: object) -> None:
+            sid = str(pid or "").strip()
+            if sid and sid not in seen_parents:
+                seen_parents.add(sid)
+                parent_ids.append(sid)
+
+        pending_obj = env.run.get("pending")
+        if not isinstance(pending_obj, dict) and env.run.get("pending_json"):
+            try:
+                pending_obj = json.loads(env.run["pending_json"])
+            except (TypeError, ValueError):
+                pending_obj = None
+        if isinstance(pending_obj, dict):
+            payload = pending_obj.get("payload") or {}
+            pending_jids = {str(x) for x in (payload.get("job_ids") or [])}
+            if not pending_jids or pending_jids & set(job_ids):
+                for pid in (payload.get("parents") or []):
+                    _add_parent(pid)
+
+        eval_job_ids: list[str] = []
+        for job in jobs:
+            if job is None:
+                continue
+            parent_of_eval = json.loads(job["params_json"] or "{}").get("eval_of_job_id")
+            if parent_of_eval:
+                _add_parent(parent_of_eval)
+                eval_job_ids.append(job["id"])
+
+        if eval_job_ids:
+            placeholders = ",".join("?" for _ in eval_job_ids)
+            conn = env.repo.db.connect()
+            try:
+                rows = conn.execute(
+                    f"SELECT train_job_id FROM job_evals WHERE eval_job_id IN ({placeholders})"
+                    " ORDER BY created_at, rowid",
+                    tuple(eval_job_ids),
+                ).fetchall()
+            finally:
+                conn.close()
+            for r in rows:
+                _add_parent(r["train_job_id"])
+
+        for pid in parent_ids:
+            if pid in set(described):
+                continue
+            parent_job = env.repo.get_job(pid)
+            if parent_job is not None and parent_job["status"] in ("FAILED", "TIMED_OUT", "CANCELLED"):
+                described.append(pid)
         return experiments.describe_jobs(env.repo, env.credentials, env.project, described)
     eval_cfg = (eval_contract or {}).get("eval") or {}
     if str(eval_cfg.get("command") or "").strip():

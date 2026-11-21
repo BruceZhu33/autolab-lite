@@ -8,8 +8,8 @@
 
 | 模式 | 适用场景 | 依赖条件 |
 |---|---|---|
-| `--mode local-sim`（默认） | 开发机离线联调、CI 回归、不在实验室时验证全套并发状态机 | 本机 `.venv`（Python 3.11+），**无需物理 GPU** |
-| `--mode ssh-lab` | 回到实验室连接真实多卡 Linux GPU 服务器做终验 | 控制机可 SSH 登录服务器且可访问服务器 Runner 端口（默认 `7810`）；服务器具备 NVIDIA 驱动（`nvidia-smi`）与 Python ≥ 3.10（若需 `PYTHONSAFEPATH=1` 沙箱，评测环境需 Python ≥ 3.11） |
+| `--mode local-sim`（默认） | 开发机离线联调、CI 回归、不在实验室时验证全套并发状态机 | 本机 `.venv`（Python 3.10+；若运行 `S1-K5` 则目标评测解释器需 Python 3.11+），**无需物理 GPU** |
+| `--mode ssh-lab` | 回到实验室连接真实多卡 Linux GPU 服务器做终验 | 控制机可 SSH 登录服务器且可访问服务器 Runner 端口（默认 `7810`）；服务器具备 NVIDIA 驱动（`nvidia-smi`）与 Python ≥ 3.10（若运行 `S1-K5` 启用 `PYTHONSAFEPATH=1` 沙箱，目标训练/评测环境需 Python ≥ 3.11） |
 
 ---
 
@@ -68,6 +68,7 @@
 > - `--ssh-password` / 环境变量 `AUTOLAB_SSH_PASSWORD`：服务器未配公钥时可用密码认证代替 `--ssh-key`。
 > - `--python-bin /path/to/python`：不依赖 `conda activate`、直接指定远端解释器绝对路径时使用。
 > - `--skip-restart`：当实验室服务器正与他人共享、不希望在 `S1-K4` 中重启远端 `autolab-runner` 守护进程时传入（此时仍会完整测试本地 Control `Scheduler` 断线重连对账）。
+> - `--cleanup-remote`：在 `ssh-lab` 结束（含异常/失败退出）时自动停止临时部署的远端 `autolab-runner`、清理受安全校验保护的临时 `--remote-root`（仅允许包含 `autolab-step1` / `tmp` 标识的专用验收目录，拒绝 `/` 或用户既有目录）并执行 `git worktree prune`。
 > - `--gates S1-K1,S1-K2`：按需只跑指定关卡用于快速复测定位。
 
 ---
@@ -103,5 +104,6 @@
 | `S1-K1` 报 `Runner 健康检查失败` / `Connection refused` | 服务器防火墙拦截 `--runner-port`（默认 `7810`）或端口被占用 | 在服务器确认 `ss -tlnp \| grep 7810`；若端口冲突改传 `--runner-port 7815`，并放行局域网入站规则 |
 | `S1-K1` 报 `pip 安装失败(需要服务器能访问 PyPI)` | 实验室机器无外网或 PyPI 镜像不可达 | 在服务器配置 `~/.pip/pip.conf` 指向校内/内网镜像源后重跑 |
 | `S1-K2` 报 `overlap_window_seconds <= 0` 或槽位数不符 | `--gpu-slots` 设为 `1` 或大于实际空闲能力 | 确保多卡机器 `--gpu-slots >= 2`（或不传以自动按 `nvidia-smi` 物理卡数探测） |
-| `S1-K5` 报 `PYTHONSAFEPATH` / `sitecustomize` 异常 | 远端 `--conda-env` 或 `--python-bin` 指向了 Python 3.10 及更早版本（不支持 `PYTHONSAFEPATH`） | 通过 `--conda-env` 或 `--python-bin` 指定 Python **3.11+** 环境 |
+| `S1-K5` 报 `PYTHONSAFEPATH` / `sitecustomize` 异常或版本预检拦截 | 远端 `--conda-env` 或 `--python-bin` 指向了 Python 3.10 及更早版本（`Control/Runner` 支持 `>=3.10`，但 `PYTHONSAFEPATH=1` 隔离需目标评测解释器为 `>=3.11`；套件会在 `S1-K5` 前预检并快速报错） | 通过 `--conda-env` 或 `--python-bin` 指定 Python **3.11+** 环境 |
+| `S1-K1` / SSH 连接报主机密钥变更或未确认指纹 | 服务器重装或主机密钥轮换导致 TOFU 指纹不一致 | 由 Owner 通过 `autolab server confirm-fingerprint --host <IP> --port <PORT> --fingerprint SHA256:... --yes`（或 `--server <ID>`）显式确认新指纹 |
 | `S1-K4` 在共享服务器上不想中断他人任务 | `S1-K4b` 默认会重启远端 `autolab-runner` 守护进程以实测孤儿接管 | 追加 `--skip-restart` 参数即可跳过远端 Runner 重启，仅执行本地 Control 重启对账 |

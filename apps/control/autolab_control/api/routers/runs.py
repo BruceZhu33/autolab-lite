@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from typing import Annotated
 
 from fastapi import APIRouter
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from ...agent import runtime, trace
 from ...core.errors import NotFound
@@ -14,14 +15,93 @@ from ...stages import baseline, campaign, research
 from ..app import Ctx
 
 
+def _reject_bool(value):
+    if isinstance(value, bool):
+        raise ValueError("布尔值不能作为数值参数")
+    return value
+
+
+def _empty_str_to_none(value):
+    if isinstance(value, bool):
+        raise ValueError("布尔值不能作为数值参数")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return value
+
+
+def _coerce_optional_str(default: str):
+    def _parse(value):
+        if value is None:
+            return default
+        text = str(value)
+        return default if not text else text
+
+    return _parse
+
+
+def _coerce_str_list(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("列表字段格式非法")
+    return [str(item) for item in value]
+
+
+class ResearchStartIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    tier: Annotated[str, BeforeValidator(_coerce_optional_str("light"))] = "light"
+    idea: Annotated[str, BeforeValidator(_coerce_optional_str(""))] = ""
+    reference: Annotated[str, BeforeValidator(_coerce_optional_str(""))] = ""
+    network: bool = False
+    max_rounds: Annotated[int | None, BeforeValidator(_empty_str_to_none)] = Field(
+        default=None, ge=0, le=1000,
+    )
+    gpu_hours: Annotated[float | None, BeforeValidator(_empty_str_to_none)] = Field(
+        default=None, ge=0.0, allow_inf_nan=False,
+    )
+    datasets: list[str] | None = None
+    kb_assist: bool = False
+    kb_spaces: list[str] | None = None
+    critic: bool = False
+    reviewer: bool = False
+    agent_spec_id: str | None = None
+
+
+class CampaignStartIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ideas: Annotated[list[str], BeforeValidator(_coerce_str_list)] = Field(default_factory=list)
+    tier: Annotated[str, BeforeValidator(_coerce_optional_str("heavy"))] = "heavy"
+    datasets: list[str] | None = None
+    critic: bool = False
+    reviewer: bool = False
+    max_rounds: Annotated[int | None, BeforeValidator(_empty_str_to_none)] = Field(
+        default=None, ge=0, le=1000,
+    )
+    gpu_hours: Annotated[float | None, BeforeValidator(_empty_str_to_none)] = Field(
+        default=None, ge=0.0, allow_inf_nan=False,
+    )
+    agent_spec_id: str | None = None
+
+
 class ValidateIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     datasets: list[str] | None = None
-    seeds: int | None = 3
-    seed_start: int = Field(default=101, ge=0, le=1_000_000)
+    seeds: Annotated[int | None, BeforeValidator(_reject_bool)] = Field(
+        default=3, ge=1, le=10,
+    )
+    seed_start: Annotated[int, BeforeValidator(_reject_bool)] = Field(
+        default=101, ge=0, le=1_000_000,
+    )
     source_run_id: str | None = None
-    gpu_hours: float | str | None = None
+    gpu_hours: Annotated[float | None, BeforeValidator(_empty_str_to_none)] = Field(
+        default=None, ge=0.0, allow_inf_nan=False,
+    )
+    regress_tol: Annotated[float | None, BeforeValidator(_empty_str_to_none)] = Field(
+        default=None, ge=0.0, le=1.0, allow_inf_nan=False,
+    )
     critic: bool = False
     reviewer: bool = False
     agent_spec_id: str | None = None
@@ -110,35 +190,32 @@ def build(ctx: Ctx) -> APIRouter:
                 "baseline": baseline.baseline_label(project) if project else None}
 
     @router.post("/api/owner/projects/{project_id}/research/start", dependencies=[ctx.owner])
-    def research_start(project_id: str, payload: dict) -> dict:
-        def number(key, cast):
-            value = payload.get(key)
-            return None if value in (None, "") else cast(value)
-
-        datasets = [str(d) for d in (payload.get("datasets") or []) if str(d).strip()]
+    def research_start(project_id: str, payload: ResearchStartIn) -> dict:
+        datasets = [str(d) for d in (payload.datasets or []) if str(d).strip()]
+        kb_spaces = [str(s) for s in (payload.kb_spaces or []) if str(s).strip()]
         return {"run": research.start(
-            repo, project_id, tier=str(payload.get("tier") or "light"),
-            idea=str(payload.get("idea") or ""), reference=str(payload.get("reference") or ""),
-            network=bool(payload.get("network")), max_rounds=number("max_rounds", int),
-            gpu_hours=number("gpu_hours", float), datasets=datasets or None,
-            kb_assist=bool(payload.get("kb_assist")),
-            kb_spaces=[str(s) for s in (payload.get("kb_spaces") or []) if str(s).strip()] or None,
-            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")),
-            agent_spec_id=str(payload.get("agent_spec_id") or "").strip() or None)}
+            repo, project_id, tier=payload.tier,
+            idea=payload.idea, reference=payload.reference,
+            network=bool(payload.network), max_rounds=payload.max_rounds,
+            gpu_hours=payload.gpu_hours, datasets=datasets or None,
+            kb_assist=bool(payload.kb_assist),
+            kb_spaces=kb_spaces or None,
+            critic=bool(payload.critic), reviewer=bool(payload.reviewer),
+            agent_spec_id=str(payload.agent_spec_id or "").strip() or None)}
 
     @router.post("/api/owner/projects/{project_id}/research/validate",
                  dependencies=[ctx.owner])
     def research_validate(project_id: str, payload: ValidateIn) -> dict:
         """把最近一次成功研究会话的冠军改动做成全量验证会话(不改代码,
         选定数据集 × N seed 按基线口径确定性重跑,0-LLM 一轮收束)。"""
-        gpu_hours = payload.gpu_hours
         return {"run": research.start_validation(
             repo, project_id, credentials=ctx.credentials,
             datasets=[str(d) for d in (payload.datasets or []) if str(d).strip()] or None,
             seeds=int(payload.seeds) if payload.seeds is not None else 3,
             seed_start=payload.seed_start,
             source_run_id=str(payload.source_run_id or "").strip() or None,
-            gpu_hours=float(gpu_hours) if gpu_hours not in (None, "") else None,
+            gpu_hours=payload.gpu_hours,
+            regress_tol=payload.regress_tol,
             critic=bool(payload.critic), reviewer=bool(payload.reviewer),
             agent_spec_id=str(payload.agent_spec_id or "").strip() or None)}
 
@@ -166,22 +243,17 @@ def build(ctx: Ctx) -> APIRouter:
 
     @router.post("/api/owner/projects/{project_id}/research/campaigns",
                  dependencies=[ctx.owner])
-    def campaign_start(project_id: str, payload: dict) -> dict:
+    def campaign_start(project_id: str, payload: CampaignStartIn) -> dict:
         """C3a 并行研究分支:每个方向 fork 独立 worktree 项目并启动研究会话,
         全部终态后按已验收指标(run.result)选冠军。"""
-        def number(key, cast):
-            value = payload.get(key)
-            return None if value in (None, "") else cast(value)
-
-        ideas = [str(i) for i in (payload.get("ideas") or [])]
-        datasets = [str(d) for d in (payload.get("datasets") or []) if str(d).strip()]
+        datasets = [str(d) for d in (payload.datasets or []) if str(d).strip()]
         return {"campaign": campaign.start_campaign(
-            repo, ctx.credentials, project_id, ideas=ideas,
-            tier=str(payload.get("tier") or "heavy"), datasets=datasets or None,
-            critic=bool(payload.get("critic")), reviewer=bool(payload.get("reviewer")),
-            max_rounds=number("max_rounds", int),
-            gpu_hours=number("gpu_hours", float),
-            agent_spec_id=str(payload.get("agent_spec_id") or "").strip() or None)}
+            repo, ctx.credentials, project_id, ideas=payload.ideas,
+            tier=payload.tier, datasets=datasets or None,
+            critic=bool(payload.critic), reviewer=bool(payload.reviewer),
+            max_rounds=payload.max_rounds,
+            gpu_hours=payload.gpu_hours,
+            agent_spec_id=str(payload.agent_spec_id or "").strip() or None)}
 
     @router.get("/api/research/campaigns/{campaign_id}", dependencies=[ctx.reader])
     def campaign_get(campaign_id: str) -> dict:

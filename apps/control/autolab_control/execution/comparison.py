@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import statistics
@@ -24,8 +25,95 @@ _MINIMIZE_TOKENS = frozenset({
     "bpb", "bpc", "nll",
 })
 _CLI_SEED_RE = re.compile(
-    r"(?:^|\s)(?:--(?:seed|random[-_]seed)(?:=|\s+)|seed=)(-?\d+)(?:\s|$)"
+    r"(?:^|(?<=[\s;|&]))(?:--(?:seed|random[-_]seed)(?:=|\s+)|(?<![A-Za-z0-9_])seed=)"
+    r"(?P<q>['\"]?)(?P<seed>-?\d+)(?P=q)(?=[\s;|&]|$)"
 )
+_ENV_SEED_REF_RE = re.compile(
+    r"\$(?:AUTOLAB_SEED(?![A-Za-z0-9_])|\{AUTOLAB_SEED(?:[:?+\-=][^}]*)?\})"
+)
+_CLI_SEED_VAR_RE = re.compile(
+    r"(?:^|(?<=[\s;|&]))(?:--(?:seed|random[-_]seed)(?:=|\s+)|(?<![A-Za-z0-9_])seed=)"
+    r"\"?\$(?:AUTOLAB_SEED(?![A-Za-z0-9_])|\{AUTOLAB_SEED(?:[:?+\-=][^}]*)?\})\"?(?=[\s;|&]|$)"
+)
+_ENV_SEED_ASSIGN_RE = re.compile(
+    r"(?:^|(?<=[\s;|&]))(?:export\s+)?AUTOLAB_SEED=(?:'([^']*)'|\"([^\"]*)\"|([^\s;|&]*))"
+)
+# Two-sided 95% Student-t critical values t_{0.975, n-1} to guard small samples against
+# discrete percentile-bootstrap anti-conservatism (for n = 2..4).
+_SMALL_SAMPLE_T_CRIT: dict[int, float] = {
+    2: 12.706204736174696,
+    3: 4.302652729749464,
+    4: 3.1824463052837073,
+}
+
+
+def _passes_small_sample_t(gains: list[float]) -> bool:
+    n = len(gains)
+    if n < 2:
+        return False
+    t_crit = _SMALL_SAMPLE_T_CRIT.get(n)
+    if t_crit is None:
+        return True
+    mean_gain = sum(gains) / n
+    if mean_gain <= 0:
+        return False
+    sd = statistics.stdev(gains)
+    if sd == 0:
+        return True
+    return (mean_gain - t_crit * sd / math.sqrt(n)) > 0
+
+
+def _effective_shell_text(cmd: str) -> str:
+    """Strip unquoted # comments and non-scalar '...' literals (scripts, $vars), keeping scalar quotes."""
+    out: list[str] = []
+    single_buf: list[str] | None = None
+    in_double = False
+    in_comment = False
+    escaped = False
+    for ch in cmd:
+        if in_comment:
+            if ch == "\n":
+                in_comment = False
+                out.append(ch)
+            continue
+        if single_buf is not None:
+            if ch == "'":
+                inner = "".join(single_buf)
+                single_buf = None
+                if not any(c.isspace() or c in "$;&|" for c in inner):
+                    out.append(f"'{inner}'")
+                else:
+                    out.append("''")
+            else:
+                single_buf.append(ch)
+            continue
+        if escaped:
+            escaped = False
+            out.append(ch)
+            continue
+        if ch == "\\":
+            escaped = True
+            out.append(ch)
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            out.append(ch)
+            continue
+        if ch == "'":
+            single_buf = []
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+            continue
+        if ch == "#" and (not out or out[-1].isspace() or out[-1] in ";|&("):
+            in_comment = True
+            continue
+        out.append(ch)
+    if single_buf is not None:
+        out.append("''")
+    return "".join(out)
 
 
 def _numeric(value) -> bool:
@@ -47,13 +135,41 @@ def infer_metric_direction(name: str, fallback: str = "maximize") -> str:
 
 
 def _extract_seed(row: dict) -> tuple[int | None, int | None]:
-    """提取 (explicit_seed, cli_seed):优先取整数 row['seed'],否则回落命令里的 --seed。"""
+    """提取 (explicit_seed, cli_seed):优先取整数 row['seed'],否则回落命令里最后一个 --seed。"""
     raw_seed = row.get("seed")
     explicit = raw_seed if (isinstance(raw_seed, int) and not isinstance(raw_seed, bool)) else None
-    cmd = str(row.get("command") or (row.get("params") or {}).get("command") or "")
-    match = _CLI_SEED_RE.search(cmd)
-    cli_seed = int(match.group(1)) if match else None
+    cmd = _effective_shell_text(
+        str(row.get("command") or (row.get("params") or {}).get("command") or "")
+    )
+    matches = list(_CLI_SEED_RE.finditer(cmd))
+    cli_seed = int(matches[-1].group("seed")) if matches else None
     return (explicit if explicit is not None else cli_seed), cli_seed
+
+
+def _effective_command_seed(cmd: str, row_seed: int | None) -> tuple[str, object] | None:
+    """Resolve the effective seed token configured by a shell command."""
+    eff = _effective_shell_text(cmd)
+    int_matches = list(_CLI_SEED_RE.finditer(eff))
+    var_matches = list(_CLI_SEED_VAR_RE.finditer(eff))
+    last_int = int_matches[-1] if int_matches else None
+    last_var = var_matches[-1] if var_matches else None
+    if last_int is not None and (last_var is None or last_int.end() > last_var.end()):
+        return ("int", int(last_int.group("seed")))
+
+    assign_matches = list(_ENV_SEED_ASSIGN_RE.finditer(eff))
+    if assign_matches:
+        m = assign_matches[-1]
+        is_single_quoted = m.group(1) is not None
+        raw_val = next(v for v in m.groups() if v is not None)
+        if is_single_quoted or not _ENV_SEED_REF_RE.search(raw_val):
+            try:
+                return ("int", int(raw_val))
+            except ValueError:
+                return ("str", raw_val)
+
+    if _ENV_SEED_REF_RE.search(eff):
+        return ("int", row_seed) if row_seed is not None else ("dynamic", None)
+    return None
 
 
 def _metric_signature(row: dict) -> str:
@@ -166,11 +282,11 @@ def variant_means(rows: list[dict]) -> list[dict]:
         g = groups.setdefault(key, {
             "variant": variant, "planId": row.get("planId"), "dataset": row.get("dataset"),
             "metric": row.get("metric"), "baseline": None,
-            "buckets": {}, "seeds": set(), "cliSeeds": set(),
+            "buckets": {}, "seeds": set(), "effectiveSeeds": set(),
             "commands": [], "signatures": set(), "jobIds": []})
         if g["baseline"] is None and _numeric(row.get("baseline")):
             g["baseline"] = row["baseline"]
-        seed_val, cli_seed = _extract_seed(row)
+        seed_val, _ = _extract_seed(row)
         bucket_key = ("seed", seed_val) if seed_val is not None else ("unseeded", None)
         bucket = g["buckets"].setdefault(bucket_key, {"values": [], "gains": []})
         bucket["values"].append(float(row["value"]))
@@ -178,11 +294,12 @@ def variant_means(rows: list[dict]) -> list[dict]:
             bucket["gains"].append(float(row["gain"]))
         if seed_val is not None:
             g["seeds"].add(seed_val)
-        if cli_seed is not None:
-            g["cliSeeds"].add(cli_seed)
         cmd = str(row.get("command") or (row.get("params") or {}).get("command") or "").strip()
         if cmd:
             g["commands"].append(cmd)
+            eff_seed = _effective_command_seed(cmd, seed_val)
+            if eff_seed is not None:
+                g["effectiveSeeds"].add(eff_seed)
         g["signatures"].add(_metric_signature(row))
         g["jobIds"].append(row["jobId"])
     out = []
@@ -200,8 +317,7 @@ def variant_means(rows: list[dict]) -> list[dict]:
             len(seeds) >= 2
             and len(g["signatures"]) == 1
             and bool(g["commands"])
-            and len(g["cliSeeds"]) < 2
-            and not any("AUTOLAB_SEED" in c for c in g["commands"])
+            and len(g["effectiveSeeds"]) < 2
         )
         n = 1 if (not seeds or seed_insensitive) else len(seeds)
         out.append({"variant": g["variant"], "planId": g["planId"], "dataset": g["dataset"],
@@ -215,6 +331,7 @@ def variant_means(rows: list[dict]) -> list[dict]:
                         not seed_insensitive
                         and ci is not None
                         and ci[0] > 0
+                        and _passes_small_sample_t(dedup_gains)
                         and len(dedup_gains) >= 3
                         and n >= 3
                     ),

@@ -52,7 +52,7 @@ export function ResearchCasesPanel({ project }: { project: Project }) {
     queryFn: () => fetchResearchCases(project.id, { query, dataset: dataset || undefined, limit: 30 }),
   });
 
-  const allCases = casesQuery.data?.cases ?? [];
+  const allCases = useMemo(() => casesQuery.data?.cases ?? [], [casesQuery.data?.cases]);
   const filteredCases = useMemo(() => {
     if (classFilter === "all") return allCases;
     if (classFilter === "success") return allCases.filter((c) => c.success || c.failureClass === "success");

@@ -8,12 +8,44 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { BadgeCheck, Database, Loader2 } from "lucide-react";
 import { fetchProjectDatasets, startValidation, type Project } from "@/lib/api";
+import { parseStrictFloat, parseStrictInt } from "@/lib/validation";
 import { Button } from "~/vendor/ui/components/ui/button";
 import {
   Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
 } from "~/vendor/ui/components/ui/dialog";
 
 const FIELD = "w-full rounded-md border-[0.5px] border-surface-border bg-background px-2 text-caption";
+
+function ValidationField({
+  label, value, onChange, placeholder, hint, error, widthClass,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+  placeholder: string;
+  hint: string;
+  error: string | null;
+  widthClass: string;
+}) {
+  return (
+    <div>
+      <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
+        {label}
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          aria-invalid={error !== null}
+          className={`${FIELD} h-7 ${widthClass} ${error !== null ? "border-destructive" : ""}`}
+        />
+        {hint}
+      </label>
+      {error !== null ? (
+        <p role="alert" className="mt-0.5 text-micro text-destructive">{error}</p>
+      ) : null}
+    </div>
+  );
+}
 
 export function ValidateLaunch({ project, sourceRunId, label }: {
   project: Project; sourceRunId?: string; label?: string;
@@ -22,6 +54,8 @@ export function ValidateLaunch({ project, sourceRunId, label }: {
   const [open, setOpen] = useState(false);
   const [seeds, setSeeds] = useState("3");
   const [seedStart, setSeedStart] = useState("101");
+  const [gpuHours, setGpuHours] = useState("");
+  const [regressTol, setRegressTol] = useState("0.005");
   const [picked, setPicked] = useState<string[]>([]);
   const [starting, setStarting] = useState(false);
   const { data } = useQuery({
@@ -31,24 +65,37 @@ export function ValidateLaunch({ project, sourceRunId, label }: {
   });
   const confirmed = (data?.datasets ?? []).filter((d) => d.state === "confirmed");
 
+  const seedsParsed = parseStrictInt(seeds, { label: "每数据集 seed 数", min: 1, max: 10 });
+  const seedStartParsed = parseStrictInt(seedStart, { label: "留存种子起始值", min: 0, max: 1_000_000 });
+  const gpuHoursParsed = parseStrictFloat(gpuHours, { label: "GPU 小时上限", min: 0, optional: true });
+  const regressTolParsed = parseStrictFloat(regressTol, {
+    label: "退化容忍度", min: 0, max: 1, optional: true,
+  });
+  const validationError =
+    (!seedsParsed.ok && seedsParsed.error)
+    || (!seedStartParsed.ok && seedStartParsed.error)
+    || (!gpuHoursParsed.ok && gpuHoursParsed.error)
+    || (!regressTolParsed.ok && regressTolParsed.error)
+    || null;
+
   const toggle = (name: string) =>
     setPicked((prev) => prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]);
 
   const launch = async () => {
+    if (!seedsParsed.ok || !seedStartParsed.ok || !gpuHoursParsed.ok || !regressTolParsed.ok) {
+      toast.error(validationError ?? "参数格式有误");
+      return;
+    }
     setStarting(true);
     try {
-      const parsedSeedStart = seedStart.trim() === "" ? 101 : Number(seedStart);
-      if (!Number.isInteger(parsedSeedStart) || parsedSeedStart < 0 || parsedSeedStart > 1_000_000) {
-        toast.error("留存种子起始值需为 0..1000000 之间的整数");
-        return;
-      }
-      const payload: Parameters<typeof startValidation>[1] & { seed_start?: number } = {
+      await startValidation(project.id, {
         datasets: picked.length ? picked : undefined,
-        seeds: Number(seeds) || 3,
-        seed_start: parsedSeedStart,
+        seeds: seedsParsed.value,
+        seed_start: seedStartParsed.value,
+        gpu_hours: gpuHoursParsed.value,
+        regress_tol: regressTolParsed.value,
         source_run_id: sourceRunId,
-      };
-      await startValidation(project.id, payload);
+      });
       setOpen(false);
       void queryClient.invalidateQueries({ queryKey: ["run-latest", project.id] });
       void queryClient.invalidateQueries({ queryKey: ["project-runs", project.id] });
@@ -89,21 +136,50 @@ export function ValidateLaunch({ project, sourceRunId, label }: {
             </div>
           ) : null}
           <div className="space-y-2">
-            <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
-              每数据集 seed 数
-              <input value={seeds} onChange={(e) => setSeeds(e.target.value)} placeholder="3"
-                     className={`${FIELD} h-7 w-14`} />
-              (1-10;判定按均值,seed 少了会记「证据不足」)
-            </label>
-            <label className="flex items-center gap-1.5 text-micro text-muted-foreground">
-              留存种子起始值
-              <input value={seedStart} onChange={(e) => setSeedStart(e.target.value)} placeholder="101"
-                     className={`${FIELD} h-7 w-20 font-mono`} />
-              (默认 101,独立于探索期种子以防偶然高分偏差)
-            </label>
+            <ValidationField
+              label="每数据集 seed 数"
+              value={seeds}
+              onChange={setSeeds}
+              placeholder="3"
+              hint="(1-10;判定按均值,seed 少了会记「证据不足」)"
+              error={seedsParsed.ok ? null : seedsParsed.error}
+              widthClass="w-14"
+            />
+            <ValidationField
+              label="留存种子起始值"
+              value={seedStart}
+              onChange={setSeedStart}
+              placeholder="101"
+              hint="(0-1000000,默认 101,独立于探索期种子)"
+              error={seedStartParsed.ok ? null : seedStartParsed.error}
+              widthClass="w-20 font-mono"
+            />
+            <ValidationField
+              label="退化容忍度"
+              value={regressTol}
+              onChange={setRegressTol}
+              placeholder="0.005"
+              hint="(0.0-1.0,默认 0.005;设为 0 表示零容忍)"
+              error={regressTolParsed.ok ? null : regressTolParsed.error}
+              widthClass="w-20 font-mono"
+            />
+            <ValidationField
+              label="GPU 小时上限"
+              value={gpuHours}
+              onChange={setGpuHours}
+              placeholder="不限"
+              hint="(可选,≥ 0)"
+              error={gpuHoursParsed.ok ? null : gpuHoursParsed.error}
+              widthClass="w-20 font-mono"
+            />
           </div>
           <DialogFooter>
-            <Button size="sm" className="gap-1" disabled={starting} onClick={() => void launch()}>
+            <Button
+              size="sm"
+              className="gap-1"
+              disabled={starting || validationError !== null}
+              onClick={() => void launch()}
+            >
               {starting ? <Loader2 className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
               启动验证
             </Button>

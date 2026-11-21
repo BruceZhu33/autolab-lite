@@ -93,9 +93,54 @@ if [[ "$AUTO" == "--auto" ]]; then
     --expect-spec-hash "$(echo "$B" | python3 -c 'import json,sys;print(json.load(sys.stdin)["plan"]["spec_hash"])')" >/dev/null
 fi
 
+WEB_BUILD_REV="$(python3 - <<'PY'
+import hashlib, os, subprocess
+from pathlib import Path
+
+web = Path("apps/web")
+h = hashlib.sha256()
+for key in ("NEXT_PUBLIC_AUTOLAB_API", "NEXT_PUBLIC_PAPERPULSE_WEB"):
+    h.update(f"{key}={os.environ.get(key, '')}\n".encode())
+for cmd in (["git", "rev-parse", "HEAD"], ["git", "status", "--porcelain", "--", "apps/web"]):
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        h.update(f"{cmd[1]}:{res.returncode}:{res.stdout}\n".encode())
+    except OSError:
+        pass
+for rel in ("package.json", "package-lock.json", "next.config.mjs", "tsconfig.json", "postcss.config.mjs"):
+    p = web / rel
+    if p.is_file():
+        st = p.stat()
+        h.update(f"F:{rel}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+for sub in ("app", "components", "lib", "vendor", "public"):
+    root = web / sub
+    if not root.is_dir():
+        continue
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            st = p.stat()
+            h.update(f"F:{p.relative_to(web)}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+print(h.hexdigest())
+PY
+)"
+STAMP_FILE="apps/web/.next/.autolab-build-rev"
+NEED_WEB_BUILD=0
+if [[ ! -f "apps/web/.next/BUILD_ID" || ! -f "$STAMP_FILE" ]]; then
+  NEED_WEB_BUILD=1
+elif [[ "$(cat "$STAMP_FILE" 2>/dev/null || true)" != "$WEB_BUILD_REV" ]]; then
+  NEED_WEB_BUILD=1
+fi
+if [[ "$NEED_WEB_BUILD" -eq 1 ]]; then
+  echo "== 构建 Web 前端（检测到缺失或源码变更）"
+  if ! ( cd apps/web && npm run build > "$WORK/web-build.log" 2>&1 ); then
+    echo "error: Web 构建失败，日志尾部：" >&2
+    tail -n 30 "$WORK/web-build.log" >&2 || true
+    exit 1
+  fi
+  printf '%s\n' "$WEB_BUILD_REV" > "$STAMP_FILE"
+fi
 echo "== 启动 Web（http://127.0.0.1:${WEB_PORT}）"
-( cd apps/web && [[ -f .next/BUILD_ID ]] || npm run build >/dev/null 2>&1
-  npm run start > "$WORK/web.log" 2>&1 ) & WEB_PID=$!
+( cd apps/web && exec npm run start > "$WORK/web.log" 2>&1 ) & WEB_PID=$!
 
 cat <<EOF
 

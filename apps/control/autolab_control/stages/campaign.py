@@ -258,12 +258,15 @@ def start_campaign(repo: Repo, credentials, source_project_id: str, *,
         raise UserError(f"ideas 最多 {MAX_IDEAS} 个(收到 {len(cleaned)})")
     if len(set(cleaned)) != len(cleaned):
         raise UserError("ideas 有重复:每个方向只分叉一个分支")
+    parsed_rounds, parsed_hours = research.validate_run_limits(
+        max_rounds=max_rounds, gpu_hours=gpu_hours,
+    )
     dataset_pool = [d for d in (datasets or []) if d in pool] or None
 
     campaign_id = new_id("camp")
     config = {"ideas": cleaned, "tier": tier, "datasets": dataset_pool,
               "critic": bool(critic), "reviewer": bool(reviewer),
-              "max_rounds": max_rounds, "gpu_hours": gpu_hours}
+              "max_rounds": parsed_rounds, "gpu_hours": parsed_hours}
     now = utc_now()
     conn = repo.db.connect()
     try:
@@ -629,7 +632,11 @@ def promote_campaign(repo: Repo, credentials, campaign_id: str, *,
         else:
             preserved_contract = copy.deepcopy(winner_snapshot.get("metric_contract"))
         if isinstance(preserved_contract, dict) and preserved_contract:
-            refresh_contract_hashes(Workspace(host, source_dir), preserved_contract)
+            refresh_contract_hashes(
+                Workspace(host, source_dir),
+                preserved_contract,
+                output_root=source.get("output_root"),
+            )
             snapshot["metric_contract"] = preserved_contract
         else:
             snapshot.pop("metric_contract", None)

@@ -4,6 +4,7 @@
  * 点进去是该空间的详情(成员/授权/文档上传与浏览)。风格沿用控制台 tokens。 */
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -30,7 +31,7 @@ function LoginCard({ onOk }: { onOk: () => void }) {
           知识库身份随控制台登录一起发放:到「设置 → 账户与访问」用 labnote 账号登录后,
           这里即可直接使用,无需单独登录。
         </p>
-        <a href="/settings"><Button size="sm" className="mt-3">去设置页登录</Button></a>
+        <Link href="/settings"><Button size="sm" className="mt-3">去设置页登录</Button></Link>
       </div>
     );
   }

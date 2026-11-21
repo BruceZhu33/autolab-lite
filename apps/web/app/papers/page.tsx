@@ -5,7 +5,7 @@
  * 排版规格(标题 17px/摘要 14.5px/推荐理由沉底块)对齐论文站,配色走控制台 CDS 令牌。
  * 数据经 control 代理(/api/papers/*, reader 即可),详情与原文在论文站(隧道 3310)。 */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { BookDown, ExternalLink, Flame, Lightbulb, Loader2, Newspaper } from "lucide-react";
 import { toast } from "sonner";
@@ -251,6 +251,8 @@ function Latest({ item }: {
   );
 }
 
+const KIND_LABEL: Record<string, string> = { rss: "RSS 订阅", json_list: "开放接口", web_list: "网页解析" };
+
 /** 「信源与说明」区块(论文流下方):大标题 + 信源河动画 + 四步联动 + 信源目录 + 补充入口。 */
 function AboutView({ sources, stats }: {
   sources: PaperSource[] | undefined;
@@ -277,7 +279,6 @@ function AboutView({ sources, stats }: {
     () => (sources ?? []).map((s) => ({ name: s.name, kind: s.kind, heatOnly: false })),
     [sources]);
 
-  const KIND_LABEL: Record<string, string> = { rss: "RSS 订阅", json_list: "开放接口", web_list: "网页解析" };
   const byKind = useMemo(() => {
     const groups = new Map<string, PaperSource[]>();
     for (const s of sources ?? []) {
@@ -415,7 +416,7 @@ export default function PapersPage() {
     },
   });
 
-  const cards = content.data?.items ?? [];
+  const cards = useMemo(() => content.data?.items ?? [], [content.data?.items]);
   const pageCount = content.data?.pageCount ?? 1;
   const hot = content.data?.hot ?? null;
   const active = columns.data?.topics.find((c) => c.slug === slug);

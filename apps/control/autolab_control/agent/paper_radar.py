@@ -14,22 +14,39 @@ import os
 
 import httpx
 
-PAPERPULSE_URL = os.environ.get("PAPERPULSE_API", "http://127.0.0.1:3311").rstrip("/")
+from . import knowledge
+
+_DEFAULT_PAPERPULSE_URL = "http://127.0.0.1:3311"
+_INIT_PAPERPULSE_URL = os.environ.get("PAPERPULSE_API", _DEFAULT_PAPERPULSE_URL).rstrip("/")
+PAPERPULSE_URL = _INIT_PAPERPULSE_URL
 
 _WINDOWS = ("24h", "7d")
 
 
+def _paperpulse_url() -> str:
+    if PAPERPULSE_URL != _INIT_PAPERPULSE_URL:
+        return (PAPERPULSE_URL or "").rstrip("/")
+    raw = os.environ.get("PAPERPULSE_API")
+    return (_DEFAULT_PAPERPULSE_URL if raw is None else raw).rstrip("/")
+
+
 def available() -> bool:
     """论文站是否可达(build_tools 时探测,不可达则不注册工具)。"""
+    base = _paperpulse_url()
+    if not base:
+        return False
     try:
-        with httpx.Client(verify=False, timeout=3, trust_env=False) as client:
-            return client.get(f"{PAPERPULSE_URL}/api/health").status_code == 200
+        with httpx.Client(verify=knowledge.tls_verify(), timeout=3, trust_env=False) as client:
+            return client.get(f"{base}/api/health").status_code == 200
     except httpx.HTTPError:
         return False
 
 
 def search(query: str = "", limit: int = 6, window: str = "7d") -> str:
     """按关键词搜最近的论文(空 query = 时间线最新);返回给人/模型读的文本块。"""
+    base = _paperpulse_url()
+    if not base:
+        return "论文雷达未配置。"
     if window not in _WINDOWS:
         window = "7d"
     params: dict[str, str | int] = {
@@ -38,8 +55,8 @@ def search(query: str = "", limit: int = 6, window: str = "7d") -> str:
     }
     if query.strip():
         params["q"] = query.strip()
-    with httpx.Client(verify=False, timeout=20, trust_env=False) as client:
-        response = client.get(f"{PAPERPULSE_URL}/api/v1/items", params=params)
+    with httpx.Client(verify=knowledge.tls_verify(), timeout=20, trust_env=False) as client:
+        response = client.get(f"{base}/api/v1/items", params=params)
         response.raise_for_status()
         data = response.json()
     items = data.get("items") or []

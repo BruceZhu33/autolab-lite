@@ -32,7 +32,7 @@
 | **立项与环境** | 探查代码结构、Conda 环境、数据加载与训练入口 | 工作区路径隔离；改 `.py` 源码前自动备份并通过 AST 语法门（语法错误自动回滚） | 登记服务器与代码源，或从历史基线一键分叉（Fork）新方向 |
 | **Baseline 阶段** | 编写非侵入式评测适配器（写出 `$AUTOLAB_OUTPUT_DIR/metrics.json`），先冒烟后跑正式 Job；缺材料调用 `ask_human` 求助 | `finish` 验收门：核验每个数据集的正式 Job 状态必须为 `SUCCEEDED` 且产出合法数值指标（NaN/Inf/比率越界一律拒收） | 供给缺失的数据集/权重（目录链接或上传 zip）；审查并**确认基线**，固化评测契约 |
 | **Research 阶段** | 结合论文 PDF、参考代码库、知识库与历史记忆提出假设 → 提交 Git 快照 → 改代码 → 冒烟 → 提交多 seed 实验 → `end_round` 收束 | 逐 Job 对照基线计算增益；多 seed 聚合均值与 **95% Bootstrap 置信区间**；校验受保护路径哈希与护栏指标；拦截同指纹重复实验 | 选择迭代档位（轻/中/重）或发起 1–3 方向并行分支（Campaign）；按需审阅轮次报告 |
-| **验证与晋级** | 验证会话在**只读工具面**（禁止改码与任意 shell）下按基线命令口径多 seed 重跑当前工作区 | 产出逐数据集均值对比结论表；采纳时全指标均值覆盖基线快照，旧基线自动归档入 `history` 并写入研究日志 | 点击 **「全量验证」**、拍板 **「采纳为新基线」** 或将 Campaign 冠军分支一键 **「回灌源项目」** |
+| **验证与晋级** | **0-LLM 确定性验证流水线**（无模型调用）：从冠军 `codeCommit` 检出隔离 `git worktree`，核验基线命令口径后确定性合成 `(dataset, seed)` Job 矩阵重跑验证 | 产出逐数据集均值对比结论表；采纳时全指标均值覆盖基线快照，旧基线自动归档入 `history` 并写入研究日志 | 点击 **「全量验证」**、拍板 **「采纳为新基线」** 或将 Campaign 冠军分支一键 **「回灌源项目」** |
 
 ---
 
@@ -55,7 +55,7 @@
        │  7. git worktree 秒级分叉新方向                                   ▼
        │     (数据集与权重符号链接零拷贝)             ┌────────────────────────────────────────┐
        └──────────────────────────────────────────── │ 5. 全量验证 (Validate) & 6. 采纳/回灌    │
-                                                     │   • 只读工具面多 seed 重跑验证            │
+                                                     │   • 0-LLM 隔离 worktree 确定性多 seed 验证│
                                                      │   • 采纳新基线 (v1→v2) / 冠军分支 Merge  │
                                                      └────────────────────────────────────────┘
 ```
@@ -241,8 +241,8 @@ AutoLab 针对自主科研场景构建了多层工程护栏，确保实验结论
 ## 5. 快速开始与部署指南
 
 ### 5.1 环境要求
-- **控制端（Control + Web）**：Python `>= 3.12`、[`uv`](https://docs.astral.sh/uv/)、Node.js `>= 20`（含 `npm`）。
-- **执行端（GPU Server Runner）**：Linux / macOS，Python `>= 3.10`，配备 NVIDIA GPU（支持 `nvidia-smi` 探测；本地开发或测试亦可运行于无卡 CPU 模式）。
+- **控制端（Control + Web）**：Python `>= 3.10`（生产与 CI 推荐 `3.12+`）、[`uv`](https://docs.astral.sh/uv/)、Node.js `>= 20`（含 `npm`）。
+- **执行端（GPU Server Runner & 评测环境）**：Linux / macOS，Runner 支持 Python `>= 3.10`；若启用 `PYTHONSAFEPATH=1` 平台独立评测隔离（含 Step 1 `S1-K5` 验收关卡），目标训练/评测 Python 解释器需 `>= 3.11`。配备 NVIDIA GPU（支持 `nvidia-smi` 探测；本地开发或测试亦可运行于无卡 CPU 模式）。
 
 ### 5.2 安装依赖
 
@@ -299,11 +299,22 @@ npm run start
 除 Web 控制台外，`packages/client` 提供了完整的 `autolab` CLI：
 
 ```bash
-# 注册本机或 SSH 远程 GPU 服务器
-uv run autolab server add-local --name local-dev --workdir /tmp/autolab-work
-uv run autolab server add-ssh --name gpu-a6000 --host 192.0.2.46 --user researcher --key-file ~/.ssh/id_ed25519
+# 1) 注册本机 Runner（通过 --db/--credentials 或 AUTOLAB_DB/AUTOLAB_CREDENTIALS）
+AUTOLAB_RUNNER_TOKEN=<token> AUTOLAB_HMAC_KEY=<hmac> \
+  uv run autolab server add-local --name local-dev --runner-port 7810 \
+    --work-root /tmp/autolab-work --output-root /tmp/autolab-out
 
-# 查看已登记项目与研究状态
+# 2) 注册 SSH 远程 GPU 服务器（客户端安全读取 --key-file 并调用 Control Owner API）
+AUTOLAB_OWNER_TOKEN=<owner_token> \
+  uv run autolab server add-ssh --name gpu-a6000 --host 192.0.2.46 --port 22 \
+    --user researcher --key-file ~/.ssh/id_ed25519 --api-url http://127.0.0.1:8710
+
+# 3) 预固定或在主机密钥变更后显式确认/轮换 SSH 主机指纹（非交互需传 --yes）
+AUTOLAB_OWNER_TOKEN=<owner_token> \
+  uv run autolab server confirm-fingerprint --host 192.0.2.46 --port 22 \
+    --fingerprint SHA256:... --yes
+
+# 4) 查看已登记项目与研究状态
 uv run autolab project list
 ```
 
@@ -339,7 +350,7 @@ uv run autolab project list
 | | `GET /api/projects/{id}/baseline/contract` | Reader | 获取项目当前的评测指标契约、各数据集已知指标清单与默认契约建议 |
 | | `PATCH /api/owner/projects/{id}/baseline/contract` | Owner | 固化主指标、优化方向、退化护栏、受保护路径（自动算哈希）与独立评测命令 |
 | **Research 与验证** | `POST /api/owner/projects/{id}/research/start` | Owner | 启动单线研究会话（支持 `tier`、`datasets`、`critic`、`reviewer`、`agent_spec_id`） |
-| | `POST /api/owner/projects/{id}/research/validate` | Owner | 将最近一次成功研究会话的冠军改动发起多 seed 只读全量验证 |
+| | `POST /api/owner/projects/{id}/research/validate` | Owner | 对冠军提交发起 0-LLM 确定性验证（隔离 `git worktree` + 多 `(dataset, seed)` Job 合成 + 基线口径核验） |
 | | `POST /api/owner/projects/{id}/research/adopt` | Owner | 采纳验证会话实测均值为新基线（旧基线归档入 `history`） |
 | | `GET /api/projects/{id}/research/rounds` | Reader | 获取研究轮次报告列表（支持按 `run_id` 过滤或查全项目历史） |
 | | `GET /api/projects/{id}/research/cases` | Reader | 检索结构化研究记忆案例（支持 `query` 关键词与 `dataset` 过滤，自动回填旧轮次） |
@@ -353,12 +364,12 @@ uv run autolab project list
 
 ## 7. 测试体系与 Agent 离线/在线评测
 
-AutoLab 拥有超过 **430 个自动化测试用例**，涵盖架构守卫、控制面单测、Agent 评测回放与真实双进程 E2E：
+AutoLab 拥有超过 **600+ 个自动化测试用例**，涵盖架构守卫、控制面单测、Client CLI 与协议校验、Runner 隔离测试、Agent 离线评测回放与真实双进程 E2E：
 
 ```bash
 # 1. 代码风格与静态检查
 uv run ruff check .
-cd apps/web && npx tsc --noEmit && cd ../..
+cd apps/web && npm run lint && npx tsc --noEmit && cd ../..
 
 # 2. 运行架构分层守卫测试 (确保无反向依赖与跨模块私有访问)
 uv run pytest apps/control/tests/test_architecture.py -q

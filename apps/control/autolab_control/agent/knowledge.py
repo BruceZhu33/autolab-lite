@@ -13,12 +13,28 @@ import os
 
 import httpx
 
-LABNOTE_URL = os.getenv("LABNOTE_URL", "")
-LABNOTE_PAT = os.getenv("LABNOTE_PAT", "")
+_INIT_LABNOTE_URL = os.getenv("LABNOTE_URL", "")
+_INIT_LABNOTE_PAT = os.getenv("LABNOTE_PAT", "")
+LABNOTE_URL = _INIT_LABNOTE_URL
+LABNOTE_PAT = _INIT_LABNOTE_PAT
+
+
+def labnote_url() -> str:
+    """Resolve LABNOTE_URL dynamically at call time while honoring module-attribute monkeypatches."""
+    if LABNOTE_URL != _INIT_LABNOTE_URL:
+        return (LABNOTE_URL or "").rstrip("/")
+    return os.getenv("LABNOTE_URL", "").rstrip("/")
+
+
+def labnote_pat() -> str:
+    """Resolve LABNOTE_PAT dynamically at call time while honoring module-attribute monkeypatches."""
+    if LABNOTE_PAT != _INIT_LABNOTE_PAT:
+        return LABNOTE_PAT or ""
+    return os.getenv("LABNOTE_PAT", "")
 
 
 def configured() -> bool:
-    return bool(LABNOTE_URL and LABNOTE_PAT)
+    return bool(labnote_url() and labnote_pat())
 
 
 def tls_verify() -> str | bool:
@@ -29,7 +45,7 @@ def tls_verify() -> str | bool:
 
 def _client() -> httpx.Client:
     return httpx.Client(verify=tls_verify(), timeout=60, trust_env=False,
-                        headers={"Authorization": f"Bearer {LABNOTE_PAT}"})
+                        headers={"Authorization": f"Bearer {labnote_pat()}"})
 
 
 def retrieve(query: str, top_k: int = 5, space_id: str = "") -> str:
@@ -38,7 +54,7 @@ def retrieve(query: str, top_k: int = 5, space_id: str = "") -> str:
     if space_id:
         payload["space_id"] = space_id
     with _client() as client:
-        response = client.post(f"{LABNOTE_URL}/api/v1/retrieve", json=payload)
+        response = client.post(f"{labnote_url()}/api/v1/retrieve", json=payload)
     response.raise_for_status()
     docs = response.json().get("docs") or []
     parts = [f"[{i}] {d.get('filename', '')}(L{d.get('chunk_level')}) "
@@ -50,7 +66,7 @@ def retrieve(query: str, top_k: int = 5, space_id: str = "") -> str:
 def ingest(filename: str, text: str, kind: str = "experiment") -> None:
     """markdown 文本 → 三级树入库(autolab 空间),下一轮可检索。"""
     with _client() as client:
-        response = client.post(f"{LABNOTE_URL}/api/v1/ingest",
+        response = client.post(f"{labnote_url()}/api/v1/ingest",
                                json={"filename": filename, "text": text, "kind": kind})
     response.raise_for_status()
 

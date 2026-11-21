@@ -24,8 +24,17 @@ export function AdoptButton({ project, runId }: { project: Project; runId: strin
       const res = await adoptValidation(project.id, runId);
       const n = Object.keys(res.adopted.baseline).length;
       toast.success(`已采纳为新基线(${n} 个数据集)`);
-      void queryClient.invalidateQueries({ queryKey: ["run-latest", project.id] });
-      void queryClient.invalidateQueries({ queryKey: ["datasets", project.id] });
+      for (const queryKey of [
+        ["run-latest", project.id],
+        ["project-runs", project.id],
+        ["datasets", project.id],
+        ["baseline-contract", project.id],
+        ["research-rounds", project.id],
+        ["projects"],
+        ["board"],
+      ]) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
     } catch (err) {
       toast.error(`采纳失败:${(err as Error).message}`);
     } finally {

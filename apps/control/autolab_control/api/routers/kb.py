@@ -29,7 +29,7 @@ _ORIG_SYNC_REQUEST = httpx.Client.request
 def _unconfigured() -> JSONResponse | None:
     """LABNOTE_URL 没配时给明确报错,而不是把空 base 拼成无协议 URL
     (httpx 抛 UnsupportedProtocol,用户只看到晦涩的 502)。"""
-    if knowledge.LABNOTE_URL:
+    if knowledge.labnote_url():
         return None
     return JSONResponse(status_code=503, content={
         "detail": "LABNOTE_URL 未配置:control 启动环境缺少知识库地址,"
@@ -37,7 +37,7 @@ def _unconfigured() -> JSONResponse | None:
 
 
 def _base() -> str:
-    return knowledge.LABNOTE_URL.rstrip("/")
+    return knowledge.labnote_url()
 
 
 def _forward_headers(request: Request) -> dict[str, str]:

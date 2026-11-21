@@ -59,7 +59,7 @@ def test_ci_workflow_defines_full_stack_jobs():
 
     # web-build gates
     assert 'node-version: "20"' in text
-    assert "cd apps/web && npm ci && npx tsc --noEmit && npm run build" in text
+    assert "cd apps/web && npm ci && npm run lint && npx tsc --noEmit && npm run build" in text
 
     # e2e-local gate
     assert "uv run pytest tests/e2e_local -q" in text

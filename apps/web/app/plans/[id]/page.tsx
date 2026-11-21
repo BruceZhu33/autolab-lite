@@ -5,8 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronRight, FileText, FlaskConical, Loader2, Timer, Users } from "lucide-react";
-import { fetchPlanDetail, fetchProjects, type PlanDetail } from "@/lib/api";
-import { Button } from "~/vendor/ui/components/ui/button";
+import { fetchPlanDetail, fetchProjects } from "@/lib/api";
 import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "@/vendor/views/layout/page-header";
 
 const STATUS_VIEW: Record<string, { label: string; cls: string }> = {

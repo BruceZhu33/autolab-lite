@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -128,16 +129,47 @@ def test_m5_full_stack_smoke(stack, web_server):
         logs = api.get(f"/api/jobs/{job_id}/logs", headers=OWNER_H).json()
         assert "log line 0" in logs["text"]
 
-    # 2. web console serves real HTML for every page
+    # 2. web console serves real HTML for every page, 404 route, and static assets
     with httpx.Client(timeout=10.0, trust_env=False,
                       base_url=f"http://127.0.0.1:{web_port}") as web:
         board_page = web.get("/")
         assert board_page.status_code == 200 and "AutoLab" in board_page.text
         assert "实验看板" in board_page.text
-        assert web.get("/runs").status_code == 200
-        assert web.get("/gpus").status_code == 200
-        assert web.get(f"/runs/{job_id}").status_code == 200
-        assert web.get(f"/plans/{created['plan']['id']}").status_code == 200
+
+        route_markers = {
+            "/projects": ("项目", "立项"),
+            "/baseline": ("Baseline",),
+            "/research": ("研究",),
+            "/kb": ("知识对话", "先登录控制台账号"),
+            "/spaces": ("AutoLab",),
+            "/papers": ("论文雷达",),
+            "/specs": ("Agent 规格",),
+            "/settings": ("账户", "外观"),
+            "/runs": ("AutoLab",),
+            "/gpus": ("AutoLab", "GPU 服务器"),
+            "/gpus/sitonholy": ("AutoLab", "思腾合力云算力管理"),
+            f"/runs/{job_id}": ("AutoLab",),
+            f"/plans/{created['plan']['id']}": ("AutoLab",),
+        }
+        for route, markers in route_markers.items():
+            resp = web.get(route)
+            assert resp.status_code == 200, f"GET {route} returned {resp.status_code}"
+            assert "text/html" in resp.headers.get("content-type", "")
+            assert "AutoLab" in resp.text, f"GET {route} missing AutoLab shell"
+            for marker in markers:
+                assert marker in resp.text, f"GET {route} missing expected marker {marker!r}"
+
+        not_found = web.get("/nonexistent-autolab-route")
+        assert not_found.status_code == 404
+        assert "页面不存在" in not_found.text
+        assert "返回实验看板" in not_found.text
+
+        asset_paths = re.findall(r"/_next/static/[^\"'<> ]+", board_page.text)
+        assert asset_paths, "expected Next.js static asset references in root HTML"
+        for asset_path in asset_paths[:3]:
+            asset_resp = web.get(asset_path)
+            assert asset_resp.status_code == 200, f"static asset {asset_path} returned {asset_resp.status_code}"
+            assert len(asset_resp.content) > 0
 
     # 3. production bundle is free of the Multica domain core
     static_dir = REPO_ROOT / "apps" / "web" / ".next" / "static"

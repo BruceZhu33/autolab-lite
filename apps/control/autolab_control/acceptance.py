@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import queue
 import re
 import secrets
@@ -59,6 +60,129 @@ SENTINEL_ANTHROPIC_KEY = "sk-ant-sentinel-never-leak-s1k1"
 SENTINEL_AUTOLAB_TOKEN = "autolab-token-sentinel-never-leak-s1k1"
 ZERO_LLM_CREDENTIAL_REFS: tuple[str, ...] = ("llm", "model:api-key", "chatagent:api-key")
 
+_FORBIDDEN_CLEANUP_ROOTS = frozenset({
+    "/",
+    "/tmp",
+    "/var/tmp",
+    "/private/tmp",
+    "/home",
+    "/users",
+    "/root",
+    "/var",
+    "/opt",
+    "/usr",
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+})
+
+
+def validate_safe_remote_cleanup_root(remote_root: str, *, home: str = "") -> str:
+    """Validate that `--cleanup-remote` only targets a dedicated temporary acceptance directory
+    (e.g. containing `autolab-step1` or a temporary subdirectory under `/tmp`), never `/` or
+    the user's existing directories."""
+    raw = (remote_root or "").strip()
+    home_clean = home.strip().rstrip("/")
+    if raw.startswith("~/") and home_clean.startswith("/"):
+        raw = f"{home_clean}/{raw[2:]}"
+    if not raw or "\x00" in raw or not raw.startswith("/"):
+        raise ValueError(
+            f"unsafe remote_root for --cleanup-remote (must be an absolute path): {remote_root!r}"
+        )
+    raw_parts = [part for part in raw.split("/") if part]
+    if ".." in raw_parts or "." in raw_parts:
+        raise ValueError(
+            f"unsafe remote_root for --cleanup-remote (path traversal not allowed): {remote_root!r}"
+        )
+
+    norm = posixpath.normpath(raw)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
+    norm_parts = [part for part in norm.split("/") if part]
+    if len(norm_parts) < 2 or norm.lower() in _FORBIDDEN_CLEANUP_ROOTS:
+        raise ValueError(f"refusing to clean protected root path: {norm!r}")
+
+    if home:
+        home_norm = posixpath.normpath(home.strip())
+        if norm == home_norm or home_norm.startswith(norm + "/"):
+            raise ValueError(f"refusing to clean $HOME or an ancestor of $HOME: {norm!r}")
+
+    base = norm_parts[-1].lower()
+    is_named_acceptance = any(
+        marker in base
+        for marker in ("autolab-step1", "autolab_step1", "step1-accept", "autolab-accept")
+    )
+    under_tmp = norm.startswith(("/tmp/", "/var/tmp/", "/private/tmp/"))
+    is_tmp_acceptance = under_tmp and (
+        "autolab" in base or "step1" in base or base.startswith("tmp")
+    )
+    if not (is_named_acceptance or is_tmp_acceptance):
+        raise ValueError(
+            f"refusing to clean non-acceptance directory {norm!r}; expected a dedicated "
+            "acceptance directory containing 'autolab-step1' (or temporary dir under /tmp)"
+        )
+    return norm
+
+
+def probe_python_version(
+    host: Host,
+    python_bin: str,
+    *,
+    conda_env: str = "",
+    timeout: float = 20.0,
+) -> tuple[int, int, int]:
+    """Probe `(major, minor, micro)` of `python_bin` (optionally inside `conda_env`)."""
+    py = (python_bin or "").strip() or "python3"
+    cmd = f"{q(py)} -c 'import sys; print(\".\".join(map(str, sys.version_info[:3])))'"
+    env_name = (conda_env or "").strip()
+    if env_name:
+        home = host.home().rstrip("/")
+        cmd = (
+            f"source {q(home + '/anaconda3/etc/profile.d/conda.sh')} 2>/dev/null || "
+            f"source {q(home + '/miniconda3/etc/profile.d/conda.sh')} 2>/dev/null; "
+            f"conda activate {q(env_name)} && {cmd}"
+        )
+    res = host.run(cmd, timeout=timeout)
+    if not res.ok:
+        detail = (res.out or "").strip()
+        env_desc = f" (conda_env={env_name!r})" if env_name else ""
+        raise RuntimeError(
+            f"Failed to probe target eval Python interpreter {py!r}{env_desc}: "
+            f"exit={res.code}, output={detail[-300:]!r}. "
+            "Verify --python-bin / --conda-env points to an existing Python >= 3.11 environment."
+        )
+    lines = [ln.strip() for ln in (res.out or "").splitlines() if ln.strip()]
+    for line in reversed(lines):
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", line)
+        if match:
+            return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    raise RuntimeError(f"Could not parse Python version from {py!r} output: {res.out!r}")
+
+
+def ensure_eval_python_311_plus(
+    host: Host,
+    python_bin: str,
+    *,
+    conda_env: str = "",
+    gate_id: str = "S1-K5",
+) -> str:
+    """Fail fast with an actionable diagnostic if the target eval Python is < 3.11."""
+    version = probe_python_version(host, python_bin, conda_env=conda_env)
+    ver_str = ".".join(str(part) for part in version)
+    if version[:2] < (3, 11):
+        env_desc = f" in conda env {conda_env!r}" if conda_env.strip() else ""
+        raise RuntimeError(
+            f"{gate_id} requires Python >= 3.11 in the target training/eval interpreter because "
+            f"platform-eval enforces PYTHONSAFEPATH=1 isolation (Python <= 3.10 ignores "
+            f"PYTHONSAFEPATH and would load malicious sitecustomize.py); probed "
+            f"{python_bin!r}{env_desc} -> Python {ver_str}. "
+            "Control/Runner support >= 3.10, but S1-K5 eval needs Python 3.11+. "
+            "Pass --python-bin /path/to/python3.11+ or --conda-env <py311-env>."
+        )
+    return ver_str
+
 
 def resolve_ssh_key_pem(raw_ssh_key: str) -> str:
     """Resolve `--ssh-key` from either inline PEM text or any local file path
@@ -97,6 +221,7 @@ class AcceptanceConfig:
     conda_env: str = ""
     python_bin: str = ""
     skip_restart: bool = False
+    cleanup_remote: bool = False
     report_out: Path | None = None
     json_out: Path | None = None
     keep_workdir: bool = False
@@ -134,6 +259,18 @@ class AcceptanceConfig:
                 raise ValueError(f"--ssh-port must be in 1..65535, got {self.ssh_port!r}")
             if not (1 <= int(self.runner_port) <= 65535):
                 raise ValueError(f"--runner-port must be in 1..65535, got {self.runner_port!r}")
+            if self.cleanup_remote:
+                raw_root = (self.remote_root or "~/autolab-step1-acceptance").strip().rstrip("/")
+                if not raw_root or raw_root == "~":
+                    raise ValueError(
+                        "unsafe --remote-root for --cleanup-remote (cannot be empty or '~')"
+                    )
+                probe_path = (
+                    f"/home/_autolab_check/{raw_root[2:]}"
+                    if raw_root.startswith("~/")
+                    else raw_root
+                )
+                validate_safe_remote_cleanup_root(probe_path, home="/home/_autolab_check")
 
 
 @dataclass
@@ -561,11 +698,14 @@ class _Step1AcceptanceHarness:
 
         self.server_id: str = ""
         self.effective_gpu_slots: int = config.resolved_gpu_slots_hint()
+        self.remote_home: str = ""
+        self.remote_root_expanded: str = ""
         self.remote_work_root: str = ""
         self.remote_out_root: str = ""
         self.job_python: str = ""
         self.gpu_inventory: list[dict[str, str]] = []
         self.host_key_fingerprint: str = ""
+        self._eval_python_version: str = ""
 
         # Shared probe & contract project state across gates
         self._exp_seq: int = 9000
@@ -584,10 +724,73 @@ class _Step1AcceptanceHarness:
                 directory.mkdir(parents=True, exist_ok=True)
             self._write_local_runner_config(gpu_slots=self.effective_gpu_slots)
             self.runner_proc = self._spawn_local_runner()
-            self.job_python = sys.executable
+            self.job_python = self.config.python_bin.strip() or sys.executable
 
         self.control_proc = self._spawn_local_control()
         self.http = _ControlHttpClient(self.api_port, self.owner_token)
+
+    def _cleanup_remote_ssh_lab(self) -> None:
+        if self.config.mode != "ssh-lab" or not self.config.cleanup_remote or not self.server_id:
+            return
+        try:
+            with self._open_server_host() as host:
+                home = (self.remote_home or host.home()).rstrip("/")
+                raw_root = (self.config.remote_root or "~/autolab-step1-acceptance").strip().rstrip("/")
+                target_root = self.remote_root_expanded or (
+                    f"{home}/{raw_root[2:]}"
+                    if raw_root.startswith("~/")
+                    else (home if raw_root == "~" else raw_root)
+                )
+                runner_root = f"{home}/.autolab-runner"
+                paths = runner_deploy.DeployPaths.for_root(runner_root)
+                venv_python = f"{runner_root}/venv/bin/python"
+                py_check = host.run(f"test -x {q(venv_python)}", timeout=10)
+                deployer = runner_deploy.RunnerDeployer(
+                    host.transport,
+                    python_bin=venv_python if py_check.ok else "python3",
+                )
+                try:
+                    deployer.stop(paths, listen_port=self.runner_port)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"autolab-control acceptance: warning: failed to stop remote runner: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+                safe_root = validate_safe_remote_cleanup_root(target_root, home=home)
+                q_root = q(safe_root)
+                cleanup_cmd = (
+                    f"if [ -d {q_root} ]; then "
+                    f"for gitdir in $(find {q_root} -maxdepth 4 -type d -name .git 2>/dev/null); do "
+                    'repo_dir=$(dirname "$gitdir"); '
+                    'git -C "$repo_dir" worktree list --porcelain 2>/dev/null '
+                    "| awk '/^worktree / {print substr($0, 10)}' | while IFS= read -r wt; do "
+                    '[ "$wt" = "$repo_dir" ] && continue; '
+                    f'case "$wt" in {q_root}/*) '
+                    'git -C "$repo_dir" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt" ;; '
+                    "esac; "
+                    "done; "
+                    'git -C "$repo_dir" worktree prune >/dev/null 2>&1 || true; '
+                    "done; "
+                    f"chmod -R u+rwx {q_root} 2>/dev/null || true; "
+                    f"rm -rf {q_root}; "
+                    "fi"
+                )
+                res = host.run(cleanup_cmd, timeout=60)
+                if not res.ok:
+                    print(
+                        f"autolab-control acceptance: warning: failed to clean remote_root "
+                        f"{safe_root}: {res.text}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"autolab-control acceptance: warning: remote cleanup error: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def close(self) -> None:
         if self.http is not None:
@@ -599,6 +802,7 @@ class _Step1AcceptanceHarness:
         if self.runner_proc is not None:
             self.runner_proc.stop()
             self.runner_proc = None
+        self._cleanup_remote_ssh_lab()
         if not self.config.keep_workdir:
             shutil.rmtree(self.local_root, ignore_errors=True)
 
@@ -806,6 +1010,8 @@ class _Step1AcceptanceHarness:
                 if raw_root.startswith("~/")
                 else (home if raw_root == "~" else raw_root)
             )
+            self.remote_home = home
+            self.remote_root_expanded = expanded_root
             self.remote_work_root = f"{expanded_root}/work"
             self.remote_out_root = f"{expanded_root}/outputs"
             mk = host.run(
@@ -820,6 +1026,17 @@ class _Step1AcceptanceHarness:
                 self.job_python = "python3"
             elif isinstance(host, SshHost):
                 self.job_python = runner_deploy.find_remote_python(host.transport)
+                if "S1-K5" in self.config.gates and probe_python_version(host, self.job_python)[:2] < (3, 11):
+                    for py311_cand in ("python3.13", "python3.12", "python3.11"):
+                        found = host.run(f"command -v {q(py311_cand)}", timeout=10)
+                        if found.ok and found.out.strip():
+                            resolved_py = found.out.strip().splitlines()[-1].strip()
+                            try:
+                                if probe_python_version(host, resolved_py)[:2] >= (3, 11):
+                                    self.job_python = resolved_py
+                                    break
+                            except RuntimeError:
+                                pass
             else:
                 self.job_python = host.python
 
@@ -1575,7 +1792,22 @@ class _Step1AcceptanceHarness:
 
     # ---------------------------- Gate S1-K5 ----------------------------
 
+    def _ensure_eval_python_311_plus(self) -> str:
+        if self._eval_python_version:
+            return self._eval_python_version
+        with self._open_server_host() as host:
+            ver = ensure_eval_python_311_plus(
+                host,
+                self.job_python,
+                conda_env=self.config.conda_env,
+                gate_id="S1-K5",
+            )
+        self._eval_python_version = ver
+        return ver
+
     def gate_s1_k5(self) -> tuple[str, dict[str, Any]]:
+        self._ensure_server_registered()
+        self._ensure_eval_python_311_plus()
         project_id, workdir, output_root = self._ensure_two_dataset_contract_project()
         project_row = self.repo.get_project(project_id)
         assert project_row is not None
@@ -1888,6 +2120,12 @@ class _Step1AcceptanceHarness:
             f"held-out seed matrix mismatch: {observed_matrix} != {expected_matrix}"
         )
 
+        with self._open_server_host() as host:
+            pre_adopt_train = host.read(f"{workdir}/train.py").decode("utf-8", errors="replace")
+        assert "CORRUPTED_MAIN_WORKDIR_TRAIN_PY" in pre_adopt_train, (
+            f"expected corrupted main workdir train.py untouched before adopt, got:\n{pre_adopt_train}"
+        )
+
         adopt_resp = self.api.request(
             "POST",
             f"/api/owner/projects/{project_id}/research/adopt",
@@ -1912,7 +2150,26 @@ class _Step1AcceptanceHarness:
             journal_content = host.read(f"{workdir}/.autolab/research_journal.md").decode(
                 "utf-8", errors="replace"
             )
-        assert "CORRUPTED_MAIN_WORKDIR_TRAIN_PY" in main_train_content
+            champ_train_res = host.run(
+                f"git -C {q(workdir)} show {q(champ_sha + ':train.py')}", timeout=30
+            )
+            head_sha_res = host.run(f"git -C {q(workdir)} rev-parse HEAD", timeout=30)
+            val_still_exists = host.run(
+                f"test -e {q(val_workdir)} -o -L {q(val_workdir)}", timeout=15
+            ).ok
+        assert "CORRUPTED_MAIN_WORKDIR_TRAIN_PY" not in main_train_content, (
+            f"corrupted main workdir train.py was not synced after adopt:\n{main_train_content}"
+        )
+        assert champ_train_res.ok and main_train_content == champ_train_res.out, (
+            f"adopted train.py does not match champion commit {champ_sha}:\n"
+            f"workdir={main_train_content!r}\nchamp={champ_train_res.out!r}"
+        )
+        assert head_sha_res.ok and head_sha_res.out.strip().splitlines()[-1] == champ_sha, (
+            f"expected git HEAD == {champ_sha}, got {head_sha_res.text!r}"
+        )
+        assert not val_still_exists, (
+            f"validation_workdir {val_workdir!r} was not cleaned up after adopt"
+        )
         assert "## 基线晋级" in journal_content and val_run_id in journal_content, (
             f"research_journal.md missing adoption record:\n{journal_content[-500:]}"
         )
@@ -2024,8 +2281,11 @@ def run_acceptance(config: AcceptanceConfig) -> AcceptanceReport:
             env_info["runner_port"] = harness.runner_port
             env_info["conda_env"] = config.conda_env or None
             env_info["skip_restart"] = config.skip_restart
+            env_info["cleanup_remote"] = config.cleanup_remote
             if harness.gpu_inventory:
                 env_info["gpus"] = harness.gpu_inventory
+        if harness._eval_python_version:
+            env_info["eval_python_version"] = harness._eval_python_version
         if config.keep_workdir:
             env_info["preserved_local_root"] = str(harness.local_root)
     finally:
@@ -2183,6 +2443,14 @@ def populate_acceptance_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="skip remote Runner daemon kill/restart in S1-K4 when sharing a lab server",
     )
     parser.add_argument(
+        "--cleanup-remote",
+        action="store_true",
+        help=(
+            "stop the temporary remote runner and safely remove the temporary remote_root "
+            "(and prune git worktrees) after ssh-lab teardown"
+        ),
+    )
+    parser.add_argument(
         "--gates",
         default="",
         help="optional comma-separated gate subset (default: all S1-K1..S1-K6)",
@@ -2237,6 +2505,7 @@ def config_from_args(args: argparse.Namespace) -> AcceptanceConfig:
         conda_env=args.conda_env,
         python_bin=args.python_bin,
         skip_restart=bool(args.skip_restart),
+        cleanup_remote=bool(args.cleanup_remote),
         report_out=Path(args.report_out) if str(args.report_out or "").strip() else None,
         json_out=Path(args.json_out) if str(args.json_out or "").strip() else None,
         keep_workdir=bool(args.keep_workdir),

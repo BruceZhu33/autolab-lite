@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import copy
 import json
-import posixpath
 import re
 import tempfile
 from pathlib import Path
@@ -223,6 +223,17 @@ def build(ctx: Ctx) -> APIRouter:
             except UserError as exc:
                 raise HTTPException(409, str(exc)) from exc
             projects.prepare_workspace(host, new_dir)
+            raw_contract = target.get("metric_contract")
+            if not isinstance(raw_contract, dict) or not raw_contract:
+                raw_contract = snapshot.get("metric_contract")
+            forked_contract: dict | None = None
+            if isinstance(raw_contract, dict) and raw_contract:
+                forked_contract = copy.deepcopy(raw_contract)
+                baseline_stage.refresh_contract_hashes(
+                    Workspace(host, new_dir),
+                    forked_contract,
+                    output_root=out_root,
+                )
         project = repo.add_project(name=name, server_id=source["server_id"],
                                    workdir=new_dir, output_root=out_root,
                                    project_id=new_id("proj"))
@@ -236,6 +247,8 @@ def build(ctx: Ctx) -> APIRouter:
                   "notes": (f"研究分叉:源自 {source['name']} 的{label}"
                             f"(代码 {commit[:8]})。\n{target.get('notes') or ''}")[:2000],
                   "datasets": datasets}
+        if forked_contract is not None:
+            forked["metric_contract"] = forked_contract
         repo.update_project(project["id"],
                             baseline_json=json.dumps(forked, ensure_ascii=False),
                             baseline_passed_at=target.get("passed_at"))
@@ -260,10 +273,7 @@ def build(ctx: Ctx) -> APIRouter:
 
         def precheck(host) -> str:
             if kind == "github":
-                clean_name = projects.validate_project_name(name)
-                return posixpath.normpath(
-                    f"{host.home().rstrip('/')}/{projects.PROJECTS_DIR}/{clean_name}"
-                )
+                return projects.project_target(host, name)
             if workdir and workdir.startswith("/"):
                 return workdir.rstrip("/") or "/"
             return ""
@@ -294,9 +304,7 @@ def build(ctx: Ctx) -> APIRouter:
                 clean_name,
                 clean_server,
                 lambda host: projects.extract_zip(host, zip_path, name=clean_name),
-                precheck_for=lambda host: posixpath.normpath(
-                    f"{host.home().rstrip('/')}/{projects.PROJECTS_DIR}/{clean_name}"
-                ),
+                precheck_for=lambda host: projects.project_target(host, clean_name),
             )
         finally:
             zip_path.unlink(missing_ok=True)
@@ -333,9 +341,7 @@ def build(ctx: Ctx) -> APIRouter:
                     workdir = projects.use_existing_dir(host, workdir)
                 else:
                     clean_name = projects.validate_project_name(project["name"])
-                    expected = posixpath.normpath(
-                        f"{host.home().rstrip('/')}/{projects.PROJECTS_DIR}/{clean_name}"
-                    )
+                    expected = projects.project_target(host, clean_name)
                     if server:
                         projects.ensure_within_roots(server, expected, f"{expected}/output")
                     workdir = projects.clone_repo(host, url=github_for_init, name=clean_name)

@@ -5,6 +5,7 @@
  * 能看到自己有权限的全部空间。autolab 服务链路(PAT)不受影响。 */
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { BookOpen, FolderPlus, Loader2, LogOut, Plus, Trash2 } from "lucide-react";
@@ -16,7 +17,7 @@ import { ChatComposer } from "@/components/chat/chat-composer";
 import { AssistantMessage, JumpToLatest, UserMessage } from "@/components/chat/chat-message";
 import { useScrollPinning } from "@/components/chat/use-scroll-pinning";
 import { Button } from "~/vendor/ui/components/ui/button";
-import { PageHeader, PAGE_GUTTER, PAGE_RAIL } from "~/vendor/views/layout/page-header";
+import { PageHeader, PAGE_GUTTER } from "~/vendor/views/layout/page-header";
 
 const FIELD = "w-full rounded-md border-[0.5px] border-surface-border bg-background px-2 text-caption";
 
@@ -34,7 +35,7 @@ function LoginCard({ onOk }: { onOk: (username: string) => void }) {
           知识库身份随控制台登录一起发放:到「设置 → 账户与访问」用 labnote 账号登录后,
           这里即可直接使用,无需单独登录。
         </p>
-        <a href="/settings"><Button size="sm" className="mt-3">去设置页登录</Button></a>
+        <Link href="/settings"><Button size="sm" className="mt-3">去设置页登录</Button></Link>
       </div>
     );
   }
@@ -66,7 +67,7 @@ function LoginCard({ onOk }: { onOk: (username: string) => void }) {
         {busy ? <Loader2 className="size-3.5 animate-spin" /> : null}登录
       </Button>
       <p className="mt-2 text-center text-micro text-muted-foreground">
-        没有账号?<a href="/settings" className="text-brand hover:underline">去「设置 → 账户与访问」注册</a>
+        没有账号?<Link href="/settings" className="text-brand hover:underline">去「设置 → 账户与访问」注册</Link>
       </p>
     </div>
   );
@@ -74,7 +75,6 @@ function LoginCard({ onOk }: { onOk: (username: string) => void }) {
 
 export default function KnowledgePage() {
   const [user, setUser] = useState("");
-  const [isAdmin, setIsAdmin] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
   const [input, setInput] = useState("");
@@ -87,7 +87,7 @@ export default function KnowledgePage() {
   useEffect(() => {
     if (!kbToken()) return;
     void kbGet<{ username: string; role: string }>("/auth/me")
-      .then((me) => { setUser(me.username); setIsAdmin(me.role === "admin"); })
+      .then((me) => { setUser(me.username); })
       .catch(() => clearKbToken());
   }, []);
 
@@ -314,10 +314,10 @@ export default function KnowledgePage() {
                 </button>
               );
             })}
-            <a href="/spaces"
+            <Link href="/spaces"
                className="ml-auto inline-flex h-7 shrink-0 items-center gap-1 rounded-md bg-surface px-2.5 text-micro shadow-[var(--surface-shadow)] hover:bg-muted/40">
               管理空间与文档<FolderPlus className="size-3" />
-            </a>
+            </Link>
           </div>
           <div className="relative min-h-0 flex-1">
             {showJumpControl ? <JumpToLatest onClick={() => scrollToBottom(true)} /> : null}

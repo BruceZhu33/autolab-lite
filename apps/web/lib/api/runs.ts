@@ -160,7 +160,8 @@ export const startResearch = (projectId: string, input: {
 
 /** 全量验证:把最近一次成功研究会话的冠军改动在选定数据集上按基线口径多 seed 重跑。 */
 export const startValidation = (projectId: string, input: {
-  datasets?: string[]; seeds?: number; source_run_id?: string; gpu_hours?: number;
+  datasets?: string[]; seeds?: number; seed_start?: number; source_run_id?: string;
+  gpu_hours?: number; regress_tol?: number;
   critic?: boolean; reviewer?: boolean; agent_spec_id?: string;
 }) => post<{ run: Run }>(`/api/owner/projects/${projectId}/research/validate`, input);
 

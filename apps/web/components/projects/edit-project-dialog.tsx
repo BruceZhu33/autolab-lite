@@ -2,7 +2,7 @@
 
 /** 补全项目:缺工作区时给目录或 GitHub 链接;本机代码目录(同步来源);追加论文。 */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { FolderOpen, Loader2 } from "lucide-react";
@@ -15,30 +15,21 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "~/vendor/ui/components/ui/dialog";
 
-export function EditProjectDialog({ project, onClose }: { project: Project | null; onClose: () => void }) {
+function EditProjectDialogInner({ project, onClose }: { project: Project; onClose: () => void }) {
   const queryClient = useQueryClient();
-  const [githubUrl, setGithubUrl] = useState(project?.githubUrl ?? "");
+  const [githubUrl, setGithubUrl] = useState(project.githubUrl ?? "");
   const [workdir, setWorkdir] = useState("");
-  const [localWorkspace, setLocalWorkspace] = useState(project?.localWorkspace ?? "");
+  const [localWorkspace, setLocalWorkspace] = useState(project.localWorkspace ?? "");
   const [paper, setPaper] = useState<File | null>(null);
   const [saving, setSaving] = useState(false);
   const [picker, setPicker] = useState<null | "workdir" | "local">(null);
 
-  useEffect(() => {
-    setGithubUrl(project?.githubUrl ?? "");
-    setWorkdir("");
-    setLocalWorkspace(project?.localWorkspace ?? "");
-    setPaper(null);
-    setPicker(null);
-  }, [project?.id, project?.githubUrl, project?.localWorkspace]);
-
   const { data: papers = [] } = useQuery({
-    queryKey: ["papers", project?.id], queryFn: () => fetchPapers(project!.id),
-    enabled: !!project?.workdir,
+    queryKey: ["papers", project.id], queryFn: () => fetchPapers(project.id),
+    enabled: !!project.workdir,
   });
 
   const save = async () => {
-    if (!project) return;
     const patch: { github_url?: string; workdir?: string; local_workspace?: string } = {};
     const nextGithub = githubUrl.trim();
     if (nextGithub !== (project.githubUrl ?? "")) {
@@ -68,19 +59,19 @@ export function EditProjectDialog({ project, onClose }: { project: Project | nul
 
   return (
     <>
-      <Dialog key={project?.id ?? "closed"} open={!!project} onOpenChange={(next) => (next ? null : onClose())}>
+      <Dialog open onOpenChange={(next) => (next ? null : onClose())}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>编辑 · {project?.name}</DialogTitle>
+            <DialogTitle>编辑 · {project.name}</DialogTitle>
             <DialogDescription>补全工作区、设置本机代码目录(同步来源)、追加论文。</DialogDescription>
           </DialogHeader>
           <div className="grid gap-3">
             <div className="grid gap-1.5">
-              <Label>GitHub 链接{project?.githubUrl ? "(已配置)" : "(没有工作区时会克隆)"}</Label>
+              <Label>GitHub 链接{project.githubUrl ? "(已配置)" : "(没有工作区时会克隆)"}</Label>
               <Input value={githubUrl} spellCheck={false}
                      onChange={(e) => setGithubUrl(e.target.value)} placeholder="https://github.com/user/repo" />
             </div>
-            {project?.workdir ? (
+            {project.workdir ? (
               <div className="grid gap-1.5">
                 <Label>工作区</Label>
                 <Input value={project.workdir} readOnly className="font-mono text-caption" />
@@ -109,7 +100,7 @@ export function EditProjectDialog({ project, onClose }: { project: Project | nul
             <div className="grid gap-1.5">
               <Label>论文 PDF{papers.length ? `(已有:${papers.join("、")})` : ""}</Label>
               <Input type="file" accept="application/pdf" className="text-caption"
-                     disabled={!project?.workdir}
+                     disabled={!project.workdir}
                      onChange={(e) => setPaper(e.target.files?.[0] ?? null)} />
             </div>
           </div>
@@ -123,7 +114,7 @@ export function EditProjectDialog({ project, onClose }: { project: Project | nul
       </Dialog>
       <FolderBrowserDialog
         open={picker !== null} onOpenChange={(v) => (v ? null : setPicker(null))}
-        source={picker === "local" ? { kind: "local" } : { kind: "server", serverId: project?.server.id ?? "" }}
+        source={picker === "local" ? { kind: "local" } : { kind: "server", serverId: project.server.id }}
         title={picker === "local" ? "选择本机代码目录" : "选择服务器工作区"}
         onPick={(path) => {
           if (picker === "local") setLocalWorkspace(path);
@@ -132,4 +123,10 @@ export function EditProjectDialog({ project, onClose }: { project: Project | nul
         }} />
     </>
   );
+}
+
+export function EditProjectDialog({ project, onClose }: { project: Project | null; onClose: () => void }) {
+  // Keyed on open + project.id so background refetches never overwrite unsaved edits.
+  if (!project) return null;
+  return <EditProjectDialogInner key={project.id} project={project} onClose={onClose} />;
 }

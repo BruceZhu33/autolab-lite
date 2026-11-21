@@ -35,7 +35,10 @@ MAX_JOBS_PER_SUBMIT = 8
 MAX_INTERNAL_JOBS_PER_SUBMIT = 64
 _METRIC_NAME = re.compile(r"^[A-Za-z0-9_.\-/]+$")
 _SEED_KV_TOKEN = re.compile(r"^(?:seed|random[-_]seed)=-?\d+$")
-_SHELL_CONTROL_OPS = ("&&", "||", ";", "|", "`", "$(", ">", "<", "\n", "\r")
+_STATIC_ENV_KV_RE = re.compile(r"^([A-Z_][A-Z0-9_]*)=(.*)$", re.DOTALL)
+_VAR_EXPAND_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})")
+_UNSAFE_ENV_VAL_CHARS = frozenset('"\'\\`;|&><()!*?[]')
+_SHELL_FORBIDDEN_NO_AND = ("||", ";", "|", "`", "$(", ">", "<", "\n", "\r")
 _INLINE_EXEC_INTERPRETERS = frozenset({"python", "python3", "bash", "sh", "zsh", "perl", "ruby", "node"})
 _DATASET_SCOPE_FLAGS = frozenset({
     "config", "config-file", "config_file",
@@ -116,11 +119,7 @@ def code_anchor(ws: Workspace) -> CodeAnchor:
     return CodeAnchor(non_git_fingerprint=hashlib.sha256(seed.encode("utf-8")).hexdigest())
 
 
-def _positional_prefix(command: str) -> list[str]:
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return []
+def _positional_prefix_tokens(tokens: list[str]) -> list[str]:
     out: list[str] = []
     i = 0
     while i < len(tokens):
@@ -147,38 +146,162 @@ def _positional_prefix(command: str) -> list[str]:
     return out
 
 
-def check_command_readonly_safe(command: str, *, baseline_command: str = "") -> None:
-    """只读复核(strict_readonly=True / validation)命令安全门:拒绝复合 shell 操作符、重定向与内联脚本。"""
-    for op in _SHELL_CONTROL_OPS:
-        if op in command:
-            label = repr(op) if op in ("\n", "\r") else op
-            raise UserError(f"只读验证模式下命令禁止包含 shell 控制或重定向操作符({label}):{command}")
+def _positional_prefix(command: str) -> list[str]:
     try:
         tokens = shlex.split(command)
+    except ValueError:
+        return []
+    return _positional_prefix_tokens(tokens)
+
+
+def _validate_token_dollars(token: str) -> bool:
+    """校验 token 里的 `$`:仅允许安全的 `$VAR`/`${VAR}` 或末尾字面 `$`,返回是否含变量展开。"""
+    has_expandable = False
+    pos = 0
+    while (idx := token.find("$", pos)) != -1:
+        if idx == len(token) - 1:
+            pos = idx + 1
+            continue
+        m = _VAR_EXPAND_RE.match(token, idx)
+        if m is None:
+            raise UserError(f"只读验证模式下禁止非静态环境变量外的 $ 展开:{token}")
+        has_expandable = True
+        pos = m.end()
+    if has_expandable and any(ch in token for ch in ('"', "\\", "`", "\n", "\r", "!")):
+        raise UserError(f"只读验证模式下含环境变量展开的参数禁止包含引号/反斜杠等控制字符:{token}")
+    return has_expandable
+
+
+def _validate_static_env_value(value: str, key: str) -> None:
+    if any(ord(ch) < 32 or ord(ch) == 127 or ch in _UNSAFE_ENV_VAL_CHARS for ch in value):
+        raise UserError(f"只读验证模式下静态环境变量 {key} 的值包含非法字符")
+    _validate_token_dollars(value)
+
+
+def split_command_env_prefix(
+    command: str,
+) -> tuple[list[list[tuple[str, str]]], list[tuple[str, str]], list[str]]:
+    """安全拆解命令前导的静态环境变量赋值(`export K=V ... &&` 与前导 `K=V`),
+    同时严格拦截所有非前导 `&&` 及 shell 控制/重定向/命令替换操作符。"""
+    raw = str(command or "").strip()
+    if not raw:
+        raise UserError("只读验证模式下命令不能为空")
+    for op in _SHELL_FORBIDDEN_NO_AND:
+        if op in raw:
+            label = repr(op) if op in ("\n", "\r") else op
+            raise UserError(f"只读验证模式下命令禁止包含 shell 控制或重定向操作符({label}):{command}")
+    segments = raw.split("&&")
+    export_clauses: list[list[tuple[str, str]]] = []
+    for seg in segments[:-1]:
+        try:
+            seg_tokens = shlex.split(seg)
+        except ValueError as exc:
+            raise UserError(f"只读验证模式下命令引号语法非法:{exc}") from exc
+        if len(seg_tokens) < 2 or seg_tokens[0] != "export":
+            raise UserError(f"只读验证模式下命令禁止包含 shell 控制或重定向操作符(&&):{command}")
+        clause: list[tuple[str, str]] = []
+        for tok in seg_tokens[1:]:
+            m = _STATIC_ENV_KV_RE.match(tok)
+            if m is None:
+                raise UserError(f"只读验证模式下命令禁止包含 shell 控制或重定向操作符(&&):{command}")
+            key, val = m.group(1), m.group(2)
+            _validate_static_env_value(val, key)
+            clause.append((key, val))
+        export_clauses.append(clause)
+    tail = segments[-1].strip()
+    if not tail:
+        raise UserError("只读验证模式下命令不能为空")
+    try:
+        tokens = shlex.split(tail)
     except ValueError as exc:
         raise UserError(f"只读验证模式下命令引号语法非法:{exc}") from exc
     if not tokens:
         raise UserError("只读验证模式下命令不能为空")
+    inline_envs: list[tuple[str, str]] = []
+    idx = 0
+    while idx < len(tokens):
+        m = _STATIC_ENV_KV_RE.match(tokens[idx])
+        if m is None:
+            break
+        key, val = m.group(1), m.group(2)
+        _validate_static_env_value(val, key)
+        inline_envs.append((key, val))
+        idx += 1
+    cmd_tokens = tokens[idx:]
+    if not cmd_tokens or cmd_tokens[0] == "export":
+        raise UserError("只读验证模式下命令不能为空")
+    for tok in cmd_tokens:
+        _validate_token_dollars(tok)
+    return export_clauses, inline_envs, cmd_tokens
+
+
+def format_shell_token(token: str) -> str:
+    """安全格式化单个命令行参数:保留 `$VAR`/`${VAR}` 与 `~/` 的 bash 展开能力,
+    不让 `shlex.quote` 用单引号屏蔽它们;仍拒绝一切不安全元字符。"""
+    if token == "~":
+        return "~"
+    if token.startswith("~/"):
+        rest = token[2:]
+        if not rest:
+            return "~/"
+        if _validate_token_dollars(rest):
+            return f'~/"{rest}"'
+        return f"~/{shlex.quote(rest)}"
+    if _validate_token_dollars(token):
+        return f'"{token}"'
+    return shlex.quote(token)
+
+
+def format_shell_command(
+    export_clauses: list[list[tuple[str, str]]],
+    inline_envs: list[tuple[str, str]],
+    cmd_tokens: list[str],
+) -> str:
+    """将拆解后的静态环境变量前缀与主命令重新拼回可由 bash 安全执行/展开的命令行。"""
+    parts: list[str] = []
+    for clause in export_clauses:
+        kvs = " ".join(f"{k}={format_shell_token(v)}" for k, v in clause)
+        parts.append(f"export {kvs}")
+    cmd_parts = [f"{k}={format_shell_token(v)}" for k, v in inline_envs]
+    cmd_parts.extend(format_shell_token(tok) for tok in cmd_tokens)
+    parts.append(" ".join(cmd_parts))
+    return " && ".join(parts)
+
+
+def check_command_readonly_safe(command: str, *, baseline_command: str = "") -> None:
+    """只读复核(strict_readonly=True / validation)命令安全门:拒绝复合 shell 操作符、重定向与内联脚本,
+    允许前导静态环境变量赋值(`export K=V ... &&` / `K=V`)与安全 `$VAR`/`~/` 路径展开。"""
+    export_clauses, inline_envs, tokens = split_command_env_prefix(command)
     exe_base = tokens[0].rsplit("/", 1)[-1]
+    base_exports: list[list[tuple[str, str]]] = []
+    base_inlines: list[tuple[str, str]] = []
     base_tokens: list[str] = []
-    if baseline_command.strip():
+    has_baseline = bool(baseline_command.strip())
+    if has_baseline:
         try:
-            base_tokens = shlex.split(baseline_command)
-        except ValueError:
-            base_tokens = []
+            base_exports, base_inlines, base_tokens = split_command_env_prefix(baseline_command)
+        except UserError:
+            try:
+                base_tokens = shlex.split(baseline_command)
+            except ValueError:
+                base_tokens = []
     if exe_base in _INLINE_EXEC_INTERPRETERS and "-c" in tokens[1:3]:
         if not (base_tokens and base_tokens[0].rsplit("/", 1)[-1] == exe_base and "-c" in base_tokens[1:3]):
             raise UserError(f"只读验证模式下禁止通过 `{exe_base} -c` 执行内联代码")
-    if baseline_command.strip():
-        expected_pos = _positional_prefix(baseline_command)
-        actual_pos = _positional_prefix(command)
+    if has_baseline:
+        expected_env = {k: v for clause in base_exports for k, v in clause} | dict(base_inlines)
+        actual_env = {k: v for clause in export_clauses for k, v in clause} | dict(inline_envs)
+        if actual_env != expected_env:
+            raise UserError("只读验证模式下只允许更换 seed 参数,不得改动前置环境变量")
+        expected_pos = _positional_prefix_tokens(base_tokens)
+        actual_pos = _positional_prefix_tokens(tokens)
         if expected_pos and actual_pos != expected_pos:
             raise UserError(
                 f"只读验证模式下命令入口必须与基线一致(期望 `{' '.join(expected_pos)}`,"
                 f"收到 `{' '.join(actual_pos) or tokens[0]}`)"
             )
-        expected_flags = _flag_pairs(baseline_command)
-        actual_flags = _flag_pairs(command)
+        expected_flags = _flag_pairs_tokens(base_tokens)
+        actual_flags = _flag_pairs_tokens(tokens)
         if actual_flags != expected_flags:
             extra = sorted(set(actual_flags) - set(expected_flags))
             missing = sorted(set(expected_flags) - set(actual_flags))
@@ -348,13 +471,7 @@ def check_duplicate_jobs(repo: Repo, approved_by: str, jobs: list[dict], *,
 _SEED_FLAG_NAMES = frozenset({"seed", "random-seed", "random_seed"})
 
 
-def _flag_pairs(command: str) -> dict[str, str]:
-    """只解析 `--长旗标 值` / `--长旗标=值` 对。单短旗标(-u/-s)与 getopt 的取值
-    歧义无法判定,一律不参与——身分比对宁可漏报不可误拦。"""
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return {}
+def _flag_pairs_tokens(tokens: list[str]) -> dict[str, str]:
     pairs: dict[str, str] = {}
     i = 0
     while i < len(tokens):
@@ -378,6 +495,16 @@ def _flag_pairs(command: str) -> dict[str, str]:
             pairs[name] = value
         i += 1
     return pairs
+
+
+def _flag_pairs(command: str) -> dict[str, str]:
+    """只解析 `--长旗标 值` / `--长旗标=值` 对。单短旗标(-u/-s)与 getopt 的取值
+    歧义无法判定,一律不参与——身分比对宁可漏报不可误拦。"""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return {}
+    return _flag_pairs_tokens(tokens)
 
 
 def check_dataset_command_consistency(dataset: str, command: str,
